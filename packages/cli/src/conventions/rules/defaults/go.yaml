@@ -1,0 +1,66 @@
+name: go-conventions
+language: go
+version: "1.0.0"
+rules:
+  - id: go-no-panic
+    name: No panic in production
+    description: Avoid using panic() outside of tests
+    severity: error
+    filePattern: "*.go"
+    deny: "\\bpanic\\("
+    message: "Do not use panic() in production code; return errors instead"
+    enabled: true
+
+  - id: go-error-check
+    name: Check errors
+    description: Errors should not be silently ignored
+    severity: warning
+    filePattern: "*.go"
+    deny: "\\b_\\s*=\\s*\\w+\\("
+    message: "Do not ignore error returns; handle or explicitly document why"
+    enabled: true
+
+  - id: go-context-first
+    name: Context as first parameter
+    description: Functions should accept context.Context as first parameter
+    severity: info
+    filePattern: "*.go"
+    trigger: "func\\s+\\w+\\([^)]*context\\.Context"
+    message: "Good: context.Context should be the first parameter"
+    enabled: true
+
+  - id: go-no-init
+    name: Avoid init functions
+    description: init() functions make code harder to test and reason about
+    severity: warning
+    filePattern: "*.go"
+    deny: "func\\s+init\\s*\\("
+    message: "Avoid init() functions; use explicit initialization instead"
+    enabled: true
+
+  - id: go-test-table
+    name: Table-driven tests
+    description: Prefer table-driven tests for multiple cases
+    severity: info
+    filePattern: "*_test.go"
+    trigger: "tests?\\s*:?=\\s*\\[\\]struct"
+    message: "Good: using table-driven tests"
+    enabled: true
+
+  - id: go-no-global-var
+    name: No mutable global variables
+    description: Avoid mutable package-level variables
+    severity: warning
+    filePattern: "*.go"
+    deny: "^var\\s+\\w+\\s+=\\s+"
+    message: "Avoid mutable global variables; use dependency injection"
+    enabled: true
+
+  - id: go-interface-suffix
+    name: Interface naming
+    description: Interfaces should describe behavior, not use -er suffix blindly
+    severity: info
+    filePattern: "*.go"
+    trigger: "type\\s+\\w+er\\s+interface"
+    message: "Consider if -er suffix describes the interface's behavior accurately"
+    enabled: true

@@ -1,0 +1,66 @@
+name: kafka-conventions
+language: any
+version: "1.0.0"
+rules:
+  - id: kafka-no-auto-commit
+    name: No auto-commit
+    description: Disable auto-commit for reliable message processing
+    severity: error
+    filePattern: "*.{ts,go,java}"
+    deny: "auto\\.commit\\.enable.*true|enableAutoCommit.*true"
+    message: "Disable auto-commit; use manual offset management for reliability"
+    enabled: true
+
+  - id: kafka-idempotent-consumer
+    name: Idempotent consumers
+    description: Consumers should be idempotent
+    severity: warning
+    filePattern: "*.{ts,go,java}"
+    trigger: "idempoten|dedup"
+    message: "Good: implementing idempotent message processing"
+    enabled: true
+
+  - id: kafka-dlq
+    name: Dead letter queue
+    description: Failed messages should go to a DLQ
+    severity: warning
+    filePattern: "*.{ts,go,java}"
+    require: "dlq|dead.letter|deadLetter"
+    message: "Ensure failed messages are sent to a dead letter queue"
+    enabled: true
+
+  - id: kafka-schema-registry
+    name: Use schema registry
+    description: Messages should use a schema registry for compatibility
+    severity: info
+    filePattern: "*.{ts,go,java}"
+    trigger: "schema.*registry|schemaRegistry|avro|protobuf"
+    message: "Good: using schema registry for message compatibility"
+    enabled: true
+
+  - id: kafka-no-string-key
+    name: Proper message keys
+    description: Avoid using plain strings as Kafka keys
+    severity: warning
+    filePattern: "*.{ts,go,java}"
+    deny: "key:\\s*['\"]\\w+['\"]"
+    message: "Use structured keys for proper partitioning"
+    enabled: true
+
+  - id: kafka-consumer-group
+    name: Named consumer groups
+    description: Consumer groups should have descriptive names
+    severity: info
+    filePattern: "*.{ts,go,java}"
+    trigger: "group\\.id|groupId|consumerGroup"
+    message: "Ensure consumer group names are descriptive and documented"
+    enabled: true
+
+  - id: kafka-retry-config
+    name: Retry configuration
+    description: Producers should configure retries
+    severity: warning
+    filePattern: "*.{ts,go,java}"
+    trigger: "retries|retry\\.backoff|maxRetries"
+    message: "Good: configuring retry behavior for producers"
+    enabled: true

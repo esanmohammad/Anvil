@@ -1,0 +1,10 @@
+export { PERSONA_NAMES, isValidPersonaName, validatePersonaConfig } from './types.js';
+export type { PersonaName, PersonaConfig, StageRule, OutputTemplate, PluginAccess } from './types.js';
+export { loadPersonaPrompt, clearPersonaCache } from './loader.js';
+export { validatePersonaPrompt } from './validator.js';
+export type { ValidationResult } from './validator.js';
+export { installPersonas } from './installer.js';
+export type { InstallResult } from './installer.js';
+export { STAGE_PERSONA_MAP, PIPELINE_STAGES, getPersonaForStage, getStagesForPersona } from './stage-map.js';
+export { STAGE_RULES, getStageRules, formatRulesForPrompt } from './stage-rules.js';
+export { getPersonaVersion, isUpgradeAvailable } from './versioning.js';

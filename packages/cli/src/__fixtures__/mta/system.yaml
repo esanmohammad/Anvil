@@ -1,0 +1,688 @@
+# systems/mta/system.yaml
+schema_version: 2
+system: mta
+title: Mail Transfer Agent (MTA)
+owner: email-marketing-engine-mta
+lifecycle: production
+tier: critical
+business_domains:
+  - email-delivery
+  - deliverability
+description: |
+  Mail Transfer Agent (MTA) system responsible for routing and delivering both marketing and transactional emails.
+
+  ## Architecture Overview
+
+  **Ingestion & Routing:**
+  Producers (sendmail, email-sending) write the mail body to Redis mailbody (hot storage) along with a metainfo hashmap, then publish a routing message to the `mta_router_trans` or `mta_router_marketing` Kafka topic. Cluster Routing consumes these topics, resolves the VIP and MX for the recipient domain, and pushes the mailbody key onto a Redis list keyed as `{ISP_ID}:{sending_domain}:{recipient_MX_IP}:(transactional|marketing)`. It then publishes a command message to QLM Handler via the `mta_qlm` Kafka topic.
+
+  **Worker Assignment (QLM):**
+  QLM Handler selects the best available MTA worker pod (based on CPU and memory) and sends a start-consumer command on a Redis pub/sub channel named after the target pod. MTA receives the command, starts a Redis list consumer for that queue, and begins delivery — prioritising transactional over marketing. MTA creates a connection pool per queue, fetches ISP limits (messages/min, parallel connections) from the mtaprocess MongoDB collection, and relays mails through an NGINX proxy which forwards to the ESP from the IP selected by MTA.
+
+  **Queue Recovery (QLM Scanner):**
+  QLM Scanner periodically scans the queue Redis cluster for stuck queues. When found, it clears queue metadata and re-issues a start command so a new worker can take over.
+
+  **Deferred Mail Retry:**
+  Deferred emails have their metadata and body key stored in rs-queues2 MongoDB. The internal-deferred component polls this collection and re-submits mails that have reached their retry time back to Cluster Routing.
+
+  **Bounce & Reply Handling (Returnpath):**
+  Returnpath handles SMTP replies and async bounce notifications. Mail bodies are temporarily stored in a dedicated returnpath Redis, read by returnpath mta-stats for parsing and stats updates, then deleted.
+
+  **Statistics & Routing Rules:**
+  All delivery DSNs (delivered, bounced, deferred) are published to their respective Kafka topics and consumed by mta-statistics services. DSNs are also published to the `mta_rerouting` Kafka topic where regex and rate-limit rules from mtaprocess are applied — these rules update Redis to reroute traffic to a different sending domain when needed.
+
+  **Mail Body Storage (Hot/Cold):**
+  Mail body uses a hot/cold storage model. Hot storage is Redis mailbody. Marketing emails over 100 KB and aged-out mails are moved to Scylla (cold storage). For campaigns, a delta-compression scheme stores only the patch in mailbody; the base template is fetched from central-db by decompress-mta-template to reconstruct the personalised email. This scheme does not apply to transactional mails.
+
+glossary:
+  - term: QLM
+    definition: Queue Lifecycle Manager — selects the best MTA worker pod and sends start-consumer commands via Redis pub/sub.
+  - term: DSN
+    definition: Delivery Status Notification — feedback message (delivered, bounced, deferred) emitted after an SMTP delivery attempt.
+  - term: ISP
+    definition: Internet Service Provider — receiving mail infrastructure whose rate limits must be respected.
+  - term: VIP
+    definition: Virtual IP address used for outbound SMTP connections, selected per sending domain and ISP.
+  - term: MX
+    definition: Mail eXchange DNS record pointing to the recipient's inbound mail server.
+  - term: mailbody key
+    definition: Redis key referencing the serialised email body in hot storage (Redis mailbody) or cold storage (Scylla).
+  - term: cluster routing
+    definition: The service (mta-cluster-routing) that consumes Kafka routing events, resolves recipients, and pushes mailbody keys to per-ISP Redis list queues.
+  - term: returnpath
+    definition: Component handling SMTP bounce replies and async delivery notifications, feeding statistics and rerouting rules.
+  - term: delta compression
+    definition: Storage optimisation for campaigns — only the per-recipient patch is stored in mailbody; the base template is fetched from central-db and merged at delivery time.
+
+invariants:
+  - id: trans-priority
+    statement: Transactional queues are always prioritised over marketing queues.
+    rationale: Protect time-sensitive email delivery (password resets, OTP codes).
+    criticality: high
+  - id: routing-via-cluster-routing
+    statement: All emails must be routed through mta-cluster-routing; never publish directly to Redis delivery queues.
+    rationale: Direct writes bypass rate limiting, priority sorting, and ISP limit enforcement.
+    criticality: high
+  - id: mailbody-hot-cold
+    statement: Mail bodies use a hot/cold storage model — Redis mailbody for hot, Scylla for cold.
+    rationale: Keeps Redis memory bounded while preserving sub-millisecond delivery latency for recent mails.
+    criticality: medium
+
+sharp_edges:
+  - id: qlm-recovery-ordering
+    statement: Queue recovery depends on QLM Scanner clearing stale metadata before re-issuing a worker assignment. If scanner misses a stuck queue, no new worker is assigned.
+    impacted_components:
+      - mta-qlm-scanner
+      - mta
+    severity: high
+  - id: direct-redis-write
+    statement: Publishing directly to Redis delivery queues bypasses rate limiting, priority sorting, and ISP limit enforcement. Always go through cluster routing.
+    impacted_components:
+      - mta-cluster-routing
+    severity: high
+  - id: delta-compression-transactional
+    statement: Delta compression only applies to campaign (marketing) emails. Transactional emails store the full body. Applying delta compression to transactional mails would break delivery.
+    impacted_components:
+      - decompress-mta-template
+    severity: medium
+
+critical_flows:
+  - id: transactional-delivery
+    name: Transactional email delivery
+    trigger: Producer publishes transactional email (password reset, OTP, order confirmation)
+    steps:
+      - component: producer
+        action: publish
+        interface: kafka:mta_router_trans
+      - component: mta-cluster-routing-trans
+        action: consume_and_route
+        interface: kafka:mta_router_trans
+        notes: Resolves VIP/MX, constructs Redis list key, pushes mailbody key
+      - component: mta-cluster-routing-trans
+        action: publish
+        interface: kafka:mta_qlm
+      - component: mta-qlm
+        action: assign_worker
+        interface: redis-pubsub:{pod_name}
+        notes: Selects best MTA worker pod by CPU/memory
+      - component: mta
+        action: deliver
+        interface: redis-list:mta-queue
+        notes: Consumes queue, enforces ISP limits, delivers via NGINX proxy
+  - id: deferred-retry
+    name: Deferred mail retry
+    trigger: Deferred mail reaches retry time in rs-queues2
+    steps:
+      - component: internal-deferred
+        action: poll
+        interface: mongo:rs-queues2
+      - component: internal-deferred
+        action: resubmit
+        interface: kafka:mta_router_trans
+        notes: Re-enters the transactional delivery flow via cluster routing
+  - id: queue-recovery
+    name: Stuck queue recovery
+    trigger: QLM Scanner detects queue with no active consumer
+    steps:
+      - component: mta-qlm-scanner
+        action: scan
+        interface: redis-cluster:mta-queue
+      - component: mta-qlm-scanner
+        action: clear_and_reissue
+        interface: kafka:mta_qlm
+        notes: Clears stale metadata, publishes new start command for QLM to reassign
+
+fixtures_path: fixtures
+repos:
+  - name: sendinblue_mta
+    github: DTSL/sendinblue_mta
+    repo_kind: multi-component-service
+    lifecycle: production
+    data_ownership:
+      - entity: isp-limits
+        source_of_truth: mtaprocess
+        notes: Messages/min and parallel connections per ISP/domain
+      - entity: deferred-mail-metadata
+        source_of_truth: rs-queues2
+        notes: Includes retry scheduling and deferred body keys
+    description: |
+      Core MTA delivery repository. Contains the main MTA service and supporting components for ISP limit control and deferred mail retry.
+
+      - **mta**: Core delivery worker. Receives start-consumer commands via Redis pub/sub, consumes transactional and
+        marketing Redis list queues (trans prioritised over marketing), creates a connection pool per queue, enforces ISP
+        limits (messages/min, parallel connections) fetched from mtaprocess, and relays mails through NGINX proxy to the ESP.
+      - **increase-isp-limit**: Manages per-ISP sending limits to improve deliverability for a given sending IP and domain.
+      - **internal-deferred**: Polls rs-queues2 for deferred mails that have reached their retry time and re-submits them
+        to Cluster Routing to be retried.
+    operational_metadata:
+      source_of_truth:
+        - mtaprocess for ISP limits (messages/min, parallel connections per ISP/domain)
+        - rs-queues2 for deferred mail metadata and retry scheduling
+      failure_modes:
+        - stale queue ownership — worker pod dies without releasing its Redis list consumer
+        - missed start-consumer command — QLM publishes but MTA pod not listening on pub/sub channel
+        - ISP limit drift — mtaprocess not updated after ISP policy changes, causing throttling or over-sending
+      observability:
+        dashboards:
+          - grafana/mta-delivery
+          - grafana/mta-queue-depth
+        alerts:
+          - pagerduty/mta-delivery-latency
+          - pagerduty/mta-stuck-queues
+      slo_hints:
+        - sub-second dequeue latency for transactional queues
+        - transactional emails delivered within 30s of Kafka consumption
+      safe_changes:
+        - adding new non-required fields to DSN Kafka events
+        - increasing ISP limits in mtaprocess
+      risky_changes:
+        - changing Redis list key format (breaks all active MTA consumers)
+        - modifying Kafka topic partition count (rebalances all consumers)
+        - changing ISP limit schema in mtaprocess (affects all MTA workers)
+      rollout_notes:
+        - MTA workers must be drained before deploy (finish active queues)
+        - rolling restart safe only if QLM scanner is active to reassign stuck queues
+    components:
+      - name: mta
+        type: service
+        language: typescript
+        runtime_kind: worker
+        path: /mta
+        description: |
+          Core MTA delivery worker. Listens for start-consumer commands on a Redis pub/sub channel (named after the pod),
+          then consumes the assigned Redis list queue. Prioritises transactional queues over marketing. Creates a connection
+          pool per queue, fetches ISP limits from mtaprocess, and delivers mail via NGINX proxy to the ESP.
+        kafka:
+          produces:
+            - topic: mta_stats_bounce
+            - topic: mta_stats_transactional_delivered
+            - topic: mta_stats_delivered_marketing
+            - topic: mta_stats_deferred
+            - topic: mta_rerouting
+        deployment:
+          kustomize_path: deploy/overlays/mta/base
+          kubernetes_label: app=mta
+      - name: increase-isp-limit
+        type: service
+        language: typescript
+        runtime_kind: worker
+        path: /increase-isp-limit
+        description: Manages per-ISP sending limits (messages/min, parallel connections) to improve deliverability for a given sending IP and domain combination.
+        depends_on_repos:
+          - repo: nodejs-library
+            reason: 'Shared Node.js/TypeScript utilities for logging, HTTP clients, database connections, and common middleware'
+      - name: internal-deferred
+        type: service
+        language: typescript
+        runtime_kind: retry-worker
+        path: /internal-deferred
+        description: Polls rs-queues2 MongoDB for deferred mails that have reached their retry time and re-submits them to Cluster Routing to be retried.
+        deployment:
+          kustomize_path: deploy/overlays/mta-internal-deferred/base
+          kubernetes_label: app=mta-internal-deferred
+    depends_on:
+      - type: mongo
+        name: mtaprocess
+        usage: 'ISP connection limits (messages/min, parallel connections) and VIP/sender IP details fetched per delivery queue'
+      - type: redis
+        name: mta
+        usage: 'MTA receives start-consumer commands via Redis pub/sub channels named after worker pods; MX cache and application state locks'
+      - type: redis-cluster
+        name: mta-queue
+        usage: 'Redis Cluster for delivery queue lists; MTA consumes mailbody keys from these lists'
+      - type: redis-cluster
+        name: mailbody
+        usage: 'Redis Cluster for email body storage (hot tier); MTA fetches mail bodies from here for delivery'
+      - type: mongo
+        name: rs-queues2
+        usage: 'Cold storage for deferred email metadata and body keys; polled by internal-deferred to re-submit mails that have reached their retry time back to cluster routing'
+      - type: scylla
+        name: mail-body-cluster
+        usage: 'Cold storage tier for email bodies; aged-out mails from Redis mailbody are moved here, and marketing emails over 100 KB are written directly to Scylla'
+      - type: wiremock
+        name: wiremock
+        usage: 'Mocks external APIs consumed by MTA services (suppression list, etc.)'
+    interfaces:
+      consumes:
+        http:
+          - name: suppression-list
+            purpose: 'Checks if a recipient email is blacklisted before delivery. Called per mail in queueMsgHandler.checkGlobalBlocklist.'
+  - name: mta-increase-isp-limit
+    github: dtsl/mta-increase-isp-limit
+    type: service
+    repo_kind: service
+    language: golang
+    runtime_kind: scheduler
+    lifecycle: production
+    description: |
+      Cron job that manages sending IP deliverability per domain. Periodically reviews ISP-level sending limits
+      and increases them for IPs that have demonstrated good reputation, improving overall throughput and deliverability.
+  - name: unified-qlm
+    github: DTSL/unified-qlm
+    repo_kind: multi-component-service
+    lifecycle: production
+    description: |
+      Queue List Manager (QLM) for MTA. Responsible for worker assignment and queue health monitoring.
+
+      - **mta-qlm** (QLM Handler): Kafka consumer of the `mta_qlm` topic. Receives queue start commands published by
+        Cluster Routing, selects the best available MTA worker pod based on CPU and memory, and sends the start-consumer
+        command on the Redis pub/sub channel named after that pod.
+      - **mta-qlm-scanner**: Periodically scans the Redis queue cluster for stuck queues (queues with no active consumer).
+        Clears stuck queue metadata and re-issues a start command so a new worker can take over.
+    components:
+      - name: mta-qlm
+        type: service
+        language: "golang"
+        runtime_kind: kafka-consumer
+        path: /cmd/mta-qlm
+        description: QLM Handler — Kafka consumer of mta_qlm topic. Selects the best MTA worker pod and sends start-consumer commands via Redis pub/sub.
+        kafka:
+          consumes:
+            - topic: mta_qlm
+              consumer_group: mta-qlm
+        deployment:
+          kustomize_path: deploy/overlays/unified-qlm-mta-qlm
+          kubernetes_label: app=mta-qlm
+      - name: mta-qlm-scanner
+        type: service
+        language: "golang"
+        runtime_kind: scheduler
+        path: /cmd/mta-qlm-scanner
+        description: Periodically scans the Redis queue cluster for stuck queues, clears their metadata, and re-issues start commands to recover delivery.
+        kafka:
+          produces:
+            - topic: mta_qlm
+        deployment:
+          kustomize_path: deploy/overlays/unified-qlm-mta-qlm-scanner
+          kubernetes_label: app=mta-qlm-scanner
+    depends_on:
+      - type: kafka
+        name: kafka
+        version: "3.6"
+        usage: 'mta-qlm consumes the mta_qlm topic to receive queue start commands from Cluster Routing'
+      - type: redis
+        name: mta
+        usage: 'mta-qlm sends start-consumer commands to MTA worker pods via Redis pub/sub channels named after each pod'
+      - type: redis-cluster
+        name: mta-queue
+        usage: 'mta-qlm-scanner scans this cluster to detect stuck queues and trigger recovery'
+  - name: mta-cluster-routing
+    github: DTSL/mta-cluster-routing
+    type: service
+    repo_kind: multi-component-service
+    lifecycle: production
+    description: |
+      Responsible for routing incoming email messages from producers (sendmail, email-sending) into the correct
+      Redis delivery queues. For each message it resolves the VIP and MX for the recipient domain, constructs a
+      Redis list key in the format `{ISP_ID}:{sending_domain}:{recipient_MX_IP}:(transactional|marketing)`, and
+      pushes the mailbody key onto that list. It then publishes a start-consumer command to QLM Handler via the
+      `mta_qlm` Kafka topic so that an MTA worker is assigned to the queue.
+    operational_metadata:
+      failure_modes:
+        - VIP/MX resolution failure — emails routed to wrong cluster or dropped
+        - Redis Cluster CLUSTERDOWN — queue writes fail, messages back-pressure in Kafka
+      slo_hints:
+        - p99 routing latency < 50ms per message
+      risky_changes:
+        - changing Redis list key format (breaks all MTA consumers reading queues)
+        - changing Kafka topic schema for mta_qlm (breaks QLM handler)
+      safe_changes:
+        - adding new metadata fields to the routing event (backward compatible)
+    components:
+      - name: mta-cluster-routing-trans
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /cmd/mta-cluster-routing
+        description: Cluster routing consumer for transactional emails.
+        kafka:
+          consumes:
+            - topic: mta_router_trans
+              consumer_group: mta-cluster-routing-trans
+          produces:
+            - topic: mta_qlm
+        deployment:
+          kustomize_path: deploy/overlays/mta-cluster-routing-mta-cluster-routing-transactional/base
+          kubernetes_label: app=mta-cluster-routing-trans
+      - name: mta-cluster-routing-marketing
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /cmd/mta-cluster-routing
+        description: Cluster routing consumer for marketing emails.
+        kafka:
+          consumes:
+            - topic: mta_router_marketing
+              consumer_group: mta-cluster-routing-marketing
+          produces:
+            - topic: mta_qlm
+        deployment:
+          kustomize_path: deploy/overlays/mta-cluster-routing-mta-cluster-routing-marketing/base
+          kubernetes_label: app=mta-cluster-routing-marketing
+      - name: local-mail-injector
+        type: service
+        language: golang
+        runtime_kind: local-benchmark
+        path: /cmd/local-mail-injector
+        description: Local test tool that injects 200 transactional emails into the MTA pipeline (100 mails, 5s pause, 100 mails) for benchmarking cluster routing end-to-end.
+        deployment:
+          kustomize_path: deploy/overlays/local-mail-injector/base
+          kubernetes_label: app=local-mail-injector
+    depends_on:
+      - type: mongo
+        name: mtaprocess
+        usage: 'Fetches VIP and sender IP details, and resolves MX records for recipient domains to construct the delivery queue key'
+      - type: redis-cluster
+        name: mailbody
+        usage: 'Redis Cluster for email body storage (ioredis Cluster mode requires CLUSTER SLOTS)'
+      - type: redis
+        name: mta
+        usage: 'MX cache and application state locks'
+      - type: redis-cluster
+        name: mta-queue
+        usage: 'Redis Cluster where delivery queue lists are created and mailbody keys are pushed'
+    interfaces:
+      exposes:
+        kafka:
+          - topic: mta-cluster-routing-async-api
+            purpose: Kafka consumer for mta_router_trans and mta_router_marketing topics published by producers (sendmail, email-sending)
+  - name: return-path
+    github: DTSL/return-path
+    type: service
+    repo_kind: service
+    language: nodejs
+    runtime_kind: http-service
+    lifecycle: production
+    description: |
+      SMTP server that handles mail replies and asynchronous bounce notifications returned from ESPs after delivery.
+      When a reply or bounce is received, it looks up the originating client email from central-db to forward replies,
+      temporarily stores the mail body in the returnpath Redis for downstream stats processing, then publishes events
+      to the appropriate mta-statistics Kafka topics. The returnpath mta-stats apps read from the returnpath Redis,
+      parse the events, push stats, and delete the entry.
+    deployment:
+      kustomize_path: deploy/overlays/returnpath/base
+      kubernetes_label: app=return-path
+    depends_on:
+      - type: mongo
+        name: central-db
+        usage: 'Fetches the client email address to forward replies to when mails are received in returnpath'
+      - type: mongo
+        name: mtaprocess
+        usage: 'ISP and sender IP details used when processing bounce and reply notifications'
+      - type: redis-cluster
+        name: mailbody
+        usage: 'Redis Cluster for email body storage (ioredis Cluster mode requires CLUSTER SLOTS)'
+      - type: redis
+        name: returnpath
+        usage: 'Temporary storage for returnpath mail bodies; read by returnpath mta-stats apps for parsing and stats updates, then deleted'
+    depends_on_repos:
+      - repo: nodejs-library
+        reason: 'Shared Node.js/TypeScript utilities for logging, HTTP clients, database connections, and common middleware'
+  - name: decompress-mta-template
+    github: dtsl/decompress-mta-template
+    type: service
+    repo_kind: service
+    language: golang
+    runtime_kind: http-service
+    lifecycle: production
+    description: |
+      Service that reconstructs personalised marketing email bodies by applying a delta patch (stored in Redis mailbody)
+      against a base campaign template (fetched from central-db MongoDB). This delta-compression scheme reduces the
+      size of data stored in mailbody for campaign sends. Not used for transactional mails, which store the full body directly.
+    depends_on:
+      - type: mongo
+        name: central-db
+        usage: 'Retrieves the base campaign template to apply against the delta patch stored in mailbody redis, reconstructing the personalised email; reduces mailbody storage size for campaigns (not used for transactional mails)'
+  - name: mta-routing-engine
+    github: DTSL/mta-routing-engine
+    type: service
+    repo_kind: service
+    runtime_kind: kafka-consumer
+    lifecycle: production
+    kafka:
+      consumes:
+        - topic: mta_rerouting
+          consumer_group: mta-routing-engine-mta_rerouting_new
+    description: |
+      Applies deliverability routing rules to all mail delivery DSNs. Consumes DSNs from MTA via Kafka,
+      reads rate-limit and regex-based routing rules from mtaprocess MongoDB, and updates Redis with rerouting
+      instructions that tell MTA to switch a queue's traffic to a different sending domain. Used to dynamically
+      manage sending reputation by redistributing traffic across IPs and domains without restarting MTA workers.
+    depends_on:
+      - type: kafka
+        name: kafka
+        version: "3.6"
+        usage: 'Consumes the mta_rerouting topic published by MTA with all delivery outcomes'
+      - type: mongo
+        name: mtaprocess
+        usage: 'Source of rate-limit and regex-based routing rules that determine when and how to reroute traffic'
+      - type: redis
+        name: mta
+        usage: 'Writes rerouting instructions that MTA reads to redirect a queue to a different sending domain'
+  - name: smtp-benchmark
+    github: DTSL/smtp-benchmark
+    repo_kind: tooling
+    lifecycle: production
+    description: |
+      SMTP server to benchmark MTA. 
+    components:
+      - name: smtp-benchmark
+        type: service
+        language: "golang"
+        runtime_kind: local-benchmark
+        path: /cmd/smtp-benchmark
+        description: Simple SMTP server written in go to accept mails from mta
+        deployment:
+          kustomize_path: deploy/overlays/smtp-benchmark-sink
+          kubernetes_label: app=smtp-benchmark-sink
+  - name: mta-statistics
+    github: DTSL/mta-statistics
+    repo_kind: multi-component-service
+    lifecycle: production
+    description: |
+      Multi-component repository of Kafka consumers responsible for processing MTA delivery events and updating statistics.
+      Each component consumes a specific event type (bounce, delivered-transactional, delivered-marketing, returnpath-bounce, deferred)
+      and writes aggregated stats to ClickHouse. Bounce classification uses regex rules from mtaprocess. Campaign-level and
+      user-level stats (blacklist, soft-bounce counters) are maintained in client-db.
+    operational_metadata:
+      source_of_truth:
+        - ClickHouse for raw delivery event statistics (OLAP analytics)
+        - client-db for campaign-level and user-level counters (delivered, bounced, blacklisted)
+        - mtaprocess for bounce regex classification rules
+      failure_modes:
+        - Kafka consumer lag — stats delayed, dashboards stale
+        - ClickHouse write failure — raw events lost (no retry buffer)
+        - bounce misclassification — wrong regex in mtaprocess marks hard bounce as soft or vice versa
+      observability:
+        dashboards:
+          - grafana/mta-statistics
+          - grafana/mta-bounce-classification
+        alerts:
+          - pagerduty/mta-stats-consumer-lag
+      risky_changes:
+        - changing bounce classification regex in mtaprocess (affects all historical consistency)
+        - changing ClickHouse table schema (requires migration of analytics queries)
+      safe_changes:
+        - adding new Kafka consumer component for a new event type
+        - adding new ClickHouse columns (additive schema change)
+    components:
+      - name: mta-delete
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /
+        kafka:
+          consumes:
+            - topic: mta_delete
+              consumer_group: mta-delete
+        interfaces:
+          exposes:
+            kafka:
+              - topic: mta-delete-api
+                purpose: Kafka consumer for processing marketing mail delete events.
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-mta-delete/base
+          kubernetes_label: app=mta-delete
+      - name: mta-statistics-bounces
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /mta-statistics-bounces
+        kafka:
+          consumes:
+            - topic: mta_stats_bounce
+              consumer_group: mta-statistics-bounces
+          produces:
+            - topic: mta_delete
+        interfaces:
+          exposes:
+            kafka:
+              - topic: mta-statistics-bounces-async-api
+                purpose: Kafka consumer for bounce event reporting. Classifies bounces (hard/soft/spam) using regex rules from mtaprocess and writes stats to ClickHouse.
+        depends_on_repos:
+          - repo: golang-libraries
+            reason: 'Shared Go utilities for Kafka consumer setup, structured logging, ClickHouse and MongoDB clients'
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-bounce/base
+          kubernetes_label: app=mta-statistics-bounce
+      - name: mta-statistics-delivered-transactional
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /mta-statistics-delivered-transactional
+        kafka:
+          consumes:
+            - topic: mta_stats_transactional_delivered
+              consumer_group: mta-statistics-delivered-transactional
+        interfaces:
+          exposes:
+            kafka:
+              - topic: mta-statistics-delivered-transactional-async-api
+                purpose: Kafka consumer for transactional delivered event reporting. Updates delivery stats in ClickHouse and campaign counters in client-db.
+        depends_on_repos:
+          - repo: golang-libraries
+            reason: 'Shared Go utilities for Kafka consumer setup, structured logging, ClickHouse and MongoDB clients'
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-delivered-transactional/base
+          kubernetes_label: app=mta-statistics-delivered-transactional
+      - name: marketing-delivered
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /marketing-delivered
+        kafka:
+          consumes:
+            - topic: mta_stats_delivered_marketing
+              consumer_group: marketing-delivered
+          produces:
+            - topic: mta_delete
+            - topic: marketing-delivered
+        interfaces:
+          exposes:
+            kafka:
+              - topic: marketing-delivered-async-api
+                purpose: Kafka consumer for marketing delivered event reporting. Updates campaign-level delivery stats.
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-delivered-marketing/base
+          kubernetes_label: app=mta-statistics-delivered-marketing
+      - name: marketing-aggregator
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /marketing-aggregator
+        kafka:
+          consumes:
+            - topic: marketing-delivered
+              consumer_group: marketing-aggregator
+        interfaces:
+          exposes:
+            kafka:
+              - topic: mta-statistics-marketing-delivered-aggregator-api
+                purpose: Kafka consumer that aggregates marketing delivered events into batches for efficient stats writes.
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-marketing-delivered-aggregator/base
+          kubernetes_label: app=mta-statistics-marketing-delivered-aggregator
+      - name: mta-statistics-returnpath-bounces
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /mta-statistics-returnpath-bounces
+        kafka:
+          consumes:
+            - topic: mta_stats_returnpath_bounce
+              consumer_group: mta-statistics-returnpath-bounces
+          produces:
+            - topic: mta_stats_returnpath_marketing_delete
+        interfaces:
+          exposes:
+            kafka:
+              - topic: mta-statistics-returnpath-bounces-async-api
+                purpose: Kafka consumer for returnpath bounce event reporting. Processes async bounce notifications received via the returnpath SMTP server.
+        depends_on_repos:
+          - repo: golang-libraries
+            reason: 'Shared Go utilities for Kafka consumer setup, structured logging, ClickHouse and MongoDB clients'
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-returnpath-bounce/base
+          kubernetes_label: app=mta-statistics-returnpath-bounce
+      - name: mta-statistics-returnpath-bounces-delete
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /mta-statistics-returnpath-bounces-delete
+        kafka:
+          consumes:
+            - topic: mta_stats_returnpath_marketing_delete
+              consumer_group: mta-statistics-returnpath-bounce-delete
+        interfaces:
+          exposes:
+            kafka:
+              - topic: mta-statistics-returnpath-bounces-delete-async-api
+                purpose: Kafka consumer for processing delete events. Batches the events by client_id and submits batch delete api calls.
+        depends_on_repos:
+          - repo: golang-libraries
+            reason: 'Shared Go utilities for Kafka consumer setup, structured logging, ClickHouse and MongoDB clients'
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-returnpath-bounces-batch-delete/base
+          kubernetes_label: app=mta-statistics-returnpath-bounces-delete
+      - name: mta-statistics-deferred
+        type: service
+        language: golang
+        runtime_kind: kafka-consumer
+        path: /mta-statistics-deferred
+        kafka:
+          consumes:
+            - topic: mta_stats_deferred
+              consumer_group: mta-statistics-deferred
+        interfaces:
+          exposes:
+            kafka:
+              - topic: mta-statistics-deferred-async-api
+                purpose: Kafka consumer for deferred mail event reporting. Records deferral stats in ClickHouse.
+        depends_on_repos:
+          - repo: golang-libraries
+            reason: 'Shared Go utilities for Kafka consumer setup, structured logging, ClickHouse and MongoDB clients'
+        deployment:
+          kustomize_path: deploy/overlays/mta-statistics-deferred/base
+          kubernetes_label: app=mta-statistics-deferred
+      - name: mta-statistics
+        type: umbrella
+        language: ""
+        runtime_kind: library
+        path: /mta-statistics
+    depends_on:
+      - type: kafka
+        name: kafka
+        version: "3.9.0"
+        usage: 'Consumes delivery event topics (delivered, bounce, returnpath bounce, deferred) published by MTA components to update statistics'
+      - type: clickhouse
+        name: clickhouse
+        usage: 'Raw event storage for delivery statistics; used for OLAP-style analytics queries and reporting dashboards'
+      - type: redis
+        name: redis-sentinel-mta-cache
+        usage: 'MX cache lookups and application state locks shared across MTA statistics components'
+      - type: mongo
+        name: client-db
+        usage: 'Campaign-level stats updates (e.g. delivered/bounce counts per campaign); user-level details including blacklist status and soft-bounce counters'
+      - type: mongo
+        name: mtaprocess
+        usage: 'Bounce regex classification rules used to categorise bounce events into hard/soft/spam etc.'

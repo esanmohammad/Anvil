@@ -1,0 +1,33 @@
+{
+  "name": "@anvil-dev/code-search-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for multi-repo code search — GitHub org or local path, zero config",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "code-search-mcp": "./dist/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "tsc -b --watch"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "0.27.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "graphology": "0.26.0",
+    "graphology-communities-louvain": "2.0.2",
+    "graphology-metrics": "2.4.0",
+    "graphology-types": "0.24.8",
+    "tree-sitter-wasms": "0.1.13",
+    "web-tree-sitter": "0.26.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2"
+  }
+}

@@ -1,0 +1,88 @@
+# factory.yaml — Go microservices with Kafka event bus
+#
+# This example shows three independent Go services that communicate
+# asynchronously through Kafka. Each service lives in its own repo.
+# Anvil clones all three and understands the event contracts
+# so it can make cross-service changes safely.
+
+name: order-platform
+domain: |
+  Order processing platform. The order-service accepts orders via gRPC,
+  publishes OrderCreated events to Kafka, which are consumed by the
+  inventory-service (reserves stock) and the notification-service
+  (sends confirmation emails via SendGrid).
+
+repos:
+  - name: order-service
+    github: myorg/order-service
+    lang: go
+    build: go build ./cmd/server
+    test: go test ./...
+    port: 50051
+    notes: "gRPC server; protobuf definitions in proto/"
+
+  - name: inventory-service
+    github: myorg/inventory-service
+    lang: go
+    build: go build ./cmd/server
+    test: go test ./...
+    port: 50052
+    notes: "Consumes OrderCreated, produces StockReserved/StockFailed"
+
+  - name: notification-service
+    github: myorg/notification-service
+    lang: go
+    build: go build ./cmd/server
+    test: go test ./...
+    port: 8080
+    notes: "HTTP health endpoint; consumes OrderCreated and StockReserved"
+
+# Service-to-service and infrastructure connections
+connects:
+  # Order service produces events to Kafka
+  - from: order-service
+    to: kafka
+    protocol: kafka
+    topic: orders.created
+    notes: "Avro schema in order-service/schemas/order_created.avsc"
+
+  # Inventory service consumes from Kafka and produces back
+  - from: inventory-service
+    to: kafka
+    protocol: kafka
+    topics:
+      - orders.created      # consumes
+      - inventory.reserved   # produces
+      - inventory.failed     # produces
+
+  # Notification service consumes from multiple topics
+  - from: notification-service
+    to: kafka
+    protocol: kafka
+    topics:
+      - orders.created
+      - inventory.reserved
+
+  # Order service writes to PostgreSQL
+  - from: order-service
+    to: postgres
+    protocol: tcp
+    port: 5432
+    database: orders
+
+  # Inventory service writes to PostgreSQL
+  - from: inventory-service
+    to: postgres
+    protocol: tcp
+    port: 5432
+    database: inventory
+
+pipeline:
+  # Shared verification across all services
+  verify:
+    - golangci-lint run ./... --timeout=5m
+  test:
+    - go test ./... -race -coverprofile=coverage.out
+  # Docker-based integration tests
+  integration:
+    - docker-compose -f docker-compose.test.yaml up --abort-on-container-exit

@@ -1,0 +1,130 @@
+/* Main stylesheet — Anvil Dashboard */
+@import './tokens.css';
+@import './components.css';
+
+/* Reset & base */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+code, pre {
+  font-family: var(--font-mono);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-elevated-3);
+  border-radius: var(--radius-full);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--bg-elevated-4);
+}
+
+/* Keyframe animations */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spin { animation: spin 1s linear infinite; }
+
+/* Knowledge Base Report markdown styles */
+.kb-report h1 { font-size: 18px; font-weight: 700; color: var(--text-primary); margin: 20px 0 8px; font-family: var(--font-sans); }
+.kb-report h2 { font-size: 15px; font-weight: 600; color: var(--text-primary); margin: 18px 0 6px; font-family: var(--font-sans); border-bottom: 1px solid var(--separator); padding-bottom: 4px; }
+.kb-report h3 { font-size: 13px; font-weight: 600; color: var(--accent); margin: 14px 0 4px; font-family: var(--font-sans); }
+.kb-report h4 { font-size: 13px; font-weight: 500; color: var(--text-secondary); margin: 10px 0 4px; font-family: var(--font-sans); }
+.kb-report p { margin: 4px 0; }
+.kb-report ul { padding-left: 18px; margin: 4px 0; }
+.kb-report li { margin: 2px 0; }
+.kb-report strong { color: var(--text-primary); }
+.kb-report hr { border: none; border-top: 1px solid var(--separator); margin: 12px 0; }
+.kb-report pre { background: var(--bg-base); border: 1px solid var(--separator); border-radius: var(--radius-sm); padding: 10px 12px; overflow-x: auto; margin: 6px 0; }
+.kb-report pre code { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
+.kb-report .kb-inline-code { font-family: var(--font-mono); font-size: 12px; padding: 1px 5px; background: var(--bg-base); border-radius: 3px; color: var(--accent); }
+
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.95); }
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 20px rgba(52, 211, 153, 0.1); }
+  50% { box-shadow: 0 0 40px rgba(52, 211, 153, 0.2); }
+}
+
+/* Page transition utility */
+.page-enter {
+  animation: fadeInUp var(--duration-normal) var(--ease-default) both;
+}
+
+/* Stagger animation utility */
+.stagger > * {
+  animation: fadeInUp var(--duration-normal) var(--ease-default) both;
+}
+.stagger > *:nth-child(1) { animation-delay: 0ms; }
+.stagger > *:nth-child(2) { animation-delay: 40ms; }
+.stagger > *:nth-child(3) { animation-delay: 80ms; }
+.stagger > *:nth-child(4) { animation-delay: 120ms; }
+.stagger > *:nth-child(5) { animation-delay: 160ms; }
+.stagger > *:nth-child(6) { animation-delay: 200ms; }
+.stagger > *:nth-child(7) { animation-delay: 240ms; }
+.stagger > *:nth-child(8) { animation-delay: 280ms; }
+.stagger > *:nth-child(9) { animation-delay: 320ms; }
+.stagger > *:nth-child(10) { animation-delay: 360ms; }
+
+/* Frosted glass */
+.frosted {
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}

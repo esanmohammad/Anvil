@@ -1,0 +1,10 @@
+.git
+node_modules
+dist
+*.md
+tests
+.env
+.env.*
+!.env.example
+.DS_Store
+tsconfig.tsbuildinfo

@@ -1,0 +1,48 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+coverage/
+.turbo/
+.DS_Store
+*.log
+
+# Tests (wave-numbered internal structure, not for public)
+tests/
+
+# Compiled output anywhere in src/
+**/*.d.ts.map
+**/*.js.map
+
+# Dashboard compiled server (built at runtime, not committed)
+packages/dashboard/server/*.js
+packages/dashboard/server/*.d.ts
+packages/dashboard/server/*.js.map
+packages/dashboard/server/*.d.ts.map
+packages/dashboard/server/adapters/*.js
+packages/dashboard/server/adapters/*.d.ts
+packages/dashboard/server/adapters/*.js.map
+packages/dashboard/server/adapters/*.d.ts.map
+packages/dashboard/server/out/
+
+# MCP compiled output in src/ (build.mjs outputs to dist/)
+packages/code-search-mcp/src/**/*.js
+packages/code-search-mcp/src/**/*.d.ts
+packages/code-search-mcp/src/**/*.js.map
+packages/code-search-mcp/src/**/*.d.ts.map
+
+# Claude Code project memory
+.claude/
+
+# Internal planning and architecture docs (not for public release)
+tasks/
+docs/
+PLAN.md
+DASHBOARD-PLAN.md
+ANALYSIS.md
+DEV-TESTING.md
+TESTING.md
+TECHNICAL_ARCHITECTURE.md
+FLOW_DIAGRAM.md

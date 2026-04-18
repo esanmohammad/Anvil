@@ -1,0 +1,88 @@
+# factory.yaml — Python ML pipeline with FastAPI serving layer
+#
+# This example demonstrates a machine learning system with a training
+# pipeline (scikit-learn / PyTorch) and a FastAPI model-serving API.
+# Anvil understands the data flow from training to serving
+# and can modify both the model code and the API together.
+
+name: recommender
+domain: |
+  Product recommendation engine. The training pipeline reads user
+  interaction data from S3, trains collaborative filtering models,
+  and writes serialized model artifacts to the model registry. The
+  serving API loads the latest model and exposes /recommend endpoints
+  consumed by the storefront frontend.
+
+repos:
+  - name: recommender-train
+    github: mlteam/recommender-train
+    lang: python
+    build: pip install -e ".[dev]"
+    test: pytest tests/ -v --cov=src
+    notes: |
+      Entry point: src/train.py
+      Config: configs/experiment.yaml (hydra)
+      Outputs model artifacts to s3://models/recommender/
+
+  - name: recommender-api
+    github: mlteam/recommender-api
+    lang: python
+    framework: fastapi
+    build: pip install -e ".[dev]"
+    test: pytest tests/ -v --cov=app
+    port: 8000
+    notes: |
+      FastAPI app in app/main.py
+      Model loading in app/model_loader.py
+      Health check: GET /healthz
+      Inference: POST /recommend
+
+connects:
+  # Training pipeline reads data from S3
+  - from: recommender-train
+    to: s3
+    protocol: https
+    bucket: raw-interactions
+    notes: "Parquet files partitioned by date"
+
+  # Training pipeline writes model artifacts to S3
+  - from: recommender-train
+    to: s3
+    protocol: https
+    bucket: models
+    prefix: recommender/
+    notes: "Versioned by run ID; includes model.pt and metadata.json"
+
+  # Serving API loads models from S3
+  - from: recommender-api
+    to: s3
+    protocol: https
+    bucket: models
+    prefix: recommender/
+
+  # Serving API caches embeddings in Redis
+  - from: recommender-api
+    to: redis
+    protocol: tcp
+    port: 6379
+    notes: "User embedding cache with 1h TTL"
+
+  # Serving API reads product metadata from PostgreSQL
+  - from: recommender-api
+    to: postgres
+    protocol: tcp
+    port: 5432
+    database: products
+
+pipeline:
+  setup:
+    - python -m venv .venv
+    - .venv/bin/pip install -e ".[dev]"
+  verify:
+    - ruff check .
+    - mypy src/ app/ --strict
+  test:
+    - pytest tests/ -v --cov --cov-fail-under=80
+  # Training smoke test with tiny dataset
+  integration:
+    - python src/train.py --config configs/test.yaml --max-epochs=1

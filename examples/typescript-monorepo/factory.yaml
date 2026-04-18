@@ -1,0 +1,68 @@
+# factory.yaml — TypeScript monorepo with Next.js frontend and Express API
+#
+# This example demonstrates a typical full-stack web application where the
+# frontend and API live in the same monorepo. Anvil will clone
+# the repo, understand both packages, and orchestrate cross-cutting changes.
+
+name: acme-web
+domain: |
+  E-commerce platform for small businesses. The Next.js frontend serves the
+  storefront and admin dashboard. The Express API handles product catalog,
+  orders, and payment processing via Stripe.
+
+# Repositories that make up this system
+repos:
+  - name: acme-web
+    github: acme-corp/acme-web
+    # Paths within the monorepo that contain deployable packages
+    packages:
+      - path: packages/storefront
+        lang: typescript
+        framework: nextjs
+        build: npm run build
+        test: npm test
+        port: 3000
+      - path: packages/api
+        lang: typescript
+        framework: express
+        build: npm run build
+        test: npm test
+        port: 4000
+
+# How services connect to each other and to external dependencies
+connects:
+  # The storefront calls the API over HTTP
+  - from: packages/storefront
+    to: packages/api
+    protocol: http
+    notes: "REST calls via /api proxy in next.config.js"
+
+  # The API connects to PostgreSQL
+  - from: packages/api
+    to: postgres
+    protocol: tcp
+    port: 5432
+    notes: "Prisma ORM — schema in packages/api/prisma/schema.prisma"
+
+  # The API connects to Redis for session/cache
+  - from: packages/api
+    to: redis
+    protocol: tcp
+    port: 6379
+
+# Pipeline configuration — controls how Anvil builds and validates
+pipeline:
+  # Install dependencies before anything else
+  setup:
+    - npm ci --workspace=packages/storefront
+    - npm ci --workspace=packages/api
+
+  # Lint and type-check gates
+  verify:
+    - npx tsc --noEmit --workspace=packages/storefront
+    - npx tsc --noEmit --workspace=packages/api
+    - npm run lint
+
+  # Integration test suite
+  test:
+    - npm test -- --ci --coverage

@@ -1,0 +1,9 @@
+schema_version: 2
+system: minimal
+title: Minimal Test System
+owner: test-team
+lifecycle: development
+description: A minimal system for testing
+repos:
+  - name: minimal-service
+    github: DTSL/minimal-service

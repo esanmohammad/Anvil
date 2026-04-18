@@ -1,0 +1,50 @@
+services:
+  code-search:
+    build: .
+    ports:
+      - "${CODE_SEARCH_PORT:-3100}:3100"
+    volumes:
+      - code-search-data:/data
+      - ${REPOS_PATH:-./repos}:/repos:ro
+    environment:
+      CODE_SEARCH_TRANSPORT: streamable-http
+      CODE_SEARCH_PORT: "3100"
+      CODE_SEARCH_AUTH_MODE: ${CODE_SEARCH_AUTH_MODE:-api-key}
+      CODE_SEARCH_AUTH_API_KEYS: ${CODE_SEARCH_AUTH_API_KEYS:-}
+      CODE_SEARCH_AUTH_JWT_SECRET: ${CODE_SEARCH_AUTH_JWT_SECRET:-}
+      CODE_SEARCH_EMBEDDING_PROVIDER: ${CODE_SEARCH_EMBEDDING_PROVIDER:-auto}
+      CODE_SEARCH_EMBEDDING_API_KEY: ${CODE_SEARCH_EMBEDDING_API_KEY:-}
+      CODE_SEARCH_EMBEDDING_MODEL: ${CODE_SEARCH_EMBEDDING_MODEL:-}
+      CODE_SEARCH_DATA_DIR: /data
+      OLLAMA_HOST: http://ollama:11434
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Optional: local Ollama for embeddings (activate with --profile with-ollama)
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - with-ollama
+
+volumes:
+  code-search-data:
+  ollama-models:

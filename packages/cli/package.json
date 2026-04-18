@@ -1,0 +1,58 @@
+{
+  "name": "@anvil-dev/cli",
+  "version": "0.1.0",
+  "description": "CLI for Anvil — AI-powered feature development pipeline",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anvil-dev/anvil.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/anvil-dev/anvil#readme",
+  "bugs": {
+    "url": "https://github.com/anvil-dev/anvil/issues"
+  },
+  "keywords": [
+    "anvil",
+    "cli",
+    "ai",
+    "agent",
+    "code-generation",
+    "devtools",
+    "pipeline"
+  ],
+  "bin": {
+    "anvil": "./dist/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./knowledge/*": "./dist/knowledge/*.js",
+    "./pipeline/*": "./dist/pipeline/*.js",
+    "./learn/*": "./dist/learn/*.js",
+    "./conventions/*": "./dist/conventions/*.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -b && cp src/templates/*.yaml dist/templates/ 2>/dev/null; true",
+    "dev": "tsc -b --watch",
+    "test": "tsc -b && node --test dist/knowledge/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "graphology": "0.26.0",
+    "graphology-communities-louvain": "2.0.2",
+    "graphology-metrics": "2.4.0",
+    "graphology-types": "0.24.8",
+    "picocolors": "^1.1.1",
+    "tree-sitter-wasms": "0.1.13",
+    "web-tree-sitter": "0.26.8",
+    "yaml": "^2.7.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2"
+  }
+}

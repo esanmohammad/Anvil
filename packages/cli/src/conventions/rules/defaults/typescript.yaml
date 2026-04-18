@@ -1,0 +1,75 @@
+name: typescript-conventions
+language: typescript
+version: "1.0.0"
+rules:
+  - id: ts-no-any
+    name: No any type
+    description: Avoid using 'any' type; use 'unknown' or proper types
+    severity: warning
+    filePattern: "*.ts"
+    deny: ":\\s*any\\b"
+    message: "Avoid 'any' type; use 'unknown' or define a proper type"
+    enabled: true
+
+  - id: ts-no-console
+    name: No console.log in production
+    description: Use a logger instead of console.log
+    severity: warning
+    filePattern: "*.ts"
+    deny: "\\bconsole\\.log\\("
+    message: "Use a structured logger instead of console.log"
+    enabled: true
+
+  - id: ts-no-non-null
+    name: No non-null assertion
+    description: Avoid non-null assertions (!)
+    severity: warning
+    filePattern: "*.ts"
+    deny: "\\w+!\\."
+    message: "Avoid non-null assertions; use optional chaining or proper null checks"
+    enabled: true
+
+  - id: ts-export-type
+    name: Use export type for type-only exports
+    description: Type-only exports should use 'export type'
+    severity: info
+    filePattern: "*.ts"
+    trigger: "export\\s+type\\s+"
+    message: "Good: using export type for type-only exports"
+    enabled: true
+
+  - id: ts-no-enum
+    name: Prefer const objects over enums
+    description: TypeScript enums have known issues; prefer const objects
+    severity: info
+    filePattern: "*.ts"
+    deny: "\\benum\\s+\\w+"
+    message: "Consider using a const object with 'as const' instead of enum"
+    enabled: true
+
+  - id: ts-strict-equality
+    name: Use strict equality
+    description: Always use === and !==
+    severity: error
+    filePattern: "*.ts"
+    deny: "[^!=]==[^=]"
+    message: "Use strict equality (===) instead of loose equality (==)"
+    enabled: true
+
+  - id: ts-async-await
+    name: Prefer async/await
+    description: Use async/await over raw promises
+    severity: info
+    filePattern: "*.ts"
+    trigger: "\\.then\\("
+    message: "Consider using async/await instead of .then() chains"
+    enabled: true
+
+  - id: ts-readonly-arrays
+    name: Use readonly arrays for parameters
+    description: Function parameters with array types should be readonly
+    severity: info
+    filePattern: "*.ts"
+    trigger: "readonly\\s+\\w+\\[\\]"
+    message: "Good: using readonly array parameters"
+    enabled: true

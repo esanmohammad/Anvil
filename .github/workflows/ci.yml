@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build CLI
+        run: cd packages/cli && npx tsc -b
+
+      - name: Build Dashboard
+        run: cd packages/dashboard && npx vite build
+
+      - name: Build Dashboard Server
+        run: cd packages/dashboard && npx esbuild server/dashboard-server.ts --outfile=server/dashboard-server.js --format=esm --platform=node --target=node20 --bundle --external:ws --external:@anvil-dev/cli
+
+      - name: Build Code Search MCP
+        run: cd packages/code-search-mcp && node build.mjs
+
+      - name: Test CLI
+        run: cd packages/cli && npm test
+
+      - name: Test Dashboard Server
+        run: cd packages/dashboard && npm run test:server
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci
+      - name: Type-check CLI
+        run: cd packages/cli && npx tsc --noEmit
+      - name: Type-check Dashboard Server
+        run: cd packages/dashboard && npx tsc -p server/tsconfig.json --noEmit
