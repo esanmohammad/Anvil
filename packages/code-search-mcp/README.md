@@ -45,6 +45,17 @@ Works with **Claude Desktop**, **Claude Code**, **Cursor**, and any MCP-compatib
 
 The default mode is **remote proxy**. No repos, no index, no GPU needed on your machine.
 
+**Claude Code:**
+
+```bash
+claude mcp add code-search \
+  -e CODE_SEARCH_SERVER=https://your-server:3100 \
+  -e CODE_SEARCH_API_KEY=your-api-key \
+  -- npx @anvil-dev/code-search-mcp
+```
+
+**Claude Desktop / Cursor (JSON config):**
+
 ```json
 {
   "mcpServers": {
@@ -59,7 +70,7 @@ The default mode is **remote proxy**. No repos, no index, no GPU needed on your 
 }
 ```
 
-That's it. Claude Desktop, Cursor, or any MCP client can now search your entire codebase.
+That's it. Your AI can now search your entire codebase.
 
 ### For infra — deploy the server
 
@@ -75,20 +86,47 @@ code-search-mcp --serve --port 3100 --auth api-key
 docker compose --profile with-ollama up
 ```
 
+Once running, index your repos via the admin API:
+
+```bash
+# Index repos at a path (no server restart needed)
+curl -X POST http://localhost:3100/index \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/repos/my-service", "project": "my-project"}'
+
+# Force full re-index (ignores cache)
+curl -X POST http://localhost:3100/index \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/repos/my-service", "project": "my-project", "force": true}'
+```
+
+Or set up automatic reindexing:
+
+```bash
+# In docker-compose.yml or .env
+CODE_SEARCH_REINDEX_INTERVAL=1h    # reindex every hour (0 = disabled)
+```
+
 ### For development — local mode
 
-Run everything on your machine (indexing + serving):
+Run everything on your machine (indexing + serving via stdio):
 
 ```bash
 code-search-mcp --local /path/to/your/repos
 code-search-mcp --local github:your-org --token ghp_xxx
 ```
 
+Add directly to Claude Code:
+
+```bash
+claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local /path/to/repos
+```
+
 ---
 
 ## Tools
 
-12 tools exposed via MCP:
+11 MCP tools available to clients, plus server-side admin APIs for indexing.
 
 ### Search
 
@@ -115,12 +153,19 @@ code-search-mcp --local github:your-org --token ghp_xxx
 | `list_repos` | All indexed repos with role, domain, description |
 | `get_repo_profile` | LLM-generated profile — role, tech stack, endpoints |
 
-### Index
+### Index (read-only for clients)
 
 | Tool | Description |
 |:--|:--|
 | `index_status` | Chunk count, embedding provider, repos, last indexed |
-| `reindex` | Trigger re-index (incremental — only changed files) |
+
+### Server Admin API (not exposed to MCP clients)
+
+| Endpoint | Description |
+|:--|:--|
+| `POST /index` | Index repos at a given path. Body: `{"path": "/repos/dir", "project": "name", "force": false}` |
+| `GET /health` | Server status, active sessions, index readiness |
+| `CODE_SEARCH_REINDEX_INTERVAL` | Auto-reindex on a schedule (e.g. `30m`, `1h`, `6h`). Default: `0` (disabled) |
 
 ---
 
@@ -284,6 +329,7 @@ code-search-mcp --local [source] [options]
 | `CODE_SEARCH_RERANKER_BASE_URL` | Custom reranker endpoint | — |
 | `CODE_SEARCH_RERANKER_MODEL` | Custom reranker model | — |
 | `CODE_SEARCH_DATA_DIR` | Data directory override | — |
+| `CODE_SEARCH_REINDEX_INTERVAL` | Auto-reindex schedule (`30m`, `1h`, `6h`, `0` to disable) | `0` |
 | `CODE_SEARCH_RATE_LIMIT_PER_MINUTE` | Rate limit per identity | `100` |
 
 ---

@@ -206,6 +206,22 @@ export class VectorStore {
     }
   }
 
+  /** Get all chunk IDs for a project (for incremental diff) */
+  async getChunkIds(project: string): Promise<string[]> {
+    if (!this.table) return [];
+    try {
+      const escapedProject = project.replace(/'/g, "''");
+      const results = await this.table
+        .query()
+        .where(`project = '${escapedProject}'`)
+        .select(['id'])
+        .toArray();
+      return results.map((r: any) => r.id as string);
+    } catch {
+      return [];
+    }
+  }
+
   /** Get index statistics */
   async getStats(): Promise<{ rowCount: number } | null> {
     if (!this.table) return null;

@@ -39,20 +39,14 @@ Most AI coding tools see one file at a time. Your project spans five repos, thre
 
 ## Privacy & Security
 
-Anvil is built **local-first**. Your code never leaves your machine unless you explicitly choose a cloud LLM provider.
+**Zero telemetry. Zero logging. Zero phone-home.**
 
-**Your code stays yours.**
+Anvil has no analytics, no crash reporters, no usage tracking, and no background network calls. There is no SaaS backend, no account system, and no data collection of any kind. The binary does exactly what you tell it to — nothing more.
 
-- **No telemetry.** Anvil collects zero usage data, analytics, or crash reports. No phone-home.
-- **No cloud dependency.** The dashboard, knowledge graph, and pipeline all run locally. No SaaS backend, no account required.
-- **Local-first knowledge base.** AST parsing, graph building, and convention detection happen entirely on your machine. Code is never uploaded for indexing.
-- **CLI providers keep code local.** Claude CLI and Gemini CLI run on your device — your code is processed by the provider's client, not uploaded to a third-party indexing service.
-- **API keys stay on disk.** Provider credentials are stored in `~/.anvil/` and never leave your environment. No key management service, no proxy.
-- **You control the LLM.** Choose which provider sees your code. Use CLI providers for fully local processing, or API providers when you're comfortable with their data policies. Anvil never routes code through its own servers.
-- **Open source.** Every line of Anvil is auditable. MIT licensed. No obfuscated binaries, no proprietary backends.
-- **Air-gapped capable.** With CLI providers installed locally, Anvil works without any internet connection. Knowledge graphs build from local AST parsing — no API calls needed.
-
-> Anvil is a developer tool, not a platform. It runs where your code runs — on your machine, in your terminal, under your control.
+- **Fully local.** Dashboard, pipeline, knowledge graph, and all indexing run on your machine. Nothing is uploaded.
+- **No cloud dependency.** Works offline with CLI providers. Knowledge graphs build from local AST parsing — no API calls needed.
+- **You choose the LLM.** Your code only goes to the provider you explicitly select. Anvil never proxies, stores, or forwards your code.
+- **Open source.** MIT licensed. Every line auditable. No obfuscated binaries.
 
 ---
 
@@ -613,6 +607,15 @@ A standalone [Model Context Protocol](https://modelcontextprotocol.io) server th
 
 ### For end users — connect to a deployed server
 
+**Claude Code:**
+```bash
+claude mcp add code-search \
+  -e CODE_SEARCH_SERVER=https://your-server:3100 \
+  -e CODE_SEARCH_API_KEY=your-api-key \
+  -- npx @anvil-dev/code-search-mcp
+```
+
+**Claude Desktop / Cursor:**
 ```json
 {
   "mcpServers": {
@@ -639,7 +642,16 @@ docker compose up
 code-search-mcp --serve --port 3100 --auth api-key
 ```
 
-12 tools available: hybrid search, semantic search, exact search, dependency graphs, cross-repo edges, callers, impact analysis, repo profiles, and index management.
+Index repos dynamically via the admin API (no restart needed):
+```bash
+curl -X POST http://localhost:3100/index \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/repos/my-service", "project": "my-project"}'
+```
+
+Set `CODE_SEARCH_REINDEX_INTERVAL=1h` for automatic scheduled reindexing.
+
+11 client tools (search, graph analysis, profiles, index status) plus server-side admin APIs for indexing. Clients cannot trigger reindexing.
 
 See [`packages/code-search-mcp/README.md`](packages/code-search-mcp/README.md) for full deployment and configuration docs.
 

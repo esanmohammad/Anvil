@@ -304,6 +304,19 @@ export class KnowledgeIndexer {
     writeFileSync(chunksPath, JSON.stringify(uniqueChunks));
     log(`Saved ${uniqueChunks.length} chunks to ${chunksPath}`);
 
+    // 11b. Save deleted files list (for incremental embedding cleanup)
+    const allDeletedFiles: Array<{ repoName: string; filePath: string }> = [];
+    for (const repo of reposToIndex) {
+      const result = repoChunkResults.get(repo.name);
+      if (result?.deletedFiles) {
+        for (const f of result.deletedFiles) {
+          allDeletedFiles.push({ repoName: repo.name, filePath: f });
+        }
+      }
+    }
+    const deletedPath = join(basePath, 'deleted_files.json');
+    writeFileSync(deletedPath, JSON.stringify(allDeletedFiles));
+
     // 12. Save per-repo metadata
     for (const repo of reposToIndex) {
       const sha = getRepoSha(repo.path);
@@ -335,7 +348,7 @@ export class KnowledgeIndexer {
   }
 
   // ---------------------------------------------------------------------------
-  // EMBED — slow, reads chunks.json, embeds with Ollama, stores in LanceDB.
+  // EMBED — incremental: only embeds new/changed chunks, preserves existing.
   // ---------------------------------------------------------------------------
 
   async embedChunks(
@@ -351,7 +364,7 @@ export class KnowledgeIndexer {
     const startTime = Date.now();
     const basePath = getKnowledgeBasePath(project);
 
-    // Load chunks from disk
+    // Load chunks from disk (only new/changed chunks from buildKB)
     const chunksPath = join(basePath, 'chunks.json');
     if (!existsSync(chunksPath)) {
       throw new Error(`No chunks found — run Build KB first. Expected: ${chunksPath}`);
@@ -359,15 +372,57 @@ export class KnowledgeIndexer {
     const chunks: CodeChunk[] = JSON.parse(readFileSync(chunksPath, 'utf-8'));
     log(`Loaded ${chunks.length} chunks from ${chunksPath}`);
 
-    // Embed
+    // Open vector store
+    const dbPath = join(basePath, 'lancedb');
+    const vectorStore = new VectorStore(dbPath);
+    await vectorStore.init();
+
+    // Determine which chunks actually need embedding by checking existing IDs
+    const existingIds = new Set<string>();
+    try {
+      const stats = await vectorStore.getStats();
+      if (stats && stats.rowCount > 0) {
+        // Load existing chunk IDs from the store
+        const existingChunks = await vectorStore.getChunkIds(project);
+        for (const id of existingChunks) existingIds.add(id);
+      }
+    } catch { /* first run — no existing data */ }
+
+    const newChunks = chunks.filter((c) => !existingIds.has(c.id));
+    const deletedIds = this.getDeletedChunkIds(basePath, project);
+
+    if (newChunks.length === 0 && deletedIds.length === 0) {
+      log('All chunks already embedded — nothing to do.');
+      report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
+      const repoNames = [...new Set(chunks.map((c) => c.repoName))];
+      return {
+        project,
+        repos: repoNames.map((n) => ({ name: n, chunkCount: chunks.filter((c) => c.repoName === n).length, language: '' })),
+        totalChunks: chunks.length,
+        totalTokens: chunks.reduce((sum, c) => sum + c.tokens, 0),
+        embeddingProvider: 'cached',
+        embeddingDimensions: 0,
+        crossRepoEdges: 0,
+        lastIndexed: new Date().toISOString(),
+        indexDurationMs: Date.now() - startTime,
+      };
+    }
+
+    // Delete chunks for files that were removed
+    if (deletedIds.length > 0) {
+      log(`Removing ${deletedIds.length} stale chunks from vector store...`);
+      await vectorStore.deleteChunksByIds(deletedIds);
+    }
+
+    // Embed only new/changed chunks
     const embedder = createEmbeddingProvider(config.embedding);
     const isOllama = embedder.name === 'ollama';
     const batchSize = isOllama ? 10 : 50;
     const batchDelay = isOllama ? 50 : 100;
 
-    log(`Embedding ${chunks.length} chunks with ${embedder.name} (batch size: ${batchSize})...`);
+    log(`Embedding ${newChunks.length} new chunks with ${embedder.name} (${chunks.length - newChunks.length} cached, batch size: ${batchSize})...`);
 
-    const texts = chunks.map((c) => c.contextualizedContent);
+    const texts = newChunks.map((c) => c.contextualizedContent);
     const embeddings: number[][] = [];
     const totalBatches = Math.ceil(texts.length / batchSize);
     let batchesDone = 0;
@@ -388,7 +443,7 @@ export class KnowledgeIndexer {
 
       report({
         phase: 'embedding',
-        message: `Embedding: ${processed}/${texts.length} (~${etaSeconds}s remaining)`,
+        message: `Embedding: ${processed}/${texts.length} new (~${etaSeconds}s remaining)`,
         percent, etaSeconds,
         chunksTotal: texts.length, chunksProcessed: processed,
       });
@@ -401,15 +456,14 @@ export class KnowledgeIndexer {
       }
     }
 
-    const embeddedChunks = chunks.map((chunk, i) => ({ ...chunk, embedding: embeddings[i] }));
+    const embeddedChunks = newChunks.map((chunk, i) => ({ ...chunk, embedding: embeddings[i] }));
 
-    // Store in LanceDB
-    report({ phase: 'storing', message: 'Saving to vector database...', percent: 92, etaSeconds: -1 });
-    const dbPath = join(basePath, 'lancedb');
-    const vectorStore = new VectorStore(dbPath);
-    await vectorStore.init();
-    await vectorStore.upsertChunks(embeddedChunks);
-    log(`Stored ${embeddedChunks.length} chunks in LanceDB`);
+    // Add only new chunks to LanceDB (existing ones are preserved)
+    report({ phase: 'storing', message: 'Saving new chunks to vector database...', percent: 92, etaSeconds: -1 });
+    if (embeddedChunks.length > 0) {
+      await vectorStore.addChunks(embeddedChunks);
+    }
+    log(`Stored ${embeddedChunks.length} new chunks in LanceDB (${deletedIds.length} removed)`);
 
     // Update metadata
     const repoNames = [...new Set(chunks.map((c) => c.repoName))];
@@ -426,7 +480,7 @@ export class KnowledgeIndexer {
     }
 
     const durationMs = Date.now() - startTime;
-    report({ phase: 'done', message: `Embedded ${chunks.length} chunks in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0 });
+    report({ phase: 'done', message: `Embedded ${newChunks.length} new chunks (${deletedIds.length} removed) in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0 });
 
     return {
       project,
@@ -439,6 +493,21 @@ export class KnowledgeIndexer {
       lastIndexed: new Date().toISOString(),
       indexDurationMs: durationMs,
     };
+  }
+
+  /** Collect chunk IDs that should be deleted (from files that were removed) */
+  private getDeletedChunkIds(basePath: string, project: string): string[] {
+    // Read the deleted files list saved by buildKB
+    const deletedPath = join(basePath, 'deleted_files.json');
+    if (!existsSync(deletedPath)) return [];
+    try {
+      const deleted: Array<{ repoName: string; filePath: string }> = JSON.parse(readFileSync(deletedPath, 'utf-8'));
+      // Chunk IDs follow the pattern: project/repoName/filePath:startLine
+      // We match by prefix: project/repoName/filePath
+      return deleted.map((d) => `${project}/${d.repoName}/${d.filePath}`);
+    } catch {
+      return [];
+    }
   }
 
   // ---------------------------------------------------------------------------

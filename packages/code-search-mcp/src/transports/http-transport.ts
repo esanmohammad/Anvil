@@ -22,6 +22,10 @@ export interface HttpTransportOptions {
   createMcpServer: McpServerFactory;
   onReady?: (url: string) => void;
   getHealth?: () => Record<string, unknown>;
+  /** Detailed indexing status for GET /status */
+  getStatus?: () => Record<string, unknown>;
+  /** Handler for POST /index — allows triggering indexing via REST */
+  onIndex?: (body: { path: string; project?: string; force?: boolean }) => Promise<Record<string, unknown>>;
 }
 
 interface Session {
@@ -64,6 +68,51 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<vo
         activeSessions: sessions.size,
         ...health,
       }));
+      return;
+    }
+
+    // ── Status (no auth — read-only) ───────────────────────────────
+    if (path === '/status' && req.method === 'GET') {
+      const status = opts.getStatus?.() ?? {};
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(status, null, 2));
+      return;
+    }
+
+    // ── Admin: Index a new path (POST /index) ─────────────────────
+    if (path === '/index' && req.method === 'POST') {
+      // Auth required even if MCP auth is disabled — this is an admin endpoint
+      if (config.authEnabled) {
+        const identity = authenticate(req, res);
+        if (!identity) return;
+      }
+
+      let body = '';
+      req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+      req.on('end', async () => {
+        try {
+          const parsed = JSON.parse(body) as { path: string; project?: string; force?: boolean };
+          if (!parsed.path) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: '`path` is required' }));
+            return;
+          }
+          if (!opts.onIndex) {
+            res.writeHead(501, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Indexing handler not configured' }));
+            return;
+          }
+          const result = await opts.onIndex(parsed);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: msg }));
+          }
+        }
+      });
       return;
     }
 
