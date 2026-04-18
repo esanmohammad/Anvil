@@ -211,6 +211,46 @@ Rate limiting: in-memory sliding window per identity (default 100 req/min).
 
 ---
 
+## Incremental Indexing & Cost Optimization
+
+Reindexing is designed to be cheap. Four layers ensure you only pay for what actually changed:
+
+| Layer | What it does | Saves |
+|:--|:--|:--|
+| **1. Git SHA skip** | Compares repo `HEAD` against last indexed SHA. If identical, entire repo is skipped. | Skips unchanged repos entirely |
+| **2. Git diff** | Uses `git diff --name-status` against last indexed commit. Only added/modified/deleted files are processed. Leverages git's Merkle DAG — O(changed files), not O(all files). | Skips unchanged files |
+| **3. Content hash** | SHA-256 of each file compared against cached hash. Catches unchanged files even when git diff isn't available (e.g., first index with existing cache). | Fallback dedup |
+| **4. Embedding diff** | Compares chunk IDs against existing LanceDB entries. Only chunks that don't already exist are sent to the embedding provider. Deleted files' chunks are surgically removed. | Saves embedding API calls |
+
+**Before optimization:** 2 files changed out of 1,000 -> re-embed all 1,000 chunks.
+**After optimization:** 2 files changed -> embed ~5 new chunks, delete old ones, preserve 995 existing embeddings.
+
+This makes scheduled reindexing (`CODE_SEARCH_REINDEX_INTERVAL=1h`) practical even with paid embedding providers — most runs complete in seconds with zero embedding API calls.
+
+### Monitoring reindex progress
+
+Use `GET /status` to see live indexing state:
+
+```json
+{
+  "indexing": {
+    "status": "indexing",
+    "phase": "embedding",
+    "message": "Embedding: 12/15 new (~3s remaining)",
+    "percent": 85,
+    "elapsedMs": 4200,
+    "lastSuccess": "2026-04-18T14:30:00Z",
+    "lastDurationMs": 8500,
+    "history": [
+      {"type": "start", "message": "auto-reindex: started..."},
+      {"type": "complete", "message": "Completed: 1200 chunks, 4 repos in 8s"}
+    ]
+  }
+}
+```
+
+---
+
 ## Embedding Providers
 
 Use any embedding provider. Auto-detection tries them in order.
