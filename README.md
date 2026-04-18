@@ -118,7 +118,7 @@ Open `http://localhost:5173`, select your project, and describe what you want to
  │  5. Tasks        Implementation task lists               │
  │  6. Build        Write code (agents run in your repos)   │
  │  7. Validate     Build, lint, test — fix until clean     │
- │  8. Ship         Commit, push, open PRs                  │
+ │  8. Ship         Commit, push, open PRs on GitHub         │
  │                                                          │
  │  Each stage: checkpointed · resumable · cost-tracked     │
  └──────────────────────────────────────────────────────────┘
@@ -151,7 +151,7 @@ The pipeline is the core engine of Anvil. Each of the 8 stages has distinct beha
 
 **7. Validate** — Runs build, lint, and test commands. Checks domain invariants (e.g., "no data leaks across tenants"). Detects regressions by comparing before/after test results. Enters an automatic fix loop (up to 5 iterations) where the agent analyzes failures, patches code, and re-validates.
 
-**8. Ship** — Optionally deploys to a sandbox environment with health checks and smoke testing. Extracts critical business flows, generates smoke tests, runs them, and enters a fix loop if they fail. Finally, creates pull requests on GitHub via `gh` CLI with cross-linked PR bodies across repos.
+**8. Ship** — Commits changes, pushes feature branches, and creates pull requests on GitHub via `gh` CLI with cross-linked PR bodies across repos.
 
 ### Agent Personas
 
@@ -502,46 +502,6 @@ When a stage fails repeatedly:
 
 ---
 
-## Sandbox & Deployment
-
-The Ship stage optionally deploys your changes to a sandbox environment before creating PRs.
-
-### Deploy Flow
-
-```
-Build completes
-      │
-      ▼
-Deploy to sandbox (custom command or ANVIL_DEPLOY_CMD)
-      │
-      ▼
-Health check (verify sandbox is running)
-      │
-      ▼
-Extract critical business flows from domain config
-      │
-      ▼
-Generate smoke tests for those flows
-      │
-      ▼
-Run smoke tests
-      │
-      ├── Pass → Create PRs
-      └── Fail → Agent fixes code → Redeploy → Re-test (up to 3 cycles)
-```
-
-Configure deployment in `factory.yaml`:
-
-```yaml
-pipeline:
-  ship:
-    deploy: ./scripts/deploy-sandbox.sh
-```
-
-If no deploy command is configured, Anvil skips the sandbox phase and creates PRs directly.
-
----
-
 ## Configuration
 
 A single `factory.yaml` in `~/.anvil/projects/<name>/` configures everything.
@@ -596,9 +556,6 @@ pipeline:
   models:                              # Per-stage model overrides
     clarify: claude-sonnet-4-6
     build: claude-sonnet-4-6
-  ship:
-    deploy: ./scripts/deploy-sandbox.sh  # Optional sandbox deployment
-
 connects:                              # Manual service dependency hints
   - from: api-gateway
     to: user-service
@@ -720,7 +677,7 @@ Full CLI pipeline commands are coming in a future release.
 | Memory (persisted, injected, influence-tracked) | Yes | Yes |
 | Cost-aware model routing (3 tiers) | Yes | Yes |
 | Resilience handlers (crash, rate-limit, overflow) | Yes | Yes |
-| Sandbox deploy + smoke testing | Yes | Yes |
+| Sandbox deploy + smoke testing | — | Yes |
 | Validation fix loops | Yes | Yes |
 | Structured logging + run timeline | Yes | Yes |
 | API providers (OpenAI, etc.) | — | Yes |
