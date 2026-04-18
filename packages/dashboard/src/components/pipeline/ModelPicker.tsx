@@ -4,9 +4,15 @@ import React, { useState } from 'react';
  * Model picker — lets user choose Claude model and presets.
  *
  * Presets: Lean ($), Balanced ($$), Smart ($$$)
- * Explicit models: claude-opus-4, claude-sonnet-4, claude-haiku-4-5
+ * Models are passed in via props from the provider registry — no hardcoded IDs.
  * Per-persona overrides (advanced, expandable).
  */
+
+export interface ModelOption {
+  id: string;
+  label: string;
+  tier?: 'fast' | 'balanced' | 'powerful';
+}
 
 export interface ModelConfig {
   model: string;
@@ -17,27 +23,35 @@ export interface ModelConfig {
 export interface ModelPickerProps {
   value: ModelConfig;
   onChange: (config: ModelConfig) => void;
+  /** Available models from provider registry. Falls back to empty if not provided. */
+  models?: ModelOption[];
 }
 
-const PRESETS: { id: 'lean' | 'balanced' | 'smart'; label: string; cost: string; model: string }[] = [
-  { id: 'lean', label: 'Lean', cost: '$', model: 'claude-haiku-4-5' },
-  { id: 'balanced', label: 'Balanced', cost: '$$', model: 'claude-sonnet-4' },
-  { id: 'smart', label: 'Smart', cost: '$$$', model: 'claude-opus-4' },
-];
+/** Map presets to provider registry tier names */
+const PRESET_TO_TIER: Record<string, string> = {
+  lean: 'fast',
+  balanced: 'balanced',
+  smart: 'powerful',
+};
 
-const MODELS = [
-  { id: 'claude-opus-4', label: 'Claude Opus 4', tier: 3, context: '200k' },
-  { id: 'claude-sonnet-4', label: 'Claude Sonnet 4', tier: 2, context: '200k' },
-  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', tier: 1, context: '200k' },
+const PRESETS: { id: 'lean' | 'balanced' | 'smart'; label: string; cost: string }[] = [
+  { id: 'lean', label: 'Lean', cost: '$' },
+  { id: 'balanced', label: 'Balanced', cost: '$$' },
+  { id: 'smart', label: 'Smart', cost: '$$$' },
 ];
 
 const PERSONAS = ['clarifier', 'analyst', 'architect', 'engineer', 'tester', 'lead', 'reviewer', 'shipper'];
 
-export function ModelPicker({ value, onChange }: ModelPickerProps) {
+export function ModelPicker({ value, onChange, models = [] }: ModelPickerProps) {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const handlePreset = (preset: typeof PRESETS[number]) => {
-    onChange({ model: preset.model, preset: preset.id, personaOverrides: value.personaOverrides });
+    // Find the best model matching this preset's tier
+    const targetTier = PRESET_TO_TIER[preset.id];
+    const match = models.find(m => m.tier === targetTier) ?? models[0];
+    if (match) {
+      onChange({ model: match.id, preset: preset.id, personaOverrides: value.personaOverrides });
+    }
   };
 
   const handleModelSelect = (model: string) => {
@@ -98,9 +112,9 @@ export function ModelPicker({ value, onChange }: ModelPickerProps) {
           cursor: 'pointer',
         }}
       >
-        {MODELS.map((m) => (
+        {models.map((m) => (
           <option key={m.id} value={m.id}>
-            {m.label} ({m.context} ctx)
+            {m.label}
           </option>
         ))}
       </select>
@@ -171,7 +185,7 @@ export function ModelPicker({ value, onChange }: ModelPickerProps) {
                 }}
               >
                 <option value="">Default ({value.model})</option>
-                {MODELS.map((m) => (
+                {models.map((m) => (
                   <option key={m.id} value={m.id}>{m.label}</option>
                 ))}
               </select>

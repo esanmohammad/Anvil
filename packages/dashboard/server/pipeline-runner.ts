@@ -22,6 +22,7 @@ import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import { estimateTokens, getModelTokenLimit, budgetPromptContext } from './context-budget.js';
+import { resolveModelByTier } from './model-tier-resolver.js';
 
 // ── Persona prompt loader ────────────────────────────────────────────
 
@@ -152,10 +153,13 @@ export interface PipelineRunnerEvents {
 
 // ── Config ────────────────────────────────────────────────────────────
 
+export type ModelTier = 'fast' | 'balanced' | 'thorough';
+
 export interface PipelineConfig {
   project: string;
   feature: string;
   model: string;
+  modelTier?: ModelTier;     // cost-aware tier — overrides single model with per-stage routing
   baseBranch?: string;       // base branch to checkout/PR against (default: auto-detect main/master)
   skipClarify?: boolean;
   skipShip?: boolean;
@@ -178,6 +182,7 @@ export interface PipelineCheckpoint {
   featureSlug: string;
   config: {
     model: string;
+    modelTier?: ModelTier;
     baseBranch?: string;
     skipClarify?: boolean;
     skipShip?: boolean;
@@ -341,6 +346,26 @@ export class PipelineRunner extends EventEmitter {
     return this.state;
   }
 
+  /**
+   * Resolve which model to use for a given stage.
+   * Priority: factory.yaml per-stage override → tier-based dynamic routing → single model fallback.
+   *
+   * Tier routing resolves model IDs from the provider registry at runtime,
+   * so new models are picked up automatically without code changes.
+   */
+  private resolveModelForStage(stageName: string): string {
+    // 1. factory.yaml per-stage override always wins
+    const yamlModels = this.projectLoader.getConfig(this.config.project)?.pipeline?.models;
+    if (yamlModels?.[stageName]) return yamlModels[stageName];
+
+    // 2. If no tier selected, use the single model from the UI dropdown
+    const tier = this.config.modelTier;
+    if (!tier) return this.config.model;
+
+    // 3. Tier-based routing — resolve from provider registry
+    return resolveModelByTier(tier, stageName, this.config.model);
+  }
+
   /** Persist pipeline state to disk for crash recovery */
   checkpoint(): void {
     try {
@@ -355,6 +380,7 @@ export class PipelineRunner extends EventEmitter {
         featureSlug: this.state.featureSlug,
         config: {
           model: this.config.model,
+          modelTier: this.config.modelTier,
           baseBranch: this.config.baseBranch,
           skipClarify: this.config.skipClarify,
           skipShip: this.config.skipShip,
@@ -833,7 +859,7 @@ export class PipelineRunner extends EventEmitter {
       project: this.config.project,
       stage: 'clarify',
       prompt: explorePrompt,
-      model: this.config.model,
+      model: this.resolveModelForStage('clarify'),
       cwd: this.workspaceDir,
       projectPrompt,
       permissionMode: 'bypassPermissions',
@@ -966,7 +992,7 @@ export class PipelineRunner extends EventEmitter {
         project: this.config.project,
         stage: `${stage.name}:${repoName}`,
         prompt,
-        model: this.config.model,
+        model: this.resolveModelForStage(stage.name),
         cwd: repoPath,
         projectPrompt,
         permissionMode: 'bypassPermissions',
@@ -1047,7 +1073,7 @@ export class PipelineRunner extends EventEmitter {
       project: this.config.project,
       stage: stage.name,
       prompt,
-      model: this.config.model,
+      model: this.resolveModelForStage(stage.name),
       cwd: this.workspaceDir,
       projectPrompt,
       permissionMode: 'bypassPermissions',
@@ -1115,7 +1141,7 @@ export class PipelineRunner extends EventEmitter {
         project: this.config.project,
         stage: `fix-${attempt}`,
         prompt,
-        model: this.config.model,
+        model: this.resolveModelForStage('validate'),
         cwd: this.workspaceDir,
         projectPrompt: this.buildProjectPrompt(buildStage),
         permissionMode: 'bypassPermissions',
@@ -1142,7 +1168,7 @@ export class PipelineRunner extends EventEmitter {
         project: this.config.project,
         stage: `fix-${attempt}:${repoName}`,
         prompt,
-        model: this.config.model,
+        model: this.resolveModelForStage('validate'),
         cwd: repoPath,
         projectPrompt: this.buildRepoProjectPrompt(buildStage, repoName),
         permissionMode: 'bypassPermissions',

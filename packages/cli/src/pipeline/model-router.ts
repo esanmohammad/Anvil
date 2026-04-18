@@ -1,6 +1,11 @@
 // Cost-aware model routing per pipeline stage
+//
+// Uses weight classes (fast/balanced/powerful) instead of hardcoded model IDs.
+// Model IDs are resolved at runtime via a pluggable resolver function,
+// so new models are picked up without code changes.
 
 export type ModelTier = 'fast' | 'balanced' | 'thorough';
+type WeightClass = 'fast' | 'balanced' | 'powerful';
 
 export interface ModelRouting {
   clarify: string;
@@ -13,39 +18,63 @@ export interface ModelRouting {
   ship: string;
 }
 
-// Tier-based default model assignments
-const TIER_DEFAULTS: Record<ModelTier, ModelRouting> = {
+// Per-stage weight class assignments for each tier (no model IDs here)
+const STAGE_WEIGHTS: Record<ModelTier, Record<keyof ModelRouting, WeightClass>> = {
   fast: {
-    clarify: 'claude-haiku-4-5-20251001',
-    requirements: 'claude-haiku-4-5-20251001',
-    'project-requirements': 'claude-haiku-4-5-20251001',
-    specs: 'claude-haiku-4-5-20251001',
-    tasks: 'claude-haiku-4-5-20251001',
-    build: 'claude-sonnet-4-6',
-    validate: 'claude-haiku-4-5-20251001',
-    ship: 'claude-haiku-4-5-20251001',
+    clarify: 'fast',
+    requirements: 'fast',
+    'project-requirements': 'fast',
+    specs: 'fast',
+    tasks: 'fast',
+    build: 'balanced',
+    validate: 'fast',
+    ship: 'fast',
   },
   balanced: {
-    clarify: 'claude-haiku-4-5-20251001',
-    requirements: 'claude-sonnet-4-6',
-    'project-requirements': 'claude-sonnet-4-6',
-    specs: 'claude-sonnet-4-6',
-    tasks: 'claude-haiku-4-5-20251001',
-    build: 'claude-sonnet-4-6',
-    validate: 'claude-sonnet-4-6',
-    ship: 'claude-haiku-4-5-20251001',
+    clarify: 'fast',
+    requirements: 'balanced',
+    'project-requirements': 'balanced',
+    specs: 'balanced',
+    tasks: 'fast',
+    build: 'balanced',
+    validate: 'balanced',
+    ship: 'fast',
   },
   thorough: {
-    clarify: 'claude-sonnet-4-6',
-    requirements: 'claude-sonnet-4-6',
-    'project-requirements': 'claude-sonnet-4-6',
-    specs: 'claude-opus-4-6',
-    tasks: 'claude-sonnet-4-6',
-    build: 'claude-sonnet-4-6',
-    validate: 'claude-sonnet-4-6',
-    ship: 'claude-sonnet-4-6',
+    clarify: 'balanced',
+    requirements: 'balanced',
+    'project-requirements': 'balanced',
+    specs: 'powerful',
+    tasks: 'balanced',
+    build: 'balanced',
+    validate: 'balanced',
+    ship: 'balanced',
   },
 };
+
+// ── Model resolver ────────────────────────────────────────────────────
+
+// Default resolver used when no external registry is configured.
+// Maps weight classes to well-known model IDs as a last resort.
+let modelResolver: (weight: WeightClass) => string = defaultResolver;
+
+function defaultResolver(weight: WeightClass): string {
+  // These are fallbacks only — the dashboard and CLI should inject
+  // a resolver from the provider registry at startup.
+  switch (weight) {
+    case 'fast': return 'claude-haiku-4-5-20251001';
+    case 'balanced': return 'claude-sonnet-4-6';
+    case 'powerful': return 'claude-opus-4-6';
+  }
+}
+
+/**
+ * Inject a custom model resolver (e.g., from the provider registry).
+ * The resolver receives a weight class and returns the best available model ID.
+ */
+export function setModelResolver(resolver: (weight: WeightClass) => string): void {
+  modelResolver = resolver;
+}
 
 // Map stage names that might vary
 const STAGE_NAME_ALIASES: Record<string, keyof ModelRouting> = {
@@ -77,29 +106,24 @@ export function getModelForStage(
     return configModels[normalizedStage]!;
   }
 
-  // 2. Check factory.yaml pipeline.models.default
-  if (configModels?.default) {
-    // Use default for stages not explicitly in tier routing
-    const tierRouting = TIER_DEFAULTS[tier];
-    const stageName = normalizedStage as keyof ModelRouting;
-    if (!(stageName in tierRouting)) {
-      return configModels.default;
-    }
+  // 2. Check factory.yaml pipeline.models.default for unknown stages
+  const stageKey = normalizedStage as keyof ModelRouting;
+  if (configModels?.default && !(stageKey in STAGE_WEIGHTS[tier])) {
+    return configModels.default;
   }
 
-  // 3. Apply tier-based defaults
-  const tierRouting = TIER_DEFAULTS[tier];
-  const stageName = normalizedStage as keyof ModelRouting;
-  if (stageName in tierRouting) {
-    return tierRouting[stageName];
-  }
-
-  // 4. Fallback
-  return configModels?.default ?? 'claude-sonnet-4-6';
+  // 3. Resolve via weight class → model ID
+  const weight = STAGE_WEIGHTS[tier][stageKey] ?? 'balanced';
+  return modelResolver(weight);
 }
 
 export function getModelRoutingForTier(tier: ModelTier): ModelRouting {
-  return { ...TIER_DEFAULTS[tier] };
+  const weights = STAGE_WEIGHTS[tier];
+  const routing: Partial<ModelRouting> = {};
+  for (const [stage, weight] of Object.entries(weights)) {
+    routing[stage as keyof ModelRouting] = modelResolver(weight);
+  }
+  return routing as ModelRouting;
 }
 
 // Agentic stages that require tool use (file read/write, shell execution)

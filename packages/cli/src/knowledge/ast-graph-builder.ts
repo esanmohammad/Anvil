@@ -581,6 +581,17 @@ interface ExtractedEntity {
   parents: string[];
 }
 
+/** Find the entity whose line range contains the given line number. */
+function findEntityAtLine(entities: ExtractedEntity[], line: number): ExtractedEntity | null {
+  // Entities are sorted by line. Find the last entity that starts at or before this line.
+  let best: ExtractedEntity | null = null;
+  for (const e of entities) {
+    if (e.line <= line) best = e;
+    else break;
+  }
+  return best;
+}
+
 export async function buildAstGraph(
   repoPath: string,
   opts?: { maxFiles?: number; workspaceMap?: WorkspaceMap },
@@ -596,6 +607,9 @@ export async function buildAstGraph(
   const nodes: GraphifyNode[] = [];
   const edges: GraphifyEdge[] = [];
   const entities: ExtractedEntity[] = [];
+
+  // Store tree-sitter results per file for use in Phase 3 & 4
+  const tsResultByFile = new Map<string, FileParseResult>();
 
   // Multi-candidate symbol map (Phase 1: replaces first-writer-wins)
   const symbolToIds = new Map<string, string[]>();
@@ -655,6 +669,7 @@ export async function buildAstGraph(
 
     if (tsResult && tsResult.entities.length > 0) {
       // ── Tree-sitter path: compiler-accurate entity extraction ──
+      tsResultByFile.set(relPath, tsResult);
       let currentClassId: string | null = null;
 
       for (const tsEntity of tsResult.entities) {
@@ -802,68 +817,128 @@ export async function buildAstGraph(
     const fileEntities = entityByFile.get(relPath);
     if (!fileEntities || fileEntities.length === 0) continue;
 
-    let content: string;
-    try {
-      content = readFileSync(filePath, 'utf-8');
-    } catch {
-      continue;
-    }
+    // Use tree-sitter type references when available (file-level, more complete)
+    const tsResult = tsResultByFile.get(relPath);
+    if (tsResult && tsResult.typeReferences.length > 0) {
+      // Tree-sitter extracted all type references from the file — resolve each
+      const seenTypeRefs = new Set<string>();
+      for (const typeName of tsResult.typeReferences) {
+        if (seenTypeRefs.has(typeName)) continue;
+        seenTypeRefs.add(typeName);
 
-    const lines = content.split('\n');
-    const lang = langFromExt(extname(filePath));
-
-    for (let ei = 0; ei < fileEntities.length; ei++) {
-      const entity = fileEntities[ei];
-      const startLine = entity.line;
-      const endLine = ei + 1 < fileEntities.length ? fileEntities[ei + 1].line : lines.length;
-      const body = lines.slice(startLine, Math.min(startLine + 30, endLine)).join('\n'); // limit body scan
-
-      // Type references
-      const typeRefs = extractTypeReferences(body, lang);
-      for (const typeName of typeRefs) {
-        const resolved = resolveCallTarget(typeName, entity.file, entity.id, symbolToIds, fileImportTargets);
+        // Attribute to the first entity in the file or the file itself
+        const sourceId = fileEntities[0]?.id ?? relPath;
+        const resolved = resolveCallTarget(typeName, relPath, sourceId, symbolToIds, fileImportTargets);
         if (resolved) {
-          edges.push({ source: entity.id, target: resolved.targetId, type: 'type-ref', confidence: Math.min(resolved.confidence, 0.85) });
+          edges.push({ source: sourceId, target: resolved.targetId, type: 'type-ref', confidence: Math.min(resolved.confidence, 0.85) });
+        }
+      }
+    } else {
+      // Regex fallback — scan entity bodies (limited to 30 lines each)
+      let content: string;
+      try {
+        content = readFileSync(filePath, 'utf-8');
+      } catch {
+        continue;
+      }
+
+      const lines = content.split('\n');
+      const lang = langFromExt(extname(filePath));
+
+      for (let ei = 0; ei < fileEntities.length; ei++) {
+        const entity = fileEntities[ei];
+        const startLine = entity.line;
+        const endLine = ei + 1 < fileEntities.length ? fileEntities[ei + 1].line : lines.length;
+        const body = lines.slice(startLine, Math.min(startLine + 30, endLine)).join('\n');
+
+        const typeRefs = extractTypeReferences(body, lang);
+        for (const typeName of typeRefs) {
+          const resolved = resolveCallTarget(typeName, entity.file, entity.id, symbolToIds, fileImportTargets);
+          if (resolved) {
+            edges.push({ source: entity.id, target: resolved.targetId, type: 'type-ref', confidence: Math.min(resolved.confidence, 0.85) });
+          }
         }
       }
     }
   }
 
   // Phase 4 — Import-aware call disambiguation (deferred cross-file resolution)
+  // Uses tree-sitter call sites when available for precise caller→callee attribution,
+  // falls back to regex scanning for files without tree-sitter support.
   for (const filePath of sourceFiles) {
     const relPath = relative(repoPath, filePath);
     const fileEntities = entityByFile.get(relPath);
     if (!fileEntities || fileEntities.length === 0) continue;
 
-    let content: string;
-    try {
-      content = readFileSync(filePath, 'utf-8');
-    } catch {
-      continue;
-    }
+    const tsResult = tsResultByFile.get(relPath);
 
-    const lines = content.split('\n');
+    if (tsResult && tsResult.callSites.length > 0) {
+      // ── Tree-sitter path: precise call sites with containing entity ──
+      const seenEdges = new Set<string>();
 
-    for (let ei = 0; ei < fileEntities.length; ei++) {
-      const entity = fileEntities[ei];
-      const startLine = entity.line;
-      const endLine = ei + 1 < fileEntities.length ? fileEntities[ei + 1].line : lines.length;
-      const body = lines.slice(startLine, endLine).join('\n');
-
-      const callRegex = /\b([a-zA-Z_]\w*)\s*\(/g;
-      let match: RegExpExecArray | null;
-      const seenCalls = new Set<string>();
-
-      while ((match = callRegex.exec(body)) !== null) {
-        const calledName = match[1];
+      for (const callSite of tsResult.callSites) {
+        const calledName = callSite.callee;
         if (calledName.length < 3) continue;
         if (SKIP_CALL_NAMES.has(calledName)) continue;
-        if (seenCalls.has(calledName)) continue;
-        seenCalls.add(calledName);
 
-        const resolved = resolveCallTarget(calledName, entity.file, entity.id, symbolToIds, fileImportTargets);
+        // Determine the calling entity — tree-sitter provides containingEntity
+        let sourceEntityId: string;
+        if (callSite.containingEntity) {
+          sourceEntityId = `${relPath}::${callSite.containingEntity}`;
+          // Verify this entity exists (might be a nested name)
+          if (!fileEntities.some(e => e.id === sourceEntityId)) {
+            // Fall back to line-based entity lookup
+            sourceEntityId = findEntityAtLine(fileEntities, callSite.startLine)?.id ?? relPath;
+          }
+        } else {
+          // Module-level call — attribute to file or nearest entity
+          sourceEntityId = findEntityAtLine(fileEntities, callSite.startLine)?.id ?? relPath;
+        }
+
+        // Deduplicate: same source→callee pair
+        const edgeKey = `${sourceEntityId}→${calledName}`;
+        if (seenEdges.has(edgeKey)) continue;
+        seenEdges.add(edgeKey);
+
+        const resolved = resolveCallTarget(calledName, relPath, sourceEntityId, symbolToIds, fileImportTargets);
         if (resolved) {
-          edges.push({ source: entity.id, target: resolved.targetId, type: 'calls', confidence: resolved.confidence });
+          // Tree-sitter call sites are more reliable — boost confidence slightly
+          const confidence = Math.min(resolved.confidence + 0.05, 1.0);
+          edges.push({ source: sourceEntityId, target: resolved.targetId, type: 'calls', confidence });
+        }
+      }
+    } else {
+      // ── Regex fallback path ──
+      let content: string;
+      try {
+        content = readFileSync(filePath, 'utf-8');
+      } catch {
+        continue;
+      }
+
+      const lines = content.split('\n');
+
+      for (let ei = 0; ei < fileEntities.length; ei++) {
+        const entity = fileEntities[ei];
+        const startLine = entity.line;
+        const endLine = ei + 1 < fileEntities.length ? fileEntities[ei + 1].line : lines.length;
+        const body = lines.slice(startLine, endLine).join('\n');
+
+        const callRegex = /\b([a-zA-Z_]\w*)\s*\(/g;
+        let match: RegExpExecArray | null;
+        const seenCalls = new Set<string>();
+
+        while ((match = callRegex.exec(body)) !== null) {
+          const calledName = match[1];
+          if (calledName.length < 3) continue;
+          if (SKIP_CALL_NAMES.has(calledName)) continue;
+          if (seenCalls.has(calledName)) continue;
+          seenCalls.add(calledName);
+
+          const resolved = resolveCallTarget(calledName, entity.file, entity.id, symbolToIds, fileImportTargets);
+          if (resolved) {
+            edges.push({ source: entity.id, target: resolved.targetId, type: 'calls', confidence: resolved.confidence });
+          }
         }
       }
     }

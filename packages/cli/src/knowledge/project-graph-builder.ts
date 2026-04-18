@@ -63,8 +63,8 @@ function detectProvider(preferredProvider?: string): { provider: string; apiKey:
     throw new Error(`Provider "${preferredProvider}" not available. Check your API key.`);
   }
 
-  // Auto-detect in order of preference (cost-effective first, then CLI tools)
-  for (const p of ['openai', 'gemini', 'anthropic', 'openrouter', 'claude-cli', 'gemini-cli']) {
+  // Auto-detect in order of preference (CLI tools first, then API providers)
+  for (const p of ['claude-cli', 'gemini-cli', 'anthropic', 'openai', 'gemini', 'openrouter']) {
     const found = tryProvider(p);
     if (found) return found;
   }

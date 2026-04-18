@@ -680,7 +680,7 @@ function App() {
 
   // Start feature from homepage or modal
   const handleStartFeature = useCallback(
-    (feature: string, options: { project: string; model: string; provider?: string; skipClarify?: boolean; skipShip?: boolean; baseBranch?: string }) => {
+    (feature: string, options: { project: string; model: string; modelTier?: 'fast' | 'balanced' | 'thorough'; provider?: string; skipClarify?: boolean; skipShip?: boolean; baseBranch?: string }) => {
       // Select the project
       const sys = projects.find((s) => s.name === options.project);
       if (sys) setCurrentProject(sys);
@@ -697,6 +697,7 @@ function App() {
         feature,
         options: {
           model: options.model,
+          modelTier: options.modelTier,
           skipClarify: options.skipClarify,
           skipShip: options.skipShip,
           baseBranch: options.baseBranch,

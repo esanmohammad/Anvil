@@ -55,6 +55,7 @@ export function KnowledgeGraphPage({
   const [pgBuilding, setPgBuilding] = useState(false);
   const [pgProgress, setPgProgress] = useState<string | null>(null);
   const [pgError, setPgError] = useState<string | null>(null);
+  const [pgProvider, setPgProvider] = useState<string>('auto');
 
   const repos = kbStatus?.repos ?? [];
 
@@ -299,22 +300,56 @@ export function KnowledgeGraphPage({
 
               {/* Project graph build CTA */}
               {graphLevel === 'project' && (
-                <button
-                  onClick={() => {
-                    if (ws) ws.send(JSON.stringify({ action: 'build-project-graph', project: projectName }));
-                  }}
-                  disabled={pgBuilding}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 4,
-                    padding: '4px 10px', fontSize: 11, fontWeight: 500,
-                    background: pgBuilding ? 'var(--bg-base)' : 'var(--color-accent)',
-                    color: pgBuilding ? 'var(--text-tertiary)' : 'white',
-                    border: 'none', borderRadius: 'var(--radius-sm)', cursor: pgBuilding ? 'default' : 'pointer',
-                  }}
-                >
-                  <Brain size={11} />
-                  {pgBuilding ? 'Building...' : pgStatus?.exists ? 'Rebuild AI Graph' : 'Build AI Graph'}
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+                  <select
+                    value={pgProvider}
+                    onChange={(e) => setPgProvider(e.target.value)}
+                    disabled={pgBuilding}
+                    style={{
+                      height: 26, padding: '0 24px 0 8px', fontSize: 11,
+                      background: 'var(--bg-elevated-2)', color: 'var(--text-secondary)',
+                      border: '1px solid var(--separator)', borderRight: 'none',
+                      borderRadius: 'var(--radius-sm) 0 0 var(--radius-sm)',
+                      outline: 'none', cursor: pgBuilding ? 'default' : 'pointer',
+                      fontFamily: 'var(--font-sans)',
+                      appearance: 'none',
+                      WebkitAppearance: 'none',
+                      backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`,
+                      backgroundRepeat: 'no-repeat',
+                      backgroundPosition: 'right 6px center',
+                    }}
+                  >
+                    <option value="auto">Auto (Claude → Gemini)</option>
+                    <option value="claude-cli">Claude CLI</option>
+                    <option value="gemini-cli">Gemini CLI</option>
+                    <option disabled>── coming soon ──</option>
+                    <option value="anthropic" disabled>Anthropic API</option>
+                    <option value="openai" disabled>OpenAI API</option>
+                    <option value="gemini" disabled>Gemini API</option>
+                    <option value="openrouter" disabled>OpenRouter</option>
+                  </select>
+                  <button
+                    onClick={() => {
+                      if (ws) {
+                        const msg: Record<string, unknown> = { action: 'build-project-graph', project: projectName };
+                        if (pgProvider !== 'auto') msg.provider = pgProvider;
+                        ws.send(JSON.stringify(msg));
+                      }
+                    }}
+                    disabled={pgBuilding}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 4,
+                      padding: '4px 10px', height: 26, fontSize: 11, fontWeight: 500,
+                      background: pgBuilding ? 'var(--bg-base)' : 'var(--color-accent)',
+                      color: pgBuilding ? 'var(--text-tertiary)' : 'white',
+                      border: 'none', borderRadius: '0 var(--radius-sm) var(--radius-sm) 0',
+                      cursor: pgBuilding ? 'default' : 'pointer',
+                    }}
+                  >
+                    <Brain size={11} />
+                    {pgBuilding ? 'Building...' : pgStatus?.exists ? 'Rebuild AI Graph' : 'Build AI Graph'}
+                  </button>
+                </div>
               )}
             </div>
           </div>

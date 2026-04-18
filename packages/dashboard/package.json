@@ -1,16 +1,27 @@
 {
   "name": "@anvil-dev/dashboard",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "main": "./server/dashboard-server.js",
+  "exports": {
+    ".": "./server/dashboard-server.js",
+    "./server/*": "./server/*.js"
+  },
+  "files": [
+    "dist",
+    "server/*.js",
+    "server/*.d.ts",
+    "server/adapters/*.js",
+    "server/adapters/*.d.ts",
+    "LICENSE"
+  ],
   "scripts": {
     "dev": "vite",
-    "build": "vite build && tsc -p server/tsconfig.json && cp server/out/*.js server/out/*.d.ts server/ 2>/dev/null; true",
+    "build": "vite build && tsc -p server/tsconfig.json && cp server/out/*.js server/out/*.d.ts server/ 2>/dev/null; cp server/out/adapters/*.js server/out/adapters/*.d.ts server/adapters/ 2>/dev/null; true",
     "preview": "vite preview",
     "test:server": "npx tsc -p server/tsconfig.json && node --test server/out/__tests__/*.test.js"
   },
   "dependencies": {
-    "@anvil-dev/cli": "*",
     "lucide-react": "1.8.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

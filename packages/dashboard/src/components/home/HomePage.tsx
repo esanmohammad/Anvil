@@ -25,6 +25,7 @@ export interface HomePageProps {
   onStartFeature: (feature: string, options: {
     project: string;
     model: string;
+    modelTier?: 'fast' | 'balanced' | 'thorough';
     provider?: string;
     skipClarify?: boolean;
     skipShip?: boolean;
@@ -282,6 +283,7 @@ export function HomePage({
 }: HomePageProps) {
   const [text, setText] = useState('');
   const [selectedModel, setSelectedModel] = useState('');
+  const [modelTier, setModelTier] = useState<'fast' | 'balanced' | 'thorough' | null>(null);
   const [actionMode, setActionMode] = useState<ActionMode>('build');
   const [budget, setBudget] = useState<{ used: number; limit: number } | null>(null);
   const [branches, setBranches] = useState<string[]>(['main']);
@@ -378,6 +380,7 @@ export function HomePage({
       onStartFeature(trimmed, {
         project: selectedProject!,
         model: selectedModel,
+        modelTier: modelTier ?? undefined,
         provider: selectedProvider?.name,
         baseBranch,
       });
@@ -390,7 +393,7 @@ export function HomePage({
       });
     }
     setText('');
-  }, [canSubmit, text, actionMode, selectedProject, selectedModel, selectedProvider, onStartFeature, onQuickAction, currentMode]);
+  }, [canSubmit, text, actionMode, selectedProject, selectedModel, modelTier, selectedProvider, onStartFeature, onQuickAction, currentMode, baseBranch]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -567,7 +570,7 @@ budget:
           <CustomDropdown
             value={selectedModel}
             options={modelOptions}
-            onChange={setSelectedModel}
+            onChange={(v) => { setSelectedModel(v); setModelTier(null); }}
             placeholder="Model..."
             minWidth={160}
           />
@@ -587,6 +590,37 @@ budget:
             Loading models...
           </div>
         )}
+
+        {/* Model tier selector — overrides single model with per-stage routing */}
+        <div style={{ display: 'flex', gap: 2, height: 32 }}>
+          {([
+            { id: 'fast' as const, label: '$', title: 'Fast — lightweight model for most stages, mid-range for build' },
+            { id: 'balanced' as const, label: '$$', title: 'Balanced — mid-range for specs/build/validate, lightweight for the rest' },
+            { id: 'thorough' as const, label: '$$$', title: 'Thorough — mid-range for most stages, top-tier for specs' },
+          ]).map((tier, i) => (
+            <button
+              key={tier.id}
+              type="button"
+              title={tier.title}
+              onClick={() => setModelTier(modelTier === tier.id ? null : tier.id)}
+              style={{
+                padding: '0 10px',
+                height: 32,
+                background: modelTier === tier.id ? 'var(--accent)' : 'var(--bg-elevated-2)',
+                border: `1px solid ${modelTier === tier.id ? 'var(--accent)' : 'var(--separator)'}`,
+                borderRadius: i === 0 ? 'var(--radius-sm) 0 0 var(--radius-sm)' : i === 2 ? '0 var(--radius-sm) var(--radius-sm) 0' : '0',
+                color: modelTier === tier.id ? '#fff' : 'var(--text-secondary)',
+                cursor: 'pointer',
+                fontSize: 11,
+                fontWeight: modelTier === tier.id ? 600 : 400,
+                fontFamily: 'var(--font-sans)',
+                borderLeft: i > 0 ? 'none' : undefined,
+              }}
+            >
+              {tier.label}
+            </button>
+          ))}
+        </div>
 
         {/* Project dropdown */}
         <CustomDropdown

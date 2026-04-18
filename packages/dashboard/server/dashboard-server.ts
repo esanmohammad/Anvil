@@ -48,6 +48,9 @@ import type { MemoryTarget } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import type { KBProjectStatus, KBRefreshProgress } from './knowledge-base-manager.js';
 import { discoverProviders, invalidateProviderCache } from './provider-registry.js';
+import { setDiscoveryResult } from './model-tier-resolver.js';
+import { autoLearn } from './pipeline-learner.js';
+import { generateConventions, saveConventionRules, loadConventionRules } from './convention-generator.js';
 
 // ── Paths ───────────────────────────────────────────────────────────────
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -212,6 +215,7 @@ export interface ClientMessage {
     models?: Record<string, string>;
     approvalRequired?: boolean;
     baseBranch?: string;
+    modelTier?: 'fast' | 'balanced' | 'thorough';
     repo?: string;
     level?: string;
   };
@@ -260,6 +264,8 @@ interface AvailableModelsResult {
 
 async function discoverAvailableModels(): Promise<AvailableModelsResult> {
   const discovery = await discoverProviders();
+  // Feed the tier resolver so it can map weight classes to actual model IDs
+  setDiscoveryResult(discovery);
   return {
     providers: discovery.providers.map(p => ({
       name: p.name,
@@ -1743,8 +1749,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
       case 'get-conventions': {
         try {
-          const conventionsMod = await import('@anvil-dev/cli/pipeline/conventions' as string);
-          const rules = conventionsMod.loadConventionRules(msg.project ?? '');
+          const rules = loadConventionRules(ANVIL_HOME, msg.project ?? '');
           ws.send(JSON.stringify({ type: 'conventions', payload: { rules } }));
         } catch {
           ws.send(JSON.stringify({ type: 'conventions', payload: { rules: [] } }));
@@ -1761,38 +1766,20 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         try {
           console.log(`[dashboard] Generating conventions for "${project}"...`);
 
-          // Import the learn module and generate rules from codebase patterns
-          const learnMod = await import('@anvil-dev/cli/learn/rule-generator' as string);
-          const ciScanner = await import('@anvil-dev/cli/learn/ci-scanner' as string);
-          const testScanner = await import('@anvil-dev/cli/learn/test-scanner' as string);
-
           // Resolve workspace path
           const workspace = getWorkspaceFromConfig(project) || join(ANVIL_HOME, 'workspaces', project);
 
-          // Scan patterns from the workspace
-          let ciConfigs: any[] = [];
-          let testPatterns: any[] = [];
-          try {
-            if (existsSync(workspace)) {
-              ciConfigs = ciScanner.scanCiConfigs?.(workspace) ?? [];
-              testPatterns = testScanner.scanTestPatterns?.(workspace) ?? [];
-            }
-          } catch { /* scanning is best-effort */ }
+          // Get repo names from project config
+          const projectConfig = projectLoader.getConfig(project);
+          const repoNames = projectConfig?.repos?.map((r: any) => r.name || r.path) ?? [];
 
-          const rules = learnMod.generateRules({
-            ciConfigs,
-            testPatterns,
-          });
+          // Generate conventions by scanning the workspace
+          const rules = generateConventions(workspace, repoNames);
 
-          // Save the generated rules to ~/.anvil/conventions/rules/<project>/generated.json
-          try {
-            const rulesDir = join(ANVIL_HOME, 'conventions', 'rules', project);
-            mkdirSync(rulesDir, { recursive: true });
-            writeFileSync(join(rulesDir, 'generated.json'), JSON.stringify({ rules }, null, 2), 'utf-8');
-            console.log(`[dashboard] Saved ${rules.length} rules to ${rulesDir}/generated.json`);
-          } catch { /* saving is best-effort */ }
-
+          // Persist to disk
+          saveConventionRules(ANVIL_HOME, project, rules);
           console.log(`[dashboard] Generated ${rules.length} convention rules for "${project}"`);
+
           ws.send(JSON.stringify({ type: 'conventions', payload: { rules } }));
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
@@ -2149,6 +2136,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       project,
       feature,
       model: options?.model ?? 'claude-sonnet-4-6',
+      modelTier: options?.modelTier,
       baseBranch: options?.baseBranch,
       skipClarify: options?.skipClarify,
       skipShip: options?.skipShip,
@@ -2347,6 +2335,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
     runner.on('pipeline-complete', (pipelineState: PipelineRunState) => {
       persistRunRecord(pipelineState, pipelineRunId);
+      autoLearn(memoryStore, pipelineState);
       activePipelineRunner = null;
       agentManager.spawn = originalSpawn; // restore original spawn
       const completedRun = activeRuns.get(pipelineRunId);
@@ -2358,6 +2347,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
     runner.on('pipeline-fail', (pipelineState: PipelineRunState) => {
       persistRunRecord(pipelineState, pipelineRunId);
+      autoLearn(memoryStore, pipelineState);
       activePipelineRunner = null;
       agentManager.spawn = originalSpawn;
       const failedRun = activeRuns.get(pipelineRunId);
