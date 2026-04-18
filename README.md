@@ -8,7 +8,7 @@
 
 **Ship features across multi-repo codebases with AI agents**
 
-Describe what you want. Anvil clarifies, plans, codes, tests, and opens PRs — across every repo in your system.
+Describe what you want. Anvil clarifies, plans, codes, tests, and opens PRs — across every repo in your project.
 
 <br/>
 
