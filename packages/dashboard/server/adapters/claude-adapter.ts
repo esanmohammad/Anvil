@@ -111,7 +111,7 @@ export class ClaudeAdapter extends BaseAdapter {
       );
 
       if (this.config.projectPrompt) {
-        args.push('--project-prompt', this.config.projectPrompt);
+        args.push('--append-system-prompt', this.config.projectPrompt);
       }
     }
 
