@@ -29,7 +29,7 @@ Describe what you want. Anvil clarifies, plans, codes, tests, and opens PRs — 
 
 ## Why Anvil?
 
-Most AI coding tools see one file at a time. Your system spans five repos, three languages, a Kafka bus, and a shared Postgres cluster. When you say *"add webhook retry with exponential backoff,"* the AI needs to know that the API gateway produces events, the worker service consumes them, and the retry table lives in a database owned by a third service.
+Most AI coding tools see one file at a time. Your project spans five repos, three languages, a Kafka bus, and a shared Postgres cluster. When you say *"add webhook retry with exponential backoff,"* the AI needs to know that the API gateway produces events, the worker service consumes them, and the retry table lives in a database owned by a third service.
 
 **Anvil gives AI agents full architectural awareness.** It builds a knowledge graph of your codebase — AST-parsed, vector-indexed, cross-repo-aware — then drives a multi-stage pipeline from clarification to shipped pull requests. Everything streams to a real-time dashboard where you steer, approve, and ship.
 
