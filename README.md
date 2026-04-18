@@ -78,7 +78,7 @@ The Anvil dashboard is the primary interface for MVP1. Everything runs through i
 
 ```bash
 # 1. Install dependencies
-git clone https://github.com/anvil-dev/anvil.git && cd anvil
+git clone https://github.com/esanmohammad/Anvil.git && cd anvil
 npm install && npm run build --workspaces
 
 # 2. Check your setup
@@ -734,7 +734,7 @@ Full CLI pipeline commands are coming in a future release.
 ## Contributing
 
 ```bash
-git clone https://github.com/anvil-dev/anvil.git
+git clone https://github.com/esanmohammad/Anvil.git
 cd anvil
 npm install
 npm run build --workspaces
@@ -759,6 +759,6 @@ MIT -- Copyright (c) 2024-2026 Esan Mohammad
 
 Built with TypeScript, React, Tree-sitter, LanceDB, and Graphology.
 
-[Issues](https://github.com/anvil-dev/anvil/issues) · [Discussions](https://github.com/anvil-dev/anvil/discussions)
+[Issues](https://github.com/esanmohammad/Anvil/issues) · [Discussions](https://github.com/esanmohammad/Anvil/discussions)
 
 </div>

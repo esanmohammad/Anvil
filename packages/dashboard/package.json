@@ -1,7 +1,19 @@
 {
   "name": "@anvil-dev/dashboard",
   "version": "0.1.0",
+  "description": "React dashboard and Node.js server for Anvil — real-time pipeline orchestration, knowledge graph visualization, and agent management",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/esanmohammad/Anvil.git",
+    "directory": "packages/dashboard"
+  },
+  "homepage": "https://github.com/esanmohammad/Anvil#dashboard",
+  "bugs": {
+    "url": "https://github.com/esanmohammad/Anvil/issues"
+  },
+  "keywords": ["anvil", "dashboard", "react", "pipeline", "ai", "agents", "knowledge-graph"],
   "main": "./server/dashboard-server.js",
   "exports": {
     ".": "./server/dashboard-server.js",

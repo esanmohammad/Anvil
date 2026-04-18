@@ -5,11 +5,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/anvil-dev/anvil.git"
+    "url": "https://github.com/esanmohammad/Anvil.git"
   },
-  "homepage": "https://github.com/anvil-dev/anvil#readme",
+  "homepage": "https://github.com/esanmohammad/Anvil#readme",
   "bugs": {
-    "url": "https://github.com/anvil-dev/anvil/issues"
+    "url": "https://github.com/esanmohammad/Anvil/issues"
   },
   "keywords": [
     "anvil",
