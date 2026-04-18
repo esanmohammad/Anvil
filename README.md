@@ -752,7 +752,7 @@ TypeScript throughout. No complex build tooling — just `tsc` and Vite. PRs wel
 
 ## License
 
-MIT
+MIT -- Copyright (c) 2024-2026 Esan Mohammad
 
 <div align="center">
 <br/>
