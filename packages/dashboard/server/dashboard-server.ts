@@ -2301,6 +2301,18 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       broadcast({ type: 'agent-output', payload: { entries: [entry], runId: pipelineRunId } });
     });
 
+    // Auth expired — send browser notification so user knows to re-login
+    runner.on('auth-required', (data: { stageName: string; message: string }) => {
+      broadcast({
+        type: 'auth-required',
+        payload: {
+          runId: pipelineRunId,
+          stageName: data.stageName,
+          message: data.message,
+        },
+      });
+    });
+
     // Show artifacts in changes tab + scan ship artifacts for PR URLs
     runner.on('artifact-written', (data: { stage: string; file: string; summary: string; content: string; repo?: string }) => {
       // If this is the ship stage artifact, scan for PR URLs and associate with this run
@@ -2352,7 +2364,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       agentManager.spawn = originalSpawn;
       const failedRun = activeRuns.get(pipelineRunId);
       if (failedRun) failedRun.status = 'failed';
-      activeRuns.delete(pipelineRunId);
+      // Keep failed runs in activeRuns — they are resumable and should stay visible
       broadcastActiveRuns();
       broadcastRuns();
     });
@@ -2557,22 +2569,38 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
   // Scan feature store for existing PR URLs on startup (async, non-blocking)
   loadPRsFromFeatureStore();
 
-  // Detect interrupted pipelines from previous sessions
+  // Restore incomplete pipelines from previous sessions into active runs
   (async () => {
     try {
       const { findInterruptedPipelines } = await import('./pipeline-runner.js');
-      const interrupted = findInterruptedPipelines(ANVIL_HOME);
-      if (interrupted.length > 0) {
-        console.log(`[dashboard] Found ${interrupted.length} interrupted pipeline(s) from previous session`);
-        for (const cp of interrupted) {
-          console.log(`  - "${cp.feature}" (${cp.project}) at stage ${cp.currentStage} [${cp.stages[cp.currentStage]?.name ?? '?'}]`);
+      const incomplete = findInterruptedPipelines(ANVIL_HOME);
+      if (incomplete.length > 0) {
+        console.log(`[dashboard] Found ${incomplete.length} incomplete pipeline(s) from previous session(s)`);
+        for (const cp of incomplete) {
+          const stageInfo = cp.stages[cp.currentStage];
+          console.log(`  - "${cp.feature}" (${cp.project}) [${cp.status}] at stage ${cp.currentStage} [${stageInfo?.name ?? '?'}]`);
+
+          // Add to activeRuns so they appear in the Active Runs page
+          activeRuns.set(cp.runId, {
+            id: cp.runId,
+            type: 'build',
+            project: cp.project,
+            description: cp.feature,
+            model: cp.config.model,
+            status: cp.status === 'cancelled' ? 'failed' : cp.status as 'running' | 'completed' | 'failed',
+            startedAt: new Date(cp.startedAt).getTime(),
+            activities: [],
+            prUrls: new Set(),
+          });
         }
-        // Broadcast to connected clients
+
+        // Broadcast to connected clients after a short delay
         setTimeout(() => {
+          broadcastActiveRuns();
           broadcast({
             type: 'interrupted-pipelines',
             payload: {
-              pipelines: interrupted.map((cp) => ({
+              pipelines: incomplete.map((cp) => ({
                 runId: cp.runId,
                 project: cp.project,
                 feature: cp.feature,
@@ -2584,6 +2612,7 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
                 stageLabel: cp.stages[cp.currentStage]?.label ?? 'Unknown',
                 totalCost: cp.totalCost,
                 startedAt: cp.startedAt,
+                status: cp.status,
                 error: cp.stages[cp.currentStage]?.error ?? 'Pipeline was interrupted (dashboard shutdown)',
               })),
             },
@@ -2591,7 +2620,7 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
         }, 2000); // Wait for clients to connect
       }
     } catch (err) {
-      console.warn('[dashboard] Failed to scan for interrupted pipelines:', err);
+      console.warn('[dashboard] Failed to scan for incomplete pipelines:', err);
     }
   })();
 

@@ -595,6 +595,27 @@ function App() {
         break;
       }
 
+      case 'auth-required': {
+        // Pipeline paused for re-authentication — notify the user
+        const auth = msg.payload as { stageName: string; message: string };
+        const title = 'Anvil — Login Required';
+        const body = auth.message || `Authentication expired before "${auth.stageName}". Please log in to resume.`;
+
+        // Browser Notification API (works even if tab is in background)
+        if ('Notification' in window) {
+          if (Notification.permission === 'granted') {
+            new Notification(title, { body, icon: '/favicon.ico', tag: 'auth-required', requireInteraction: true });
+          } else if (Notification.permission !== 'denied') {
+            Notification.requestPermission().then((perm) => {
+              if (perm === 'granted') {
+                new Notification(title, { body, icon: '/favicon.ico', tag: 'auth-required', requireInteraction: true });
+              }
+            });
+          }
+        }
+        break;
+      }
+
       default:
         break;
     }

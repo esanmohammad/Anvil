@@ -13,7 +13,7 @@ import { EventEmitter } from 'node:events';
 import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { execSync } from 'node:child_process';
+import { execSync, spawn as cpSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { AgentManager } from './agent-manager.js';
 import { ProjectLoader } from './project-loader.js';
@@ -23,6 +23,67 @@ import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import { estimateTokens, getModelTokenLimit, budgetPromptContext } from './context-budget.js';
 import { resolveModelByTier } from './model-tier-resolver.js';
+
+// ── Claude CLI binary ────────────────────────────────────────────────
+
+const CLAUDE_BIN = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? process.env.CLAUDE_BIN ?? 'claude';
+
+// ── Auth helpers ─────────────────────────────────────────────────────
+
+/**
+ * Check if the Claude CLI is authenticated.
+ * Returns true if logged in, false otherwise.
+ */
+function checkClaudeAuth(): boolean {
+  try {
+    const out = execSync(`${CLAUDE_BIN} auth status --json`, { timeout: 10_000, stdio: ['pipe', 'pipe', 'pipe'] });
+    const status = JSON.parse(out.toString());
+    return status.loggedIn === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Trigger an automatic re-login via `claude auth login`.
+ * Opens the browser for OAuth and polls until auth succeeds or times out.
+ * Returns true if re-auth succeeded.
+ */
+function refreshClaudeAuth(timeoutMs = 120_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    // Spawn login process — opens browser automatically
+    const loginProc = cpSpawn(CLAUDE_BIN, ['auth', 'login'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const deadline = Date.now() + timeoutMs;
+
+    // Poll auth status until it succeeds or we time out
+    const poll = () => {
+      if (Date.now() > deadline) {
+        loginProc.kill();
+        resolve(false);
+        return;
+      }
+      if (checkClaudeAuth()) {
+        loginProc.kill();
+        resolve(true);
+        return;
+      }
+      setTimeout(poll, 2000);
+    };
+
+    // Give the browser a moment to open before polling
+    setTimeout(poll, 3000);
+
+    loginProc.on('exit', () => {
+      // Check one final time after login process exits
+      setTimeout(() => resolve(checkClaudeAuth()), 500);
+    });
+
+    loginProc.on('error', () => resolve(false));
+  });
+}
 
 // ── Persona prompt loader ────────────────────────────────────────────
 
@@ -223,12 +284,12 @@ export function readCheckpoint(featureDir: string): PipelineCheckpoint | null {
   }
 }
 
-/** Find all interrupted pipelines across all projects */
+/** Find all incomplete pipelines across all projects (interrupted, failed, or waiting) */
 export function findInterruptedPipelines(anvilHome: string): PipelineCheckpoint[] {
   const featuresDir = join(anvilHome, 'features');
   if (!existsSync(featuresDir)) return [];
 
-  const interrupted: PipelineCheckpoint[] = [];
+  const incomplete: PipelineCheckpoint[] = [];
   try {
     for (const project of readdirSync(featuresDir)) {
       const projectDir = join(featuresDir, project);
@@ -236,15 +297,19 @@ export function findInterruptedPipelines(anvilHome: string): PipelineCheckpoint[
       try {
         for (const slug of readdirSync(projectDir)) {
           const cp = readCheckpoint(join(projectDir, slug));
-          if (cp && (cp.status === 'running' || cp.status === 'waiting')) {
+          if (!cp) continue;
+          if (cp.status === 'running' || cp.status === 'waiting') {
             // Was in-progress when dashboard died — mark as interrupted
-            interrupted.push({ ...cp, status: 'failed' as any });
+            incomplete.push({ ...cp, status: 'failed' as any });
+          } else if (cp.status === 'failed' || cp.status === 'cancelled') {
+            // Previously failed/cancelled — still resumable
+            incomplete.push(cp);
           }
         }
       } catch { /* skip unreadable dirs */ }
     }
   } catch { /* skip */ }
-  return interrupted;
+  return incomplete;
 }
 
 // ── Pipeline Runner ───────────────────────────────────────────────────
@@ -559,6 +624,9 @@ export class PipelineRunner extends EventEmitter {
           this.checkpoint();
           continue;
         }
+
+        // Ensure Claude CLI auth is valid before spawning agents
+        await this.ensureAuth(stage.name);
 
         // Create feature branch before build stage starts
         if (stage.name === 'build') {
@@ -1085,6 +1153,73 @@ export class PipelineRunner extends EventEmitter {
     this.emit('stage-start', index, agent.id);
 
     return this.waitForAgent(agent.id);
+  }
+
+  // ── Auth helper ──────────────────────────────────────────────────────
+
+  /**
+   * Ensure Claude CLI auth is valid before spawning agents for a stage.
+   * If the token has expired:
+   *   1. Checkpoints current state so the pipeline is resumable
+   *   2. Pauses the pipeline with a 'waiting-auth' status
+   *   3. Sends a browser notification to alert the user
+   *   4. Opens the login flow automatically
+   *   5. Polls until auth succeeds, then resumes
+   */
+  private async ensureAuth(stageName: string): Promise<void> {
+    // Only relevant for Claude CLI models
+    const model = this.resolveModelForStage(stageName);
+    if (!model.startsWith('claude-') && model !== 'claude') return;
+
+    if (checkClaudeAuth()) return; // Still valid
+
+    console.warn(`[pipeline] Auth expired before "${stageName}" — pausing for re-login...`);
+
+    // Checkpoint so the pipeline can be resumed even if the server restarts
+    this.checkpoint();
+
+    // Update pipeline state to reflect auth-waiting status
+    this.state.status = 'waiting';
+    this.state.waitingForInput = true;
+    this.broadcastState();
+
+    // Emit events — dashboard-server will broadcast to frontend for notification
+    this.emit('auth-required', {
+      stageName,
+      message: `Authentication expired before "${stageName}" stage. Opening browser for re-login — pipeline will resume automatically.`,
+    });
+
+    this.emit('project-event', {
+      source: 'auth',
+      message: `Authentication expired — opening browser for re-login. Pipeline will resume automatically once logged in.`,
+      level: 'warn',
+    });
+
+    // Auto-open the login flow and poll until it succeeds
+    const ok = await refreshClaudeAuth(600_000); // 10 min timeout
+
+    if (!ok) {
+      // Checkpoint as failed so user can resume later
+      this.state.status = 'failed';
+      this.state.waitingForInput = false;
+      this.broadcastState();
+      this.checkpoint();
+      throw new Error(
+        `Authentication expired and automatic re-login timed out after 10 minutes. ` +
+        `Run "claude auth login" manually, then resume the pipeline from the "${stageName}" stage.`
+      );
+    }
+
+    // Auth restored — resume pipeline
+    console.log(`[pipeline] Re-authentication successful — resuming "${stageName}"`);
+    this.state.status = 'running';
+    this.state.waitingForInput = false;
+    this.broadcastState();
+
+    this.emit('project-event', {
+      source: 'auth',
+      message: `Re-authentication successful — resuming pipeline.`,
+    });
   }
 
   // ── Agent completion helper ────────────────────────────────────────
