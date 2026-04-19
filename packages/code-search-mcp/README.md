@@ -6,44 +6,62 @@
 
 **Multi-repo code intelligence via the Model Context Protocol**
 
-Give any MCP client deep understanding of your codebase — semantic search,
-dependency graphs, cross-repo analysis, and impact tracing.
-
-<br/>
-
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](../../LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP%201.0-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2020-339933?style=flat-square&logo=node.js&logoColor=white)]()
 [![Docker](https://img.shields.io/badge/docker-ready-2496ED?style=flat-square&logo=docker&logoColor=white)]()
 
-<br/>
-
-[Quick Start](#quick-start) · [Tools](#tools) · [Deployment](#deployment) · [Configuration](#configuration)
+[Quick Start](#quick-start) · [Tools](#tools) · [Deploy](#deployment) · [Configuration](#configuration)
 
 </div>
 
 ---
 
-## What is this?
+## What You Get
 
-Point it at a local directory or a GitHub organization. It discovers repos, parses code with tree-sitter, builds vector embeddings, constructs AST graphs, detects cross-repo dependencies — then exposes **12 tools** via MCP that your AI can call to search, navigate, and reason about your code.
+Ask questions in natural language. The server searches, traces, and analyzes across all your repos.
 
-Works with **Claude Desktop**, **Claude Code**, **Cursor**, and any MCP-compatible client.
+| Query | Tool | Result |
+|:------|:-----|:-------|
+| "How does authentication work across services?" | `search_code` | 8 results from 3 repos, ranked by relevance |
+| "What calls handlePayment?" | `find_callers` | 12 call sites traced across api-gateway and billing-service |
+| "If I change user.ts, what breaks?" | `impact_analysis` | 4 files in 2 repos identified as affected |
 
-**Two roles, clean separation:**
+Works with Claude Code, Claude Desktop, Cursor, and any MCP client.
 
-| Role | What it does | What it needs |
-|:--|:--|:--|
-| **Client** (default) | Connects to a remote server via MCP | URL + API key |
-| **Server** | Hosts repos, indexes, serves tools | Repos, Docker, embedding API |
+---
+
+## Architecture
+
+```mermaid
+graph LR
+    A[Your AI Client] -- stdio / http --> B[Code Search MCP Server]
+    B --> C[LanceDB vectors]
+    B --> D[AST Graph]
+    B --> E[Git Repos]
+```
 
 ---
 
 ## Quick Start
 
-### For users — connect to a server
+<details open>
+<summary><strong>Local mode</strong> -- run on your machine</summary>
 
-The default mode is **remote proxy**. No repos, no index, no GPU needed on your machine.
+```bash
+claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local /path/to/repos
+```
+
+For GitHub orgs:
+
+```bash
+claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local github:your-org --token ghp_xxx
+```
+
+</details>
+
+<details>
+<summary><strong>Connect to a team server</strong></summary>
 
 **Claude Code:**
 
@@ -70,166 +88,137 @@ claude mcp add code-search \
 }
 ```
 
-That's it. Your AI can now search your entire codebase.
+</details>
 
-### For infra — deploy the server
+<details>
+<summary><strong>Deploy the server</strong> (Docker)</summary>
 
 ```bash
-# Option 1: Docker (recommended)
-cp .env.example .env    # configure embedding API key + auth keys
+cp .env.example .env
 docker compose up
-
-# Option 2: Direct
-code-search-mcp --serve --port 3100 --auth api-key
-
-# Option 3: Docker with local Ollama for free embeddings
-docker compose --profile with-ollama up
 ```
 
-Once running, index your repos via the admin API:
+Index repos via the admin API (no restart needed):
 
 ```bash
-# Index repos at a path (no server restart needed)
 curl -X POST http://localhost:3100/index \
   -H 'Content-Type: application/json' \
   -d '{"path": "/repos/my-service", "project": "my-project"}'
-
-# Force full re-index (ignores cache)
-curl -X POST http://localhost:3100/index \
-  -H 'Content-Type: application/json' \
-  -d '{"path": "/repos/my-service", "project": "my-project", "force": true}'
 ```
 
-Or set up automatic reindexing:
+Enable automatic reindexing:
 
 ```bash
-# In docker-compose.yml or .env
-CODE_SEARCH_REINDEX_INTERVAL=1h    # reindex every hour (0 = disabled)
+CODE_SEARCH_REINDEX_INTERVAL=1h   # 0 = disabled (default)
 ```
 
-### For development — local mode
-
-Run everything on your machine (indexing + serving via stdio):
-
-```bash
-code-search-mcp --local /path/to/your/repos
-code-search-mcp --local github:your-org --token ghp_xxx
-```
-
-Add directly to Claude Code:
-
-```bash
-claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local /path/to/repos
-```
+</details>
 
 ---
 
 ## Tools
 
-11 MCP tools available to clients, plus server-side admin APIs for indexing.
+**Search** -- `search_code` · `search_semantic` · `search_exact`
+Hybrid vector+BM25, semantic-only, and keyword search across all indexed repos.
 
-### Search
+**Graph** -- `get_repo_graph` · `find_callers` · `find_dependencies` · `impact_analysis` · `get_cross_repo_edges`
+AST knowledge graph, caller tracing, dependency lookup, change impact, and cross-repo connections.
 
-| Tool | Description |
-|:--|:--|
-| `search_code` | Hybrid search — vector + BM25 + graph expansion + cross-encoder reranking |
-| `search_semantic` | Vector-only semantic search for conceptual queries |
-| `search_exact` | BM25 keyword search for exact names, error codes, paths |
+**Profiles** -- `list_repos` · `get_repo_profile`
+Indexed repo listing and LLM-generated repo profiles with role, stack, and endpoints.
 
-### Graph & Analysis
+**Index** -- `index_status`
+Chunk count, embedding provider, repo list, and last-indexed timestamp.
 
-| Tool | Description |
-|:--|:--|
-| `get_repo_graph` | AST knowledge graph — entities and relationships for a repo |
-| `get_cross_repo_edges` | Connections between repos — shared deps, Kafka, HTTP, DB, gRPC |
-| `find_callers` | All functions that call a given function across the codebase |
-| `find_dependencies` | What a function depends on — calls, imports, types |
-| `impact_analysis` | Trace what's affected if a file or entity changes |
-
-### Profiles
-
-| Tool | Description |
-|:--|:--|
-| `list_repos` | All indexed repos with role, domain, description |
-| `get_repo_profile` | LLM-generated profile — role, tech stack, endpoints |
-
-### Index (read-only for clients)
-
-| Tool | Description |
-|:--|:--|
-| `index_status` | Chunk count, embedding provider, repos, last indexed |
-
-### Server Admin API (not exposed to MCP clients)
+### Server Admin API
 
 | Endpoint | Description |
-|:--|:--|
-| `POST /index` | Index repos at a given path. Body: `{"path": "/repos/dir", "project": "name", "force": false}` |
+|:---------|:------------|
+| `POST /index` | Index repos at a path. Body: `{"path": "...", "project": "...", "force": false}` |
 | `GET /health` | Server status, active sessions, index readiness |
-| `CODE_SEARCH_REINDEX_INTERVAL` | Auto-reindex on a schedule (e.g. `30m`, `1h`, `6h`). Default: `0` (disabled) |
+| `GET /status` | Live indexing progress, phase, percent, history |
 
 ---
 
-## Deployment
+## Under the Hood
 
-### Docker
+<details>
+<summary>Incremental Indexing -- 4-layer cost optimization</summary>
 
-The Docker image bundles everything. Configure entirely via environment variables.
+| Layer | Scope | What it does |
+|:------|:------|:-------------|
+| 1. Git SHA skip | Repo | Compares HEAD against last indexed SHA; skips unchanged repos |
+| 2. Git diff via Merkle DAG | File | Only processes added/modified/deleted files from `git diff` |
+| 3. Content hash SHA-256 | File | Fallback dedup when git diff is unavailable |
+| 4. Embedding diff against LanceDB | Chunk | Only new/changed chunks sent to the embedding provider |
 
-```yaml
-# docker-compose.yml
-services:
-  code-search:
-    build: .
-    ports:
-      - "3100:3100"
-    volumes:
-      - code-search-data:/data      # persistent index
-      - ./repos:/repos:ro            # your repos (read-only)
-    environment:
-      CODE_SEARCH_TRANSPORT: streamable-http
-      CODE_SEARCH_AUTH_MODE: api-key
-      CODE_SEARCH_AUTH_API_KEYS: ${CODE_SEARCH_API_KEY}
-      CODE_SEARCH_EMBEDDING_PROVIDER: codestral
-      CODE_SEARCH_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+**Before:** 2 files changed out of 1,000 -- re-embed all 1,000 chunks.
+**After:** 2 files changed -- 5 chunks re-embedded, 995 preserved.
+
+Scheduled reindexing (`CODE_SEARCH_REINDEX_INTERVAL=1h`) is practical even with paid providers -- most runs complete in seconds with zero API calls.
+
+</details>
+
+<details>
+<summary>Embedding Providers</summary>
+
+| Provider | Env var | Model |
+|:---------|:--------|:------|
+| Ollama (local, free) | `OLLAMA_HOST` | `bge-m3` |
+| Mistral / Codestral | `MISTRAL_API_KEY` | `codestral-embed-2505` |
+| OpenAI | `OPENAI_API_KEY` | `text-embedding-3-large` |
+| Voyage AI | `VOYAGE_API_KEY` | `voyage-code-3` |
+| Gemini | OAuth via `~/.gemini/` | `text-embedding-004` |
+| Any OpenAI-compatible | `CODE_SEARCH_EMBEDDING_BASE_URL` | Custom |
+
+**Bring Your Own Provider** -- any service with an OpenAI-compatible `/v1/embeddings` endpoint:
+
+```bash
+CODE_SEARCH_EMBEDDING_PROVIDER=custom
+CODE_SEARCH_EMBEDDING_BASE_URL=https://api.together.xyz
+CODE_SEARCH_EMBEDDING_MODEL=togethercomputer/m2-bert-80M-8k-retrieval
+CODE_SEARCH_EMBEDDING_API_KEY=your-key
 ```
 
-**Volumes:**
-- `/data` — LanceDB indices, graph files (persistent)
-- `/repos` — mounted repositories (read-only)
+</details>
 
-**Health check:** `GET /health` returns index status, uptime, auth mode, active sessions.
+<details>
+<summary>LLM Configuration -- repo profiling and service mesh inference</summary>
 
-### Authentication
+The server uses an LLM for repo profiling and service mesh detection. Mode is auto-detected:
 
-| Mode | How it works |
-|:--|:--|
-| `none` (default for stdio) | No auth — process boundary is the security boundary |
-| `api-key` | `Authorization: Bearer <key>` checked against allowlist |
-| `jwt` | HS256 JWT verification with expiry + issuer validation |
+- API key present -- `api` mode
+- Claude CLI available -- `cli` mode
+- Neither -- `none` (LLM features disabled)
 
-Rate limiting: in-memory sliding window per identity (default 100 req/min).
+Override with environment variables:
 
----
+```bash
+CODE_SEARCH_LLM_MODE=api          # api | cli | none
+CODE_SEARCH_LLM_API_KEY=sk-...
+CODE_SEARCH_LLM_PROVIDER=anthropic # anthropic | openai | ollama | custom
+```
 
-## Incremental Indexing & Cost Optimization
+</details>
 
-Reindexing is designed to be cheap. Four layers ensure you only pay for what actually changed:
+<details>
+<summary>Cross-Repo Detection -- 14 automatic strategies</summary>
 
-| Layer | What it does | Saves |
-|:--|:--|:--|
-| **1. Git SHA skip** | Compares repo `HEAD` against last indexed SHA. If identical, entire repo is skipped. | Skips unchanged repos entirely |
-| **2. Git diff** | Uses `git diff --name-status` against last indexed commit. Only added/modified/deleted files are processed. Leverages git's Merkle DAG — O(changed files), not O(all files). | Skips unchanged files |
-| **3. Content hash** | SHA-256 of each file compared against cached hash. Catches unchanged files even when git diff isn't available (e.g., first index with existing cache). | Fallback dedup |
-| **4. Embedding diff** | Compares chunk IDs against existing LanceDB entries. Only chunks that don't already exist are sent to the embedding provider. Deleted files' chunks are surgically removed. | Saves embedding API calls |
+npm dependencies, TypeScript shared types, HTTP route matching, Kafka topics, gRPC services, database tables, environment variables, Docker Compose links, Redis keys, S3 buckets, protobuf imports, shared constants, API schemas (OpenAPI/Swagger), and Kubernetes service references.
 
-**Before optimization:** 2 files changed out of 1,000 -> re-embed all 1,000 chunks.
-**After optimization:** 2 files changed -> embed ~5 new chunks, delete old ones, preserve 995 existing embeddings.
+</details>
 
-This makes scheduled reindexing (`CODE_SEARCH_REINDEX_INTERVAL=1h`) practical even with paid embedding providers — most runs complete in seconds with zero embedding API calls.
+<details>
+<summary>Supported Languages</summary>
 
-### Monitoring reindex progress
+**Tree-sitter AST parsing:** TypeScript, JavaScript, Go, Python, Rust, Java, PHP, C/C++
 
-Use `GET /status` to see live indexing state:
+All other text files are indexed with BM25 keyword search.
+
+</details>
+
+<details>
+<summary>Monitoring -- GET /status</summary>
 
 ```json
 {
@@ -249,141 +238,86 @@ Use `GET /status` to see live indexing state:
 }
 ```
 
----
-
-## Embedding Providers
-
-Use any embedding provider. Auto-detection tries them in order.
-
-| Provider | Env var | Notes |
-|:--|:--|:--|
-| Ollama (local) | `OLLAMA_HOST` | Free, default `bge-m3` model |
-| Mistral/Codestral | `MISTRAL_API_KEY` | `codestral-embed-2505` |
-| OpenAI | `OPENAI_API_KEY` | `text-embedding-3-large` |
-| Voyage AI | `VOYAGE_API_KEY` | `voyage-code-3` |
-| Gemini | OAuth via `~/.gemini/` | `text-embedding-004` |
-| **Any OpenAI-compatible** | `CODE_SEARCH_EMBEDDING_BASE_URL` | Bring your own provider |
-
-### Bring Your Own Provider
-
-Any service with an OpenAI-compatible `/v1/embeddings` endpoint:
-
-```bash
-CODE_SEARCH_EMBEDDING_PROVIDER=custom
-CODE_SEARCH_EMBEDDING_BASE_URL=https://api.together.xyz
-CODE_SEARCH_EMBEDDING_MODEL=togethercomputer/m2-bert-80M-8k-retrieval
-CODE_SEARCH_EMBEDDING_API_KEY=your-key
-```
-
-Same for reranking — any LLM with a chat completions API:
-
-```bash
-CODE_SEARCH_RERANKER_PROVIDER=custom
-CODE_SEARCH_RERANKER_BASE_URL=https://api.groq.com/openai
-CODE_SEARCH_RERANKER_MODEL=llama-3.1-8b-instant
-CODE_SEARCH_RERANKER_API_KEY=your-key
-```
+</details>
 
 ---
 
-## Supported Languages
+## Configuration
 
-Tree-sitter AST parsing for 8 languages. All other text files indexed with BM25.
+### Essential
 
-| Language | Extensions |
-|:--|:--|
-| TypeScript | `.ts`, `.tsx` |
-| JavaScript | `.js`, `.jsx` |
-| Go | `.go` |
-| Python | `.py` |
-| Rust | `.rs` |
-| Java | `.java` |
-| PHP | `.php` |
-| C / C++ | `.c`, `.h`, `.cpp` |
+| Variable | Role | Description |
+|:---------|:-----|:------------|
+| `CODE_SEARCH_SERVER` | Client | Remote server URL |
+| `CODE_SEARCH_API_KEY` | Client | API key for remote server |
+| `CODE_SEARCH_EMBEDDING_PROVIDER` | Server | `auto` \| `codestral` \| `openai` \| `voyage` \| `ollama` \| `custom` |
+| `CODE_SEARCH_LLM_API_KEY` | Server | API key for LLM provider (repo profiling, service mesh) |
+| `CODE_SEARCH_AUTH_MODE` | Server | `none` \| `api-key` \| `jwt` |
 
----
+<details>
+<summary>Full Configuration Reference</summary>
 
-## Cross-Repo Detection
-
-14 automatic strategies:
-
-| Strategy | Detects |
-|:--|:--|
-| npm dependencies | Shared packages, workspace refs |
-| TypeScript types | Shared interfaces and type defs |
-| HTTP routes | REST/GraphQL endpoint matching |
-| Kafka topics | Producer-consumer relationships |
-| gRPC services | Proto definitions and stubs |
-| Database tables | Shared table access |
-| Environment variables | Shared config, feature flags |
-| Docker Compose | Service links, depends_on |
-| Redis keys | Cache and pub/sub channels |
-| S3 buckets | Shared storage patterns |
-| Protobuf imports | Shared .proto references |
-| Shared constants | Magic strings across repos |
-| API schemas | OpenAPI/Swagger definitions |
-| K8s services | Kubernetes service references |
-
----
-
-## Configuration Reference
-
-### Client environment variables
-
-| Variable | Description |
-|:--|:--|
-| `CODE_SEARCH_SERVER` | Remote server URL (required for default mode) |
-| `CODE_SEARCH_API_KEY` | API key for remote server |
-
-### Server CLI flags
+**Server CLI flags:**
 
 ```
 code-search-mcp --serve [options]
-
   --port <port>        HTTP port (default: 3100)
   --auth <mode>        none | api-key | jwt
   --transport <mode>   streamable-http | sse
 
 code-search-mcp --local [source] [options]
-
   --project <name>     Project name (default: derived from source)
   --token <token>      GitHub token (or GITHUB_TOKEN env)
   --force              Force full re-index
 ```
 
-### Server environment variables
+**All environment variables:**
 
 | Variable | Description | Default |
-|:--|:--|:--|
+|:---------|:------------|:--------|
 | `CODE_SEARCH_TRANSPORT` | Transport mode | `streamable-http` |
 | `CODE_SEARCH_PORT` | HTTP port | `3100` |
 | `CODE_SEARCH_HOST` | Bind address | `0.0.0.0` |
 | `CODE_SEARCH_AUTH_MODE` | Auth mode | `none` |
-| `CODE_SEARCH_AUTH_API_KEYS` | Comma-separated API keys | — |
-| `CODE_SEARCH_AUTH_JWT_SECRET` | JWT signing secret | — |
-| `CODE_SEARCH_EMBEDDING_PROVIDER` | `auto\|codestral\|openai\|voyage\|ollama\|custom` | `auto` |
-| `CODE_SEARCH_EMBEDDING_API_KEY` | Unified embedding API key | — |
-| `CODE_SEARCH_EMBEDDING_BASE_URL` | Custom embedding endpoint | — |
-| `CODE_SEARCH_EMBEDDING_MODEL` | Custom embedding model | — |
-| `CODE_SEARCH_RERANKER_PROVIDER` | `ollama\|cohere\|voyage\|custom\|none` | `ollama` |
-| `CODE_SEARCH_RERANKER_BASE_URL` | Custom reranker endpoint | — |
-| `CODE_SEARCH_RERANKER_MODEL` | Custom reranker model | — |
-| `CODE_SEARCH_DATA_DIR` | Data directory override | — |
-| `CODE_SEARCH_REINDEX_INTERVAL` | Auto-reindex schedule (`30m`, `1h`, `6h`, `0` to disable) | `0` |
+| `CODE_SEARCH_AUTH_API_KEYS` | Comma-separated API keys | -- |
+| `CODE_SEARCH_AUTH_JWT_SECRET` | JWT signing secret | -- |
+| `CODE_SEARCH_EMBEDDING_PROVIDER` | Embedding provider | `auto` |
+| `CODE_SEARCH_EMBEDDING_API_KEY` | Unified embedding API key | -- |
+| `CODE_SEARCH_EMBEDDING_BASE_URL` | Custom embedding endpoint | -- |
+| `CODE_SEARCH_EMBEDDING_MODEL` | Custom embedding model | -- |
+| `CODE_SEARCH_RERANKER_PROVIDER` | `ollama` \| `cohere` \| `voyage` \| `custom` \| `none` | `ollama` |
+| `CODE_SEARCH_RERANKER_BASE_URL` | Custom reranker endpoint | -- |
+| `CODE_SEARCH_RERANKER_MODEL` | Custom reranker model | -- |
+| `CODE_SEARCH_DATA_DIR` | Data directory override | -- |
+| `CODE_SEARCH_REINDEX_INTERVAL` | Auto-reindex schedule (`30m`, `1h`, `6h`, `0`) | `0` |
 | `CODE_SEARCH_RATE_LIMIT_PER_MINUTE` | Rate limit per identity | `100` |
+| `CODE_SEARCH_LLM_MODE` | `cli` \| `api` \| `none` | `cli` |
+| `CODE_SEARCH_LLM_PROVIDER` | `anthropic` \| `openai` \| `ollama` \| `custom` | `anthropic` |
+| `CODE_SEARCH_LLM_API_KEY` | API key for LLM provider | -- |
+| `CODE_SEARCH_LLM_MODEL` | Model for profiling + service mesh | `claude-sonnet-4-6` |
+| `CODE_SEARCH_LLM_BASE_URL` | Custom LLM endpoint | -- |
+
+</details>
 
 ---
 
 ## Requirements
 
 - **Node.js >= 20**
-- One embedding provider: **Ollama** (free, local) or any API key above
-- **Optional:** `gh` CLI for GitHub org cloning
+- One embedding provider: Ollama (free, local) or any supported API key
 
 ```bash
 # Recommended: Ollama for free local embeddings
 brew install ollama && ollama pull bge-m3
 ```
+
+### Authentication Modes
+
+| Mode | How it works |
+|:-----|:-------------|
+| `none` | No auth -- process boundary is the security boundary (default for stdio) |
+| `api-key` | `Authorization: Bearer <key>` checked against allowlist |
+| `jwt` | HS256 JWT verification with expiry and issuer validation |
 
 ---
 
@@ -394,6 +328,6 @@ MIT
 <div align="center">
 <br/>
 
-Built with [Model Context Protocol](https://modelcontextprotocol.io), [LanceDB](https://lancedb.com), [Tree-sitter](https://tree-sitter.github.io), and [Graphology](https://graphology.github.io)
+Built with [Model Context Protocol](https://modelcontextprotocol.io) · [LanceDB](https://lancedb.com) · [Tree-sitter](https://tree-sitter.github.io) · [Graphology](https://graphology.github.io)
 
 </div>

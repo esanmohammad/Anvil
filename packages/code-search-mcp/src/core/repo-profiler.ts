@@ -337,14 +337,12 @@ export async function profileRepo(
   fingerprint: RepoFingerprint,
   opts?: { model?: string },
 ): Promise<RepoProfile> {
-  const model = opts?.model ?? 'claude-sonnet-4-6';
-
   const fingerprintText = buildFingerprintText(fingerprint);
 
   const result = await runClaude(
     fingerprintText,
     PROFILER_SYSTEM_PROMPT,
-    { model, timeoutMs: 600_000 },
+    { model: opts?.model, timeoutMs: 600_000 },
   );
 
   const parsed = parseLLMJson(result.result);
@@ -360,7 +358,7 @@ export async function profileRepo(
     consumes: (parsed.consumes as RepoProfile['consumes']) ?? [],
     entryPoints: (parsed.entryPoints as string[]) ?? [],
     profiledAt: new Date().toISOString(),
-    profiledBy: model,
+    profiledBy: opts?.model ?? 'default',
     fingerprintHash: fingerprint.fingerprintHash,
   };
 

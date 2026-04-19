@@ -137,23 +137,28 @@ export class KnowledgeIndexer {
       return { project, repos: [], totalChunks: 0, totalTokens: 0, crossRepoEdges: 0, durationMs: 0, chunksPath: join(basePath, 'chunks.json') };
     }
 
-    // 2. LLM Repo Profiling (WS-1)
-    report({ phase: 'profiling', message: `Profiling ${repos.length} repos with LLM...`, percent: 3, etaSeconds: -1, reposTotal: repos.length, reposProcessed: 0 });
-    log(`Profiling ${repos.length} repos with Claude...`);
-    try {
-      const profiles = await profileProject(project, repos, {
-        model: 'claude-sonnet-4-6',
-        force: opts?.force,
-        onProgress: (m) => {
-          log(m);
-          report({ phase: 'profiling', message: m, percent: 5, etaSeconds: -1 });
-        },
-      });
-      log(`Profiled ${profiles.length} repos`);
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Warning: Repo profiling skipped: ${errMsg}`);
-      report({ phase: 'profiling', message: `Profiling skipped: ${errMsg.slice(0, 100)}`, percent: 8, etaSeconds: -1 });
+    // 2. LLM Repo Profiling (WS-1) — skipped if LLM_MODE=none
+    const { isLlmAvailable } = await import('./claude-runner.js');
+    if (isLlmAvailable()) {
+      report({ phase: 'profiling', message: `Profiling ${repos.length} repos with LLM...`, percent: 3, etaSeconds: -1, reposTotal: repos.length, reposProcessed: 0 });
+      log(`Profiling ${repos.length} repos with LLM...`);
+      try {
+        const profiles = await profileProject(project, repos, {
+          force: opts?.force,
+          onProgress: (m) => {
+            log(m);
+            report({ phase: 'profiling', message: m, percent: 5, etaSeconds: -1 });
+          },
+        });
+        log(`Profiled ${profiles.length} repos`);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log(`Warning: Repo profiling skipped: ${errMsg}`);
+        report({ phase: 'profiling', message: `Profiling skipped: ${errMsg.slice(0, 100)}`, percent: 8, etaSeconds: -1 });
+      }
+    } else {
+      log('LLM profiling disabled (CODE_SEARCH_LLM_MODE=none) — skipping');
+      report({ phase: 'profiling', message: 'Skipped (LLM disabled)', percent: 8, etaSeconds: -1 });
     }
 
     // 3. Chunk repos — use git diff for incremental detection
@@ -265,29 +270,33 @@ export class KnowledgeIndexer {
       log(`Detected ${crossEdges.length} cross-repo edges`);
     }
 
-    // 8. LLM Service Mesh Inference (WS-2)
-    report({ phase: 'service-mesh', message: 'Inferring service mesh from profiles...', percent: 80, etaSeconds: -1 });
-    try {
-      const profiles = loadAllProfiles(project);
-      if (profiles.length > 0) {
-        log(`Inferring service mesh from ${profiles.length} profiles...`);
-        const meshEdges = await inferServiceMesh(profiles, {
-          model: 'claude-sonnet-4-6',
-          onProgress: (m) => {
-            log(m);
-            report({ phase: 'service-mesh', message: m, percent: 82, etaSeconds: -1 });
-          },
-        });
-        if (meshEdges.length > 0) {
-          graphBuilder.addCrossRepoEdges(meshEdges);
-          crossRepoEdgeCount += meshEdges.length;
-          log(`Service mesh: ${meshEdges.length} edges inferred`);
+    // 8. LLM Service Mesh Inference (WS-2) — skipped if LLM_MODE=none
+    if (isLlmAvailable()) {
+      report({ phase: 'service-mesh', message: 'Inferring service mesh from profiles...', percent: 80, etaSeconds: -1 });
+      try {
+        const profiles = loadAllProfiles(project);
+        if (profiles.length > 0) {
+          log(`Inferring service mesh from ${profiles.length} profiles...`);
+          const meshEdges = await inferServiceMesh(profiles, {
+            onProgress: (m) => {
+              log(m);
+              report({ phase: 'service-mesh', message: m, percent: 82, etaSeconds: -1 });
+            },
+          });
+          if (meshEdges.length > 0) {
+            graphBuilder.addCrossRepoEdges(meshEdges);
+            crossRepoEdgeCount += meshEdges.length;
+            log(`Service mesh: ${meshEdges.length} edges inferred`);
+          }
+        } else {
+          log('No profiles found — skipping service mesh inference');
         }
-      } else {
-        log('No profiles found — skipping service mesh inference');
+      } catch (err) {
+        log(`Warning: Service mesh inference failed (non-fatal): ${err}`);
       }
-    } catch (err) {
-      log(`Warning: Service mesh inference failed (non-fatal): ${err}`);
+    } else {
+      log('LLM service mesh inference disabled — skipping');
+      report({ phase: 'service-mesh', message: 'Skipped (LLM disabled)', percent: 85, etaSeconds: -1 });
     }
 
     // 9. Community detection
@@ -389,9 +398,9 @@ export class KnowledgeIndexer {
     } catch { /* first run — no existing data */ }
 
     const newChunks = chunks.filter((c) => !existingIds.has(c.id));
-    const deletedIds = this.getDeletedChunkIds(basePath, project);
+    const deletedFiles = this.getDeletedFiles(basePath);
 
-    if (newChunks.length === 0 && deletedIds.length === 0) {
+    if (newChunks.length === 0 && deletedFiles.length === 0) {
       log('All chunks already embedded — nothing to do.');
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
       const repoNames = [...new Set(chunks.map((c) => c.repoName))];
@@ -408,10 +417,19 @@ export class KnowledgeIndexer {
       };
     }
 
-    // Delete chunks for files that were removed
-    if (deletedIds.length > 0) {
-      log(`Removing ${deletedIds.length} stale chunks from vector store...`);
-      await vectorStore.deleteChunksByIds(deletedIds);
+    // Delete chunks for files that were removed — use file path matching, not chunk IDs
+    if (deletedFiles.length > 0) {
+      // Group by repo for efficient deletion
+      const byRepo = new Map<string, string[]>();
+      for (const d of deletedFiles) {
+        const list = byRepo.get(d.repoName) ?? [];
+        list.push(d.filePath);
+        byRepo.set(d.repoName, list);
+      }
+      for (const [repoName, filePaths] of byRepo) {
+        log(`Removing chunks for ${filePaths.length} deleted files from ${repoName}...`);
+        await vectorStore.deleteFileChunks(project, repoName, filePaths);
+      }
     }
 
     // Embed only new/changed chunks
@@ -495,16 +513,12 @@ export class KnowledgeIndexer {
     };
   }
 
-  /** Collect chunk IDs that should be deleted (from files that were removed) */
-  private getDeletedChunkIds(basePath: string, project: string): string[] {
-    // Read the deleted files list saved by buildKB
+  /** Read the deleted files list saved by buildKB */
+  private getDeletedFiles(basePath: string): Array<{ repoName: string; filePath: string }> {
     const deletedPath = join(basePath, 'deleted_files.json');
     if (!existsSync(deletedPath)) return [];
     try {
-      const deleted: Array<{ repoName: string; filePath: string }> = JSON.parse(readFileSync(deletedPath, 'utf-8'));
-      // Chunk IDs follow the pattern: project/repoName/filePath:startLine
-      // We match by prefix: project/repoName/filePath
-      return deleted.map((d) => `${project}/${d.repoName}/${d.filePath}`);
+      return JSON.parse(readFileSync(deletedPath, 'utf-8'));
     } catch {
       return [];
     }

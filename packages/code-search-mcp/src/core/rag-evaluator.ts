@@ -6,9 +6,9 @@
  * stream-json output parsed for result + cost.
  */
 
-import { spawn } from 'node:child_process';
 import type { ScoredChunk } from './types';
 import type { RetrievalMode } from './retriever.js';
+import { runClaude, type ClaudeResult } from './claude-runner.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,109 +44,7 @@ export interface JudgeResult {
   model: string;
 }
 
-// ---------------------------------------------------------------------------
-// Claude CLI helper — same pattern as AgentProcess
-// ---------------------------------------------------------------------------
-
-const CLAUDE_BIN = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? process.env.CLAUDE_BIN ?? 'claude';
-
-interface ClaudeResult {
-  result: string;
-  costUsd: number;
-  inputTokens: number;
-  outputTokens: number;
-  durationMs: number;
-}
-
-/**
- * Run Claude CLI with short prompt via `-p` and long context via `--project-prompt`.
- * Same split used by spawnQuickAction: -p gets the instruction, --project-prompt gets the context.
- * Uses `--output-format stream-json` and parses the result message.
- */
-async function runClaude(
-  prompt: string,
-  projectPrompt: string,
-  opts?: { model?: string },
-): Promise<ClaudeResult> {
-  const model = opts?.model ?? 'claude-sonnet-4-6';
-
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-p', prompt,
-      '--system-prompt', projectPrompt,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--max-turns', '1',
-      '--model', model,
-      '--permission-mode', 'bypassPermissions',
-    ];
-
-    const proc = spawn(CLAUDE_BIN, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
-
-    proc.stdin?.end();
-
-    let buffer = '';
-    let fullText = '';
-    let resultData: ClaudeResult | null = null;
-
-    const timer = setTimeout(() => {
-      proc.kill('SIGTERM');
-      reject(new Error('Claude CLI timed out after 300s'));
-    }, 600_000);
-
-    proc.stdout?.on('data', (data: Buffer) => {
-      buffer += data.toString();
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const msg = JSON.parse(trimmed);
-
-          // Collect text content
-          if (msg.type === 'assistant' && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === 'text' && block.text) {
-                fullText += block.text;
-              }
-            }
-          }
-
-          // Result message — has cost + usage
-          if (msg.type === 'result') {
-            resultData = {
-              result: msg.result ?? fullText,
-              costUsd: msg.total_cost_usd ?? 0,
-              inputTokens: msg.usage?.input_tokens ?? 0,
-              outputTokens: msg.usage?.output_tokens ?? 0,
-              durationMs: msg.duration_ms ?? 0,
-            };
-          }
-        } catch { /* skip unparseable lines */ }
-      }
-    });
-
-    let stderr = '';
-    proc.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
-
-    proc.on('error', (err) => { clearTimeout(timer); reject(err); });
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      if (resultData) {
-        resolve(resultData);
-      } else if (code === 0 && fullText) {
-        resolve({ result: fullText, costUsd: 0, inputTokens: 0, outputTokens: 0, durationMs: 0 });
-      } else {
-        reject(new Error(`claude exited with code ${code}: ${stderr.slice(0, 500)}`));
-      }
-    });
-  });
-}
+// Claude CLI helper is now shared via claude-runner.ts
 
 // ---------------------------------------------------------------------------
 // Answer Generation

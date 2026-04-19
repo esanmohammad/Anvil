@@ -123,6 +123,14 @@ export async function startServer(
     },
   };
 
+  // Log resolved LLM configuration
+  const llmInfo = config.llmMode === 'none'
+    ? 'disabled (profiling + service mesh skipped)'
+    : config.llmMode === 'api'
+      ? `api → ${config.llmProvider}/${config.llmModel}${config.llmApiKey ? '' : ' (WARNING: no API key!)'}`
+      : `cli → ${config.claudeBin}`;
+  console.error(`[code-search-mcp] LLM: ${llmInfo}`);
+
   // --- Auto-index if needed ---
   await autoIndex(ctx);
 

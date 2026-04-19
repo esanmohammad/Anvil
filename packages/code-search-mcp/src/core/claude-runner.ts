@@ -1,17 +1,16 @@
 /**
- * Shared Claude CLI runner — same pattern as rag-evaluator.ts.
+ * LLM runner — supports CLI (claude binary) and API (HTTP) modes.
  *
- * Spawns the Claude CLI binary with `-p` for the short prompt and
- * `--system-prompt` for the long context. Parses `stream-json` output
- * for result + cost.
+ * Mode is controlled by CODE_SEARCH_LLM_MODE:
+ *   - 'cli'  (default) — spawns claude binary, requires claude CLI installed + auth
+ *   - 'api'  — direct HTTP calls to Anthropic/OpenAI/custom, requires API key
+ *   - 'none' — skips all LLM inference (profiling + service mesh disabled)
  *
- * Used by: repo-profiler (WS-1), service-mesh-inferrer (WS-2),
- * rag-evaluator, semantic-edge-detector.
+ * Used by: repo-profiler, service-mesh-inferrer, rag-evaluator.
  */
 
 import { spawn } from 'node:child_process';
-
-const CLAUDE_BIN = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? process.env.CLAUDE_BIN ?? 'claude';
+import { loadServerConfig } from './env-config.js';
 
 export interface ClaudeResult {
   result: string;
@@ -22,17 +21,49 @@ export interface ClaudeResult {
 }
 
 /**
- * Run Claude CLI with short prompt via `-p` and long context via `--system-prompt`.
- * Uses `--output-format stream-json` and parses the result message.
+ * Run an LLM inference call. Routes to CLI or API based on config.
+ * Throws if mode is 'none'.
  */
 export async function runClaude(
   prompt: string,
   systemPrompt: string,
   opts?: { model?: string; timeoutMs?: number },
 ): Promise<ClaudeResult> {
-  const model = opts?.model ?? 'claude-sonnet-4-6';
+  const config = loadServerConfig();
+
+  if (config.llmMode === 'none') {
+    throw new Error('LLM inference disabled (CODE_SEARCH_LLM_MODE=none)');
+  }
+
+  const model = opts?.model ?? config.llmModel;
   const timeoutMs = opts?.timeoutMs ?? 600_000;
 
+  if (config.llmMode === 'api') {
+    return runViaApi(prompt, systemPrompt, model, timeoutMs, config);
+  }
+
+  return runViaCli(prompt, systemPrompt, model, timeoutMs, config.claudeBin);
+}
+
+/**
+ * Check if LLM inference is available.
+ */
+export function isLlmAvailable(): boolean {
+  const config = loadServerConfig();
+  return config.llmMode !== 'none';
+}
+
+// ---------------------------------------------------------------------------
+// CLI mode — spawns claude binary
+// ---------------------------------------------------------------------------
+
+function runViaCli(
+  prompt: string,
+  systemPrompt: string,
+  model: string,
+  timeoutMs: number,
+  claudeBin: string,
+): Promise<ClaudeResult> {
   return new Promise((resolve, reject) => {
     const args = [
       '-p', prompt,
@@ -43,7 +74,7 @@ export async function runClaude(
       '--permission-mode', 'bypassPermissions',
     ];
 
-    const proc = spawn(CLAUDE_BIN, args, {
+    const proc = spawn(claudeBin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
     });
@@ -70,7 +101,6 @@ export async function runClaude(
         try {
           const msg = JSON.parse(trimmed);
 
-          // Collect text content
           if (msg.type === 'assistant' && msg.message?.content) {
             for (const block of msg.message.content) {
               if (block.type === 'text' && block.text) {
@@ -79,7 +109,6 @@ export async function runClaude(
             }
           }
 
-          // Result message — has cost + usage
           if (msg.type === 'result') {
             resultData = {
               result: msg.result ?? fullText,
@@ -108,4 +137,111 @@ export async function runClaude(
       }
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// API mode — direct HTTP calls (Anthropic, OpenAI-compatible)
+// ---------------------------------------------------------------------------
+
+interface ApiConfig {
+  llmProvider: string;
+  llmApiKey: string | undefined;
+  llmBaseUrl: string | undefined;
+}
+
+async function runViaApi(
+  prompt: string,
+  systemPrompt: string,
+  model: string,
+  timeoutMs: number,
+  config: ApiConfig,
+): Promise<ClaudeResult> {
+  const startTime = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const isAnthropic = config.llmProvider === 'anthropic';
+    const url = isAnthropic
+      ? 'https://api.anthropic.com/v1/messages'
+      : `${config.llmBaseUrl ?? 'https://api.openai.com'}/v1/chat/completions`;
+
+    if (!config.llmApiKey) {
+      throw new Error(
+        `CODE_SEARCH_LLM_API_KEY not set. Required for LLM_MODE=api. ` +
+        `Set it to your ${config.llmProvider} API key, or use LLM_MODE=cli for Claude CLI, or LLM_MODE=none to disable.`
+      );
+    }
+
+    let body: string;
+    let headers: Record<string, string>;
+
+    if (isAnthropic) {
+      headers = {
+        'Content-Type': 'application/json',
+        'x-api-key': config.llmApiKey,
+        'anthropic-version': '2023-06-01',
+      };
+      body = JSON.stringify({
+        model,
+        max_tokens: 8192,
+        system: [{ type: 'text', text: systemPrompt }],
+        messages: [{ role: 'user', content: prompt }],
+      });
+    } else {
+      headers = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${config.llmApiKey}`,
+      };
+      body = JSON.stringify({
+        model,
+        max_tokens: 8192,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: prompt },
+        ],
+      });
+    }
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      throw new Error(`LLM API error ${response.status}: ${errBody.slice(0, 500)}`);
+    }
+
+    const json = await response.json() as any;
+    const durationMs = Date.now() - startTime;
+
+    if (isAnthropic) {
+      // Concatenate all text blocks (model may return multiple)
+      const text = (json.content as Array<{ type: string; text?: string }> ?? [])
+        .filter((b: any) => b.type === 'text' && b.text)
+        .map((b: any) => b.text)
+        .join('');
+      return {
+        result: text,
+        costUsd: 0,
+        inputTokens: json.usage?.input_tokens ?? 0,
+        outputTokens: json.usage?.output_tokens ?? 0,
+        durationMs,
+      };
+    } else {
+      const text = json.choices?.[0]?.message?.content ?? '';
+      return {
+        result: text,
+        costUsd: 0,
+        inputTokens: json.usage?.prompt_tokens ?? 0,
+        outputTokens: json.usage?.completion_tokens ?? 0,
+        durationMs,
+      };
+    }
+  } finally {
+    clearTimeout(timer);
+  }
 }
