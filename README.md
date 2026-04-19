@@ -9,11 +9,13 @@
 [![MCP](https://img.shields.io/badge/MCP-compatible-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
 [![Privacy](https://img.shields.io/badge/telemetry-none-22c55e?style=flat-square)]()
 
-[Pipeline](#anvil-pipeline) · [Code Search](#code-search-mcp) · [Quick Start](#quick-start) · [Docs](#configuration)
+[Pipeline](#anvil-pipeline) · [Code Search](#code-search-mcp) · [Quick Start](#quick-start) · [Docs](#configuration) · [Demo](https://drive.google.com/file/d/1xsJWrYI5C6aaoE5_n4DbOTaFie1L2d7G/view?usp=drive_link)
 
 <br />
 
-![Anvil dashboard showcase](./assets/Anvil_showcase.gif)
+[![Anvil dashboard showcase](./assets/Anvil_showcase.gif)](https://drive.google.com/file/d/1xsJWrYI5C6aaoE5_n4DbOTaFie1L2d7G/view?usp=drive_link)
+
+_Click the gif to watch the full demo_
 
 </div>
 
