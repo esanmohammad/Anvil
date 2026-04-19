@@ -6,6 +6,9 @@
  */
 
 import { execSync } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -63,6 +66,27 @@ function detectProviders(): ProviderInfo[] {
 
   // Claude CLI
   const claudeVersion = tryExec('claude --version');
+  const claudeCurrentModel = tryExec('claude model');  // e.g. "claude-opus-4-7[1m]"
+  // Aliases are a stable Claude CLI contract — they always resolve to the
+  // current latest version. Pinned model IDs come dynamically from:
+  //   1. `claude model` — user's currently-active model (authoritative)
+  //   2. Anthropic Models API (if ANTHROPIC_API_KEY set) — full account list
+  //   3. ~/.anvil/models.json — user overrides
+  // so new Claude releases appear without code changes.
+  const claudeModels: ModelInfo[] = [
+    { id: 'opus', displayName: 'Claude Opus (latest)', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'powerful' },
+    { id: 'sonnet', displayName: 'Claude Sonnet (latest)', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'balanced' },
+    { id: 'haiku', displayName: 'Claude Haiku (latest)', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'fast' },
+  ];
+  if (claudeCurrentModel) {
+    claudeModels.push({
+      id: claudeCurrentModel,
+      displayName: `${claudeCurrentModel} (current)`,
+      provider: 'claude',
+      capabilities: ['agentic', 'chat'],
+      tier: inferTier(claudeCurrentModel),
+    });
+  }
   providers.push({
     name: 'claude',
     displayName: 'Claude CLI',
@@ -72,11 +96,7 @@ function detectProviders(): ProviderInfo[] {
     binary: 'claude',
     capabilities: ['agentic', 'chat'],
     setupHint: 'Install: npm install -g @anthropic-ai/claude-code',
-    models: [
-      { id: 'claude-opus-4-6', displayName: 'Claude Opus 4.6', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'powerful' },
-      { id: 'claude-sonnet-4-6', displayName: 'Claude Sonnet 4.6', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'balanced' },
-      { id: 'claude-haiku-4-5-20251001', displayName: 'Claude Haiku 4.5', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'fast' },
-    ],
+    models: claudeModels,
   });
 
   // Gemini CLI
@@ -162,6 +182,77 @@ function detectProviders(): ProviderInfo[] {
   return providers;
 }
 
+// ── Async Claude model discovery ─────────────────────────────────────────
+
+/**
+ * Fetch Claude models from the Anthropic Models API.
+ * Authoritative: returns whatever the user's account actually has access to.
+ * Docs: https://docs.claude.com/en/api/models-list
+ */
+async function fetchAnthropicModels(): Promise<ModelInfo[]> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return [];
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const res = await fetch('https://api.anthropic.com/v1/models?limit=50', {
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return [];
+    const data = await res.json() as { data?: Array<{ id: string; display_name?: string }> };
+    return (data.data ?? []).map(m => ({
+      id: m.id,
+      displayName: m.display_name || m.id,
+      provider: 'claude',
+      capabilities: ['agentic', 'chat'] as Capability[],
+      tier: inferTier(m.id),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/** Load user-defined model IDs from ~/.anvil/models.json (highest trust source). */
+function loadUserModels(providerName: string): ModelInfo[] {
+  const path = join(homedir(), '.anvil', 'models.json');
+  if (!existsSync(path)) return [];
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as {
+      [provider: string]: Array<{ id: string; displayName?: string; tier?: 'fast' | 'balanced' | 'powerful' }>;
+    };
+    const entries = raw[providerName] ?? [];
+    return entries.map(e => ({
+      id: e.id,
+      displayName: e.displayName ?? e.id,
+      provider: providerName,
+      capabilities: ['agentic', 'chat'] as Capability[],
+      tier: e.tier ?? inferTier(e.id),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function inferTier(id: string): 'fast' | 'balanced' | 'powerful' {
+  if (/haiku|flash|mini/i.test(id)) return 'fast';
+  if (/opus|pro/i.test(id)) return 'powerful';
+  return 'balanced';
+}
+
+/** De-duplicate models by ID, preferring entries earlier in the list. */
+function dedupeModels(models: ModelInfo[]): ModelInfo[] {
+  const seen = new Set<string>();
+  const out: ModelInfo[] = [];
+  for (const m of models) {
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    out.push(m);
+  }
+  return out;
+}
+
 // ── Async Ollama detection ───────────────────────────────────────────────
 
 async function detectOllamaModels(): Promise<{ available: boolean; models: ModelInfo[] }> {
@@ -208,10 +299,32 @@ export async function discoverProviders(): Promise<DiscoveryResult> {
 
   const providers = detectProviders();
 
-  // Async: detect Ollama models
+  // Async: enrich Claude, OpenAI, and Ollama model lists from live sources
+  const [claudeApiModels, ollama] = await Promise.all([
+    fetchAnthropicModels(),
+    detectOllamaModels(),
+  ]);
+
+  const claudeIdx = providers.findIndex(p => p.name === 'claude');
+  if (claudeIdx >= 0) {
+    const userClaude = loadUserModels('claude');
+    // Order: user overrides first, then API, then aliases (from detectProviders).
+    providers[claudeIdx].models = dedupeModels([
+      ...userClaude,
+      ...claudeApiModels,
+      ...providers[claudeIdx].models,
+    ]);
+  }
+
+  // Also let users extend non-Claude providers via ~/.anvil/models.json
+  for (const p of providers) {
+    if (p.name === 'claude') continue;
+    const extra = loadUserModels(p.name);
+    if (extra.length > 0) p.models = dedupeModels([...extra, ...p.models]);
+  }
+
   const ollamaIdx = providers.findIndex(p => p.name === 'ollama');
   if (ollamaIdx >= 0) {
-    const ollama = await detectOllamaModels();
     providers[ollamaIdx].available = ollama.available;
     providers[ollamaIdx].models = ollama.models;
   }
@@ -225,12 +338,12 @@ export async function discoverProviders(): Promise<DiscoveryResult> {
   }
 
   // Determine defaults: prefer claude CLI > gemini CLI > first available API
-  let defaultModel = 'claude-sonnet-4-6';
+  let defaultModel = 'sonnet';
   let defaultProvider = 'claude';
 
   const claude = providers.find(p => p.name === 'claude');
   if (claude?.available) {
-    defaultModel = 'claude-sonnet-4-6';
+    defaultModel = 'sonnet';
     defaultProvider = 'claude';
   } else {
     const gemini = providers.find(p => p.name === 'gemini-cli');

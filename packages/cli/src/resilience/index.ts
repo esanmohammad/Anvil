@@ -6,7 +6,7 @@
 export { HeartbeatMonitor, type HeartbeatConfig } from './heartbeat-monitor.js';
 export { CrashRecovery, type CrashAttempt, type CrashRecoveryConfig } from './crash-recovery.js';
 export { StageTimeoutManager, type StageTimeoutConfig, type TimeoutResult } from './stage-timeout.js';
-export { ContextOverflowDetector, type ContextOverflowConfig, type ContextStatus, MODEL_TOKEN_LIMITS } from './context-overflow.js';
+export { ContextOverflowDetector, type ContextOverflowConfig, type ContextStatus, resolveTokenLimit } from './context-overflow.js';
 export { GarbageDetector, type GarbageReport, type GarbageIssue, type GarbageDetectorConfig } from './garbage-detector.js';
 
 // Section B — Output Validation Gates

@@ -91,7 +91,7 @@ export async function generateAnswer(
     outputTokens: result.outputTokens,
     costUsd: result.costUsd,
     durationMs: result.durationMs,
-    model: opts?.model ?? 'claude-sonnet-4-6',
+    model: opts?.model ?? 'sonnet',
     contextTokens,
   };
 }
@@ -181,7 +181,7 @@ Respond with ONLY valid JSON:
     outputTokens: result.outputTokens,
     costUsd: result.costUsd,
     durationMs: result.durationMs,
-    model: opts?.model ?? 'claude-sonnet-4-6',
+    model: opts?.model ?? 'sonnet',
   };
 }
 
@@ -289,6 +289,6 @@ Respond with ONLY this JSON structure:
     outputTokens: result.outputTokens,
     costUsd: result.costUsd,
     durationMs: result.durationMs,
-    model: opts?.model ?? 'claude-sonnet-4-6',
+    model: opts?.model ?? 'sonnet',
   };
 }

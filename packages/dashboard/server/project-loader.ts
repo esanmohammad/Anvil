@@ -1014,13 +1014,13 @@ export class ProjectLoader {
 
   /**
    * Get the configured model for a specific stage.
-   * Falls back: stage model → default model → 'claude-sonnet-4-6'
+   * Falls back: stage model → default model → 'sonnet'
    */
   getModelForStage(project: string, stage: string): string {
     const config = this.getConfig(project);
     const models = config?.pipeline?.models;
-    if (!models) return 'claude-sonnet-4-6';
-    return models[stage] || models['default'] || 'claude-sonnet-4-6';
+    if (!models) return 'sonnet';
+    return models[stage] || models['default'] || 'sonnet';
   }
 
   /**

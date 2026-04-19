@@ -3,54 +3,16 @@
  *
  * Estimates token counts, applies priority-based truncation when context
  * exceeds provider limits, and provides usage feedback.
+ *
+ * Token limits are resolved via `model-catalog.ts` (family rules + overrides +
+ * env-var escape hatch), so new model versions work without code changes.
  */
 
-// ── Provider token limits ─────────────────────────────────────────────
+import { getContextWindow, getMaxOutput } from './model-catalog.js';
 
-const MODEL_LIMITS: Record<string, number> = {
-  // Claude (via CLI — has its own compression, but we still budget)
-  'claude-opus-4-6': 200_000,
-  'claude-sonnet-4-6': 200_000,
-  'claude-sonnet-4': 200_000,
-  'claude-haiku-4-5-20251001': 200_000,
-  // Gemini
-  'gemini-2.5-pro': 1_000_000,
-  'gemini-2.5-flash': 1_000_000,
-  'gemini-2.5-pro-preview-05-06': 1_000_000,
-  'gemini-2.5-flash-preview-05-20': 1_000_000,
-  // OpenAI
-  'gpt-4o': 128_000,
-  'gpt-4o-mini': 128_000,
-  'o3-mini': 200_000,
-  'o1': 200_000,
-};
-
-const DEFAULT_LIMIT = 128_000; // Conservative default for unknown models
-
-/** Get the token limit for a model */
+/** Get the token limit for a model (input context window). */
 export function getModelTokenLimit(modelId: string): number {
-  // Exact match
-  if (MODEL_LIMITS[modelId]) return MODEL_LIMITS[modelId];
-
-  // Prefix match
-  for (const [prefix, limit] of Object.entries(MODEL_LIMITS)) {
-    if (modelId.startsWith(prefix)) return limit;
-  }
-
-  // Heuristic by provider prefix
-  if (modelId.startsWith('claude-')) return 200_000;
-  if (modelId.startsWith('gemini-')) return 1_000_000;
-  if (modelId.startsWith('gpt-')) return 128_000;
-  if (modelId.startsWith('o1') || modelId.startsWith('o3')) return 200_000;
-
-  // OpenRouter models (org/model format)
-  if (modelId.includes('/')) {
-    if (modelId.includes('claude')) return 200_000;
-    if (modelId.includes('gemini')) return 1_000_000;
-    if (modelId.includes('gpt')) return 128_000;
-  }
-
-  return DEFAULT_LIMIT;
+  return getContextWindow(modelId);
 }
 
 // ── Token estimation ──────────────────────────────────────────────────
@@ -93,10 +55,11 @@ export interface BudgetResult {
 export function applyBudget(
   components: ContextComponent[],
   modelId: string,
-  reserveForOutput: number = 16_000, // Reserve tokens for model output
+  reserveForOutput?: number, // Reserve tokens for model output; defaults to model's max_output
 ): BudgetResult {
   const limit = getModelTokenLimit(modelId);
-  const budget = limit - reserveForOutput;
+  const reserve = reserveForOutput ?? Math.min(getMaxOutput(modelId), Math.floor(limit * 0.1));
+  const budget = limit - reserve;
 
   // Calculate total
   let totalTokens = components.reduce((sum, c) => sum + c.tokens, 0);

@@ -134,7 +134,7 @@ export function loadServerConfig(): ServerConfig {
 
     llmMode: resolveLlmMode(env('LLM_MODE'), env('LLM_API_KEY') ?? process.env.ANTHROPIC_API_KEY),
     llmProvider: env('LLM_PROVIDER') ?? 'anthropic',
-    llmModel: env('LLM_MODEL') ?? 'claude-sonnet-4-6',
+    llmModel: env('LLM_MODEL') ?? 'sonnet',
     llmApiKey: env('LLM_API_KEY') ?? process.env.ANTHROPIC_API_KEY,
     llmBaseUrl: env('LLM_BASE_URL'),
     claudeBin: env('CLAUDE_BIN') ?? process.env.CLAUDE_BIN ?? 'claude',

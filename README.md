@@ -11,6 +11,10 @@
 
 [Pipeline](#anvil-pipeline) · [Code Search](#code-search-mcp) · [Quick Start](#quick-start) · [Docs](#configuration)
 
+<br />
+
+![Anvil dashboard showcase](./assets/Anvil_showcase.gif)
+
 </div>
 
 ---
@@ -203,7 +207,9 @@ pipeline:
     build: claude-sonnet-4-6
 ```
 
-Providers: **Claude CLI** (200K context, full tool use) and **Gemini CLI** (1M context, full tool use). Additional providers planned.
+Providers: **Claude CLI** (up to 1M context on Opus 4.7 / Sonnet 4.6 / Opus 4.6, 200K on Haiku 4.5) and **Gemini CLI** (1M context). Both run full tool use. Additional providers planned.
+
+Context windows are resolved per-model via a family-rule catalog (`packages/dashboard/server/model-catalog.ts`) — no per-version hardcoding. Override any model with `ANVIL_CONTEXT_WINDOW_<MODEL_ID>=<tokens>` if you're on a custom endpoint.
 
 | Command | Description |
 |:--|:--|

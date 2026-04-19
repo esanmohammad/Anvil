@@ -10,8 +10,10 @@ import { renderTemplate } from '../templates/renderer.js';
 import { getRequiredVariables } from '../templates/variables.js';
 import YAML from 'yaml';
 
-const WARN_SIZE = 100 * 1024;  // 100KB
-const ERROR_SIZE = 200 * 1024; // 200KB
+// Byte-size guard rails for assembled context (not a model token limit — see model-catalog).
+// Override with ANVIL_CONTEXT_WARN_KB / ANVIL_CONTEXT_ERROR_KB if you want different thresholds.
+const WARN_SIZE = (parseInt(process.env.ANVIL_CONTEXT_WARN_KB ?? '', 10) || 400) * 1024;
+const ERROR_SIZE = (parseInt(process.env.ANVIL_CONTEXT_ERROR_KB ?? '', 10) || 1200) * 1024;
 
 export interface AssemblyResult {
   prompt: string;
@@ -88,10 +90,10 @@ export async function assembleContext(
   // Check size
   const size = Buffer.byteLength(rendered, 'utf-8');
   if (size > ERROR_SIZE) {
-    throw new Error(`Assembled context exceeds 200KB limit (${Math.round(size / 1024)}KB)`);
+    throw new Error(`Assembled context exceeds ${Math.round(ERROR_SIZE / 1024)}KB limit (${Math.round(size / 1024)}KB)`);
   }
   if (size > WARN_SIZE) {
-    warnings.push(`Assembled context is large: ${Math.round(size / 1024)}KB (warn threshold: 100KB)`);
+    warnings.push(`Assembled context is large: ${Math.round(size / 1024)}KB (warn threshold: ${Math.round(WARN_SIZE / 1024)}KB)`);
   }
 
   return { prompt: rendered, warnings };

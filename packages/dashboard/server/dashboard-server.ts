@@ -796,7 +796,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       // Load projects and discover models in parallel to avoid waterfalls
       const [projects, availableModels] = await Promise.all([
         projectLoader.listProjects(),
-        discoverAvailableModels().catch(() => ({ providers: [], defaultModel: 'claude-sonnet-4-6', defaultProvider: 'claude' }) as AvailableModelsResult),
+        discoverAvailableModels().catch(() => ({ providers: [], defaultModel: 'sonnet', defaultProvider: 'claude' }) as AvailableModelsResult),
       ]);
 
       const projectInfos: ProjectSummary[] = projects.map((s) => ({
@@ -1014,7 +1014,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         const project = checkpoint?.project ?? prevRun?.project ?? resumeProject ?? '';
         const feature = checkpoint?.feature ?? prevRun?.feature ?? '';
         const slug = checkpoint?.featureSlug ?? prevRun?.featureSlug ?? resumeSlug ?? '';
-        const model = cpConfig?.model ?? prevRun?.model ?? msg.options?.model ?? 'claude-sonnet-4-6';
+        const model = cpConfig?.model ?? prevRun?.model ?? msg.options?.model ?? 'sonnet';
 
         console.log(`[dashboard] Resuming "${feature}" from stage ${resumeFrom} (${stages[resumeFrom]?.name ?? 'unknown'}) [source: ${checkpoint ? 'checkpoint' : 'runs-index'}]`);
 
@@ -1081,7 +1081,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
             project: msg.project,
             stage: (msg as any).stage ?? 'general',
             prompt: msg.feature,
-            model: msg.options?.model ?? 'claude-sonnet-4-6',
+            model: msg.options?.model ?? 'sonnet',
             cwd,
             projectPrompt: agentProjectPrompt,
           });
@@ -2135,7 +2135,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     const runner = new PipelineRunner(agentManager, projectLoader, featureStore, {
       project,
       feature,
-      model: options?.model ?? 'claude-sonnet-4-6',
+      model: options?.model ?? 'sonnet',
       modelTier: options?.modelTier,
       baseBranch: options?.baseBranch,
       skipClarify: options?.skipClarify,
@@ -2156,7 +2156,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       type: 'build',
       project,
       description: feature,
-      model: options?.model ?? 'claude-sonnet-4-6',
+      model: options?.model ?? 'sonnet',
       status: 'running',
       startedAt: Date.now(),
       activities: pipelineActivities,
@@ -2512,7 +2512,7 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
       stage: actionType.replace('run-', ''),
       prompt: promptMap[actionType] ?? description,
       projectPrompt,
-      model: model ?? 'claude-sonnet-4-6',
+      model: model ?? 'sonnet',
       cwd,
       permissionMode: 'bypassPermissions',
     });
@@ -2524,7 +2524,7 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
       type: runType,
       project,
       description,
-      model: model ?? 'claude-sonnet-4-6',
+      model: model ?? 'sonnet',
       status: 'running',
       startedAt: Date.now(),
       agentId: agent.id,

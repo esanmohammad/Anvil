@@ -655,11 +655,14 @@ A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Gra
 
   let prompt = injected + (overrides.length > 0 ? '\n\n' + overrides.join('\n') : '');
 
-  // Enforce prompt size budget — truncate oversized prompts
-  const MAX_PROMPT_CHARS = 150_000; // ~37.5K tokens, well within 200K context
+  // Sanity guard on assembled prompt size. This is a pre-model cap — it keeps
+  // a runaway prompt from reaching the provider, not a per-model context limit.
+  // Per-model context enforcement happens in `context-overflow` / `context-budget`.
+  // Override with `ANVIL_MAX_PROMPT_CHARS` if you want looser / tighter guard rails.
+  const MAX_PROMPT_CHARS = parseInt(process.env.ANVIL_MAX_PROMPT_CHARS ?? '', 10) || 600_000; // ~150K tokens
   if (prompt.length > MAX_PROMPT_CHARS) {
-    warn(`[prompt-budget] Project prompt is ${prompt.length} chars (${Math.ceil(prompt.length / 4)} tokens) — trimming to fit context window`);
-    prompt = prompt.slice(0, MAX_PROMPT_CHARS) + '\n\n[... prompt truncated to fit context window ...]';
+    warn(`[prompt-budget] Project prompt is ${prompt.length} chars (${Math.ceil(prompt.length / 4)} tokens) — trimming to pre-model sanity cap (${MAX_PROMPT_CHARS} chars)`);
+    prompt = prompt.slice(0, MAX_PROMPT_CHARS) + '\n\n[... prompt truncated to pre-model sanity cap ...]';
   }
 
   info(`[prompt-budget] Project prompt: ${Math.ceil(prompt.length / 4)} tokens`);
