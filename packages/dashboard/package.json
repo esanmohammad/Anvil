@@ -1,6 +1,7 @@
 {
   "name": "@anvil-dev/dashboard",
-  "version": "0.1.0",
+  "version": "0.0.1",
+  "private": true,
   "description": "React dashboard and Node.js server for Anvil — real-time pipeline orchestration, knowledge graph visualization, and agent management",
   "type": "module",
   "license": "MIT",

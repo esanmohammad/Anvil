@@ -4,7 +4,7 @@
 
 **AI agents that ship features across multi-repo codebases**
 
-[![v0.1.0](https://img.shields.io/badge/anvil-v0.1.0-8B5CF6?style=flat-square)](https://github.com/esanmohammad/Anvil)
+[![v0.0.3](https://img.shields.io/badge/anvil-v0.0.3-8B5CF6?style=flat-square)](https://github.com/esanmohammad/Anvil)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-compatible-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
 [![Privacy](https://img.shields.io/badge/telemetry-none-22c55e?style=flat-square)]()
@@ -52,11 +52,20 @@ A standalone MCP server that gives Claude Code, Cursor, or any MCP client semant
 
 ## Quick Start
 
+**Install from npm (recommended):**
+
+```bash
+npm install -g @esankhan3/anvil-cli
+anvil doctor
+anvil dashboard
+```
+
+**Or clone and build from source:**
+
 ```bash
 git clone https://github.com/esanmohammad/Anvil.git && cd anvil
 npm install && npm run build --workspaces
-anvil doctor
-anvil dashboard
+./packages/cli/dist/index.js dashboard
 ```
 
 Open `http://localhost:5173`, select your project, and describe what you want to build.
@@ -160,7 +169,7 @@ A standalone MCP server that gives any MCP client deep understanding of your cod
 **Install for Claude Code:**
 
 ```bash
-claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local /path/to/repos
+claude mcp add code-search -- npx @esankhan3/code-search-mcp --local /path/to/repos
 ```
 
 **Tool categories:**
@@ -232,11 +241,14 @@ cd packages/code-search-mcp && node build.mjs  # build MCP server
 
 ## Packages
 
-| Package | Description |
-|:--|:--|
-| `@anvil-dev/cli` | CLI -- `anvil init`, `anvil doctor`, `anvil dashboard` |
-| `@anvil-dev/dashboard` | React dashboard + Node.js server -- pipeline orchestration |
-| `@anvil-dev/code-search-mcp` | Standalone MCP server for multi-repo code search |
+Published on npm — install directly, no build step needed.
+
+| Package | Install | What it is |
+|:--|:--|:--|
+| [`@esankhan3/anvil-cli`](https://www.npmjs.com/package/@esankhan3/anvil-cli) | `npm i -g @esankhan3/anvil-cli` | CLI + dashboard bundled together. Provides the `anvil` command (`init`, `doctor`, `dashboard`). [README](packages/cli/README.md) |
+| [`@esankhan3/code-search-mcp`](https://www.npmjs.com/package/@esankhan3/code-search-mcp) | `npx @esankhan3/code-search-mcp` | Standalone MCP server for multi-repo code search, AST graphs, and cross-repo impact analysis. Works with any MCP client. [README](packages/code-search-mcp/README.md) |
+
+> **`packages/dashboard`** is an internal monorepo source folder — its compiled output (React bundle + Node server) is bundled inside `@esankhan3/anvil-cli` and published together. It is not published as a standalone npm package.
 
 ## License
 

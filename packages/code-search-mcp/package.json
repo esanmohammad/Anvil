@@ -1,6 +1,6 @@
 {
-  "name": "@anvil-dev/code-search-mcp",
-  "version": "0.1.0",
+  "name": "@esankhan3/code-search-mcp",
+  "version": "0.0.2",
   "description": "MCP server for multi-repo code search — GitHub org or local path, zero config",
   "type": "module",
   "license": "MIT",

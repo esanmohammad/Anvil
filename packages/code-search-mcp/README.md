@@ -49,13 +49,13 @@ graph LR
 <summary><strong>Local mode</strong> -- run on your machine</summary>
 
 ```bash
-claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local /path/to/repos
+claude mcp add code-search -- npx @esankhan3/code-search-mcp --local /path/to/repos
 ```
 
 For GitHub orgs:
 
 ```bash
-claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local github:your-org --token ghp_xxx
+claude mcp add code-search -- npx @esankhan3/code-search-mcp --local github:your-org --token ghp_xxx
 ```
 
 </details>
@@ -69,7 +69,7 @@ claude mcp add code-search -- npx @anvil-dev/code-search-mcp --local github:your
 claude mcp add code-search \
   -e CODE_SEARCH_SERVER=https://your-server:3100 \
   -e CODE_SEARCH_API_KEY=your-api-key \
-  -- npx @anvil-dev/code-search-mcp
+  -- npx @esankhan3/code-search-mcp
 ```
 
 **Claude Desktop / Cursor (JSON config):**

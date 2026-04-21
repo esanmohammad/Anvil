@@ -3,27 +3,35 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { info, error } from '../logger.js';
 
 /**
- * Resolve the dashboard package directory.
- * Works in both monorepo dev (sibling package) and npx/global install
- * (resolved via node_modules from @anvil-dev/dashboard dependency).
+ * Resolve the dashboard directory.
+ * Published package: bundled at dist/dashboard (sibling of this file's compiled location).
+ * Monorepo dev: sibling package at packages/dashboard.
  */
-function resolveDashboardDir(): string | null {
-  // 1. Try resolving as an installed dependency (npx / global install)
-  try {
-    const require = createRequire(import.meta.url);
-    const pkgPath = require.resolve('@anvil-dev/dashboard/package.json');
-    return dirname(pkgPath);
-  } catch { /* not installed as dependency */ }
-
-  // 2. Fallback: monorepo sibling (development)
+function resolveDashboardDir(): { dir: string; staticDir: string; serverEntry: string } | null {
   const cliDir = dirname(fileURLToPath(import.meta.url));
-  const monorepoPath = resolve(cliDir, '../../..', 'dashboard');
-  if (existsSync(resolve(monorepoPath, 'package.json'))) {
-    return monorepoPath;
+
+  // 1. Published layout: dist/commands/dashboard.js → dist/dashboard/{dist,server}
+  const bundled = resolve(cliDir, '..', 'dashboard');
+  if (existsSync(resolve(bundled, 'dist', 'index.html'))
+    && existsSync(resolve(bundled, 'server', 'dashboard-server.js'))) {
+    return {
+      dir: bundled,
+      staticDir: resolve(bundled, 'dist'),
+      serverEntry: resolve(bundled, 'server', 'dashboard-server.js'),
+    };
+  }
+
+  // 2. Monorepo dev: packages/cli/dist/commands/dashboard.js → packages/dashboard
+  const monorepo = resolve(cliDir, '../../..', 'dashboard');
+  if (existsSync(resolve(monorepo, 'package.json'))) {
+    return {
+      dir: monorepo,
+      staticDir: resolve(monorepo, 'dist'),
+      serverEntry: resolve(monorepo, 'server', 'dashboard-server.js'),
+    };
   }
 
   return null;
@@ -34,20 +42,18 @@ export const dashboardCommand = new Command('dashboard')
   .option('-p, --port <port>', 'Port to serve on', '5173')
   .option('--no-open', 'Do not open browser automatically')
   .action(async (opts: { port: string; open: boolean }) => {
-    const dashboardDir = resolveDashboardDir();
+    const resolved = resolveDashboardDir();
 
-    if (!dashboardDir) {
-      error('Dashboard package not found. Install @anvil-dev/dashboard or run from the Anvil monorepo.');
+    if (!resolved) {
+      error('Dashboard assets not found. Reinstall @anvil-dev/anvil or run from the Anvil monorepo.');
       process.exitCode = 1;
       return;
     }
 
-    // Build frontend if needed (only in monorepo dev — published packages include pre-built dist)
-    const staticDir = resolve(dashboardDir, 'dist');
-    if (!existsSync(resolve(staticDir, 'index.html'))) {
+    if (!existsSync(resolve(resolved.staticDir, 'index.html'))) {
       info('Building dashboard...');
       try {
-        execSync('npx vite build', { cwd: dashboardDir, stdio: 'inherit' });
+        execSync('npx vite build', { cwd: resolved.dir, stdio: 'inherit' });
       } catch {
         error('Dashboard build failed.');
         process.exitCode = 1;
@@ -58,14 +64,11 @@ export const dashboardCommand = new Command('dashboard')
     const port = parseInt(opts.port, 10);
     info(`Starting dashboard server on http://localhost:${port}`);
 
-    // Import and start the combined HTTP+WS dashboard server
-    const { startDashboardServer } = await import(
-      resolve(dashboardDir, 'server', 'dashboard-server.js')
-    );
+    const { startDashboardServer } = await import(resolved.serverEntry);
 
     await startDashboardServer({
       port,
-      staticDir,
+      staticDir: resolved.staticDir,
       open: opts.open,
     });
   });
