@@ -161,14 +161,15 @@ interface StageDefinition {
 }
 
 const STAGES: StageDefinition[] = [
-  { index: 0, name: 'clarify',           label: 'Understanding',        persona: 'clarifier', perRepo: false },
-  { index: 1, name: 'requirements',      label: 'Planning requirements', persona: 'analyst',   perRepo: false },
-  { index: 2, name: 'repo-requirements', label: 'Repo requirements',    persona: 'analyst',   perRepo: true },
-  { index: 3, name: 'specs',             label: 'Writing specs',        persona: 'architect', perRepo: true },
-  { index: 4, name: 'tasks',             label: 'Creating tasks',       persona: 'lead',      perRepo: true },
-  { index: 5, name: 'build',             label: 'Writing code',         persona: 'engineer',  perRepo: true },
-  { index: 6, name: 'validate',          label: 'Testing',              persona: 'tester',    perRepo: true },
-  { index: 7, name: 'ship',              label: 'Shipping',             persona: 'engineer',  perRepo: false },
+  { index: 0, name: 'clarify',           label: 'Understanding',        persona: 'clarifier',   perRepo: false },
+  { index: 1, name: 'requirements',      label: 'Planning requirements', persona: 'analyst',    perRepo: false },
+  { index: 2, name: 'repo-requirements', label: 'Repo requirements',    persona: 'analyst',     perRepo: true },
+  { index: 3, name: 'specs',             label: 'Writing specs',        persona: 'architect',   perRepo: true },
+  { index: 4, name: 'tasks',             label: 'Creating tasks',       persona: 'lead',        perRepo: true },
+  { index: 5, name: 'build',             label: 'Writing code',         persona: 'engineer',    perRepo: true },
+  { index: 6, name: 'test',              label: 'Generating tests',     persona: 'test-author', perRepo: true },
+  { index: 7, name: 'validate',          label: 'Testing',              persona: 'tester',      perRepo: true },
+  { index: 8, name: 'ship',              label: 'Shipping',             persona: 'engineer',    perRepo: false },
 ];
 
 /** Stages whose artifacts can be fully derived from a Plan — skipped when planSeed is provided. */
@@ -720,6 +721,40 @@ export class PipelineRunner extends EventEmitter {
           this.state.stages[i].completedAt = new Date().toISOString();
           this.broadcastState();
           this.checkpoint();
+          continue;
+        }
+
+        // Test-gen stage: deterministic behavior extraction + grounding + scaffold
+        // emission. Opt-in via planSeed (we need Behaviors from somewhere); without
+        // a plan, we skip so existing non-plan flows are unchanged.
+        if (stage.name === 'test') {
+          if (!this.config.planSeed) {
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = 'Test stage skipped (no plan seed).';
+            prevArtifact = this.state.stages[i].artifact;
+            this.state.stages[i].completedAt = new Date().toISOString();
+            this.broadcastState();
+            this.checkpoint();
+            continue;
+          }
+          try {
+            const artifact = await this.runTestGenStage(i);
+            this.state.stages[i].status = 'completed';
+            this.state.stages[i].artifact = artifact;
+            this.state.stages[i].completedAt = new Date().toISOString();
+            prevArtifact = artifact;
+            this.broadcastState();
+            this.checkpoint();
+          } catch (err) {
+            // Non-fatal: test-gen failure shouldn't block validate. Downgrade to skipped.
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn('[pipeline] test-gen failed, continuing to validate:', msg);
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = `Test stage skipped (${msg}).`;
+            this.state.stages[i].completedAt = new Date().toISOString();
+            this.broadcastState();
+            this.checkpoint();
+          }
           continue;
         }
 
@@ -1411,6 +1446,143 @@ export class PipelineRunner extends EventEmitter {
       if (/\b[1-9]\d*\s+(?:failed|failing)\b/i.test(line)) return true;
     }
     return false;
+  }
+
+  /**
+   * Deterministic test-generation stage: fingerprint per repo → extract behaviors
+   * from plan → ground → emit test cases → write to repos → persist TestSpec +
+   * TestCase artifacts. No LLM calls in Phase 1; validate runs whatever lands.
+   */
+  private async runTestGenStage(stageIndex: number): Promise<string> {
+    if (!this.config.planSeed) return 'Test stage skipped (no plan seed).';
+
+    const { fingerprintConventions } = await import('./convention-fingerprinter.js');
+    const { extractBehaviorsFromPlan } = await import('./behavior-extractor.js');
+    const { groundBehaviors } = await import('./test-grounder.js');
+    const { emitTestCase } = await import('./test-code-emitter.js');
+    const { TestSpecStore } = await import('./test-spec-store.js');
+    const { TestCaseStore } = await import('./test-case-store.js');
+
+    const plan = this.config.planSeed.plan;
+    const repoNames = this.state.repoNames.length ? this.state.repoNames : Object.keys(this.repoPaths);
+    const repoLocalPaths: Record<string, string> = {};
+    for (const r of repoNames) repoLocalPaths[r] = this.repoPaths[r] ?? join(this.workspaceDir, r);
+
+    // Fingerprint conventions on the first repo that has code; that becomes the
+    // reference for the whole spec. If a repo has its own fingerprint later,
+    // individual test cases can be re-emitted per repo.
+    let conventions = await fingerprintConventions(
+      Object.values(repoLocalPaths).find((p) => existsSync(p)) ?? this.workspaceDir,
+    );
+    this.state.stages[stageIndex].artifact = `Detected runner: ${conventions.runner}\n`;
+
+    // Extract Behaviors from the plan (deterministic).
+    const behaviors = extractBehaviorsFromPlan(plan, { maxPerRepo: 20 });
+    if (behaviors.length === 0) {
+      return `Test stage skipped (no behaviors extracted from plan ${plan.slug}).`;
+    }
+
+    // Ground against disk in all repos.
+    const grounded = await groundBehaviors(behaviors, repoLocalPaths);
+    const resolvedBehaviors = grounded.map((g) => g.behavior);
+
+    // Persist TestSpec (v1).
+    const specStore = new TestSpecStore();
+    const spec = specStore.createSpec(this.config.project, plan.title || plan.slug, plan.model ?? this.config.model, {
+      title: `Tests for ${plan.title || plan.slug}`,
+      source: {
+        plan: { slug: plan.slug, version: plan.version },
+        files: plan.repos.flatMap((r) => r.files ?? []),
+      },
+      behaviors: resolvedBehaviors,
+      conventions,
+    });
+
+    // Emit deterministic TestCase scaffolds.
+    const cases = resolvedBehaviors.map((b) =>
+      emitTestCase(b, conventions, {
+        specSlug: spec.slug,
+        specVersion: spec.version,
+        projectSlug: this.config.project,
+      }),
+    );
+    const caseStore = new TestCaseStore();
+    caseStore.writeCases(this.config.project, spec.slug, spec.version, cases);
+
+    // Write each test file into the appropriate repo. The emitter picks a file
+    // path relative to the target file's directory; we rebase onto each repo's
+    // local clone by best-matching the target file against repo file trees.
+    let writtenCount = 0;
+    const notes: string[] = [];
+    for (const c of cases) {
+      const behavior = resolvedBehaviors.find((b) => b.id === c.behaviorId);
+      if (!behavior) continue;
+      const targetRepo = this.pickRepoForBehavior(behavior, repoLocalPaths);
+      if (!targetRepo) {
+        notes.push(`- ${behavior.intent}: no repo match for target ${behavior.target.file}`);
+        continue;
+      }
+      const fullPath = join(repoLocalPaths[targetRepo], c.filePath);
+      try {
+        if (!existsSync(fullPath) || readFileSync(fullPath, 'utf-8').includes('// anvil-generated')) {
+          mkdirSync(dirname(fullPath), { recursive: true });
+          const header = `// anvil-generated — spec:${spec.slug}@v${spec.version} behavior:${c.behaviorId}\n`;
+          const tmp = fullPath + '.tmp';
+          writeFileSync(tmp, header + c.code, 'utf-8');
+          renameSync(tmp, fullPath);
+          writtenCount++;
+        } else {
+          notes.push(`- ${c.filePath}: existing hand-written test, not overwritten`);
+        }
+      } catch (err) {
+        notes.push(`- ${c.filePath}: write failed (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
+
+    const summary = [
+      `Runner: ${conventions.runner} · file layout: ${conventions.fileLayout}`,
+      `Behaviors extracted: ${resolvedBehaviors.length} (${resolvedBehaviors.filter((b) => b.ground.confidence >= 1).length} fully grounded)`,
+      `Test cases written: ${writtenCount}/${cases.length}`,
+      `Spec: ${spec.slug}@v${spec.version}`,
+      notes.length ? `\nNotes:\n${notes.join('\n')}` : '',
+    ].join('\n');
+
+    // Broadcast via pipeline state artifact — dashboard consumers can subscribe.
+    this.emit('artifact-written', {
+      stage: 'test',
+      file: `tests/${spec.slug}/spec-v${spec.version}.json`,
+      summary: `${writtenCount} test case${writtenCount !== 1 ? 's' : ''} generated`,
+      content: summary,
+    });
+
+    return summary;
+  }
+
+  /** Pick the repo whose local path contains the behavior's target file. */
+  private pickRepoForBehavior(
+    behavior: { target: { file: string } },
+    repoLocalPaths: Record<string, string>,
+  ): string | null {
+    const targetBase = behavior.target.file.split('/').pop() ?? '';
+    for (const [repoName, path] of Object.entries(repoLocalPaths)) {
+      if (!path || !existsSync(path)) continue;
+      try {
+        const full = join(path, behavior.target.file);
+        if (existsSync(full)) return repoName;
+      } catch { /* ignore */ }
+    }
+    // Fallback: first repo with any file matching the basename.
+    if (!targetBase) return Object.keys(repoLocalPaths)[0] ?? null;
+    for (const [repoName, path] of Object.entries(repoLocalPaths)) {
+      if (!path || !existsSync(path)) continue;
+      try {
+        const found = execSync(`find "${path}" -name "${targetBase}" -not -path "*/node_modules/*" | head -1`, {
+          encoding: 'utf-8', timeout: 5_000,
+        }).trim();
+        if (found) return repoName;
+      } catch { /* continue */ }
+    }
+    return Object.keys(repoLocalPaths)[0] ?? null;
   }
 
   /** Run engineer agents to fix validation issues, then return */

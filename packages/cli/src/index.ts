@@ -8,6 +8,7 @@ import { doctorCommand } from './commands/doctor.js';
 import { dashboardCommand } from './commands/dashboard.js';
 import { planCommand } from './commands/plan.js';
 import { reviewCommand } from './commands/review.js';
+import { testCommand } from './commands/test.js';
 
 const program = new Command();
 
@@ -24,6 +25,7 @@ program.addCommand(doctorCommand);
 program.addCommand(dashboardCommand);
 program.addCommand(planCommand);
 program.addCommand(reviewCommand);
+program.addCommand(testCommand);
 
 // ── Future CLI commands (disabled for MVP 1) ─────────────────────────
 const comingSoon = (name: string, desc: string) => {

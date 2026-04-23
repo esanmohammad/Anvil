@@ -58,6 +58,10 @@ import { ReviewStore, prIdFromUrl, newFindingId } from './review-store.js';
 import type {
   Review, ReviewFinding, Persona, Resolution, Severity, Category, Confidence,
 } from './review-store.js';
+import { TestSpecStore } from './test-spec-store.js';
+import { TestCaseStore } from './test-case-store.js';
+import { TestRunStore } from './test-run-store.js';
+import { TestLearningsStore } from './test-learnings.js';
 import { publishReview } from './review-publisher.js';
 import { buildPlanCompliance } from './review-plan-compliance.js';
 import { runSecurityPrepass } from './review-rules/security-prepass.js';
@@ -391,6 +395,37 @@ function serveStatic(staticDir: string, kbManagerRef?: { current: KnowledgeBaseM
       }
     }
 
+    // Serve shared test spec: /share/tests/:token — returns the frozen spec + cases.
+    const testShareMatch = url.pathname.match(/^\/share\/tests\/([A-Za-z0-9_\-.]+)$/);
+    if (testShareMatch) {
+      try {
+        const { verifyTestShareToken, getOrCreateTestShareSecret } = await import('./test-share.js');
+        const secret = getOrCreateTestShareSecret(ANVIL_HOME);
+        const payload = verifyTestShareToken(testShareMatch[1], secret);
+        if (!payload) {
+          res.writeHead(410, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Share link invalid or expired.' }));
+          return;
+        }
+        const specStore = new TestSpecStore(ANVIL_HOME);
+        const caseStore = new TestCaseStore(ANVIL_HOME);
+        const spec = specStore.readVersion(payload.project, payload.slug, payload.version);
+        if (!spec) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Test spec version not found.' }));
+          return;
+        }
+        const cases = caseStore.readCases(payload.project, payload.slug, payload.version);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ spec, cases, expiresAt: payload.expiresAt }));
+        return;
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Internal error' }));
+        return;
+      }
+    }
+
     // Serve knowledge base graph.html: /api/kb/:project/:repo/graph.html
     const kbMatch = url.pathname.match(/^\/api\/kb\/([^/]+)\/([^/]+)\/graph\.html$/);
     if (kbMatch && kbManagerRef?.current) {
@@ -461,6 +496,10 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const planStore = new PlanStore(ANVIL_HOME);
   const planValidator = new PlanValidator(projectLoader);
   const reviewStore = new ReviewStore(ANVIL_HOME);
+  const testSpecStore = new TestSpecStore(ANVIL_HOME);
+  const testCaseStore = new TestCaseStore(ANVIL_HOME);
+  const testRunStore = new TestRunStore(ANVIL_HOME);
+  const testLearningsStore = new TestLearningsStore(ANVIL_HOME);
   kbManagerRef.current = kbManager;
 
   // ── Clean up stale "running" state from previous crashes ────────────
@@ -1916,12 +1955,639 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         if (!msg.project || !reviewId || !findingId) break;
         try {
           const commitSha = await applyReviewFix(msg.project, reviewId, findingId);
+          const updated = reviewStore.readCurrent(msg.project, reviewId);
           ws.send(JSON.stringify({
             type: 'review-fix-applied',
-            payload: { reviewId, findingId, commitSha },
+            payload: { reviewId, findingId, commitSha, review: updated },
           }));
+          if (updated) {
+            broadcast({
+              type: 'review-finding-resolved',
+              payload: { reviewId, findingId, resolution: 'addressed', review: updated },
+            });
+          }
         } catch (err) {
           ws.send(JSON.stringify({ type: 'review-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      // ── Test generation ─────────────────────────────────────────────
+      case 'get-test-specs': {
+        if (!msg.project) break;
+        try {
+          const specs = testSpecStore.listSpecs(msg.project);
+          ws.send(JSON.stringify({ type: 'test-specs', payload: { specs } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-fingerprint-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'get-test-spec': {
+        const slug = (msg as { slug?: string }).slug;
+        if (!msg.project || !slug) break;
+        const spec = testSpecStore.readCurrent(msg.project, slug);
+        if (!spec) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Test spec ${slug} not found` } }));
+          break;
+        }
+        ws.send(JSON.stringify({ type: 'test-spec', payload: { spec } }));
+        break;
+      }
+
+      case 'get-test-cases': {
+        const slug = (msg as { slug?: string }).slug;
+        const version = (msg as { version?: number }).version;
+        if (!msg.project || !slug || version == null) break;
+        const cases = testCaseStore.readCases(msg.project, slug, version);
+        ws.send(JSON.stringify({ type: 'test-cases', payload: { slug, version, cases } }));
+        break;
+      }
+
+      case 'get-test-runs': {
+        const slug = (msg as { slug?: string }).slug;
+        if (!msg.project || !slug) break;
+        const runs = testRunStore.listRuns(msg.project, slug);
+        ws.send(JSON.stringify({ type: 'test-runs', payload: { slug, runs } }));
+        break;
+      }
+
+      case 'fingerprint-test-conventions': {
+        if (!msg.project) break;
+        try {
+          const { fingerprintConventions } = await import('./convention-fingerprinter.js');
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const first = Object.values(repoPaths).find((p) => p && existsSync(p));
+          if (!first) {
+            ws.send(JSON.stringify({ type: 'test-fingerprint-error', payload: { message: 'No repo clones found. Run the pipeline once first.' } }));
+            break;
+          }
+          const conventions = await fingerprintConventions(first);
+          ws.send(JSON.stringify({ type: 'test-fingerprint', payload: { conventions } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-fingerprint-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'create-test-spec-from-plan': {
+        const planSlug = (msg as { planSlug?: string }).planSlug;
+        const model = (msg as { model?: string }).model ?? 'claude-sonnet-4-6';
+        if (!msg.project || !planSlug) break;
+        try {
+          const plan = planStore.readCurrent(msg.project, planSlug);
+          if (!plan) {
+            ws.send(JSON.stringify({ type: 'test-spec-error', payload: { message: `Plan ${planSlug} not found` } }));
+            break;
+          }
+          const { fingerprintConventions } = await import('./convention-fingerprinter.js');
+          const { extractBehaviorsFromPlan } = await import('./behavior-extractor.js');
+          const { groundBehaviors } = await import('./test-grounder.js');
+          const { emitTestCase } = await import('./test-code-emitter.js');
+
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const first = Object.values(repoPaths).find((p) => p && existsSync(p)) ?? '';
+          const conventions = await fingerprintConventions(first);
+
+          const behaviors = extractBehaviorsFromPlan(plan, { maxPerRepo: 20 });
+          const grounded = await groundBehaviors(behaviors, repoPaths);
+          const resolvedBehaviors = grounded.map((g) => g.behavior);
+
+          const spec = testSpecStore.createSpec(msg.project, plan.title || plan.slug, model, {
+            title: `Tests for ${plan.title || plan.slug}`,
+            source: {
+              plan: { slug: plan.slug, version: plan.version },
+              files: plan.repos.flatMap((r) => r.files ?? []),
+            },
+            behaviors: resolvedBehaviors,
+            conventions,
+          });
+
+          const cases = resolvedBehaviors.map((b) =>
+            emitTestCase(b, conventions, {
+              specSlug: spec.slug,
+              specVersion: spec.version,
+              projectSlug: msg.project!,
+            }),
+          );
+          testCaseStore.writeCases(msg.project, spec.slug, spec.version, cases);
+
+          ws.send(JSON.stringify({ type: 'test-spec-created', payload: { spec, cases } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-spec-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'run-test-spec': {
+        const slug = (msg as { slug?: string }).slug;
+        if (!msg.project || !slug) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) {
+            ws.send(JSON.stringify({ type: 'test-run-error', payload: { message: `Test spec ${slug} not found` } }));
+            break;
+          }
+          const cases = testCaseStore.readCases(msg.project, slug, spec.version);
+          const run = testRunStore.createRun(msg.project, slug, spec.version, 'manual');
+          ws.send(JSON.stringify({ type: 'test-run-started', payload: { run } }));
+
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const repoPath = Object.values(repoPaths).find((p) => p && existsSync(p));
+          if (!repoPath) {
+            const completed = testRunStore.updateRun(msg.project, slug, run.id, {
+              status: 'error',
+              verdict: 'fail',
+              completedAt: new Date().toISOString(),
+            });
+            ws.send(JSON.stringify({ type: 'test-run-completed', payload: { run: completed, error: 'No repo clone found. Run the pipeline once first.' } }));
+            break;
+          }
+
+          const { executeTestRun } = await import('./test-executor.js');
+          const exec = await executeTestRun({
+            project: msg.project,
+            repoLocalPath: repoPath,
+            runner: spec.conventions.runner,
+            cases,
+            timeoutMs: 300_000,
+            flakinessRerunCount: 2,
+            onLog: (stream, line) => {
+              broadcast({ type: 'test-run-log', payload: { runId: run.id, stream, line } });
+            },
+          });
+
+          const completed = testRunStore.updateRun(msg.project, slug, run.id, {
+            status: exec.status,
+            verdict: exec.verdict,
+            results: exec.results,
+            flakyQuarantined: exec.flakyQuarantined,
+            completedAt: new Date().toISOString(),
+          });
+
+          // Learning loop: record flaky tests for future calibration.
+          for (const caseId of exec.flakyQuarantined) {
+            const r = exec.results.find((x) => x.caseId === caseId);
+            if (r?.flakyScore != null) {
+              try { testLearningsStore.recordFlaky(msg.project, caseId, r.flakyScore); } catch { /* ok */ }
+            }
+          }
+
+          ws.send(JSON.stringify({ type: 'test-run-completed', payload: { run: completed } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-run-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'review-test-spec': {
+        const slug = (msg as { slug?: string }).slug;
+        const runId = (msg as { runId?: string }).runId;
+        const personas = (msg as { personas?: string[] }).personas;
+        const model = (msg as { model?: string }).model ?? 'claude-sonnet-4-6';
+        if (!msg.project || !slug || !runId) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) {
+            ws.send(JSON.stringify({ type: 'test-review-error', payload: { message: `Spec ${slug} not found` } }));
+            break;
+          }
+          const cases = testCaseStore.readCases(msg.project, slug, spec.version);
+          const run = testRunStore.readRun(msg.project, slug, runId);
+          if (!run) {
+            ws.send(JSON.stringify({ type: 'test-review-error', payload: { message: `Run ${runId} not found` } }));
+            break;
+          }
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const cwd = Object.values(repoPaths).find((p) => p && existsSync(p)) ?? process.cwd();
+
+          const { runMultiPersonaReview } = await import('./test-review-runner.js');
+          ws.send(JSON.stringify({ type: 'test-review-started', payload: { runId, personas: personas ?? ['test-architect','edge-case-hunter','security-tester','perf-tester','flakiness-auditor'] } }));
+
+          const result = await runMultiPersonaReview({
+            agentManager,
+            runStore: testRunStore,
+            learningsStore: testLearningsStore,
+            project: msg.project,
+            spec,
+            cases,
+            runId,
+            personas: personas as any,
+            model,
+            cwd,
+            onPersonaStart: (persona, agentId) => {
+              broadcast({ type: 'test-review-persona-start', payload: { runId, persona, agentId } });
+            },
+            onPersonaDone: (persona, findings, cost) => {
+              broadcast({ type: 'test-review-persona-done', payload: { runId, persona, findingCount: findings.length, cost } });
+            },
+            onError: (persona, message) => {
+              broadcast({ type: 'test-review-persona-error', payload: { runId, persona, message } });
+            },
+          });
+
+          const updated = testRunStore.readRun(msg.project, slug, runId);
+          broadcast({
+            type: 'test-review-complete',
+            payload: { runId, run: updated, totalFindings: result.findings.length, perPersona: Object.fromEntries(Object.entries(result.perPersonaFindings).map(([k, v]) => [k, v.length])) },
+          });
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-review-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'mutation-test-spec': {
+        const slug = (msg as { slug?: string }).slug;
+        const runId = (msg as { runId?: string }).runId;
+        if (!msg.project || !slug || !runId) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) {
+            ws.send(JSON.stringify({ type: 'test-mutation-error', payload: { message: `Spec ${slug} not found` } }));
+            break;
+          }
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const repoPath = Object.values(repoPaths).find((p) => p && existsSync(p));
+          if (!repoPath) {
+            ws.send(JSON.stringify({ type: 'test-mutation-error', payload: { message: 'No repo clone found.' } }));
+            break;
+          }
+          ws.send(JSON.stringify({ type: 'test-mutation-started', payload: { runId } }));
+          const { runMutationTesting } = await import('./mutation-runner.js');
+          const result = await runMutationTesting({
+            repoLocalPath: repoPath,
+            runner: spec.conventions.runner,
+            timeoutMs: 600_000,
+            onLog: (stream, line) => {
+              broadcast({ type: 'test-mutation-log', payload: { runId, stream, line } });
+            },
+          });
+
+          if (result.supported && result.score != null) {
+            testRunStore.updateRun(msg.project, slug, runId, {
+              mutationScore: {
+                score: result.score,
+                killed: result.killed,
+                total: result.total,
+                byFile: result.byFile,
+              },
+            });
+            try { testLearningsStore.updateMutationScore(msg.project, result.byFile); } catch { /* ok */ }
+          }
+          const updated = testRunStore.readRun(msg.project, slug, runId);
+          ws.send(JSON.stringify({ type: 'test-mutation-complete', payload: { runId, run: updated, result } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-mutation-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'polish-test-spec': {
+        const slug = (msg as { slug?: string }).slug;
+        const model = (msg as { model?: string }).model ?? 'claude-sonnet-4-6';
+        const concurrency = (msg as { concurrency?: number }).concurrency ?? 4;
+        if (!msg.project || !slug) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) {
+            ws.send(JSON.stringify({ type: 'test-polish-error', payload: { message: `Spec ${slug} not found` } }));
+            break;
+          }
+          const cases = testCaseStore.readCases(msg.project, slug, spec.version);
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const cwd = Object.values(repoPaths).find((p) => p && existsSync(p)) ?? process.cwd();
+
+          const { runTestAuthor } = await import('./test-author-runner.js');
+          ws.send(JSON.stringify({ type: 'test-polish-started', payload: { slug, caseCount: cases.length } }));
+
+          const result = await runTestAuthor({
+            agentManager,
+            caseStore: testCaseStore,
+            learningsStore: testLearningsStore,
+            project: msg.project,
+            spec,
+            cases,
+            repoLocalPaths: repoPaths,
+            cwd,
+            model,
+            concurrency,
+            onlyScaffolds: true,
+            onCaseStart: (caseId, agentId) => {
+              broadcast({ type: 'test-polish-case-start', payload: { slug, caseId, agentId } });
+            },
+            onCaseDone: (caseId, updated, cost) => {
+              broadcast({ type: 'test-polish-case-done', payload: { slug, caseId, cost, case: updated } });
+            },
+            onError: (caseId, message) => {
+              broadcast({ type: 'test-polish-case-error', payload: { slug, caseId, message } });
+            },
+          });
+
+          ws.send(JSON.stringify({
+            type: 'test-polish-complete',
+            payload: {
+              slug,
+              polished: result.polished.length,
+              skipped: result.skipped.length,
+              failed: result.failed.length,
+              totalCost: result.totalCost,
+            },
+          }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-polish-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'resolve-test-finding': {
+        const slug = (msg as { slug?: string }).slug;
+        const runId = (msg as { runId?: string }).runId;
+        const findingId = (msg as { findingId?: string }).findingId;
+        const resolution = (msg as { resolution?: Resolution }).resolution;
+        if (!msg.project || !slug || !runId || !findingId || !resolution) break;
+        const prior = testRunStore.readRun(msg.project, slug, runId);
+        const priorFinding = prior?.findings.find((f) => f.id === findingId);
+        const updated = testRunStore.setResolution(msg.project, slug, runId, findingId, resolution);
+        if (!updated) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'Finding not found' } }));
+          break;
+        }
+        const updatedFinding = updated.findings.find((f) => f.id === findingId);
+        if (updatedFinding && priorFinding) {
+          try {
+            testLearningsStore.recordResolution(msg.project, updatedFinding, priorFinding.resolution);
+          } catch (err) {
+            console.warn('[test-gen] recordResolution failed:', err);
+          }
+        }
+        broadcast({
+          type: 'test-finding-resolved',
+          payload: { runId, findingId, resolution, run: updated },
+        });
+        break;
+      }
+
+      // ── Test gen — Phase 3/4 ─────────────────────────────────────────
+      case 'regenerate-mutation-tests': {
+        const slug = (msg as { slug?: string }).slug;
+        const runId = (msg as { runId?: string }).runId;
+        const threshold = (msg as { threshold?: number }).threshold ?? 0.75;
+        if (!msg.project || !slug || !runId) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Spec ${slug} not found` } })); break; }
+          const run = testRunStore.readRun(msg.project, slug, runId);
+          if (!run || !run.mutationScore) {
+            ws.send(JSON.stringify({ type: 'test-error', payload: { message: 'Run has no mutation score — run mutation testing first.' } }));
+            break;
+          }
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const repoPath = Object.values(repoPaths).find((p) => p && existsSync(p));
+          if (!repoPath) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: 'No repo clone.' } })); break; }
+          const reportPath = join(repoPath, 'reports', 'mutation', 'mutation.json');
+          if (!existsSync(reportPath)) {
+            ws.send(JSON.stringify({ type: 'test-error', payload: { message: 'Stryker report not found at reports/mutation/mutation.json' } }));
+            break;
+          }
+          const { runMutationRegen, applyRegenToSpec } = await import('./mutation-regen.js');
+          const regen = await runMutationRegen({
+            repoLocalPath: repoPath,
+            reportJsonPath: reportPath,
+            scoreThreshold: threshold,
+            maxNewBehaviors: 20,
+            conventions: spec.conventions,
+          });
+          const { spec: newSpec, cases: newCases } = applyRegenToSpec({
+            specStore: testSpecStore,
+            caseStore: testCaseStore,
+            project: msg.project,
+            specSlug: slug,
+            newBehaviors: regen.newBehaviors,
+            conventions: spec.conventions,
+          });
+          broadcast({ type: 'test-regen-complete', payload: { spec: newSpec, cases: newCases, summary: regen.summary, added: regen.newBehaviors.length } });
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'generate-contract-tests': {
+        const slug = (msg as { slug?: string }).slug;
+        if (!msg.project) break;
+        try {
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const repoPath = Object.values(repoPaths).find((p) => p && existsSync(p));
+          if (!repoPath) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: 'No repo clone.' } })); break; }
+          const { discoverContractSources, generateContractBehaviors } = await import('./contract-test-gen.js');
+          const sources = await discoverContractSources({ repoLocalPath: repoPath });
+          const result = await generateContractBehaviors({ repoLocalPath: repoPath, sources: sources.sources });
+          if (slug) {
+            const current = testSpecStore.readCurrent(msg.project, slug);
+            if (current) {
+              const merged = [...current.behaviors, ...result.behaviors];
+              const next = testSpecStore.bumpVersion(msg.project, slug, { behaviors: merged });
+              const { emitTestCase } = await import('./test-code-emitter.js');
+              const existing = testCaseStore.readCases(msg.project, slug, current.version);
+              const newCases = result.behaviors.map((b) => emitTestCase(b, current.conventions, { specSlug: slug, specVersion: next.version, projectSlug: msg.project! }));
+              testCaseStore.writeCases(msg.project, slug, next.version, [...existing, ...newCases]);
+              broadcast({ type: 'test-contract-complete', payload: { spec: next, added: result.behaviors.length, bySource: result.bySource } });
+              break;
+            }
+          }
+          ws.send(JSON.stringify({ type: 'test-contract-complete', payload: { sources, behaviors: result.behaviors, bySource: result.bySource } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'generate-integration-scenarios': {
+        const slug = (msg as { slug?: string }).slug;
+        const planSlug = (msg as { planSlug?: string }).planSlug;
+        const extraJourneys = (msg as { extraJourneys?: string[] }).extraJourneys;
+        if (!msg.project || !planSlug) break;
+        try {
+          const plan = planStore.readCurrent(msg.project, planSlug);
+          if (!plan) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Plan ${planSlug} not found` } })); break; }
+          const { generateIntegrationScenarios } = await import('./integration-scenario-gen.js');
+          const result = generateIntegrationScenarios({ plan, extraJourneys, maxScenarios: 12 });
+          if (slug) {
+            const current = testSpecStore.readCurrent(msg.project, slug);
+            if (current) {
+              const merged = [...current.behaviors, ...result.behaviors];
+              const next = testSpecStore.bumpVersion(msg.project, slug, { behaviors: merged });
+              const { emitTestCase } = await import('./test-code-emitter.js');
+              const existing = testCaseStore.readCases(msg.project, slug, current.version);
+              const newCases = result.behaviors.map((b) => emitTestCase(b, current.conventions, { specSlug: slug, specVersion: next.version, projectSlug: msg.project! }));
+              testCaseStore.writeCases(msg.project, slug, next.version, [...existing, ...newCases]);
+              broadcast({ type: 'test-scenarios-complete', payload: { spec: next, added: result.behaviors.length, derivedFrom: result.derivedFrom } });
+              break;
+            }
+          }
+          ws.send(JSON.stringify({ type: 'test-scenarios-complete', payload: { behaviors: result.behaviors, derivedFrom: result.derivedFrom } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'analyze-flakiness': {
+        const slug = (msg as { slug?: string }).slug;
+        const runId = (msg as { runId?: string }).runId;
+        const model = (msg as { model?: string }).model ?? 'claude-sonnet-4-6';
+        if (!msg.project || !slug || !runId) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Spec ${slug} not found` } })); break; }
+          const run = testRunStore.readRun(msg.project, slug, runId);
+          if (!run) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Run ${runId} not found` } })); break; }
+          const cases = testCaseStore.readCases(msg.project, slug, spec.version);
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const repoPath = Object.values(repoPaths).find((p) => p && existsSync(p));
+          if (!repoPath) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: 'No repo clone.' } })); break; }
+          const { analyzeFlakiness } = await import('./flakiness-analyzer.js');
+          ws.send(JSON.stringify({ type: 'test-flakiness-started', payload: { runId, quarantinedCount: run.flakyQuarantined.length } }));
+          const result = await analyzeFlakiness({
+            agentManager, learningsStore: testLearningsStore,
+            project: msg.project, run, cases,
+            repoLocalPath: repoPath, cwd: repoPath, model,
+            onAnalyzeStart: (caseId, agentId) => broadcast({ type: 'test-flakiness-case-start', payload: { runId, caseId, agentId } }),
+            onAnalyzeDone: (caseId, finding) => broadcast({ type: 'test-flakiness-case-done', payload: { runId, caseId, finding } }),
+            onError: (caseId, message) => broadcast({ type: 'test-flakiness-case-error', payload: { runId, caseId, message } }),
+          });
+          if (result.findings.length > 0) {
+            testRunStore.appendFindings(msg.project, slug, runId, result.findings);
+          }
+          const updated = testRunStore.readRun(msg.project, slug, runId);
+          broadcast({ type: 'test-flakiness-complete', payload: { runId, run: updated, findings: result.findings.length, signals: result.heuristicSignals } });
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'publish-test-checks': {
+        const slug = (msg as { slug?: string }).slug;
+        const runId = (msg as { runId?: string }).runId;
+        const headSha = (msg as { headSha?: string }).headSha;
+        const repo = (msg as { repo?: string }).repo;
+        if (!msg.project || !slug || !runId || !headSha || !repo) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          const run = testRunStore.readRun(msg.project, slug, runId);
+          if (!spec || !run) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: 'Spec or run not found' } })); break; }
+          const { publishTestChecks } = await import('./test-checks-publisher.js');
+          const result = await publishTestChecks({ repo, headSha, spec, run, minSeverity: 'info' });
+          ws.send(JSON.stringify({ type: 'test-checks-published', payload: result }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'share-test-spec': {
+        const slug = (msg as { slug?: string }).slug;
+        if (!msg.project || !slug) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Spec ${slug} not found` } })); break; }
+          const { signTestShareToken, getOrCreateTestShareSecret, TEST_SHARE_TOKEN_TTL_MS } = await import('./test-share.js');
+          const ttl = (msg as { ttlMs?: number }).ttlMs ?? TEST_SHARE_TOKEN_TTL_MS;
+          const secret = getOrCreateTestShareSecret(ANVIL_HOME);
+          const expiresAt = Date.now() + ttl;
+          const token = signTestShareToken({ project: spec.project, slug: spec.slug, version: spec.version, expiresAt }, secret);
+          const httpPort = (msg as { httpPort?: number }).httpPort ?? 0;
+          const url = httpPort ? `http://localhost:${httpPort}/share/tests/${token}` : `/share/tests/${token}`;
+          ws.send(JSON.stringify({ type: 'test-spec-shared', payload: { slug, token, url, expiresAt } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'get-coverage-sla': {
+        if (!msg.project) break;
+        try {
+          const { readProjectSLA } = await import('./coverage-sla.js');
+          const sla = readProjectSLA(ANVIL_HOME, msg.project);
+          ws.send(JSON.stringify({ type: 'coverage-sla', payload: { sla } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'set-coverage-sla': {
+        const sla = (msg as { sla?: any }).sla;
+        if (!msg.project || !sla) break;
+        try {
+          const { writeProjectSLA, readProjectSLA } = await import('./coverage-sla.js');
+          writeProjectSLA(ANVIL_HOME, msg.project, sla);
+          const stored = readProjectSLA(ANVIL_HOME, msg.project);
+          ws.send(JSON.stringify({ type: 'coverage-sla', payload: { sla: stored } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'check-coverage-sla': {
+        const slug = (msg as { slug?: string }).slug;
+        const runId = (msg as { runId?: string }).runId;
+        if (!msg.project || !slug || !runId) break;
+        try {
+          const { checkCoverageSLA, readProjectSLA } = await import('./coverage-sla.js');
+          const sla = readProjectSLA(ANVIL_HOME, msg.project);
+          if (!sla) { ws.send(JSON.stringify({ type: 'coverage-sla-report', payload: { report: { pass: true, violations: ['No SLA configured for this project.'] } } })); break; }
+          const run = testRunStore.readRun(msg.project, slug, runId);
+          const all = testRunStore.listRuns(msg.project, slug);
+          const prev = all.find((r) => r.id !== runId && r.completedAt) ?? null;
+          if (!run) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Run ${runId} not found` } })); break; }
+          const report = checkCoverageSLA(run, prev, sla);
+          ws.send(JSON.stringify({ type: 'coverage-sla-report', payload: { report } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'plan-parallelization': {
+        const slug = (msg as { slug?: string }).slug;
+        const runner = (msg as { runner?: string }).runner;
+        if (!msg.project || !slug) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Spec ${slug} not found` } })); break; }
+          const cases = testCaseStore.readCases(msg.project, slug, spec.version);
+          const runs = testRunStore.listRuns(msg.project, slug);
+          const { planParallelization, emitCIMatrix } = await import('./parallelization-planner.js');
+          const plan = planParallelization(runs, cases, { targetShardDurationMs: 60_000, maxShards: 8, minShards: 1 });
+          const matrix = emitCIMatrix(plan, (runner ?? spec.conventions.runner) as any);
+          ws.send(JSON.stringify({ type: 'test-parallel-plan', payload: { plan, matrix } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'detect-stale-tests': {
+        const slug = (msg as { slug?: string }).slug;
+        if (!msg.project || !slug) break;
+        try {
+          const spec = testSpecStore.readCurrent(msg.project, slug);
+          if (!spec) { ws.send(JSON.stringify({ type: 'test-error', payload: { message: `Spec ${slug} not found` } })); break; }
+          const cases = testCaseStore.readCases(msg.project, slug, spec.version);
+          const runs = testRunStore.listRuns(msg.project, slug);
+          const repoPaths = projectLoader.getRepoLocalPaths(msg.project);
+          const repoPath = Object.values(repoPaths).find((p) => p && existsSync(p));
+          const { detectStaleTests } = await import('./stale-test-detector.js');
+          const candidates = await detectStaleTests(runs, cases, { repoLocalPath: repoPath, runsWindow: 20, minNonFailRuns: 15 });
+          ws.send(JSON.stringify({ type: 'test-stale-candidates', payload: { candidates } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'test-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
         }
         break;
       }

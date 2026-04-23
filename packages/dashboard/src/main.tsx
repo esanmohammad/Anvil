@@ -12,6 +12,7 @@ import { KnowledgeGraphPage } from './components/knowledge-graph/KnowledgeGraphP
 
 import { ReviewPage } from './components/review/ReviewPage.js';
 import { TestGenPage } from './components/test-gen/TestGenPage.js';
+import { TestSpecPage } from './components/test/TestSpecPage.js';
 import { PlanPage } from './components/plan/PlanPage.js';
 import { PlanCompare } from './components/plan/PlanCompare.js';
 import { SettingsPage } from './components/settings/SettingsPage.js';
@@ -1084,6 +1085,9 @@ function App() {
 
       case 'review':
         return <ReviewPage project={currentProject?.name ?? null} ws={wsRef.current} />;
+
+      case 'tests':
+        return <TestSpecPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'test-gen':
         return <ComingSoonOverlay label="Test Generation"><TestGenPage project={currentProject?.name ?? null} ws={wsRef.current} /></ComingSoonOverlay>;

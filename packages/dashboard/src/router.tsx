@@ -18,6 +18,7 @@ export const routes: RouteConfig[] = [
   { path: '/runs', id: 'runs', label: 'Active Runs', primary: true },
   { path: '/pr-board', id: 'pr-board', label: 'Pull Requests', primary: true },
   { path: '/review', id: 'review', label: 'Review', primary: true },
+  { path: '/tests', id: 'tests', label: 'Tests', primary: true },
   { path: '/test-gen', id: 'test-gen', label: 'Test Gen', primary: true, comingSoon: true },
   { path: '/plan', id: 'plan', label: 'Plan', primary: true },
   { path: '/plan/compare', id: 'plan-compare', label: 'Compare plans' },

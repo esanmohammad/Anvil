@@ -1,10 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   GitPullRequest,
-  AlertCircle,
-  AlertTriangle,
-  Info,
-  Minus,
   CheckCircle2,
   XCircle,
   MessageSquare,
@@ -12,7 +8,6 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronRight,
-  Wrench,
   ExternalLink,
   Shield,
   Bug,
@@ -23,9 +18,18 @@ import {
   Loader2,
   Check,
   X,
-  Ban,
   Clock,
 } from 'lucide-react';
+import {
+  Pill,
+  severityConfig,
+  type Severity,
+  type Resolution,
+  type Confidence,
+} from '../common/findingPrimitives.js';
+import { FindingList, type FindingGroup } from '../common/FindingList.js';
+import { Toast } from '../common/Toast.js';
+import { useResolvableFinding } from '../common/useResolvableFinding.js';
 
 export interface ReviewPageProps {
   project: string | null;
@@ -34,11 +38,9 @@ export interface ReviewPageProps {
 
 // ── Types (mirror server review-store.ts) ──────────────────────────────
 
-type Severity = 'blocker' | 'error' | 'warn' | 'info' | 'nit';
 type Category = 'correctness' | 'security' | 'convention' | 'test' | 'perf' | 'docs' | 'plan-drift';
 type Verdict = 'approve' | 'request-changes' | 'comment';
 type Persona = 'architect' | 'security' | 'style' | 'tester' | 'domain';
-type Resolution = 'pending' | 'addressed' | 'dismissed' | 'wont-fix';
 
 interface ReviewFinding {
   id: string;
@@ -52,7 +54,7 @@ interface ReviewFinding {
   suggestedFix: { diff: string; rationale: string } | null;
   kbRef?: { nodeId: string; repo: string };
   cve?: string;
-  confidence: 'high' | 'med' | 'low';
+  confidence: Confidence;
   resolution: Resolution;
 }
 
@@ -105,19 +107,6 @@ const personaConfig: Record<Persona, { label: string; icon: React.ComponentType<
   domain: { label: 'Domain', icon: BookOpen },
 };
 
-const severityConfig: Record<Severity, {
-  label: string;
-  color: string;
-  icon: React.ComponentType<any>;
-  weight: number;
-}> = {
-  blocker: { label: 'Blocker', color: 'var(--color-error, #ef4444)', icon: AlertCircle, weight: 4 },
-  error:   { label: 'Error',   color: 'var(--color-error, #ef4444)', icon: AlertCircle, weight: 3 },
-  warn:    { label: 'Warn',    color: 'var(--color-warning, #f59e0b)', icon: AlertTriangle, weight: 2 },
-  info:    { label: 'Info',    color: 'var(--color-info, #3b82f6)', icon: Info, weight: 1 },
-  nit:     { label: 'Nit',     color: 'var(--text-tertiary)', icon: Minus, weight: 0 },
-};
-
 const categoryConfig: Record<Category, { label: string; color: string }> = {
   correctness: { label: 'correctness', color: 'var(--color-error, #ef4444)' },
   security:    { label: 'security',    color: 'var(--color-error, #ef4444)' },
@@ -158,87 +147,6 @@ const verdictConfig: Record<Verdict, {
   },
 };
 
-const resolutionConfig: Record<Exclude<Resolution, 'pending'>, {
-  label: string;
-  color: string;
-  icon: React.ComponentType<any>;
-}> = {
-  addressed: { label: 'Addressed', color: 'var(--color-success, #22c55e)', icon: Check },
-  dismissed: { label: 'Dismissed', color: 'var(--text-tertiary)', icon: X },
-  'wont-fix': { label: "Won't fix", color: 'var(--text-tertiary)', icon: Ban },
-};
-
-// ── Shared small primitives ────────────────────────────────────────────
-
-function Pill({
-  children,
-  color = 'var(--text-tertiary)',
-  bg,
-  border,
-  mono,
-}: {
-  children: React.ReactNode;
-  color?: string;
-  bg?: string;
-  border?: string;
-  mono?: boolean;
-}) {
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: 4,
-      height: 18, padding: '0 7px',
-      fontSize: 10, fontWeight: 600,
-      color,
-      background: bg ?? 'var(--bg-elevated-3)',
-      border: border ?? '1px solid transparent',
-      borderRadius: 999,
-      fontFamily: mono ? 'var(--font-mono)' : 'var(--font-sans)',
-      textTransform: 'uppercase',
-      letterSpacing: 0.3,
-      whiteSpace: 'nowrap',
-    }}>
-      {children}
-    </span>
-  );
-}
-
-function ConfidenceDot({ confidence }: { confidence: 'high' | 'med' | 'low' }) {
-  const base = {
-    width: 8, height: 8, borderRadius: 999,
-    display: 'inline-block',
-    flexShrink: 0,
-  } as const;
-  const label = `Confidence: ${confidence}`;
-  if (confidence === 'high') {
-    return (
-      <span
-        role="img"
-        aria-label={label}
-        title={label}
-        style={{ ...base, background: 'var(--text-secondary)' }}
-      />
-    );
-  }
-  if (confidence === 'med') {
-    return (
-      <span
-        role="img"
-        aria-label={label}
-        title={label}
-        style={{ ...base, background: 'transparent', border: '1.5px solid var(--text-secondary)' }}
-      />
-    );
-  }
-  return (
-    <span
-      role="img"
-      aria-label={label}
-      title={label}
-      style={{ ...base, background: 'transparent', border: '1.5px dashed var(--text-tertiary)' }}
-    />
-  );
-}
-
 // ── Helpers ────────────────────────────────────────────────────────────
 
 function parseGithubPrUrl(input: string): { repo: string; number: number } | null {
@@ -278,23 +186,22 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
   const [publishing, setPublishing] = useState(false);
   const [rereviewing, setRereviewing] = useState(false);
   const [applyingFix, setApplyingFix] = useState<Record<string, boolean>>({});
-  const [resolvingId, setResolvingId] = useState<string | null>(null);
   const [publishedResult, setPublishedResult] = useState<{ commentsPosted: number; summaryUrl: string } | null>(null);
 
-  // Remembers the previous resolution of the last-resolved finding for Undo.
-  const lastResolveRef = useRef<{ findingId: string; prev: Resolution } | null>(null);
-  const [toast, setToast] = useState<{ message: string; canUndo: boolean } | null>(null);
-  const toastTimeoutRef = useRef<number | null>(null);
-
-  const showToast = useCallback((message: string, canUndo = true) => {
-    setToast({ message, canUndo });
-    if (toastTimeoutRef.current) window.clearTimeout(toastTimeoutRef.current);
-    toastTimeoutRef.current = window.setTimeout(() => setToast(null), 4000);
-  }, []);
+  // Shared resolve/undo/toast lifecycle — functional setState inside the hook
+  // prevents the stale-closure bug we just fixed.
+  const { resolvingId, toast, resolve, undoResolve, dismissToast } = useResolvableFinding<Review>({
+    ws,
+    project,
+    resource: review,
+    setResource: setReview,
+    resolveAction: 'resolve-review-finding',
+    resolvedEvent: 'review-finding-resolved',
+    resourceIdField: 'reviewId',
+  });
 
   // UI state
   const [banner, setBanner] = useState<{ level: 'info' | 'error' | 'success'; message: string } | null>(null);
-  const [collapsedCategories, setCollapsedCategories] = useState<Partial<Record<Category, boolean>>>({});
   const [planComplianceOpen, setPlanComplianceOpen] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -381,40 +288,8 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
     }));
   }, [ws, project, review]);
 
-  const handleResolve = useCallback((findingId: string, resolution: 'addressed' | 'dismissed' | 'wont-fix') => {
-    if (!ws || !project || !review) return;
-    setResolvingId(findingId);
-    // Remember the prior resolution so we can offer undo.
-    const prev = review.findings.find((f) => f.id === findingId)?.resolution ?? 'pending';
-    lastResolveRef.current = { findingId, prev };
-    ws.send(JSON.stringify({
-      action: 'resolve-review-finding',
-      project,
-      reviewId: review.id,
-      findingId,
-      resolution,
-    }));
-  }, [ws, project, review]);
-
-  const handleUndoResolve = useCallback(() => {
-    if (!ws || !project || !review || !lastResolveRef.current) return;
-    const { findingId, prev } = lastResolveRef.current;
-    lastResolveRef.current = null;
-    setResolvingId(findingId);
-    ws.send(JSON.stringify({
-      action: 'resolve-review-finding',
-      project,
-      reviewId: review.id,
-      findingId,
-      resolution: prev,
-    }));
-  }, [ws, project, review]);
-
-  const toggleCategory = useCallback((cat: Category) => {
-    setCollapsedCategories((prev) => ({ ...prev, [cat]: !prev[cat] }));
-  }, []);
-
-  // WebSocket subscription
+  // WebSocket subscription — review-only lifecycle events. The
+  // `review-finding-resolved` event is handled inside `useResolvableFinding`.
   useEffect(() => {
     if (!ws) return;
     const handler = (event: MessageEvent) => {
@@ -443,8 +318,6 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
             setLoading(false);
             setRereviewing(false);
             setRunningReviewId(incoming.id);
-            // Clear any transient resolve spinner — latest review is authoritative.
-            setResolvingId(null);
             setApplyingFix({});
           }
           break;
@@ -484,31 +357,6 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
           }
           break;
         }
-        case 'review-finding-resolved': {
-          setResolvingId(null);
-          const p = msg.payload;
-          if (p?.review && p.review.id === review?.id) {
-            setReview(p.review as Review);
-          } else if (p?.findingId && p?.resolution && review) {
-            setReview({
-              ...review,
-              findings: review.findings.map((f) =>
-                f.id === p.findingId ? { ...f, resolution: p.resolution as Resolution } : f,
-              ),
-            });
-          }
-          // Visual feedback — toast with Undo (unless the change WAS an undo).
-          const res: Resolution | undefined = p?.resolution;
-          if (res && res !== 'pending') {
-            const label = res === 'dismissed' ? 'Finding dismissed'
-              : res === 'wont-fix' ? "Marked as won't fix"
-              : 'Finding marked addressed';
-            showToast(label, lastResolveRef.current?.findingId === p.findingId);
-          } else if (res === 'pending') {
-            showToast('Restored', false);
-          }
-          break;
-        }
         default: break;
       }
     };
@@ -521,13 +369,13 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
     [review],
   );
 
-  // Group findings by category, preserving a stable category ordering.
   // Resolved findings (addressed/dismissed/wont-fix) are excluded from the
   // main list unless `showResolved` is toggled on — the count still shows.
   const [showResolved, setShowResolved] = useState(false);
 
-  const findingsByCategory = useMemo(() => {
-    if (!review) return [] as Array<[Category, ReviewFinding[]]>;
+  // Group findings by category, preserving a stable category ordering.
+  const groups = useMemo<FindingGroup<ReviewFinding>[]>(() => {
+    if (!review) return [];
     const order: Category[] = ['correctness', 'security', 'plan-drift', 'test', 'perf', 'convention', 'docs'];
     const grouped: Record<string, ReviewFinding[]> = {};
     for (const f of review.findings) {
@@ -545,10 +393,18 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
     }
     return order
       .filter((c) => grouped[c]?.length)
-      .map((c) => [c, grouped[c]] as [Category, ReviewFinding[]]);
+      .map((c) => {
+        const cfg = categoryConfig[c];
+        return {
+          key: c,
+          label: cfg.label,
+          color: cfg.color,
+          findings: grouped[c],
+        };
+      });
   }, [review, showResolved]);
 
-  const resolvedCounts = useMemo(() => {
+  const resolvedCount = useMemo(() => {
     const counts = { addressed: 0, dismissed: 0, 'wont-fix': 0, total: 0 };
     for (const f of review?.findings ?? []) {
       if (f.resolution === 'pending') continue;
@@ -559,6 +415,59 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
   }, [review]);
 
   const parsedPr = useMemo(() => parseGithubPrUrl(prUrl), [prUrl]);
+
+  // Domain-specific render slots for the shared FindingCard.
+  const renderCategoryPill = useCallback((f: ReviewFinding) => {
+    const cfg = categoryConfig[f.category];
+    return (
+      <Pill color={cfg.color} border={`1px solid ${cfg.color}`} bg="transparent">
+        {cfg.label}
+      </Pill>
+    );
+  }, []);
+
+  const renderPersonaPill = useCallback((f: ReviewFinding) => {
+    if (!f.persona) return null;
+    const cfg = personaConfig[f.persona];
+    const Icon = cfg.icon;
+    return (
+      <Pill>
+        <Icon size={10} strokeWidth={1.75} aria-hidden="true" />
+        {cfg.label}
+      </Pill>
+    );
+  }, []);
+
+  const renderLocationTag = useCallback((f: ReviewFinding) => (
+    <>
+      {f.cve && (
+        <Pill color="var(--color-error, #ef4444)" border="1px solid var(--color-error, #ef4444)" bg="transparent" mono>
+          {f.cve}
+        </Pill>
+      )}
+      <span style={{
+        fontFamily: 'var(--font-mono)', fontSize: 11,
+        color: 'var(--text-secondary)',
+        marginLeft: 2,
+      }}>
+        {f.file}
+        <span style={{ color: 'var(--text-tertiary)' }}>:{f.line}</span>
+      </span>
+      {f.kbRef && (
+        <span
+          style={{
+            fontSize: 10, fontFamily: 'var(--font-mono)',
+            color: 'var(--text-tertiary)',
+            padding: '1px 6px', borderRadius: 3,
+            background: 'var(--bg-elevated-3)',
+          }}
+          title={`KB: ${f.kbRef.repo}#${f.kbRef.nodeId}`}
+        >
+          kb:{f.kbRef.nodeId.slice(0, 6)}
+        </span>
+      )}
+    </>
+  ), []);
 
   // ── Render ───────────────────────────────────────────────────────────
 
@@ -777,61 +686,14 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
         </div>
       )}
 
-      {/* Toast — bottom-right, auto-dismiss 4s */}
+      {/* Toast — shared primitive, auto-dismiss timing lives in the hook */}
       {toast && (
-        <div
-          role="status"
-          aria-live="polite"
-          style={{
-            position: 'fixed',
-            bottom: 24,
-            right: 24,
-            zIndex: 1000,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 12,
-            padding: '10px 14px',
-            background: 'var(--bg-elevated-3)',
-            border: '1px solid var(--separator)',
-            borderRadius: 'var(--radius-md)',
-            color: 'var(--text-primary)',
-            fontSize: 13,
-            fontFamily: 'var(--font-sans)',
-            boxShadow: '0 8px 24px rgba(0,0,0,0.25)',
-            animation: 'slide-in 200ms var(--ease-default, ease-out)',
-          }}
-        >
-          <CheckCircle2 size={14} style={{ color: 'var(--color-success, #22c55e)' }} aria-hidden="true" />
-          <span>{toast.message}</span>
-          {toast.canUndo && (
-            <button
-              onClick={() => { handleUndoResolve(); setToast(null); }}
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: 'var(--accent)',
-                fontWeight: 600,
-                fontSize: 12,
-                cursor: 'pointer',
-                padding: 0,
-                marginLeft: 4,
-              }}
-            >
-              Undo
-            </button>
-          )}
-          <button
-            onClick={() => setToast(null)}
-            aria-label="Dismiss toast"
-            style={{
-              background: 'transparent', border: 'none',
-              color: 'var(--text-tertiary)', cursor: 'pointer',
-              padding: 0, marginLeft: 4,
-            }}
-          >
-            <X size={12} strokeWidth={2} />
-          </button>
-        </div>
+        <Toast
+          message={toast.message}
+          canUndo={toast.canUndo}
+          onUndo={undoResolve}
+          onDismiss={dismissToast}
+        />
       )}
 
       {/* Body */}
@@ -870,58 +732,20 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
               />
             )}
 
-            {findingsByCategory.length === 0 ? (
-              <div style={{
-                padding: 24, textAlign: 'center',
-                fontSize: 13, color: 'var(--color-success, #22c55e)',
-                background: 'var(--bg-elevated-2)',
-                border: '1px solid var(--separator)',
-                borderRadius: 'var(--radius-md)',
-              }}>
-                <CheckCircle2 size={20} style={{ verticalAlign: 'middle', marginRight: 8 }} aria-hidden="true" />
-                No findings from {review.personas.length} persona{review.personas.length !== 1 ? 's' : ''} — looks clean.
-              </div>
-            ) : (
-              findingsByCategory.map(([cat, findings]) => (
-                <CategoryGroup
-                  key={cat}
-                  category={cat}
-                  findings={findings}
-                  collapsed={!!collapsedCategories[cat]}
-                  onToggle={() => toggleCategory(cat)}
-                  onApplyFix={handleApplyFix}
-                  onResolve={handleResolve}
-                  applyingFix={applyingFix}
-                  resolvingId={resolvingId}
-                />
-              ))
-            )}
-
-            {resolvedCounts.total > 0 && (
-              <button
-                onClick={() => setShowResolved((v) => !v)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  width: '100%', marginTop: 8,
-                  padding: '10px 14px',
-                  background: 'transparent',
-                  border: '1px dashed var(--separator)',
-                  borderRadius: 'var(--radius-md)',
-                  color: 'var(--text-tertiary)',
-                  fontSize: 12,
-                  fontFamily: 'var(--font-sans)',
-                  cursor: 'pointer',
-                  textAlign: 'left',
-                }}
-              >
-                {showResolved ? '— Hide resolved' : '+ Show resolved'}
-                <span style={{ color: 'var(--text-secondary)' }}>
-                  {resolvedCounts.addressed > 0 && ` ${resolvedCounts.addressed} addressed`}
-                  {resolvedCounts.dismissed > 0 && ` · ${resolvedCounts.dismissed} dismissed`}
-                  {resolvedCounts['wont-fix'] > 0 && ` · ${resolvedCounts['wont-fix']} won't fix`}
-                </span>
-              </button>
-            )}
+            <FindingList<ReviewFinding>
+              groups={groups}
+              emptyMessage={`No findings from ${review.personas.length} persona${review.personas.length !== 1 ? 's' : ''} — looks clean.`}
+              resolvedCount={resolvedCount}
+              showResolved={showResolved}
+              onToggleShowResolved={() => setShowResolved((v) => !v)}
+              onApplyFix={handleApplyFix}
+              onResolve={resolve}
+              applyingFix={applyingFix}
+              resolvingId={resolvingId}
+              renderCategoryPill={renderCategoryPill}
+              renderPersonaPill={renderPersonaPill}
+              renderLocationTag={renderLocationTag}
+            />
 
             <div style={{ height: 40 }} />
           </>
@@ -1428,367 +1252,6 @@ function ComplianceList({
         </ul>
       )}
     </div>
-  );
-}
-
-// ── Category group ─────────────────────────────────────────────────────
-
-function CategoryGroup({
-  category,
-  findings,
-  collapsed,
-  onToggle,
-  onApplyFix,
-  onResolve,
-  applyingFix,
-  resolvingId,
-}: {
-  category: Category;
-  findings: ReviewFinding[];
-  collapsed: boolean;
-  onToggle: () => void;
-  onApplyFix: (id: string) => void;
-  onResolve: (id: string, resolution: 'addressed' | 'dismissed' | 'wont-fix') => void;
-  applyingFix: Record<string, boolean>;
-  resolvingId: string | null;
-}) {
-  const cfg = categoryConfig[category];
-  const pendingCount = findings.filter((f) => f.resolution === 'pending').length;
-  return (
-    <section
-      aria-label={`${cfg.label} findings`}
-      style={{ marginBottom: 12 }}
-    >
-      <button
-        onClick={onToggle}
-        aria-expanded={!collapsed}
-        aria-controls={`category-${category}-body`}
-        style={{
-          display: 'flex', alignItems: 'center', gap: 8,
-          width: '100%', padding: '8px 12px',
-          background: 'var(--bg-elevated-2)',
-          border: '1px solid var(--separator)',
-          borderRadius: 'var(--radius-sm)',
-          color: 'var(--text-primary)',
-          fontSize: 13, fontWeight: 600,
-          cursor: 'pointer',
-          fontFamily: 'var(--font-sans)',
-          textAlign: 'left',
-        }}
-      >
-        {collapsed ? <ChevronRight size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
-        <span style={{
-          display: 'inline-block', width: 8, height: 8, borderRadius: 999,
-          background: cfg.color, flexShrink: 0,
-        }} />
-        {cfg.label}
-        <span style={{
-          fontSize: 11, fontWeight: 500,
-          color: 'var(--text-tertiary)',
-          marginLeft: 4,
-        }}>
-          {findings.length}
-        </span>
-        {pendingCount > 0 && pendingCount !== findings.length && (
-          <span style={{
-            fontSize: 10, fontWeight: 600,
-            padding: '1px 6px', borderRadius: 999,
-            background: 'var(--bg-elevated-3)',
-            color: 'var(--text-tertiary)',
-            marginLeft: 4,
-          }}>
-            {pendingCount} pending
-          </span>
-        )}
-      </button>
-
-      {!collapsed && (
-        <div
-          id={`category-${category}-body`}
-          style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}
-        >
-          {findings.map((f) => (
-            <FindingCard
-              key={f.id}
-              finding={f}
-              onApplyFix={() => onApplyFix(f.id)}
-              onResolve={(r) => onResolve(f.id, r)}
-              applying={!!applyingFix[f.id]}
-              resolving={resolvingId === f.id}
-            />
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-// ── Finding card ───────────────────────────────────────────────────────
-
-function FindingCard({
-  finding,
-  onApplyFix,
-  onResolve,
-  applying,
-  resolving,
-}: {
-  finding: ReviewFinding;
-  onApplyFix: () => void;
-  onResolve: (resolution: 'addressed' | 'dismissed' | 'wont-fix') => void;
-  applying: boolean;
-  resolving: boolean;
-}) {
-  const sevCfg = severityConfig[finding.severity];
-  const SevIcon = sevCfg.icon;
-  const catCfg = categoryConfig[finding.category];
-  const personaCfg = finding.persona ? personaConfig[finding.persona] : null;
-  const PersonaIcon = personaCfg?.icon;
-  const isResolved = finding.resolution !== 'pending';
-  const resCfg = isResolved ? resolutionConfig[finding.resolution as Exclude<Resolution, 'pending'>] : null;
-  const ResIcon = resCfg?.icon;
-
-  return (
-    <article
-      aria-label={`Finding: ${finding.description.slice(0, 80)}`}
-      style={{
-        padding: '12px 14px',
-        background: 'var(--bg-elevated-2)',
-        border: '1px solid var(--separator)',
-        borderRadius: 'var(--radius-md)',
-        opacity: isResolved && finding.resolution !== 'addressed' ? 0.65 : 1,
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
-        <SevIcon
-          size={16}
-          strokeWidth={1.75}
-          style={{ color: sevCfg.color, marginTop: 2, flexShrink: 0 }}
-          aria-label={sevCfg.label}
-        />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {/* meta row */}
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 6,
-            flexWrap: 'wrap', marginBottom: 6,
-          }}>
-            <Pill color={catCfg.color} border={`1px solid ${catCfg.color}`} bg="transparent">
-              {catCfg.label}
-            </Pill>
-            {personaCfg && PersonaIcon && (
-              <Pill>
-                <PersonaIcon size={10} strokeWidth={1.75} aria-hidden="true" />
-                {personaCfg.label}
-              </Pill>
-            )}
-            <ConfidenceDot confidence={finding.confidence} />
-            {finding.cve && (
-              <Pill color="var(--color-error, #ef4444)" border="1px solid var(--color-error, #ef4444)" bg="transparent" mono>
-                {finding.cve}
-              </Pill>
-            )}
-            <span style={{
-              fontFamily: 'var(--font-mono)', fontSize: 11,
-              color: 'var(--text-secondary)',
-              marginLeft: 2,
-            }}>
-              {finding.file}
-              <span style={{ color: 'var(--text-tertiary)' }}>:{finding.line}</span>
-            </span>
-            {finding.kbRef && (
-              <span
-                style={{
-                  fontSize: 10, fontFamily: 'var(--font-mono)',
-                  color: 'var(--text-tertiary)',
-                  padding: '1px 6px', borderRadius: 3,
-                  background: 'var(--bg-elevated-3)',
-                }}
-                title={`KB: ${finding.kbRef.repo}#${finding.kbRef.nodeId}`}
-              >
-                kb:{finding.kbRef.nodeId.slice(0, 6)}
-              </span>
-            )}
-          </div>
-
-          {/* snippet */}
-          {finding.snippet && (
-            <pre style={{
-              margin: '0 0 8px', padding: '8px 10px',
-              background: 'var(--bg-base)',
-              border: '1px solid var(--separator)',
-              borderRadius: 'var(--radius-sm)',
-              fontSize: 11, fontFamily: 'var(--font-mono)',
-              color: 'var(--text-secondary)',
-              lineHeight: 1.5,
-              whiteSpace: 'pre',
-              overflowX: 'auto',
-            }}>
-              {finding.snippet}
-            </pre>
-          )}
-
-          {/* description */}
-          <div style={{ fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.55 }}>
-            {finding.description}
-          </div>
-
-          {/* suggested fix */}
-          {finding.suggestedFix && (
-            <div style={{
-              marginTop: 10,
-              padding: '8px 10px',
-              background: 'var(--bg-elevated-3)',
-              border: '1px dashed var(--separator)',
-              borderRadius: 'var(--radius-sm)',
-            }}>
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 6,
-                fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)',
-                marginBottom: 4, textTransform: 'uppercase',
-              }}>
-                <Wrench size={11} strokeWidth={1.75} aria-hidden="true" />
-                Suggested fix
-              </div>
-              <div style={{
-                fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5,
-                marginBottom: 8,
-              }}>
-                {finding.suggestedFix.rationale}
-              </div>
-              <details>
-                <summary style={{
-                  fontSize: 11, color: 'var(--accent)',
-                  cursor: 'pointer', userSelect: 'none',
-                  fontFamily: 'var(--font-sans)',
-                }}>
-                  Show diff
-                </summary>
-                <pre style={{
-                  margin: '6px 0 0', padding: '8px 10px',
-                  background: 'var(--bg-base)',
-                  borderRadius: 'var(--radius-sm)',
-                  fontSize: 11, fontFamily: 'var(--font-mono)',
-                  color: 'var(--text-secondary)',
-                  lineHeight: 1.5,
-                  whiteSpace: 'pre',
-                  overflowX: 'auto',
-                  border: '1px solid var(--separator)',
-                }}>
-                  {finding.suggestedFix.diff}
-                </pre>
-              </details>
-              {!isResolved && (
-                <button
-                  onClick={onApplyFix}
-                  disabled={applying}
-                  aria-busy={applying}
-                  style={{
-                    marginTop: 8,
-                    display: 'inline-flex', alignItems: 'center', gap: 6,
-                    height: 26, padding: '0 10px',
-                    fontSize: 11, fontWeight: 600,
-                    background: 'var(--accent)',
-                    color: 'var(--text-inverse)',
-                    border: 'none', borderRadius: 'var(--radius-sm)',
-                    cursor: applying ? 'wait' : 'pointer',
-                    opacity: applying ? 0.7 : 1,
-                    fontFamily: 'var(--font-sans)',
-                  }}
-                >
-                  {applying ? (
-                    <Loader2 size={11} style={{ animation: 'spin 1s linear infinite' }} aria-hidden="true" />
-                  ) : (
-                    <Wrench size={11} strokeWidth={1.75} aria-hidden="true" />
-                  )}
-                  {applying ? 'Applying…' : 'Apply fix'}
-                </button>
-              )}
-            </div>
-          )}
-
-          {/* resolution footer */}
-          <div style={{
-            marginTop: 10, paddingTop: 8,
-            borderTop: '1px dashed var(--separator)',
-            display: 'flex', alignItems: 'center', gap: 6,
-            fontSize: 11,
-          }}>
-            {isResolved && resCfg && ResIcon ? (
-              <span style={{
-                display: 'inline-flex', alignItems: 'center', gap: 4,
-                height: 22, padding: '0 8px', borderRadius: 999,
-                fontSize: 11, fontWeight: 600,
-                color: resCfg.color,
-                background: 'var(--bg-elevated-3)',
-                border: `1px solid ${resCfg.color === 'var(--text-tertiary)' ? 'var(--separator)' : resCfg.color}`,
-              }}>
-                <ResIcon size={11} strokeWidth={2} aria-hidden="true" />
-                {resCfg.label}
-              </span>
-            ) : (
-              <>
-                <span style={{ color: 'var(--text-tertiary)' }}>Mark as:</span>
-                <ResolveButton
-                  label="Addressed"
-                  icon={Check}
-                  color="var(--color-success, #22c55e)"
-                  onClick={() => onResolve('addressed')}
-                  loading={resolving}
-                />
-                <ResolveButton
-                  label="Dismiss"
-                  icon={X}
-                  color="var(--text-secondary)"
-                  onClick={() => onResolve('dismissed')}
-                  loading={resolving}
-                />
-                <ResolveButton
-                  label="Won't fix"
-                  icon={Ban}
-                  color="var(--text-secondary)"
-                  onClick={() => onResolve('wont-fix')}
-                  loading={resolving}
-                />
-              </>
-            )}
-          </div>
-        </div>
-      </div>
-    </article>
-  );
-}
-
-function ResolveButton({
-  label,
-  icon: Icon,
-  color,
-  onClick,
-  loading,
-}: {
-  label: string;
-  icon: React.ComponentType<any>;
-  color: string;
-  onClick: () => void;
-  loading: boolean;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={loading}
-      style={{
-        display: 'inline-flex', alignItems: 'center', gap: 4,
-        height: 22, padding: '0 8px',
-        fontSize: 11, fontWeight: 500,
-        background: 'transparent',
-        border: '1px solid var(--separator)',
-        borderRadius: 999,
-        color,
-        cursor: loading ? 'wait' : 'pointer',
-        fontFamily: 'var(--font-sans)',
-      }}
-    >
-      <Icon size={10} strokeWidth={2} aria-hidden="true" />
-      {label}
-    </button>
   );
 }
 
