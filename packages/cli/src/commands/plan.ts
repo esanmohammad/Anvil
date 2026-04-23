@@ -1,289 +1,519 @@
-// CLI command: anvil plan <project> "<feature>" — architecture-first planning
+/**
+ * `anvil plan` — command group for the structured Plan feature.
+ *
+ * All subcommands talk to a running `anvil dashboard` over WebSocket. They
+ * resolve the active project from --project, ./factory.yaml, or ./anvil.yaml,
+ * and exit with actionable error messages when the dashboard isn't running.
+ */
 
 import { Command } from 'commander';
-import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
-import { createInterface } from 'node:readline';
 import pc from 'picocolors';
-import { info, success, error } from '../logger.js';
+import { info, success, warn, error } from '../logger.js';
+import { getAnvilHome } from '../home.js';
+import { connectDashboard, type DashboardClient, type DashboardMessage } from '../lib/dashboard-ws.js';
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Types (narrow local mirrors of the dashboard-side types) ─────────────
 
-function resolveBinary(): string {
-  return (
-    process.env.ANVIL_AGENT_CMD ??
-    process.env.FF_AGENT_CMD ??
-    process.env.CLAUDE_BIN ??
-    'claude'
-  );
+interface PlanPointer {
+  slug: string;
+  title: string;
+  currentVersion: number;
+  updatedAt: string;
 }
 
-function loadFactoryConfig(project: string): Record<string, unknown> | null {
-  const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil');
-  const paths = [
-    join(anvilHome, 'projects', project, 'factory.yaml'),
-    join(anvilHome, 'projects', project, 'project.yaml'),
+interface PlanEstimate { usd: number; minutes: number; prs: number }
+
+interface Plan {
+  version: number;
+  slug: string;
+  project: string;
+  title: string;
+  problem: string;
+  scope: { inScope: string[]; outOfScope: string[] };
+  repos: Array<{ name: string; changes: string; files: string[]; symbols: string[] }>;
+  contracts: Array<{ kind: string; name: string; producer: string; consumers: string[]; description: string }>;
+  architecture: { mermaid: string; notes: string };
+  risks: Array<{ title: string; mitigation: string; severity: string }>;
+  rollout: { strategy: string; flags: string[]; order: string[]; rollback: string };
+  tests: { unit: string[]; integration: string[]; manual: string[] };
+  estimate: PlanEstimate;
+  model: string;
+  feature: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface PlanIssue { severity: 'error' | 'warn' | 'info'; path: string; message: string; hint?: string; repo?: string }
+interface PlanValidation {
+  generatedAt: string;
+  planVersion: number;
+  issues: PlanIssue[];
+  counts: { errors: number; warnings: number; infos: number };
+}
+
+// ── Project resolution ──────────────────────────────────────────────────
+
+/** Parse a `project:` value out of a YAML-ish config file. */
+function readProjectField(path: string): string | null {
+  try {
+    const raw = readFileSync(path, 'utf-8');
+    const m = raw.match(/^\s*project:\s*["']?([^"'\r\n#]+)["']?\s*$/m);
+    return m ? m[1].trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function listConfiguredProjects(): string[] {
+  const projectsDir = join(getAnvilHome(), 'projects');
+  if (!existsSync(projectsDir)) return [];
+  try {
+    return readdirSync(projectsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
+      .map((d) => d.name)
+      .filter((name) => existsSync(join(projectsDir, name, 'factory.yaml'))
+        || existsSync(join(projectsDir, name, 'project.yaml')));
+  } catch { return []; }
+}
+
+/**
+ * Resolve the project name from CLI opts or the working directory.
+ * - --project flag wins.
+ * - Otherwise: ./factory.yaml → ./anvil.yaml → ./.factory/config.yaml.
+ * - If none found and multiple projects are configured, exit with a list.
+ */
+function resolveProject(explicit?: string): string {
+  if (explicit) return explicit;
+
+  const cwd = process.cwd();
+  const candidates = [
+    join(cwd, 'factory.yaml'),
+    join(cwd, 'anvil.yaml'),
+    join(cwd, '.factory', 'config.yaml'),
+    join(cwd, '.anvil', 'config.yaml'),
   ];
-  for (const p of paths) {
-    if (existsSync(p)) {
-      try {
-        return { _raw: readFileSync(p, 'utf-8'), _path: p };
-      } catch { /* ignore */ }
+
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    const name = readProjectField(path);
+    if (name) return name;
+  }
+
+  // No local hint — fall back to the single configured project, if unambiguous.
+  const projects = listConfiguredProjects();
+  if (projects.length === 1) return projects[0];
+
+  if (projects.length === 0) {
+    error('No project specified and no factory.yaml/anvil.yaml in the current directory.');
+    error('Pass --project <name> or run `anvil init` to scaffold one.');
+  } else {
+    error('Multiple projects configured — please pass --project <name>.');
+    for (const p of projects) error(`  - ${p}`);
+  }
+  process.exit(1);
+}
+
+// ── `--from-issue` helper ────────────────────────────────────────────────
+
+function fetchIssueViaGh(url: string): { title: string; body: string; labels: string[] } {
+  try {
+    const out = execSync(`gh issue view ${JSON.stringify(url)} --json title,body,labels`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 15_000,
+    });
+    const parsed = JSON.parse(out) as { title?: string; body?: string; labels?: Array<{ name?: string } | string> };
+    return {
+      title: parsed.title ?? '',
+      body: parsed.body ?? '',
+      labels: (parsed.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name ?? '')).filter(Boolean),
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    error(`Failed to fetch issue via gh: ${msg}`);
+    error('Check that `gh` is installed, authenticated, and the URL is correct.');
+    process.exit(1);
+  }
+}
+
+// ── Markdown rendering (minimal reimplementation of PlanStore.renderMarkdown) ──
+
+function renderPlanMarkdown(plan: Plan): string {
+  const lines: string[] = [];
+  lines.push(`# ${plan.title}`);
+  lines.push(`> Plan v${plan.version} — ${plan.project} — ${plan.model}`);
+  lines.push('');
+
+  lines.push('## Problem');
+  lines.push(plan.problem || '_No problem statement._');
+  lines.push('');
+
+  lines.push('## Scope');
+  if (plan.scope.inScope.length) {
+    lines.push('**In scope**');
+    for (const s of plan.scope.inScope) lines.push(`- ${s}`);
+  }
+  if (plan.scope.outOfScope.length) {
+    lines.push('');
+    lines.push('**Out of scope**');
+    for (const s of plan.scope.outOfScope) lines.push(`- ${s}`);
+  }
+  lines.push('');
+
+  if (plan.repos.length) {
+    lines.push('## Affected repositories');
+    for (const r of plan.repos) {
+      lines.push(`### ${r.name}`);
+      if (r.changes) lines.push(r.changes);
+      if (r.files.length) lines.push(`**Files:** ${r.files.map((f) => `\`${f}\``).join(', ')}`);
+      if (r.symbols.length) lines.push(`**Symbols:** ${r.symbols.map((s) => `\`${s}\``).join(', ')}`);
+      lines.push('');
     }
   }
-  return null;
-}
 
-function extractDomainContext(rawConfig: string): string {
-  // Extract known domain-context sections from factory.yaml
-  const sections: string[] = [];
-  const sectionNames = ['invariants', 'sharp_edges', 'critical_flows', 'domain', 'constraints', 'architecture'];
+  if (plan.contracts.length) {
+    lines.push('## Cross-repo contracts');
+    for (const c of plan.contracts) {
+      lines.push(`- **${c.kind.toUpperCase()} · ${c.name}** — ${c.producer} → ${c.consumers.join(', ') || '(none)'}`);
+      if (c.description) lines.push(`  ${c.description}`);
+    }
+    lines.push('');
+  }
 
-  let currentSection = '';
-  let capturing = false;
-
-  for (const line of rawConfig.split('\n')) {
-    const sectionMatch = line.match(/^(\w[\w_-]*):/);
-    if (sectionMatch) {
-      const name = sectionMatch[1];
-      if (sectionNames.includes(name)) {
-        capturing = true;
-        currentSection = line + '\n';
-      } else {
-        if (capturing && currentSection) {
-          sections.push(currentSection.trim());
-        }
-        capturing = false;
-        currentSection = '';
-      }
-    } else if (capturing) {
-      currentSection += line + '\n';
+  if (plan.architecture.notes || plan.architecture.mermaid) {
+    lines.push('## Architecture');
+    if (plan.architecture.notes) { lines.push(plan.architecture.notes); lines.push(''); }
+    if (plan.architecture.mermaid) {
+      lines.push('```mermaid');
+      lines.push(plan.architecture.mermaid);
+      lines.push('```');
+      lines.push('');
     }
   }
-  if (capturing && currentSection) {
-    sections.push(currentSection.trim());
+
+  if (plan.risks.length) {
+    lines.push('## Risks');
+    for (const r of plan.risks) lines.push(`- **[${r.severity}] ${r.title}** — ${r.mitigation}`);
+    lines.push('');
   }
 
-  return sections.join('\n\n');
+  lines.push('## Rollout');
+  if (plan.rollout.strategy) lines.push(plan.rollout.strategy);
+  if (plan.rollout.flags.length) lines.push(`- Flags: ${plan.rollout.flags.join(', ')}`);
+  if (plan.rollout.order.length) lines.push(`- Order: ${plan.rollout.order.join(' → ')}`);
+  if (plan.rollout.rollback) lines.push(`- Rollback: ${plan.rollout.rollback}`);
+  lines.push('');
+
+  lines.push('## Tests');
+  if (plan.tests.unit.length) {
+    lines.push('**Unit**');
+    for (const t of plan.tests.unit) lines.push(`- ${t}`);
+  }
+  if (plan.tests.integration.length) {
+    lines.push('**Integration**');
+    for (const t of plan.tests.integration) lines.push(`- ${t}`);
+  }
+  if (plan.tests.manual.length) {
+    lines.push('**Manual**');
+    for (const t of plan.tests.manual) lines.push(`- ${t}`);
+  }
+  lines.push('');
+
+  lines.push('## Estimate');
+  lines.push(`- ~$${plan.estimate.usd.toFixed(2)} · ${plan.estimate.minutes} min · ${plan.estimate.prs} PR(s)`);
+
+  return lines.join('\n') + '\n';
 }
 
-// ---------------------------------------------------------------------------
-// Stream-JSON result parser
-// ---------------------------------------------------------------------------
+// ── Agent-output streaming ───────────────────────────────────────────────
 
-interface StreamResult {
-  output: string;
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
-  durationMs: number;
+/** Extract a short text snippet from an agent-output broadcast. */
+function streamAgentOutput(msg: DashboardMessage): void {
+  if (msg.type !== 'agent-output') return;
+  const payload = msg.payload as { entries?: Array<{ content?: string; summary?: string; kind?: string }> } | undefined;
+  const entries = payload?.entries;
+  if (!Array.isArray(entries)) return;
+
+  for (const entry of entries) {
+    const text = (entry.content || entry.summary || '').trim();
+    if (!text) continue;
+    // Keep it readable — cap each broadcast at 4 lines.
+    const lines = text.split(/\r?\n/).slice(0, 4);
+    for (const line of lines) process.stdout.write(`  ${pc.dim('│')} ${line}\n`);
+  }
 }
 
-function parseStreamResult(child: ReturnType<typeof spawn>): Promise<StreamResult> {
-  return new Promise((resolve, reject) => {
-    let buffer = '';
-    let output = '';
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let costUsd = 0;
-    let durationMs = 0;
+// ── Subcommand: plan new ────────────────────────────────────────────────
 
-    child.stdout?.on('data', (chunk: Buffer) => {
-      const data = chunk.toString();
-      process.stdout.write(data);
+const newCmd = new Command('new')
+  .description('Generate a new plan for a feature (requires `anvil dashboard` running)')
+  .argument('<feature>', 'Feature description')
+  .option('--project <name>', 'Project name (defaults to factory.yaml in cwd)')
+  .option('--model <id>', 'Model id to use for planning')
+  .option('--from-issue <url>', 'Prepend the title + body of a GitHub issue (uses `gh`)')
+  .option('--port <port>', 'Dashboard port', '5173')
+  .action(async (feature: string, opts: Record<string, string | undefined>) => {
+    const project = resolveProject(opts.project);
+    const port = parseInt(opts.port || '5173', 10);
 
-      buffer += data;
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+    let fullFeature = feature;
+    if (opts.fromIssue) {
+      info(`Fetching issue ${opts.fromIssue}...`);
+      const issue = fetchIssueViaGh(opts.fromIssue);
+      fullFeature = `# ${issue.title}\n\n${issue.body}\n\n---\n\n${feature}`;
+      if (issue.labels.length) info(`Labels: ${issue.labels.join(', ')}`);
+    }
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const msg = JSON.parse(trimmed);
-          if (msg.type === 'assistant' && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === 'text' && block.text) {
-                output += block.text;
-              }
-            }
-          } else if (msg.type === 'result') {
-            if (msg.result) output = msg.result;
-            inputTokens = msg.usage?.input_tokens ?? 0;
-            outputTokens = msg.usage?.output_tokens ?? 0;
-            costUsd = msg.total_cost_usd ?? 0;
-            durationMs = msg.duration_ms ?? 0;
-          }
-        } catch { /* skip non-JSON */ }
+    let client: DashboardClient | null = null;
+    try {
+      client = await connectDashboard({ port });
+      info(`Connected to dashboard at ${client.url}`);
+      info(`Planning "${pc.bold(project)}"...`);
+      console.error('');
+
+      const result = await client.request<{ plan: Plan; validation: PlanValidation | null }>(
+        { action: 'run-plan', project, feature: fullFeature, options: { model: opts.model } },
+        {
+          resolveOn: ['plan-created'],
+          rejectOn: ['error', 'plan-error'],
+          onMessage: streamAgentOutput,
+          timeoutMs: 10 * 60_000,
+        },
+      );
+
+      const { plan, validation } = result.payload;
+      console.error('');
+      success(`Plan created: ${pc.bold(plan.title)}`);
+      console.error(`  slug:    ${plan.slug}`);
+      console.error(`  version: v${plan.version}`);
+      console.error(`  repos:   ${plan.repos.length}`);
+      console.error(`  cost:    ~$${plan.estimate.usd.toFixed(2)} · ${plan.estimate.minutes} min · ${plan.estimate.prs} PR(s)`);
+      if (validation) {
+        const { errors, warnings, infos } = validation.counts;
+        console.error(`  lint:    ${errors} error(s), ${warnings} warning(s), ${infos} info(s)`);
       }
-    });
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      process.stderr.write(chunk);
-    });
-
-    child.on('close', (code) => {
-      resolve({ output, inputTokens, outputTokens, costUsd, durationMs });
-    });
-
-    child.on('error', reject);
+      console.error('');
+      info(`View: ${pc.cyan(`anvil plan show ${plan.slug} --project ${project}`)}`);
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    } finally {
+      client?.close();
+    }
   });
-}
 
-// ---------------------------------------------------------------------------
-// Command
-// ---------------------------------------------------------------------------
+// ── Subcommand: plan show ───────────────────────────────────────────────
+
+const showCmd = new Command('show')
+  .description('Show a plan in markdown or JSON')
+  .argument('<slug>', 'Plan slug')
+  .option('--project <name>', 'Project name')
+  .option('--format <fmt>', 'Output format: md or json', 'md')
+  .option('--port <port>', 'Dashboard port', '5173')
+  .action(async (slug: string, opts: Record<string, string | undefined>) => {
+    const project = resolveProject(opts.project);
+    const port = parseInt(opts.port || '5173', 10);
+    const format = (opts.format || 'md').toLowerCase();
+
+    let client: DashboardClient | null = null;
+    try {
+      client = await connectDashboard({ port });
+      const { payload } = await client.request<{ plan: Plan | null; validation: PlanValidation | null }>(
+        { action: 'get-plan', project, planSlug: slug },
+        { resolveOn: ['plan'], rejectOn: ['error'] },
+      );
+
+      if (!payload.plan) {
+        error(`Plan not found: ${project}/${slug}`);
+        process.exitCode = 1;
+        return;
+      }
+
+      if (format === 'json') {
+        process.stdout.write(JSON.stringify(payload.plan, null, 2) + '\n');
+      } else if (format === 'md' || format === 'markdown') {
+        process.stdout.write(renderPlanMarkdown(payload.plan));
+      } else {
+        error(`Unknown format: ${format}. Use md or json.`);
+        process.exitCode = 1;
+      }
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    } finally {
+      client?.close();
+    }
+  });
+
+// ── Subcommand: plan list ───────────────────────────────────────────────
+
+const listCmd = new Command('list')
+  .description('List plans for a project')
+  .option('--project <name>', 'Project name (omit to list all)')
+  .option('--port <port>', 'Dashboard port', '5173')
+  .action(async (opts: Record<string, string | undefined>) => {
+    // `list` is tolerant of an unset project: the server accepts undefined.
+    const project = opts.project ?? (() => {
+      try { return resolveProject(undefined); } catch { return undefined; }
+    })();
+    const port = parseInt(opts.port || '5173', 10);
+
+    let client: DashboardClient | null = null;
+    try {
+      client = await connectDashboard({ port });
+      const { payload } = await client.request<{ plans: PlanPointer[] }>(
+        { action: 'get-plans', project },
+        { resolveOn: ['plans'], rejectOn: ['error'] },
+      );
+
+      const plans = payload.plans ?? [];
+      if (plans.length === 0) {
+        info(project ? `No plans for project "${project}".` : 'No plans found.');
+        return;
+      }
+
+      // Table: slug | title | version | updatedAt
+      const header = ['SLUG', 'TITLE', 'VERSION', 'UPDATED'];
+      const rows = plans.map((p) => [
+        p.slug,
+        p.title.length > 50 ? p.title.slice(0, 47) + '...' : p.title,
+        `v${p.currentVersion}`,
+        p.updatedAt.slice(0, 16).replace('T', ' '),
+      ]);
+      const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
+
+      const fmtRow = (cells: string[]): string =>
+        cells.map((c, i) => c.padEnd(widths[i])).join('  ');
+
+      console.log(pc.bold(fmtRow(header)));
+      console.log(widths.map((w) => '─'.repeat(w)).join('  '));
+      for (const row of rows) console.log(fmtRow(row));
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    } finally {
+      client?.close();
+    }
+  });
+
+// ── Subcommand: plan validate ───────────────────────────────────────────
+
+const validateCmd = new Command('validate')
+  .description('Validate a plan. Exits non-zero if errors are found (CI-friendly).')
+  .argument('<slug>', 'Plan slug')
+  .option('--project <name>', 'Project name')
+  .option('--port <port>', 'Dashboard port', '5173')
+  .action(async (slug: string, opts: Record<string, string | undefined>) => {
+    const project = resolveProject(opts.project);
+    const port = parseInt(opts.port || '5173', 10);
+
+    let client: DashboardClient | null = null;
+    try {
+      client = await connectDashboard({ port });
+      const { payload } = await client.request<{ validation: PlanValidation; planSlug: string }>(
+        { action: 'validate-plan', project, planSlug: slug },
+        {
+          resolveOn: ['plan-validation'],
+          rejectOn: ['error'],
+          filter: (m) => {
+            const p = m.payload as { planSlug?: string } | undefined;
+            return !p?.planSlug || p.planSlug === slug;
+          },
+        },
+      );
+
+      const { errors, warnings, infos } = payload.validation.counts;
+      console.log(pc.bold(`Validation for ${project}/${slug} (v${payload.validation.planVersion})`));
+      console.log(`  ${errors > 0 ? pc.red(`${errors} errors`) : pc.green(`${errors} errors`)}, ${pc.yellow(`${warnings} warnings`)}, ${pc.dim(`${infos} infos`)}`);
+
+      if (payload.validation.issues.length) {
+        console.log('');
+        for (const issue of payload.validation.issues) {
+          const color = issue.severity === 'error' ? pc.red : issue.severity === 'warn' ? pc.yellow : pc.dim;
+          console.log(`  ${color(`[${issue.severity}]`)} ${issue.path}: ${issue.message}`);
+          if (issue.hint) console.log(`    ${pc.dim('hint:')} ${issue.hint}`);
+        }
+      }
+
+      if (errors > 0) process.exitCode = 1;
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    } finally {
+      client?.close();
+    }
+  });
+
+// ── Subcommand: plan execute ────────────────────────────────────────────
+
+const executeCmd = new Command('execute')
+  .description('Hand a plan to the pipeline. Blocked by validation errors unless --force.')
+  .argument('<slug>', 'Plan slug')
+  .option('--project <name>', 'Project name')
+  .option('--force', 'Execute even when validation errors exist', false)
+  .option('--port <port>', 'Dashboard port', '5173')
+  .action(async (slug: string, opts: Record<string, string | boolean | undefined>) => {
+    const project = resolveProject(opts.project as string | undefined);
+    const port = parseInt((opts.port as string) || '5173', 10);
+    const force = !!opts.force;
+
+    let client: DashboardClient | null = null;
+    try {
+      client = await connectDashboard({ port });
+
+      const { type, payload } = await client.request<
+        | { planSlug: string }
+        | { validation: PlanValidation; blocked: boolean; message: string; planSlug: string }
+      >(
+        { action: 'execute-plan', project, planSlug: slug, force },
+        {
+          resolveOn: ['plan-execute-started', 'plan-validation'],
+          rejectOn: ['error'],
+          filter: (m) => {
+            const p = m.payload as { planSlug?: string } | undefined;
+            return !p?.planSlug || p.planSlug === slug;
+          },
+        },
+      );
+
+      if (type === 'plan-execute-started') {
+        success(`Pipeline started — watch at ${pc.cyan(`http://localhost:${port}/#/runs`)}`);
+        return;
+      }
+
+      // plan-validation response with blocked=true means the server refused.
+      const p = payload as { validation?: PlanValidation; blocked?: boolean; message?: string };
+      if (p.blocked && p.validation) {
+        warn(p.message || 'Plan execution blocked by validation errors.');
+        for (const issue of p.validation.issues.filter((i) => i.severity === 'error')) {
+          console.error(`  ${pc.red('[error]')} ${issue.path}: ${issue.message}`);
+          if (issue.hint) console.error(`    ${pc.dim('hint:')} ${issue.hint}`);
+        }
+        console.error('');
+        info(`Fix the errors, or re-run with ${pc.cyan('--force')} to execute anyway.`);
+        process.exitCode = 1;
+      } else {
+        warn('Unexpected response from server:');
+        console.error(JSON.stringify(p, null, 2));
+        process.exitCode = 1;
+      }
+    } catch (err) {
+      error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    } finally {
+      client?.close();
+    }
+  });
+
+// ── Command group ───────────────────────────────────────────────────────
 
 export const planCommand = new Command('plan')
-  .description('Generate an architecture plan before running a full pipeline')
-  .argument('<project>', 'Project name')
-  .argument('<feature>', 'Feature description')
-  .option('-o, --output <path>', 'Output plan file path', './anvil-plan.md')
-  .option('--model <model>', 'Model to use for planning')
-  .action(async (project: string, feature: string, opts: Record<string, unknown>) => {
-    const outputPath = (opts.output as string) || './anvil-plan.md';
-    const model = opts.model as string | undefined;
-
-    info(`Planning architecture for project "${pc.bold(project)}"`);
-    info(`Feature: ${feature}`);
-
-    // 1. Load project config (factory.yaml)
-    const config = loadFactoryConfig(project);
-    let domainContext = '';
-    if (config?._raw) {
-      domainContext = extractDomainContext(config._raw as string);
-      if (domainContext) {
-        info(`Loaded domain context from ${config._path}`);
-      }
-    }
-
-    // 2. Load KB context (graceful fallback)
-    let kbContext = '';
-    try {
-      const { loadKnowledgeGraph } = await import('../context/knowledge-graph.js');
-      const kb = await loadKnowledgeGraph(project, feature);
-      if (kb) {
-        kbContext = kb.slice(0, 12000);
-        info(`[knowledge-base] KB available (${kb.length} chars)`);
-      }
-    } catch {
-      // KB not available — continue without it
-    }
-
-    // 3. Load architect persona prompt (graceful fallback)
-    let personaPrompt = '';
-    try {
-      const { loadPersonaPrompt } = await import('../personas/loader.js');
-      personaPrompt = await loadPersonaPrompt('architect');
-      info('Loaded architect persona prompt');
-    } catch {
-      // Persona not available — use inline fallback
-      personaPrompt = `You are a senior software architect. You analyze requirements, design projects, and create detailed implementation plans. You consider scalability, maintainability, security, and developer experience in your designs.`;
-    }
-
-    // 4. Build prompts
-    const projectPrompt = `${personaPrompt}
-
-${kbContext ? `\n## Relevant Knowledge Base Context\n\n${kbContext}\n` : ''}
-${domainContext ? `\n## Domain Context (from project config)\n\n${domainContext}\n` : ''}
-
-You are creating an architecture plan for the "${project}" project. Your output should be a well-structured markdown document that can be saved and used as a reference for implementation.
-
-Output format requirements:
-- Use structured markdown with clear headings
-- Include specific file paths, API endpoints, and database schema changes where applicable
-- Be concrete and actionable — avoid vague statements
-- Include a risk assessment section
-- Include an estimated complexity rating (S/M/L/XL)`;
-
-    const userPrompt = `Create a detailed implementation plan for the following feature:
-
-**Feature:** ${feature}
-
-**Project:** ${project}
-
-Include the following sections:
-
-1. **Summary** — One paragraph overview of the change
-2. **Affected Repositories & Files** — List every repo and file that needs to change, with the type of change (new, modify, delete)
-3. **Architecture Changes** — Component diagrams, data flow changes, new services or modules
-4. **API Changes** — New or modified endpoints, request/response schemas, breaking changes
-5. **Database Changes** — Schema migrations, new tables/columns, index changes
-6. **Implementation Steps** — Ordered list of implementation tasks with dependencies
-7. **Test Strategy** — What to test, testing approach for each layer (unit, integration, e2e)
-8. **Risks & Mitigations** — What could go wrong and how to handle it
-9. **Estimated Complexity** — S/M/L/XL with justification
-
-Be specific and actionable. Reference actual file paths and code patterns from the codebase where possible.`;
-
-    // 5. Spawn agent
-    info('Spawning planning agent...');
-    console.error('');
-
-    const bin = resolveBinary();
-    const args: string[] = [
-      '-p', userPrompt,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--project-prompt', projectPrompt,
-    ];
-
-    if (model) {
-      args.push('--model', model);
-    }
-
-    // Use workspace dir if available, otherwise cwd
-    const workspaceRoot = process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace');
-    const workspaceDir = join(workspaceRoot, project);
-    const cwd = existsSync(workspaceDir) ? workspaceDir : process.cwd();
-
-    if (existsSync(workspaceDir)) {
-      info(`Using workspace: ${workspaceDir}`);
-    }
-
-    const child = spawn(bin, args, {
-      cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
-
-    // Close stdin — non-interactive
-    child.stdin?.end();
-
-    const result = await parseStreamResult(child);
-
-    // 6. Write output to file
-    if (result.output) {
-      try {
-        writeFileSync(outputPath, result.output, 'utf-8');
-        console.error('');
-        success(`Plan saved to ${pc.bold(outputPath)}`);
-      } catch (err) {
-        error(`Failed to write plan: ${err instanceof Error ? err.message : String(err)}`);
-        // Still show the output even if file write fails
-        console.error('');
-        console.error(result.output);
-      }
-    } else {
-      error('Agent produced no output.');
-      process.exit(1);
-      return;
-    }
-
-    // 7. Show summary
-    if (result.costUsd > 0) {
-      console.error(`  Cost: $${result.costUsd.toFixed(4)} (${result.inputTokens} in / ${result.outputTokens} out)`);
-    }
-    if (result.durationMs > 0) {
-      console.error(`  Duration: ${(result.durationMs / 1000).toFixed(1)}s`);
-    }
-
-    console.error('');
-    info(`To execute: ${pc.dim(`anvil run ${project} "${feature}" --answers ${outputPath}`)}`);
-
-    process.exit(0);
-  });
+  .description('Generate, inspect, validate, and execute structured plans')
+  .addCommand(newCmd)
+  .addCommand(showCmd)
+  .addCommand(listCmd)
+  .addCommand(validateCmd)
+  .addCommand(executeCmd);

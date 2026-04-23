@@ -1,5 +1,6 @@
 import React from 'react';
-import type { PRData } from './usePRData.js';
+import { CheckCircle2, AlertCircle, MessageCircle } from 'lucide-react';
+import type { PRData, PRReviewSummary } from './usePRData.js';
 
 export interface PRCardProps {
   pr: PRData;
@@ -16,6 +17,101 @@ const LABEL_COLORS: Record<string, { bg: string; fg: string }> = {
 
 function labelColor(label: string): { bg: string; fg: string } {
   return LABEL_COLORS[label.toLowerCase()] ?? { bg: 'var(--bg-elevated-3)', fg: 'var(--text-secondary)' };
+}
+
+/* ─── Review verdict badge ─────────────────────────────────── */
+
+interface ReviewBadgeProps {
+  review: PRReviewSummary | null | undefined;
+}
+
+function ReviewBadge({ review }: ReviewBadgeProps) {
+  // Pending review: muted grey "— not reviewed" with no icon
+  if (!review) {
+    return (
+      <span
+        aria-label="Not reviewed yet"
+        style={{
+          fontSize: 10,
+          fontWeight: 500,
+          padding: '1px 7px',
+          borderRadius: 'var(--radius-full)',
+          background: 'var(--bg-elevated-3)',
+          color: 'var(--text-tertiary)',
+          fontStyle: 'italic',
+        }}
+      >
+        — not reviewed
+      </span>
+    );
+  }
+
+  const { verdict, blockers, errors, summary, reviewId } = review;
+
+  let icon: React.ReactNode = null;
+  let label = '';
+  let color: string = 'var(--text-tertiary)';
+  let ariaLabel = '';
+
+  if (verdict === 'approve') {
+    color = 'var(--color-success)';
+    icon = <CheckCircle2 size={10} strokeWidth={2} aria-hidden="true" style={{ color }} />;
+    label = 'Approved';
+    ariaLabel = `Review: approved. ${summary}`;
+  } else if (verdict === 'request-changes') {
+    color = 'var(--color-error)';
+    icon = <AlertCircle size={10} strokeWidth={2} aria-hidden="true" style={{ color }} />;
+    const issueCount = (blockers ?? 0) + (errors ?? 0);
+    label = `${issueCount} issue${issueCount === 1 ? '' : 's'}`;
+    ariaLabel = `Review: changes requested. ${issueCount} issue${issueCount === 1 ? '' : 's'}. ${summary}`;
+  } else {
+    // comment
+    color = 'var(--color-warning)';
+    icon = <MessageCircle size={10} strokeWidth={2} aria-hidden="true" style={{ color }} />;
+    label = 'Comments';
+    ariaLabel = `Review: comments. ${summary}`;
+  }
+
+  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    window.location.hash = `#/review?reviewId=${encodeURIComponent(reviewId)}`;
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      window.location.hash = `/review?reviewId=${encodeURIComponent(reviewId)}`;
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      onKeyDown={handleKeyDown}
+      title={summary}
+      aria-label={ariaLabel}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        fontSize: 10,
+        fontWeight: 500,
+        padding: '1px 7px',
+        borderRadius: 'var(--radius-full)',
+        background: 'var(--bg-elevated-3)',
+        color,
+        border: '1px solid var(--separator)',
+        cursor: 'pointer',
+        fontFamily: 'inherit',
+        lineHeight: 1.4,
+      }}
+    >
+      {icon}
+      <span>{label}</span>
+    </button>
+  );
 }
 
 export function PRCard({ pr, onClick }: PRCardProps) {
@@ -37,20 +133,22 @@ export function PRCard({ pr, onClick }: PRCardProps) {
       }}>
         {pr.title}
       </div>
-      {pr.labels && pr.labels.length > 0 && (
-        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 6 }}>
-          {pr.labels.map((label) => (
-            <span key={label} style={{
-              fontSize: 10, fontWeight: 500,
-              padding: '1px 7px', borderRadius: 'var(--radius-full)',
-              background: labelColor(label).bg,
-              color: labelColor(label).fg,
-            }}>
-              {label}
-            </span>
-          ))}
-        </div>
-      )}
+      <div style={{
+        display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 6,
+        alignItems: 'center',
+      }}>
+        {pr.labels?.map((label) => (
+          <span key={label} style={{
+            fontSize: 10, fontWeight: 500,
+            padding: '1px 7px', borderRadius: 'var(--radius-full)',
+            background: labelColor(label).bg,
+            color: labelColor(label).fg,
+          }}>
+            {label}
+          </span>
+        ))}
+        <ReviewBadge review={pr.review} />
+      </div>
       <div style={{
         display: 'flex', alignItems: 'center', gap: 'var(--space-sm)',
         flexWrap: 'wrap',

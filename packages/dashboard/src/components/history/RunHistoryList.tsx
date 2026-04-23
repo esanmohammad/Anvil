@@ -8,11 +8,12 @@ export interface RunHistoryListProps {
   runs: RunSummary[];
   getRunStages: (runId: string) => PipelineStage[];
   initialSelectedId?: string | null;
+  ws?: WebSocket | null;
 }
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 
-export function RunHistoryList({ runs, getRunStages, initialSelectedId }: RunHistoryListProps) {
+export function RunHistoryList({ runs, getRunStages, initialSelectedId, ws }: RunHistoryListProps) {
   const [selectedRun, setSelectedRun] = useState<string | null>(initialSelectedId ?? null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const selected = runs.find((r) => r.id === selectedRun);
@@ -78,7 +79,7 @@ export function RunHistoryList({ runs, getRunStages, initialSelectedId }: RunHis
             background: 'var(--bg-elevated-1)',
             borderRadius: 'var(--radius-md)',
           }}>
-            <RunDetail run={selected} stages={getRunStages(selected.id)} />
+            <RunDetail run={selected} stages={getRunStages(selected.id)} ws={ws} />
           </div>
         )}
       </div>

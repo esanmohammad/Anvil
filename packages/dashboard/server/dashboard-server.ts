@@ -47,6 +47,24 @@ import { MemoryStore } from './memory-store.js';
 import type { MemoryTarget } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import type { KBProjectStatus, KBRefreshProgress } from './knowledge-base-manager.js';
+import { PlanStore } from './plan-store.js';
+import type { Plan, PlanSection } from './plan-store.js';
+import { PlanValidator } from './plan-validator.js';
+import {
+  signShareToken, verifyShareToken, getOrCreateShareSecret,
+  SHARE_TOKEN_TTL_MS,
+} from './plan-share.js';
+import { ReviewStore, prIdFromUrl, newFindingId } from './review-store.js';
+import type {
+  Review, ReviewFinding, Persona, Resolution, Severity, Category, Confidence,
+} from './review-store.js';
+import { publishReview } from './review-publisher.js';
+import { buildPlanCompliance } from './review-plan-compliance.js';
+import { runSecurityPrepass } from './review-rules/security-prepass.js';
+import { runConventionRules } from './review-rules/conventions.js';
+import {
+  recordResolution, recordReviewCreated, formatLearningsForPrompt,
+} from './review-learner.js';
 import { discoverProviders, invalidateProviderCache } from './provider-registry.js';
 import { setDiscoveryResult } from './model-tier-resolver.js';
 import { autoLearn } from './pipeline-learner.js';
@@ -208,6 +226,9 @@ export interface ClientMessage {
   maxPerDay?: number;           // budget: max per day
   alertAt?: number;             // budget: alert threshold
   key?: string;                 // API key value for set-auth-key
+  planSlug?: string;            // plan identifier for plan-related actions
+  section?: string;             // plan section to regenerate
+  plan?: unknown;               // plan payload for save/update
   options?: {
     skipClarify?: boolean;
     skipShip?: boolean;
@@ -342,6 +363,34 @@ function serveStatic(staticDir: string, kbManagerRef?: { current: KnowledgeBaseM
   return async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
 
+    // Serve shared plan: /share/plan/:token — returns JSON of the frozen plan version.
+    const shareMatch = url.pathname.match(/^\/share\/plan\/([A-Za-z0-9_\-.]+)$/);
+    if (shareMatch) {
+      try {
+        const secret = getOrCreateShareSecret(ANVIL_HOME);
+        const payload = verifyShareToken(shareMatch[1], secret);
+        if (!payload) {
+          res.writeHead(410, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Share link invalid or expired.' }));
+          return;
+        }
+        const planStoreLocal = new PlanStore(ANVIL_HOME);
+        const plan = planStoreLocal.readVersion(payload.project, payload.slug, payload.version);
+        if (!plan) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Plan version not found.' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ plan, expiresAt: payload.expiresAt }));
+        return;
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Internal error' }));
+        return;
+      }
+    }
+
     // Serve knowledge base graph.html: /api/kb/:project/:repo/graph.html
     const kbMatch = url.pathname.match(/^\/api\/kb\/([^/]+)\/([^/]+)\/graph\.html$/);
     if (kbMatch && kbManagerRef?.current) {
@@ -409,6 +458,9 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const agentManager = new AgentManager();
   const memoryStore = new MemoryStore();
   const kbManager = new KnowledgeBaseManager(projectLoader);
+  const planStore = new PlanStore(ANVIL_HOME);
+  const planValidator = new PlanValidator(projectLoader);
+  const reviewStore = new ReviewStore(ANVIL_HOME);
   kbManagerRef.current = kbManager;
 
   // ── Clean up stale "running" state from previous crashes ────────────
@@ -573,7 +625,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   // ── Active runs tracker (multi-run support) ────────────────────────
   interface ActiveRun {
     id: string;
-    type: 'build' | 'fix' | 'spike';
+    type: 'build' | 'fix' | 'spike' | 'plan';
     project: string;
     description: string;
     model: string;
@@ -661,6 +713,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
   agentManager.on('agent-done', ({ agent }) => {
     broadcast({ type: 'agent-done', payload: { agentId: agent.id, agent } });
+
+    // Plan-agent post-processing: parse JSON, persist, validate, broadcast.
+    try { finalizePlanAgent(agent.id, agent.output ?? ''); } catch { /* already broadcast */ }
+    // Review-agent post-processing: same shape, different store.
+    try { finalizeReviewAgent(agent.id, agent); } catch { /* already broadcast */ }
 
     // Persist active run to RUNS_INDEX
     const runId = agentToRunId.get(agent.id);
@@ -950,6 +1007,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         break;
       }
 
+      case 'resume':           // UI sends this from RunDetail's Replay button
       case 'resume-pipeline': {
         // Resume a failed/stopped/cancelled pipeline from where it left off
         const runId = (msg as any).runId as string;
@@ -1027,6 +1085,73 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           featureSlug: slug,
           failureContext,
         });
+        break;
+      }
+
+      case 'rollback-run': {
+        // Rollback a completed/failed/cancelled run's local changes.
+        // Conservative: switch each repo off the feature branch to its base branch
+        // and delete the local branch. Remote PR (if any) is left intact —
+        // closing it is the user's call via gh.
+        const runId = (msg as { runId?: string }).runId;
+        if (!runId) break;
+        const allRuns = loadRunsSync();
+        const run = allRuns.find((r) => r.id === runId);
+        if (!run) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Run ${runId} not found.` } }));
+          break;
+        }
+        try {
+          const repoPaths = projectLoader.getRepoLocalPaths(run.project);
+          const branchName = `anvil/${run.featureSlug}`;
+          const results: Array<{ repo: string; ok: boolean; detail: string }> = [];
+          for (const [repoName, path] of Object.entries(repoPaths)) {
+            if (!existsSync(path)) {
+              results.push({ repo: repoName, ok: false, detail: 'path missing' });
+              continue;
+            }
+            try {
+              // Only act if the feature branch exists locally.
+              execSync(`git rev-parse --verify "${branchName}"`, { cwd: path, stdio: 'pipe' });
+            } catch {
+              results.push({ repo: repoName, ok: true, detail: 'no local branch' });
+              continue;
+            }
+            try {
+              // Determine base (prefer origin/HEAD, fall back to main).
+              let base = 'main';
+              try {
+                const headRef = execSync('git symbolic-ref refs/remotes/origin/HEAD', { cwd: path, encoding: 'utf-8', stdio: 'pipe' }).trim();
+                base = headRef.replace(/^refs\/remotes\/origin\//, '') || 'main';
+              } catch { /* leave default */ }
+              // If currently on the feature branch, checkout base first.
+              const current = execSync('git rev-parse --abbrev-ref HEAD', { cwd: path, encoding: 'utf-8', stdio: 'pipe' }).trim();
+              if (current === branchName) {
+                execSync(`git checkout "${base}"`, { cwd: path, stdio: 'pipe' });
+              }
+              execSync(`git branch -D "${branchName}"`, { cwd: path, stdio: 'pipe' });
+              results.push({ repo: repoName, ok: true, detail: `deleted ${branchName}` });
+            } catch (err) {
+              results.push({ repo: repoName, ok: false, detail: err instanceof Error ? err.message : String(err) });
+            }
+          }
+          // Mark the feature record as cancelled.
+          try {
+            if (run.featureSlug) {
+              featureStore.updateFeature(run.project, run.featureSlug, { status: 'cancelled' });
+            }
+          } catch { /* ok */ }
+          ws.send(JSON.stringify({
+            type: 'rollback-done',
+            payload: { runId, results, ok: results.every((r) => r.ok) },
+          }));
+          broadcastRuns();
+        } catch (err) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: `Rollback failed: ${err instanceof Error ? err.message : String(err)}` },
+          }));
+        }
         break;
       }
 
@@ -1575,6 +1700,450 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         break;
       }
 
+      case 'run-plan': {
+        if (!msg.project || !msg.feature) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and feature are required' } }));
+          return;
+        }
+        spawnPlanAgent(msg.project, msg.feature, msg.options?.model);
+        break;
+      }
+
+      case 'run-plan-variants': {
+        if (!msg.project || !msg.feature) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and feature are required' } }));
+          return;
+        }
+        const variants = Array.isArray((msg as any).variants) ? (msg as any).variants as Array<{ label: string; prompt?: string }> : [];
+        if (!variants.length) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'variants[] is required' } }));
+          return;
+        }
+        spawnPlanVariants(msg.project, msg.feature, variants, msg.options?.model);
+        break;
+      }
+
+      case 'adopt-plan-variant': {
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug (variant slug) are required' } }));
+          return;
+        }
+        const variant = planStore.readCurrent(msg.project, msg.planSlug);
+        if (!variant) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Variant ${msg.planSlug} not found` } }));
+          break;
+        }
+        // Create a fresh plan from the variant (copies all content).
+        const { slug: _s, version: _v, createdAt: _c, updatedAt: _u, project: _p, ...rest } = variant;
+        const adopted = planStore.createPlan(msg.project, variant.feature, variant.model, rest);
+        const validation = planValidator.validate(adopted);
+        planStore.writeValidation(msg.project, adopted.slug, validation);
+        ws.send(JSON.stringify({
+          type: 'plan-variant-adopted',
+          payload: { plan: adopted, validation, adoptedFrom: variant.slug },
+        }));
+        break;
+      }
+
+      // ── Collaboration: comments ──────────────────────────────────────
+      case 'list-plan-comments': {
+        if (!msg.project || !msg.planSlug) break;
+        ws.send(JSON.stringify({
+          type: 'plan-comments',
+          payload: { planSlug: msg.planSlug, comments: planStore.listComments(msg.project, msg.planSlug) },
+        }));
+        break;
+      }
+      case 'add-plan-comment': {
+        const sectionPath = (msg as { sectionPath?: string }).sectionPath;
+        const body = (msg as { body?: string }).body;
+        const author = (msg as { author?: string }).author;
+        if (!msg.project || !msg.planSlug || !sectionPath || !body) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project, planSlug, sectionPath, body required' } }));
+          return;
+        }
+        const comment = planStore.addComment(msg.project, msg.planSlug, sectionPath, body, author);
+        broadcast({ type: 'plan-comment-added', payload: { planSlug: msg.planSlug, comment } });
+        break;
+      }
+      case 'resolve-plan-comment': {
+        const commentId = (msg as { commentId?: string }).commentId;
+        if (!msg.project || !msg.planSlug || !commentId) break;
+        const ok = planStore.resolveComment(msg.project, msg.planSlug, commentId);
+        broadcast({ type: 'plan-comment-resolved', payload: { planSlug: msg.planSlug, commentId, ok } });
+        break;
+      }
+      case 'delete-plan-comment': {
+        const commentId = (msg as { commentId?: string }).commentId;
+        if (!msg.project || !msg.planSlug || !commentId) break;
+        const ok = planStore.deleteComment(msg.project, msg.planSlug, commentId);
+        broadcast({ type: 'plan-comment-deleted', payload: { planSlug: msg.planSlug, commentId, ok } });
+        break;
+      }
+
+      // ── Collaboration: approvals ─────────────────────────────────────
+      case 'list-plan-approvals': {
+        if (!msg.project || !msg.planSlug) break;
+        const approvals = planStore.listApprovals(msg.project, msg.planSlug);
+        const pointer = planStore.readPointer(msg.project, msg.planSlug);
+        ws.send(JSON.stringify({
+          type: 'plan-approvals',
+          payload: {
+            planSlug: msg.planSlug,
+            approvals,
+            currentVersion: pointer?.currentVersion ?? null,
+          },
+        }));
+        break;
+      }
+      case 'approve-plan': {
+        const user = (msg as { user?: string }).user ?? process.env.ANVIL_USER_NAME ?? 'anonymous';
+        const note = (msg as { note?: string }).note;
+        if (!msg.project || !msg.planSlug) break;
+        try {
+          const approval = planStore.addApproval(msg.project, msg.planSlug, user, note);
+          broadcast({ type: 'plan-approved', payload: { planSlug: msg.planSlug, approval } });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          ws.send(JSON.stringify({ type: 'error', payload: { message } }));
+        }
+        break;
+      }
+
+      // ── Review: PR review flow ───────────────────────────────────────
+      case 'run-review-pr': {
+        const prUrl = (msg as { prUrl?: string }).prUrl;
+        if (!msg.project || !prUrl) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and prUrl are required' } }));
+          return;
+        }
+        const personas = ((msg as { options?: { personas?: Persona[] } }).options?.personas)
+          ?? ['architect', 'security', 'style', 'tester'];
+        try {
+          await startReviewRun(msg.project, prUrl, 'manual', personas, msg.options?.model);
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'review-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'run-review-incremental': {
+        const reviewId = (msg as { reviewId?: string }).reviewId;
+        if (!msg.project || !reviewId) break;
+        const prior = reviewStore.readCurrent(msg.project, reviewId);
+        if (!prior) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Review ${reviewId} not found` } }));
+          break;
+        }
+        try {
+          await startReviewRun(msg.project, prior.pr.url, 'push', prior.personas, msg.options?.model, prior);
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'review-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'get-review': {
+        const reviewId = (msg as { reviewId?: string }).reviewId;
+        if (!msg.project || !reviewId) break;
+        const review = reviewStore.readCurrent(msg.project, reviewId);
+        ws.send(JSON.stringify({ type: 'review', payload: { review } }));
+        break;
+      }
+
+      case 'list-reviews': {
+        const limit = (msg as { limit?: number }).limit ?? 200;
+        const reviews = reviewStore.listReviews(msg.project ?? undefined, limit);
+        ws.send(JSON.stringify({ type: 'reviews', payload: { reviews } }));
+        break;
+      }
+
+      case 'publish-review': {
+        const reviewId = (msg as { reviewId?: string }).reviewId;
+        if (!msg.project || !reviewId) break;
+        const review = reviewStore.readCurrent(msg.project, reviewId);
+        if (!review) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Review ${reviewId} not found` } }));
+          break;
+        }
+        try {
+          const result = await publishReview(review);
+          ws.send(JSON.stringify({
+            type: 'review-published',
+            payload: {
+              reviewId,
+              commentsPosted: result.commentsPosted,
+              summaryUrl: result.summaryUrl,
+              errors: result.errors,
+            },
+          }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'review-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      case 'resolve-review-finding': {
+        const reviewId = (msg as { reviewId?: string }).reviewId;
+        const findingId = (msg as { findingId?: string }).findingId;
+        const resolution = (msg as { resolution?: Resolution }).resolution;
+        if (!msg.project || !reviewId || !findingId || !resolution) break;
+        const prior = reviewStore.readCurrent(msg.project, reviewId);
+        const priorFinding = prior?.findings.find((f) => f.id === findingId);
+        const updated = reviewStore.setResolution(msg.project, reviewId, findingId, resolution);
+        if (!updated) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'Finding not found' } }));
+          break;
+        }
+        const updatedFinding = updated.findings.find((f) => f.id === findingId);
+        if (updatedFinding && priorFinding) {
+          try {
+            recordResolution(ANVIL_HOME, msg.project, updated, updatedFinding, priorFinding.resolution);
+          } catch (err) {
+            console.warn('[review] recordResolution failed:', err);
+          }
+        }
+        broadcast({
+          type: 'review-finding-resolved',
+          payload: { reviewId, findingId, resolution, review: updated },
+        });
+        break;
+      }
+
+      case 'apply-review-fix': {
+        const reviewId = (msg as { reviewId?: string }).reviewId;
+        const findingId = (msg as { findingId?: string }).findingId;
+        if (!msg.project || !reviewId || !findingId) break;
+        try {
+          const commitSha = await applyReviewFix(msg.project, reviewId, findingId);
+          ws.send(JSON.stringify({
+            type: 'review-fix-applied',
+            payload: { reviewId, findingId, commitSha },
+          }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'review-error', payload: { message: err instanceof Error ? err.message : String(err) } }));
+        }
+        break;
+      }
+
+      // ── Collaboration: share link ────────────────────────────────────
+      case 'share-plan': {
+        if (!msg.project || !msg.planSlug) break;
+        const plan = planStore.readCurrent(msg.project, msg.planSlug);
+        if (!plan) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Plan ${msg.planSlug} not found` } }));
+          break;
+        }
+        const ttl = (msg as { ttlMs?: number }).ttlMs ?? SHARE_TOKEN_TTL_MS;
+        const secret = getOrCreateShareSecret(ANVIL_HOME);
+        const token = signShareToken({
+          project: plan.project,
+          slug: plan.slug,
+          version: plan.version,
+          expiresAt: Date.now() + ttl,
+        }, secret);
+        const httpPort = (msg as { httpPort?: number }).httpPort ?? 0;
+        const url = httpPort
+          ? `http://localhost:${httpPort}/share/plan/${token}`
+          : `/share/plan/${token}`;
+        ws.send(JSON.stringify({
+          type: 'plan-shared',
+          payload: { planSlug: msg.planSlug, token, url, expiresAt: Date.now() + ttl },
+        }));
+        break;
+      }
+
+      case 'get-plans': {
+        try {
+          const plans = planStore.listPlans(msg.project ?? undefined);
+          ws.send(JSON.stringify({ type: 'plans', payload: { plans } }));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Failed to list plans: ${message}` } }));
+        }
+        break;
+      }
+
+      case 'get-plan': {
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
+          return;
+        }
+        const plan = planStore.readCurrent(msg.project, msg.planSlug);
+        const validation = plan ? planStore.readValidation(msg.project, msg.planSlug) : null;
+        ws.send(JSON.stringify({
+          type: 'plan',
+          payload: { plan, validation, versions: plan ? planStore.listVersions(msg.project, msg.planSlug) : [] },
+        }));
+        break;
+      }
+
+      case 'save-plan': {
+        if (!msg.project || !msg.planSlug || !msg.plan) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project, planSlug and plan are required' } }));
+          return;
+        }
+        try {
+          const next = planStore.bumpVersion(msg.project, msg.planSlug, msg.plan as Partial<Plan>);
+          const validation = planValidator.validate(next);
+          planStore.writeValidation(msg.project, msg.planSlug, validation);
+          ws.send(JSON.stringify({ type: 'plan-updated', payload: { plan: next, validation } }));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Failed to save plan: ${message}` } }));
+        }
+        break;
+      }
+
+      case 'validate-plan': {
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
+          return;
+        }
+        const plan = planStore.readCurrent(msg.project, msg.planSlug);
+        if (!plan) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Plan ${msg.project}/${msg.planSlug} not found` } }));
+          break;
+        }
+        // Look up budget caps + gh mapping for deep validation
+        const budgetCfg: { max_per_run?: number; max_per_day?: number } = (() => {
+          try { return projectLoader.getBudgetConfig(msg.project); } catch { return {}; }
+        })();
+        const githubByRepoName: Record<string, string> = (() => {
+          try {
+            // project-loader doesn't expose factory.yaml's `github:` field via a typed API;
+            // best-effort via listProjects sync API if present, else skip deep PR check.
+            const names = Object.keys(projectLoader.getRepoLocalPaths(msg.project));
+            const out: Record<string, string> = {};
+            for (const n of names) out[n] = n;
+            return out;
+          } catch { return {}; }
+        })();
+
+        const validation = planValidator.validate(plan, {
+          deep: !!(msg as { deep?: boolean }).deep,
+          maxPerRun: budgetCfg.max_per_run,
+          maxPerDay: budgetCfg.max_per_day,
+          githubByRepoName,
+        });
+        planStore.writeValidation(msg.project, msg.planSlug, validation);
+        ws.send(JSON.stringify({ type: 'plan-validation', payload: { validation, planSlug: msg.planSlug } }));
+        break;
+      }
+
+      case 'estimate-plan': {
+        // Deterministic re-estimate with what-if overrides; no LLM call.
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
+          return;
+        }
+        const base = planStore.readCurrent(msg.project, msg.planSlug);
+        if (!base) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Plan ${msg.planSlug} not found` } }));
+          break;
+        }
+        const excludeRepos: string[] = Array.isArray((msg as any).excludeRepos) ? (msg as any).excludeRepos : [];
+        const tier: 'fast' | 'balanced' | 'thorough' = ((msg as any).modelTier as 'fast' | 'balanced' | 'thorough') ?? 'balanced';
+        const tierMultiplier = { fast: 0.35, balanced: 1, thorough: 2.2 }[tier];
+
+        // Re-estimate: baseline cost per remaining repo × tier multiplier.
+        const keptRepos = base.repos.filter((r) => !excludeRepos.includes(r.name));
+        const perRepoUsd = base.repos.length ? base.estimate.usd / base.repos.length : 0;
+        const perRepoMin = base.repos.length ? base.estimate.minutes / base.repos.length : 0;
+        const newEstimate = {
+          usd: Number((perRepoUsd * keptRepos.length * tierMultiplier).toFixed(2)),
+          minutes: Math.round(perRepoMin * keptRepos.length * tierMultiplier),
+          prs: keptRepos.length,
+        };
+
+        ws.send(JSON.stringify({
+          type: 'plan-estimate',
+          payload: {
+            planSlug: msg.planSlug,
+            estimate: newEstimate,
+            excludedRepos: excludeRepos,
+            modelTier: tier,
+            keptRepoCount: keptRepos.length,
+          },
+        }));
+        break;
+      }
+
+      case 'regen-plan-section': {
+        if (!msg.project || !msg.planSlug || !msg.section) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project, planSlug and section are required' } }));
+          return;
+        }
+        const plan = planStore.readCurrent(msg.project, msg.planSlug);
+        if (!plan) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Plan ${msg.project}/${msg.planSlug} not found` } }));
+          break;
+        }
+        spawnPlanSectionRegen(plan, msg.section as PlanSection, msg.options?.model);
+        break;
+      }
+
+      case 'execute-plan': {
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
+          return;
+        }
+        const plan = planStore.readCurrent(msg.project, msg.planSlug);
+        if (!plan) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Plan ${msg.project}/${msg.planSlug} not found` } }));
+          break;
+        }
+        // Block execution if the plan has errors. Warnings/infos are OK.
+        const validation = planValidator.validate(plan);
+        planStore.writeValidation(msg.project, msg.planSlug, validation);
+        if (validation.counts.errors > 0 && !msg.force) {
+          ws.send(JSON.stringify({
+            type: 'plan-validation',
+            payload: {
+              validation,
+              planSlug: msg.planSlug,
+              blocked: true,
+              message: `Plan has ${validation.counts.errors} error(s). Fix them or pass force=true to execute anyway.`,
+            },
+          }));
+          break;
+        }
+
+        // A validated plan replaces stages 0–4. Short feature string (for UI/commits),
+        // plan content seeds Clarify, planSeed lets the runner derive Requirements/
+        // Repo-reqs/Specs/Tasks deterministically — pipeline jumps straight to Build.
+        const planMarkdown = planStore.renderMarkdown(plan);
+        // Hard cap the pipeline title at 120 chars — the pipeline's `feature`
+        // ends up in UI headers, commit messages, and active-run rows where
+        // long strings distort layout. The full plan content rides in planSeed.
+        const rawShort = (plan.title && plan.title.trim()) || plan.feature || 'Plan execution';
+        const shortFeature = rawShort.length > 120
+          ? rawShort.slice(0, 117).trimEnd() + '…'
+          : rawShort;
+        startPipeline(msg.project, shortFeature, {
+          model: msg.options?.model ?? plan.model ?? 'sonnet',
+          modelTier: msg.options?.modelTier,
+          baseBranch: msg.options?.baseBranch,
+          skipClarify: true,
+          clarifySeedArtifact:
+            `<!-- Generated from Anvil Plan v${plan.version} (${plan.slug}) -->\n\n${planMarkdown}`,
+          planSeed: {
+            project: plan.project,
+            slug: plan.slug,
+            version: plan.version,
+            plan,
+          },
+        });
+        ws.send(JSON.stringify({
+          type: 'plan-execute-started',
+          payload: {
+            planSlug: msg.planSlug,
+            stagesSkipped: ['clarify', 'requirements', 'repo-requirements', 'specs', 'tasks'],
+          },
+        }));
+        break;
+      }
+
       case 'get-interrupted-pipelines': {
         try {
           const { findInterruptedPipelines } = await import('./pipeline-runner.js');
@@ -2062,29 +2631,34 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   // ── Project overview builder ─────────────────────────────────────────
 
   async function buildProjectOverview(projectName: string) {
-    // Memory
-    const memoryEntries = memoryStore.getEntries(projectName, 'memory');
-    const userEntries = memoryStore.getEntries(projectName, 'user');
+    // Memory — use per-entry timestamps (headers) instead of Date.now()
+    const memoryEntries = memoryStore.getEntriesWithMeta(projectName, 'memory');
+    const userEntries = memoryStore.getEntriesWithMeta(projectName, 'user');
     const memories: Array<{ id: string; key: string; value: string; category: string; timestamp: number }> = [];
 
     for (let i = 0; i < memoryEntries.length; i++) {
+      const e = memoryEntries[i];
       memories.push({
         id: `mem-${i}`,
-        key: memoryEntries[i].split('\n')[0].slice(0, 80),
-        value: memoryEntries[i],
+        key: e.content.split('\n')[0].slice(0, 80),
+        value: e.content,
         category: 'memory',
-        timestamp: Date.now(),
+        timestamp: Date.parse(e.addedAt) || 0,
       });
     }
     for (let i = 0; i < userEntries.length; i++) {
+      const e = userEntries[i];
       memories.push({
         id: `user-${i}`,
-        key: userEntries[i].split('\n')[0].slice(0, 80),
-        value: userEntries[i],
+        key: e.content.split('\n')[0].slice(0, 80),
+        value: e.content,
         category: 'user',
-        timestamp: Date.now(),
+        timestamp: Date.parse(e.addedAt) || 0,
       });
     }
+
+    // Newest first
+    memories.sort((a, b) => b.timestamp - a.timestamp);
 
     // Repos from project config (cached 30s)
     let repos: Array<{ name: string; language: string }> = [];
@@ -2125,6 +2699,8 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       resumeFromStage?: number;
       featureSlug?: string;
       failureContext?: string;
+      clarifySeedArtifact?: string;
+      planSeed?: { project: string; slug: string; version: number; plan: Plan };
     },
   ): void {
     // Kill any existing pipeline
@@ -2144,6 +2720,8 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       resumeFromStage: options?.resumeFromStage,
       featureSlug: options?.featureSlug,
       failureContext: options?.failureContext,
+      clarifySeedArtifact: options?.clarifySeedArtifact,
+      planSeed: options?.planSeed,
     }, memoryStore, kbManager);
 
     activePipelineRunner = runner;
@@ -2348,6 +2926,19 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     runner.on('pipeline-complete', (pipelineState: PipelineRunState) => {
       persistRunRecord(pipelineState, pipelineRunId);
       autoLearn(memoryStore, pipelineState);
+
+      // Auto-review Anvil-authored PRs when the run was plan-seeded.
+      // Fire-and-forget; reviews run async and broadcast their own events.
+      const completedRunForPrs = activeRuns.get(pipelineRunId);
+      const prUrls = completedRunForPrs ? Array.from(completedRunForPrs.prUrls) : [];
+      if (prUrls.length && options?.planSeed) {
+        const personas: Persona[] = ['architect', 'security', 'tester'];
+        for (const prUrl of prUrls) {
+          startReviewRun(project, prUrl, 'ship', personas, options?.model)
+            .catch((err) => console.warn(`[ship-review] ${prUrl}:`, err?.message ?? err));
+        }
+      }
+
       activePipelineRunner = null;
       agentManager.spawn = originalSpawn; // restore original spawn
       const completedRun = activeRuns.get(pipelineRunId);
@@ -2535,6 +3126,843 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
     broadcastActiveRuns();
 
     broadcast({ type: 'agent-spawned', payload: { ...agent, runId } });
+  }
+
+  // ── Plan agent: structured Plan generation ─────────────────────────
+
+  /** Map planAgentId → { project, feature, model, section?, variant? } for post-run JSON extraction. */
+  const planAgentContext = new Map<string, {
+    project: string;
+    feature: string;
+    model: string;
+    existingSlug?: string;        // if present, bump a version; otherwise create
+    section?: PlanSection;        // if present, merge only this section of the plan
+    variant?: { batchId: string; index: number; label: string };  // A/B variant generation
+  }>();
+
+  /** Extract the last fenced ```json ... ``` block from streamed agent output. */
+  function extractJsonBlock(text: string): unknown | null {
+    // Match fenced blocks first
+    const fenceRe = /```json\s*([\s\S]*?)```/gi;
+    let match: RegExpExecArray | null;
+    let last: string | null = null;
+    while ((match = fenceRe.exec(text)) !== null) {
+      last = match[1];
+    }
+    if (last) {
+      try { return JSON.parse(last.trim()); } catch { /* fall through */ }
+    }
+    // Fallback: find the largest top-level {...} block
+    const braceStart = text.indexOf('{');
+    const braceEnd = text.lastIndexOf('}');
+    if (braceStart >= 0 && braceEnd > braceStart) {
+      const candidate = text.slice(braceStart, braceEnd + 1);
+      try { return JSON.parse(candidate); } catch { /* give up */ }
+    }
+    return null;
+  }
+
+  function buildPlanPrompt(
+    project: string,
+    feature: string,
+    repoNames: string[],
+    kbReport: string,
+    mode: 'full' | PlanSection,
+    existingPlan?: Plan,
+  ): string {
+    const schema = `{
+  "title": "string — short title (<80 chars)",
+  "problem": "string — plain English problem statement",
+  "scope": { "inScope": ["string"], "outOfScope": ["string"] },
+  "repos": [
+    {
+      "name": "string — must match a project repo",
+      "changes": "string — concise description of changes in this repo",
+      "files": ["string — path relative to repo root; use new ones freely"],
+      "symbols": ["string — function/class/type names modified or added"]
+    }
+  ],
+  "contracts": [
+    {
+      "kind": "http | grpc | kafka | db | other",
+      "name": "string",
+      "producer": "string — repo name",
+      "consumers": ["string — repo names"],
+      "description": "string"
+    }
+  ],
+  "architecture": { "mermaid": "string — optional mermaid diagram body", "notes": "string" },
+  "risks": [ { "title": "string", "mitigation": "string", "severity": "low | med | high" } ],
+  "rollout": {
+    "strategy": "string",
+    "flags": ["string"],
+    "order": ["string — repos in deploy order"],
+    "rollback": "string"
+  },
+  "tests": { "unit": ["string"], "integration": ["string"], "manual": ["string"] },
+  "estimate": { "usd": 0.0, "minutes": 0, "prs": 0 }
+}`;
+
+    const rules = [
+      `You are a senior staff engineer producing an implementation plan for the "${project}" project.`,
+      `Project repos (you MUST only reference these): ${repoNames.join(', ') || '(none configured)'}.`,
+      kbReport ? 'The Knowledge Base in your project prompt lists every existing module, function and import. Ground file paths and symbol names in the KB. Only invent names for NEW symbols you will create.' : 'No Knowledge Base is available; use plain engineering judgement.',
+      'Be specific. Prefer concrete file paths and function names over vague descriptions.',
+      'Keep estimates realistic: count repos touched × typical stage cost. Default model: $5/run, $10 for multi-repo changes.',
+      'Do NOT modify any files. This is planning only.',
+    ].filter(Boolean).join('\n');
+
+    if (mode === 'full') {
+      return `${rules}
+
+## Feature to plan
+
+${feature}
+
+## Required output
+
+Output EXACTLY one fenced \`\`\`json ... \`\`\` block containing a JSON object matching this schema:
+
+\`\`\`json
+${schema}
+\`\`\`
+
+No prose outside the JSON block. All string fields must be non-empty where the schema has no "optional" qualifier.`;
+    }
+
+    // Section regen
+    const planJson = existingPlan ? JSON.stringify(existingPlan, null, 2) : '{}';
+    return `${rules}
+
+## Existing plan (regenerate one section only)
+
+\`\`\`json
+${planJson}
+\`\`\`
+
+## Task
+
+Regenerate the **"${mode}"** section of the plan based on the existing context and any new information you gather.
+
+Output EXACTLY one fenced \`\`\`json ... \`\`\` block containing ONLY the updated section value (matching that section's schema — an object for scope/architecture/rollout/tests/estimate, or an array for repos/contracts/risks, or a string for problem).
+
+No prose outside the JSON block.`;
+  }
+
+  function spawnPlanAgent(project: string, feature: string, modelId?: string): void {
+    outputBuffer = [];
+
+    const configWorkspace = getWorkspaceFromConfig(project);
+    const cwd = configWorkspace && existsSync(configWorkspace)
+      ? configWorkspace
+      : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), project);
+
+    const runId = `plan-${Date.now().toString(36)}`;
+    const model = modelId ?? 'sonnet';
+
+    // Load KB for context
+    let kbReport = '';
+    const indexPrompt = kbManager.getIndexForPrompt(project);
+    if (indexPrompt) {
+      const queryContext = kbManager.getQueryContextForPrompt(project, feature);
+      kbReport = `${indexPrompt}\n\n---\n\n${queryContext}`;
+    } else {
+      kbReport = kbManager.getAllGraphReports(project);
+    }
+
+    // Repo names
+    const repoInfo = projectLoader.getRepoLocalPaths(project);
+    const repoNames = Object.keys(repoInfo);
+    const repoPaths = Object.entries(repoInfo).map(([n, p]) => `- ${n}: ${p}`).join('\n');
+
+    const projectPromptParts: string[] = [
+      `You are a senior engineer planning work in the "${project}" project.`,
+      `\n## Project Repos\nThis project has ${repoNames.length} repositories. You may reference these and only these:\n${repoPaths}`,
+    ];
+    if (kbReport) {
+      projectPromptParts.push(
+        `\n## Codebase Knowledge Base\n${kbReport}\n\n` +
+        `**Rules when KB is present:** do NOT spawn sub-agents. Do NOT run find/ls/tree. Cite the KB by name when choosing files and symbols.`
+      );
+    }
+    const projectMemory = memoryStore.formatForPrompt(project, 'memory');
+    const userProfile = memoryStore.formatForPrompt(project, 'user');
+    if (projectMemory || userProfile) {
+      projectPromptParts.push(`\n## Memories\n${[projectMemory, userProfile].filter(Boolean).join('\n\n')}`);
+    }
+    const projectPrompt = projectPromptParts.join('\n');
+
+    const prompt = buildPlanPrompt(project, feature, repoNames, kbReport, 'full');
+
+    const agent = agentManager.spawn({
+      name: `plan-${project}`,
+      persona: 'architect',
+      project,
+      stage: 'plan',
+      prompt,
+      projectPrompt,
+      model,
+      cwd,
+      permissionMode: 'bypassPermissions',
+    });
+
+    planAgentContext.set(agent.id, { project, feature, model });
+
+    activeRuns.set(runId, {
+      id: runId,
+      type: 'plan',
+      project,
+      description: feature,
+      model,
+      status: 'running',
+      startedAt: Date.now(),
+      agentId: agent.id,
+      activities: [],
+      prUrls: new Set(),
+    });
+    agentToRunId.set(agent.id, runId);
+    broadcastActiveRuns();
+
+    broadcast({ type: 'agent-spawned', payload: { ...agent, runId } });
+  }
+
+  function spawnPlanVariants(
+    project: string,
+    feature: string,
+    variants: Array<{ label: string; prompt?: string }>,
+    modelId?: string,
+  ): void {
+    const model = modelId ?? 'sonnet';
+    const batchId = `variants-${Date.now().toString(36)}`;
+
+    // Announce batch start so the UI can render N placeholder columns.
+    broadcast({
+      type: 'plan-variants-started',
+      payload: {
+        project,
+        feature,
+        batchId,
+        variants: variants.map((v, i) => ({ index: i, label: v.label })),
+      },
+    });
+
+    variants.forEach((variant, index) => {
+      // Each variant gets its own agent. We tag the planAgentContext with variant
+      // metadata so finalizePlanAgent knows to tag the resulting plan.
+      const configWorkspace = getWorkspaceFromConfig(project);
+      const cwd = configWorkspace && existsSync(configWorkspace)
+        ? configWorkspace
+        : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), project);
+
+      let kbReport = '';
+      const indexPrompt = kbManager.getIndexForPrompt(project);
+      if (indexPrompt) {
+        const queryContext = kbManager.getQueryContextForPrompt(project, feature);
+        kbReport = `${indexPrompt}\n\n---\n\n${queryContext}`;
+      } else {
+        kbReport = kbManager.getAllGraphReports(project);
+      }
+
+      const repoInfo = projectLoader.getRepoLocalPaths(project);
+      const repoNames = Object.keys(repoInfo);
+      const repoPaths = Object.entries(repoInfo).map(([n, p]) => `- ${n}: ${p}`).join('\n');
+
+      const variantHint = variant.prompt
+        ? `This variant is approach "${variant.label}". ${variant.prompt}`
+        : `This variant is approach "${variant.label}". Bias your plan toward that approach (${variant.label.toLowerCase()} — e.g. smallest change, cleanest refactor, or a greenfield rewrite).`;
+
+      const projectPromptParts: string[] = [
+        `You are a senior engineer planning work in the "${project}" project.`,
+        `\n## Variant\n${variantHint}`,
+        `\n## Project Repos\n${repoNames.length} repositories:\n${repoPaths}`,
+      ];
+      if (kbReport) {
+        projectPromptParts.push(`\n## Codebase Knowledge Base\n${kbReport}`);
+      }
+      const projectMemory = memoryStore.formatForPrompt(project, 'memory');
+      const userProfile = memoryStore.formatForPrompt(project, 'user');
+      if (projectMemory || userProfile) {
+        projectPromptParts.push(`\n## Memories\n${[projectMemory, userProfile].filter(Boolean).join('\n\n')}`);
+      }
+      const projectPrompt = projectPromptParts.join('\n');
+
+      const prompt = buildPlanPrompt(project, feature, repoNames, kbReport, 'full');
+
+      const agent = agentManager.spawn({
+        name: `plan-variant-${variant.label}-${project}`,
+        persona: 'architect',
+        project,
+        stage: `plan-variant:${variant.label}`,
+        prompt,
+        projectPrompt,
+        model,
+        cwd,
+        permissionMode: 'bypassPermissions',
+      });
+
+      planAgentContext.set(agent.id, {
+        project,
+        feature,
+        model,
+        variant: { batchId, index, label: variant.label },
+      });
+
+      const runId = `plan-var-${batchId}-${index}`;
+      activeRuns.set(runId, {
+        id: runId,
+        type: 'plan',
+        project,
+        description: `[variant:${variant.label}] ${feature}`,
+        model,
+        status: 'running',
+        startedAt: Date.now(),
+        agentId: agent.id,
+        activities: [],
+        prUrls: new Set(),
+      });
+      agentToRunId.set(agent.id, runId);
+
+      broadcast({ type: 'agent-spawned', payload: { ...agent, runId, variant: { batchId, index, label: variant.label } } });
+    });
+
+    broadcastActiveRuns();
+  }
+
+  function spawnPlanSectionRegen(existingPlan: Plan, section: PlanSection, modelId?: string): void {
+    const configWorkspace = getWorkspaceFromConfig(existingPlan.project);
+    const cwd = configWorkspace && existsSync(configWorkspace)
+      ? configWorkspace
+      : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), existingPlan.project);
+
+    const runId = `plan-${section}-${Date.now().toString(36)}`;
+    const model = modelId ?? existingPlan.model ?? 'sonnet';
+
+    let kbReport = '';
+    const indexPrompt = kbManager.getIndexForPrompt(existingPlan.project);
+    if (indexPrompt) {
+      const queryContext = kbManager.getQueryContextForPrompt(existingPlan.project, existingPlan.feature);
+      kbReport = `${indexPrompt}\n\n---\n\n${queryContext}`;
+    }
+
+    const repoInfo = projectLoader.getRepoLocalPaths(existingPlan.project);
+    const repoNames = Object.keys(repoInfo);
+
+    const projectPrompt = `You are a senior engineer iterating on an existing plan for "${existingPlan.project}".\n\n## Repos\n${repoNames.map((n) => `- ${n}`).join('\n')}\n\n${kbReport ? `## Knowledge Base\n${kbReport}\n` : ''}`;
+
+    const prompt = buildPlanPrompt(existingPlan.project, existingPlan.feature, repoNames, kbReport, section, existingPlan);
+
+    const agent = agentManager.spawn({
+      name: `plan-${section}-${existingPlan.project}`,
+      persona: 'architect',
+      project: existingPlan.project,
+      stage: `plan-${section}`,
+      prompt,
+      projectPrompt,
+      model,
+      cwd,
+      permissionMode: 'bypassPermissions',
+    });
+
+    planAgentContext.set(agent.id, {
+      project: existingPlan.project,
+      feature: existingPlan.feature,
+      model,
+      existingSlug: existingPlan.slug,
+      section,
+    });
+
+    activeRuns.set(runId, {
+      id: runId,
+      type: 'plan',
+      project: existingPlan.project,
+      description: `Regenerate ${section} — ${existingPlan.title}`,
+      model,
+      status: 'running',
+      startedAt: Date.now(),
+      agentId: agent.id,
+      activities: [],
+      prUrls: new Set(),
+    });
+    agentToRunId.set(agent.id, runId);
+    broadcastActiveRuns();
+
+    broadcast({ type: 'agent-spawned', payload: { ...agent, runId } });
+  }
+
+  /**
+   * Finalize a plan-agent run: parse JSON, persist, validate, broadcast.
+   * Called from the global agent-done handler when the agent was spawned by the plan flow.
+   */
+  function finalizePlanAgent(agentId: string, agentOutput: string): void {
+    const ctx = planAgentContext.get(agentId);
+    if (!ctx) return;
+    planAgentContext.delete(agentId);
+
+    const parsed = extractJsonBlock(agentOutput);
+    if (parsed === null || typeof parsed !== 'object') {
+      broadcast({
+        type: 'plan-error',
+        payload: {
+          project: ctx.project,
+          message: 'Plan agent output did not contain valid JSON.',
+          raw: agentOutput.slice(0, 2000),
+        },
+      });
+      return;
+    }
+
+    try {
+      if (ctx.existingSlug && ctx.section) {
+        // Section regen: merge one key into the existing plan
+        const current = planStore.readCurrent(ctx.project, ctx.existingSlug);
+        if (!current) throw new Error(`Plan ${ctx.existingSlug} disappeared`);
+        const update: Partial<Plan> = { [ctx.section]: parsed } as Partial<Plan>;
+        const next = planStore.bumpVersion(ctx.project, ctx.existingSlug, update);
+        const validation = planValidator.validate(next);
+        planStore.writeValidation(ctx.project, ctx.existingSlug, validation);
+        broadcast({ type: 'plan-updated', payload: { plan: next, validation, section: ctx.section } });
+      } else if (ctx.variant) {
+        // A/B variant: tag the plan title so it's easy to recognise.
+        const seed = parsed as Partial<Plan>;
+        if (seed.title) seed.title = `[${ctx.variant.label}] ${seed.title}`;
+        const plan = planStore.createPlan(ctx.project, ctx.feature, ctx.model, seed);
+        const validation = planValidator.validate(plan);
+        planStore.writeValidation(ctx.project, plan.slug, validation);
+        broadcast({
+          type: 'plan-variant-created',
+          payload: { plan, validation, variant: ctx.variant },
+        });
+      } else {
+        // Fresh plan
+        const seed = parsed as Partial<Plan>;
+        const plan = planStore.createPlan(ctx.project, ctx.feature, ctx.model, seed);
+        const validation = planValidator.validate(plan);
+        planStore.writeValidation(ctx.project, plan.slug, validation);
+        broadcast({ type: 'plan-created', payload: { plan, validation } });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      broadcast({
+        type: 'plan-error',
+        payload: { project: ctx.project, message: `Failed to persist plan: ${message}` },
+      });
+    }
+  }
+
+  // ── PR Review: agent spawner + persona orchestration ──────────────
+
+  /**
+   * Map reviewAgentId → { reviewId, project, persona } so finalizeReviewAgent
+   * knows where to merge the parsed findings.
+   */
+  const reviewAgentContext = new Map<string, {
+    reviewId: string;
+    project: string;
+    persona: Persona;
+  }>();
+
+  /** Load diff lines from gh CLI — trivial prepass input for the security + convention rules. */
+  async function loadPrDiff(repo: string, prNumber: number): Promise<{
+    diff: string;
+    files: Array<{ path: string; addedLines: Array<{ lineNumber: number; text: string }> }>;
+    additions: number;
+    deletions: number;
+    fileCount: number;
+    headSha: string;
+    baseSha: string;
+    title?: string;
+    author?: string;
+  }> {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+
+    const metaOut = await execFileAsync('gh', [
+      'api', `repos/${repo}/pulls/${prNumber}`,
+      '--jq', '{head: .head.sha, base: .base.sha, title: .title, author: .user.login, additions: .additions, deletions: .deletions, files: .changed_files}',
+    ], { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }).catch(() => ({ stdout: '{}' }));
+    const meta = (() => { try { return JSON.parse(metaOut.stdout); } catch { return {}; } })();
+
+    const diffOut = await execFileAsync('gh', [
+      'pr', 'diff', String(prNumber), '--repo', repo,
+    ], { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }).catch(() => ({ stdout: '' }));
+    const diff = diffOut.stdout;
+
+    // Parse unified diff to extract per-file added lines.
+    const files: Array<{ path: string; addedLines: Array<{ lineNumber: number; text: string }> }> = [];
+    let currentFile: { path: string; addedLines: Array<{ lineNumber: number; text: string }> } | null = null;
+    let newLineNo = 0;
+    for (const line of diff.split('\n')) {
+      if (line.startsWith('+++ b/')) {
+        currentFile = { path: line.slice(6), addedLines: [] };
+        files.push(currentFile);
+      } else if (line.startsWith('@@ ')) {
+        const m = line.match(/\+(\d+)/);
+        newLineNo = m ? parseInt(m[1], 10) - 1 : 0;
+      } else if (currentFile && (line.startsWith('+') && !line.startsWith('+++'))) {
+        newLineNo++;
+        currentFile.addedLines.push({ lineNumber: newLineNo, text: line.slice(1) });
+      } else if (currentFile && !line.startsWith('-') && !line.startsWith('\\')) {
+        newLineNo++;
+      }
+    }
+
+    return {
+      diff,
+      files,
+      additions: meta.additions ?? 0,
+      deletions: meta.deletions ?? 0,
+      fileCount: meta.files ?? files.length,
+      headSha: meta.head ?? '',
+      baseSha: meta.base ?? '',
+      title: meta.title,
+      author: meta.author,
+    };
+  }
+
+  function buildReviewerPrompt(
+    persona: Persona,
+    review: Review,
+    diff: string,
+    plan: Plan | null,
+    learnings: string,
+  ): string {
+    const personaRole: Record<Persona, string> = {
+      architect: 'senior staff engineer reviewing overall design, layering, and abstraction fit',
+      security: 'security engineer focused on OWASP Top 10: injection, auth, secrets, CSRF, XSS, SSRF',
+      style: 'code-style reviewer enforcing this project\'s conventions (see rules below)',
+      tester: 'QA engineer assessing test coverage delta, flaky patterns, missing asserts',
+      domain: 'domain expert using the project memory + KB to verify business-logic correctness',
+    };
+
+    const schema = `{
+  "findings": [
+    {
+      "severity": "blocker | error | warn | info | nit",
+      "category": "correctness | security | convention | test | perf | docs | plan-drift",
+      "file": "path/relative/to/repo",
+      "line": 1,
+      "snippet": "up to 160 chars of the problematic code",
+      "description": "one-sentence actionable issue",
+      "suggestedFix": { "diff": "unified diff", "rationale": "why this fix" } | null,
+      "confidence": "high | med | low"
+    }
+  ],
+  "summary": "<200 char verdict summary"
+}`;
+
+    const planBlock = plan
+      ? `## Plan context\nThis PR was produced from a plan. Flag **plan-drift** findings if the diff diverges from the plan:\n\`\`\`json\n${JSON.stringify({ title: plan.title, repos: plan.repos, contracts: plan.contracts }, null, 2).slice(0, 4000)}\n\`\`\`\n`
+      : '';
+
+    return `You are a ${personaRole[persona]} reviewing PR ${review.pr.url}.
+
+${planBlock}${learnings ? learnings + '\n' : ''}
+## Diff
+\`\`\`diff
+${diff.slice(0, 60000)}
+\`\`\`
+
+## Your task
+Review the diff from the **${persona}** perspective. Be terse. Prefer high-confidence findings. Skip style noise when a \`style\` persona exists separately (unless you ARE the style persona).
+
+## Required output
+Emit EXACTLY one fenced \`\`\`json ... \`\`\` block matching:
+\`\`\`json
+${schema}
+\`\`\`
+Findings array may be empty. No prose outside the JSON block.`;
+  }
+
+  async function startReviewRun(
+    project: string,
+    prUrl: string,
+    trigger: Review['trigger'],
+    personas: Persona[],
+    modelId?: string,
+    priorReview?: Review,
+  ): Promise<void> {
+    const parsed = prIdFromUrl(prUrl);
+    if (!parsed) throw new Error(`Could not parse PR URL: ${prUrl}`);
+    const { prId, repo, number } = parsed;
+    const model = modelId ?? 'sonnet';
+
+    // Resolve workspace for the repo (for plan compliance file checks).
+    const configWorkspace = getWorkspaceFromConfig(project);
+    const cwd = configWorkspace && existsSync(configWorkspace)
+      ? configWorkspace
+      : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), project);
+
+    // Load diff
+    let diffInfo;
+    try {
+      diffInfo = await loadPrDiff(repo, number);
+    } catch (err) {
+      throw new Error(`Failed to load PR diff (is gh auth configured?): ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Look up linked plan if any (best-effort — first plan whose slug is in the PR title).
+    let linkedPlan: Plan | null = null;
+    let linkedPlanSlug: string | undefined;
+    try {
+      const pointers = planStore.listPlans(project);
+      const hit = pointers.find((p) => diffInfo.title?.includes(p.slug));
+      if (hit) {
+        linkedPlan = planStore.readCurrent(project, hit.slug);
+        linkedPlanSlug = hit.slug;
+      }
+    } catch { /* ok */ }
+
+    // Seed the review (or bump from prior for incremental).
+    const now = new Date().toISOString();
+    const baseReview = priorReview
+      ? reviewStore.bumpVersion(project, prId, {
+          pr: { ...priorReview.pr, headSha: diffInfo.headSha, baseSha: diffInfo.baseSha },
+          trigger,
+          startedAt: now,
+          completedAt: '',
+          personas,
+          // Carry prior findings forward; re-review will merge
+        })
+      : reviewStore.createReview(project, {
+          id: prId,
+          project,
+          pr: {
+            repo, number, url: prUrl,
+            headSha: diffInfo.headSha, baseSha: diffInfo.baseSha,
+            title: diffInfo.title, author: diffInfo.author,
+          },
+          planSlug: linkedPlanSlug,
+          trigger,
+          personas,
+          diffStats: { additions: diffInfo.additions, deletions: diffInfo.deletions, files: diffInfo.fileCount },
+          findings: [],
+          planCompliance: null,
+          convention: { rulesChecked: 0, violations: 0 },
+          security: { checks: [], flags: 0 },
+          summary: '',
+          verdict: 'comment',
+          estimate: { usd: 0, seconds: 0 },
+          model,
+          startedAt: now,
+          completedAt: '',
+        });
+
+    try { recordReviewCreated(ANVIL_HOME, project); } catch { /* ok */ }
+
+    broadcast({
+      type: 'review-started',
+      payload: { reviewId: prId, prId, personas, project },
+    });
+
+    // ── Run prepass rules synchronously (cheap) ─────────────────────
+    const prepassFindings: ReviewFinding[] = [];
+
+    try {
+      const secFindings = runSecurityPrepass({ files: diffInfo.files });
+      prepassFindings.push(...secFindings.map((f) => normaliseFinding(f)));
+    } catch (err) { console.warn('[review] security prepass failed:', err); }
+
+    try {
+      const convFindings = runConventionRules(
+        { files: diffInfo.files },
+        { anvilHome: ANVIL_HOME, project },
+      );
+      prepassFindings.push(...convFindings.map((f) => normaliseFinding(f)));
+    } catch (err) { console.warn('[review] convention prepass failed:', err); }
+
+    // ── Plan compliance (also cheap — no LLM) ──────────────────────
+    if (linkedPlan) {
+      try {
+        const repoLocalPaths = projectLoader.getRepoLocalPaths(project);
+        const featureDir = join(cwd, '.anvil', 'reviews', prId);
+        const { report, findings } = buildPlanCompliance({
+          plan: linkedPlan,
+          featureDir,
+          repoLocalPaths,
+          baseBranch: 'main',
+          branch: '',
+        });
+        prepassFindings.push(...findings);
+        reviewStore.bumpVersion(project, prId, { planCompliance: report });
+      } catch (err) {
+        console.warn('[review] plan compliance failed:', err);
+      }
+    }
+
+    if (prepassFindings.length) {
+      reviewStore.appendFindings(project, prId, prepassFindings);
+    }
+
+    // ── Spawn LLM reviewers (one per persona) in parallel ──────────
+    const currentForPrompt = reviewStore.readCurrent(project, prId) ?? baseReview;
+    const learnings = formatLearningsForPrompt(ANVIL_HOME, project);
+
+    for (const persona of personas) {
+      const prompt = buildReviewerPrompt(persona, currentForPrompt, diffInfo.diff, linkedPlan, learnings);
+      const projectPrompt = `You are reviewing code for project "${project}".\nPersona: **${persona}**.\n${learnings}`;
+
+      const agent = agentManager.spawn({
+        name: `review-${persona}-${prId}`,
+        persona,
+        project,
+        stage: `review-${persona}`,
+        prompt,
+        projectPrompt,
+        model,
+        cwd,
+        permissionMode: 'bypassPermissions',
+      });
+
+      reviewAgentContext.set(agent.id, { reviewId: prId, project, persona });
+
+      broadcast({ type: 'agent-spawned', payload: { ...agent, reviewId: prId, persona } });
+    }
+  }
+
+  /** Normalise an incoming finding (from prepass rules) into a full ReviewFinding. */
+  function normaliseFinding(partial: Partial<ReviewFinding> & {
+    severity: Severity; category: Category; file: string; line: number;
+    snippet: string; description: string;
+  }): ReviewFinding {
+    return {
+      id: newFindingId(),
+      severity: partial.severity,
+      category: partial.category,
+      persona: partial.persona,
+      file: partial.file,
+      line: partial.line,
+      snippet: partial.snippet,
+      description: partial.description,
+      suggestedFix: partial.suggestedFix ?? null,
+      kbRef: partial.kbRef,
+      cve: partial.cve,
+      confidence: (partial.confidence ?? 'med') as Confidence,
+      resolution: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  function extractJsonBlockFromText(text: string): unknown | null {
+    const fenceRe = /```json\s*([\s\S]*?)```/gi;
+    let match: RegExpExecArray | null;
+    let last: string | null = null;
+    while ((match = fenceRe.exec(text)) !== null) last = match[1];
+    if (last) { try { return JSON.parse(last.trim()); } catch { /* fall through */ } }
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try { return JSON.parse(text.slice(start, end + 1)); } catch { /* */ }
+    }
+    return null;
+  }
+
+  function finalizeReviewAgent(agentId: string, agent: AgentState): void {
+    const ctx = reviewAgentContext.get(agentId);
+    if (!ctx) return;
+    reviewAgentContext.delete(agentId);
+
+    const parsed = extractJsonBlockFromText(agent.output ?? '');
+    let findings: ReviewFinding[] = [];
+    let summary = '';
+    if (parsed && typeof parsed === 'object') {
+      const p = parsed as { findings?: unknown; summary?: string };
+      if (Array.isArray(p.findings)) {
+        findings = (p.findings as Array<Partial<ReviewFinding>>).map((f) => normaliseFinding({
+          severity: (f.severity ?? 'warn') as Severity,
+          category: (f.category ?? 'correctness') as Category,
+          persona: ctx.persona,
+          file: f.file ?? '',
+          line: f.line ?? 0,
+          snippet: f.snippet ?? '',
+          description: f.description ?? '',
+          suggestedFix: f.suggestedFix ?? null,
+          confidence: (f.confidence ?? 'med') as Confidence,
+        }));
+      }
+      if (typeof p.summary === 'string') summary = p.summary;
+    }
+
+    try {
+      const current = reviewStore.appendFindings(ctx.project, ctx.reviewId, findings);
+      // Accumulate summary — append each persona's blurb.
+      if (summary) {
+        const combined = current.summary
+          ? `${current.summary} | ${ctx.persona}: ${summary}`
+          : `${ctx.persona}: ${summary}`;
+        reviewStore.bumpVersion(ctx.project, ctx.reviewId, {
+          summary: combined.slice(0, 800),
+          completedAt: new Date().toISOString(),
+          estimate: {
+            usd: current.estimate.usd + agent.cost.totalUsd,
+            seconds: current.estimate.seconds + Math.round(agent.cost.durationMs / 1000),
+          },
+        });
+      }
+      broadcast({
+        type: 'review-persona-done',
+        payload: { reviewId: ctx.reviewId, persona: ctx.persona, findingCount: findings.length },
+      });
+      // If this was the last persona, also broadcast the complete review.
+      const final = reviewStore.readCurrent(ctx.project, ctx.reviewId);
+      if (final) {
+        const anyStillRunning = Array.from(reviewAgentContext.values()).some((c) => c.reviewId === ctx.reviewId);
+        if (!anyStillRunning) {
+          broadcast({ type: 'review-created', payload: { review: final } });
+        }
+      }
+    } catch (err) {
+      broadcast({ type: 'review-error', payload: { message: err instanceof Error ? err.message : String(err), reviewId: ctx.reviewId } });
+    }
+  }
+
+  /**
+   * Apply a review finding's `suggestedFix` — checks out the PR branch, applies
+   * the patch, commits, pushes, and marks the finding `addressed`.
+   */
+  async function applyReviewFix(project: string, reviewId: string, findingId: string): Promise<string> {
+    const review = reviewStore.readCurrent(project, reviewId);
+    if (!review) throw new Error(`Review ${reviewId} not found`);
+    const finding = review.findings.find((f) => f.id === findingId);
+    if (!finding) throw new Error(`Finding ${findingId} not found`);
+    if (!finding.suggestedFix) throw new Error(`Finding ${findingId} has no suggestedFix`);
+
+    const repoLocalPaths = projectLoader.getRepoLocalPaths(project);
+    const [, repoName] = review.pr.repo.split('/');
+    const localPath = repoLocalPaths[repoName];
+    if (!localPath || !existsSync(localPath)) {
+      throw new Error(`Local clone for ${review.pr.repo} not found. Run the pipeline once first.`);
+    }
+
+    // Find the branch name — fetch the PR ref.
+    execSync(`gh pr checkout ${review.pr.number} --repo ${review.pr.repo}`, { cwd: localPath, stdio: 'pipe' });
+
+    // Apply patch via `git apply`. Fall back to 3-way if straight apply fails.
+    const tmpPatch = join(localPath, `.anvil-fix-${findingId}.patch`);
+    writeFileSync(tmpPatch, finding.suggestedFix.diff, 'utf-8');
+    try {
+      execSync(`git apply "${tmpPatch}"`, { cwd: localPath, stdio: 'pipe' });
+    } catch {
+      execSync(`git apply --3way "${tmpPatch}"`, { cwd: localPath, stdio: 'pipe' });
+    }
+
+    execSync(`git add -A`, { cwd: localPath, stdio: 'pipe' });
+    const msg = `[anvil-review] fix: ${finding.description.slice(0, 80).replace(/"/g, '\\"')}`;
+    execSync(`git commit -m "${msg}"`, { cwd: localPath, stdio: 'pipe' });
+    const sha = execSync(`git rev-parse HEAD`, { cwd: localPath, encoding: 'utf-8' }).trim();
+    execSync(`git push`, { cwd: localPath, stdio: 'pipe' });
+
+    // Mark the finding addressed.
+    const updated = reviewStore.setResolution(project, reviewId, findingId, 'addressed');
+    const priorResolution = review.findings.find((f) => f.id === findingId)?.resolution ?? 'pending';
+    if (updated) {
+      const finding2 = updated.findings.find((f) => f.id === findingId);
+      if (finding2) {
+        try { recordResolution(ANVIL_HOME, project, updated, finding2, priorResolution); } catch { /* ok */ }
+      }
+    }
+
+    return sha;
   }
 
   // ── Cancel legacy pipeline ─────────────────────────────────────────

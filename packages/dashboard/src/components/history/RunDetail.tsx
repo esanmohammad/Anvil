@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { RotateCcw, Undo2 } from 'lucide-react';
 import { RunTimeline } from './RunTimeline.js';
 import { Badge } from '../ui/Badge.js';
@@ -15,6 +15,34 @@ export interface RunDetailProps {
 export function RunDetail({ run, stages, ws }: RunDetailProps) {
   const [showReplayPicker, setShowReplayPicker] = useState(false);
   const [showRollbackConfirm, setShowRollbackConfirm] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+
+  // Surface server replies for replay / rollback so the buttons feel responsive.
+  useEffect(() => {
+    if (!ws) return;
+    const handler = (event: MessageEvent) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'rollback-done') {
+          const ok = msg.payload?.ok;
+          const count = msg.payload?.results?.length ?? 0;
+          setToast(ok ? `Rolled back ${count} repo(s).` : 'Rollback completed with errors — see server logs.');
+          window.setTimeout(() => setToast(null), 4000);
+        }
+        if (msg.type === 'error' && typeof msg.payload?.message === 'string') {
+          setToast(msg.payload.message);
+          window.setTimeout(() => setToast(null), 4000);
+        }
+        if (msg.type === 'state' && msg.payload?.activePipeline?.status === 'running') {
+          // Replay fired successfully — server started a new pipeline.
+          setToast('Replay started — switch to Active Runs to watch.');
+          window.setTimeout(() => setToast(null), 3500);
+        }
+      } catch { /* ignore */ }
+    };
+    ws.addEventListener('message', handler);
+    return () => ws.removeEventListener('message', handler);
+  }, [ws]);
 
   const duration = run.durationMs ?? ((run.completedAt ?? Date.now()) - run.startedAt);
   const durationLabel = duration < 60000 ? `${Math.round(duration / 1000)}s` : `${Math.round(duration / 60000)}m`;
@@ -31,9 +59,29 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
           <h3 style={{ fontSize: 'var(--text-lg)', fontWeight: 600, marginBottom: 4 }}>{run.feature}</h3>
           <div style={{ display: 'flex', gap: 'var(--space-xs)', position: 'relative' }}>
-            {/* Replay button */}
+            {/* Replay — single-click resume from last failed/cancelled stage.
+                Alt/Option-click opens the stage picker for advanced resume. */}
             <button
-              onClick={() => setShowReplayPicker(!showReplayPicker)}
+              onClick={(e) => {
+                if (e.altKey) {
+                  setShowReplayPicker((v) => !v);
+                  return;
+                }
+                if (!ws) {
+                  setToast('Not connected to dashboard — restart `anvil-loc dashboard`.');
+                  window.setTimeout(() => setToast(null), 4000);
+                  return;
+                }
+                if (ws.readyState !== WebSocket.OPEN) {
+                  setToast(`WebSocket not open (state ${ws.readyState}). Restart the dashboard.`);
+                  window.setTimeout(() => setToast(null), 4000);
+                  return;
+                }
+                ws.send(JSON.stringify({ action: 'resume', runId: run.id }));
+                setToast('Replay requested — resuming from last cancelled stage…');
+                window.setTimeout(() => setToast(null), 3500);
+              }}
+              title="Resume from last cancelled stage (Alt-click to choose stage)"
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 6,
                 padding: '5px 12px', fontSize: 12, fontWeight: 500,
@@ -73,8 +121,13 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
                   <button
                     key={i}
                     onClick={() => {
-                      if (ws) {
+                      if (!ws || ws.readyState !== WebSocket.OPEN) {
+                        setToast('Not connected — restart `anvil-loc dashboard`.');
+                        window.setTimeout(() => setToast(null), 4000);
+                      } else {
                         ws.send(JSON.stringify({ action: 'resume', runId: run.id, fromStage: stage.name }));
+                        setToast(`Replay requested from "${stage.label || stage.name}"…`);
+                        window.setTimeout(() => setToast(null), 3500);
                       }
                       setShowReplayPicker(false);
                     }}
@@ -120,8 +173,13 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
                   </button>
                   <button
                     onClick={() => {
-                      if (ws) {
+                      if (!ws || ws.readyState !== WebSocket.OPEN) {
+                        setToast('Not connected — restart `anvil-loc dashboard`.');
+                        window.setTimeout(() => setToast(null), 4000);
+                      } else {
                         ws.send(JSON.stringify({ action: 'rollback-run', runId: run.id }));
+                        setToast('Rollback requested…');
+                        window.setTimeout(() => setToast(null), 3000);
                       }
                       setShowRollbackConfirm(false);
                     }}
@@ -276,6 +334,25 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
               </a>
             );
           })}
+        </div>
+      )}
+
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: 'fixed', bottom: 24, right: 24, zIndex: 1000,
+            padding: '10px 14px',
+            background: 'var(--bg-elevated-3)',
+            border: '1px solid var(--separator)',
+            borderRadius: 'var(--radius-md)',
+            color: 'var(--text-primary)',
+            fontSize: 13, fontFamily: 'var(--font-sans)',
+            boxShadow: '0 8px 24px rgba(0,0,0,0.25)',
+          }}
+        >
+          {toast}
         </div>
       )}
     </div>

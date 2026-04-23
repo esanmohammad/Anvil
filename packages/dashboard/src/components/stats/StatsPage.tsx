@@ -1,6 +1,7 @@
-import React, { useMemo } from 'react';
-import { BarChart3, TrendingUp, TrendingDown, DollarSign, Clock, CheckCircle2 } from 'lucide-react';
+import React, { useMemo, useEffect, useState, useCallback } from 'react';
+import { BarChart3, TrendingUp, TrendingDown, DollarSign, Clock, CheckCircle2, AlertCircle, MessageCircle, GitPullRequest } from 'lucide-react';
 import type { RunSummary } from '../history/RunRow.js';
+import { useSystem } from '../../context/ProjectContext.js';
 
 export interface StatsPageProps {
   runs: RunSummary[];
@@ -629,6 +630,9 @@ export function StatsPage({ runs, features, projects, prs: _prs }: StatsPageProp
           Insights
         </h2>
         <EmptyState />
+        <div style={{ marginTop: 'var(--space-xl)' }}>
+          <ReviewsSection />
+        </div>
       </div>
     );
   }
@@ -717,7 +721,619 @@ export function StatsPage({ runs, features, projects, prs: _prs }: StatsPageProp
           <CostTimelineSection dailyCosts={dailyCosts} />
         </div>
       )}
+
+      {/* ── PR Reviews ── */}
+      <div style={{ marginBottom: 'var(--space-xl)' }}>
+        <ReviewsSection />
+      </div>
     </div>
+  );
+}
+
+/* ─── PR Reviews Section ───────────────────────────────────── */
+
+type ReviewVerdict = 'approve' | 'request-changes' | 'comment';
+
+interface ReviewSeverityCounts {
+  blocker: number;
+  error: number;
+  warn: number;
+  info: number;
+  nit: number;
+}
+
+interface ReviewResolutionCounts {
+  pending: number;
+  addressed: number;
+  dismissed: number;
+  'wont-fix': number;
+}
+
+interface ReviewListItem {
+  reviewId: string;
+  prUrl: string;
+  prTitle: string;
+  project: string;
+  verdict: ReviewVerdict;
+  createdAt: number;
+  severityCounts: ReviewSeverityCounts;
+  resolutionCounts: ReviewResolutionCounts;
+  topCategory: string | null;
+}
+
+/**
+ * Starts of each of the last `days` days (UTC midnight), ordered oldest first.
+ */
+function getLastNDayStarts(days: number): number[] {
+  const now = new Date();
+  const starts: number[] = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+    starts.push(d.getTime());
+  }
+  return starts;
+}
+
+function formatAge(createdAt: number): string {
+  const hours = Math.max(0, Math.round((Date.now() - createdAt) / (1000 * 60 * 60)));
+  if (hours < 1) return 'just now';
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
+}
+
+function verdictColor(verdict: ReviewVerdict): string {
+  if (verdict === 'approve') return 'var(--color-success)';
+  if (verdict === 'request-changes') return 'var(--color-error)';
+  return 'var(--color-warning)';
+}
+
+function navigateToReview(reviewId: string) {
+  window.location.hash = `/review?reviewId=${encodeURIComponent(reviewId)}`;
+}
+
+function VerdictBadge({ verdict }: { verdict: ReviewVerdict }) {
+  const color = verdictColor(verdict);
+  const Icon =
+    verdict === 'approve' ? CheckCircle2 :
+    verdict === 'request-changes' ? AlertCircle :
+    MessageCircle;
+  const label =
+    verdict === 'approve' ? 'Approved' :
+    verdict === 'request-changes' ? 'Changes' :
+    'Comment';
+
+  return (
+    <span
+      aria-label={`Verdict: ${label}`}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 4,
+        fontSize: 'var(--text-2xs)', fontWeight: 500,
+        padding: '1px 7px', borderRadius: 'var(--radius-full)',
+        background: 'var(--bg-elevated-3)',
+        color,
+        border: '1px solid var(--separator)',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <Icon size={10} strokeWidth={2} aria-hidden="true" />
+      {label}
+    </span>
+  );
+}
+
+interface SparklineProps {
+  data: number[];
+  width?: number;
+  height?: number;
+}
+
+function Sparkline({ data, width = 180, height = 32 }: SparklineProps) {
+  if (data.length === 0) return null;
+  const max = Math.max(...data, 1);
+  const stepX = data.length > 1 ? width / (data.length - 1) : width;
+
+  const points = data
+    .map((v, i) => {
+      const x = data.length === 1 ? width / 2 : i * stepX;
+      const y = height - (v / max) * (height - 2) - 1;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+
+  const lastIdx = data.length - 1;
+  const lastX = data.length === 1 ? width / 2 : lastIdx * stepX;
+  const lastY = height - (data[lastIdx] / max) * (height - 2) - 1;
+
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label={`Verdict counts per day for the last ${data.length} days: ${data.join(', ')}`}
+    >
+      <polyline
+        fill="none"
+        stroke="var(--accent)"
+        strokeWidth="1.5"
+        strokeLinejoin="round"
+        strokeLinecap="round"
+        points={points}
+      />
+      <circle cx={lastX} cy={lastY} r={2} fill="var(--accent)" aria-hidden="true" />
+    </svg>
+  );
+}
+
+function VerdictMixBar({
+  approveCount,
+  changesCount,
+  commentCount,
+}: {
+  approveCount: number;
+  changesCount: number;
+  commentCount: number;
+}) {
+  const total = approveCount + changesCount + commentCount;
+  if (total === 0) {
+    return (
+      <div
+        style={{
+          height: 6,
+          borderRadius: 'var(--radius-full)',
+          background: 'var(--bg-elevated-3)',
+        }}
+      />
+    );
+  }
+  return (
+    <div
+      role="img"
+      aria-label={`Verdict mix: ${approveCount} approved, ${changesCount} changes requested, ${commentCount} comment`}
+      style={{
+        display: 'flex',
+        height: 6,
+        borderRadius: 'var(--radius-full)',
+        overflow: 'hidden',
+        background: 'var(--bg-elevated-3)',
+      }}
+    >
+      {approveCount > 0 && (
+        <div style={{ width: `${(approveCount / total) * 100}%`, background: 'var(--color-success)' }} />
+      )}
+      {changesCount > 0 && (
+        <div style={{ width: `${(changesCount / total) * 100}%`, background: 'var(--color-error)' }} />
+      )}
+      {commentCount > 0 && (
+        <div style={{ width: `${(commentCount / total) * 100}%`, background: 'var(--color-warning)' }} />
+      )}
+    </div>
+  );
+}
+
+function ReviewsSection() {
+  const { currentProject } = useSystem();
+  const project = currentProject?.name ?? null;
+
+  const [reviews, setReviews] = useState<ReviewListItem[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Open a short-lived WebSocket to fetch the review list. Kept local so we
+  // don't have to touch main.tsx's shared connection wiring.
+  useEffect(() => {
+    if (!project) {
+      setReviews([]);
+      return;
+    }
+
+    let cancelled = false;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    let ws: WebSocket | null = null;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      setError('Could not connect to review service');
+      setLoading(false);
+      return;
+    }
+
+    const handleOpen = () => {
+      ws?.send(JSON.stringify({ action: 'list-reviews', project, limit: 200 }));
+    };
+    const handleMessage = (event: MessageEvent) => {
+      if (cancelled) return;
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg?.type === 'reviews') {
+          const payload = msg.payload?.reviews;
+          setReviews(Array.isArray(payload) ? payload : []);
+          setLoading(false);
+          ws?.close();
+        }
+      } catch { /* ignore non-JSON */ }
+    };
+    const handleError = () => {
+      if (cancelled) return;
+      setError('Could not reach review service');
+      setLoading(false);
+    };
+
+    ws.addEventListener('open', handleOpen);
+    ws.addEventListener('message', handleMessage);
+    ws.addEventListener('error', handleError);
+
+    return () => {
+      cancelled = true;
+      ws?.removeEventListener('open', handleOpen);
+      ws?.removeEventListener('message', handleMessage);
+      ws?.removeEventListener('error', handleError);
+      if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
+    };
+  }, [project]);
+
+  const handleRowClick = useCallback((reviewId: string) => {
+    navigateToReview(reviewId);
+  }, []);
+
+  const handleRowKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTableRowElement>, reviewId: string) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        navigateToReview(reviewId);
+      }
+    },
+    [],
+  );
+
+  // ── Derived metrics ──────────────────────────────────────
+  const metrics = useMemo(() => {
+    if (!reviews) return null;
+
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const thisWeek = reviews.filter((r) => r.createdAt >= weekAgo);
+
+    let approveCount = 0;
+    let changesCount = 0;
+    let commentCount = 0;
+    for (const r of thisWeek) {
+      if (r.verdict === 'approve') approveCount++;
+      else if (r.verdict === 'request-changes') changesCount++;
+      else commentCount++;
+    }
+
+    // Average findings per review (this week only; meaningful when we have data)
+    const findingsThisWeek = thisWeek.reduce((sum, r) => {
+      const sc = r.severityCounts;
+      return sum + (sc.blocker + sc.error + sc.warn + sc.info + sc.nit);
+    }, 0);
+    const avgFindings = thisWeek.length > 0 ? findingsThisWeek / thisWeek.length : 0;
+
+    // Top finding category this week
+    const categoryCounts: Record<string, number> = {};
+    for (const r of thisWeek) {
+      if (r.topCategory) {
+        categoryCounts[r.topCategory] = (categoryCounts[r.topCategory] ?? 0) + 1;
+      }
+    }
+    const topCategory = Object.entries(categoryCounts).sort(([, a], [, b]) => b - a)[0]?.[0] ?? null;
+
+    // Verdict counts per day for last 14 days (any reviews in range)
+    const dayStarts = getLastNDayStarts(14);
+    const dayMs = 24 * 60 * 60 * 1000;
+    const daily: number[] = dayStarts.map((start) => {
+      const end = start + dayMs;
+      return reviews.filter((r) => r.createdAt >= start && r.createdAt < end).length;
+    });
+
+    // False-positive rate across all reviews
+    let totalFindings = 0;
+    let dismissed = 0;
+    for (const r of reviews) {
+      const sc = r.severityCounts;
+      totalFindings += sc.blocker + sc.error + sc.warn + sc.info + sc.nit;
+      dismissed += r.resolutionCounts.dismissed ?? 0;
+    }
+    const fpRate = totalFindings > 0 ? (dismissed / totalFindings) * 100 : 0;
+    const hasDismissals = dismissed > 0;
+
+    return {
+      thisWeekCount: thisWeek.length,
+      approveCount,
+      changesCount,
+      commentCount,
+      avgFindings,
+      topCategory,
+      daily,
+      totalFindings,
+      dismissed,
+      fpRate,
+      hasDismissals,
+    };
+  }, [reviews]);
+
+  const recentReviews = useMemo(() => {
+    if (!reviews) return [];
+    return [...reviews].sort((a, b) => b.createdAt - a.createdAt).slice(0, 10);
+  }, [reviews]);
+
+  // ── Render ───────────────────────────────────────────────
+  return (
+    <section aria-label="PR Reviews">
+      <h3 style={sectionTitleStyle}>PR Reviews</h3>
+
+      {loading && !reviews && (
+        <div style={{ ...cardStyle, padding: 'var(--space-md)', color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)' }}>
+          Loading reviews...
+        </div>
+      )}
+
+      {error && !loading && (
+        <div style={{ ...cardStyle, padding: 'var(--space-md)', color: 'var(--color-error)', fontSize: 'var(--text-sm)' }} role="alert">
+          {error}
+        </div>
+      )}
+
+      {!loading && !error && reviews && reviews.length === 0 && (
+        <div
+          style={{
+            ...cardStyle,
+            padding: 'var(--space-lg)',
+            textAlign: 'center',
+            color: 'var(--text-tertiary)',
+            fontSize: 'var(--text-sm)',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: 'var(--space-sm)',
+          }}
+        >
+          <GitPullRequest size={24} strokeWidth={1.25} style={{ opacity: 0.5 }} aria-hidden="true" />
+          <div>
+            No reviews yet. Reviews appear after <code style={{ fontFamily: 'var(--font-mono)' }}>anvil review &lt;pr-url&gt;</code>
+            {' '}or automatically after pipeline Ship stage.
+          </div>
+        </div>
+      )}
+
+      {!loading && !error && reviews && reviews.length > 0 && metrics && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-md)' }}>
+          {/* Summary tiles */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(4, 1fr)',
+              gap: 'var(--space-sm)',
+            }}
+          >
+            <div style={cardStyle}>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)' }}>
+                Reviews this week
+              </div>
+              <div
+                style={{
+                  fontSize: 'var(--text-2xl)', fontWeight: 700,
+                  fontFamily: 'var(--font-mono)', color: 'var(--text-primary)', lineHeight: 1.2,
+                }}
+              >
+                {metrics.thisWeekCount}
+              </div>
+            </div>
+
+            <div style={cardStyle}>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)' }}>
+                Verdict mix
+              </div>
+              <VerdictMixBar
+                approveCount={metrics.approveCount}
+                changesCount={metrics.changesCount}
+                commentCount={metrics.commentCount}
+              />
+              <div
+                style={{
+                  display: 'flex', gap: 'var(--space-sm)', marginTop: 'var(--space-xs)',
+                  fontSize: 'var(--text-2xs)', fontFamily: 'var(--font-mono)',
+                }}
+              >
+                <span style={{ color: 'var(--color-success)' }}>{metrics.approveCount}</span>
+                <span style={{ color: 'var(--color-error)' }}>{metrics.changesCount}</span>
+                <span style={{ color: 'var(--color-warning)' }}>{metrics.commentCount}</span>
+              </div>
+            </div>
+
+            <div style={cardStyle}>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)' }}>
+                Avg findings / review
+              </div>
+              <div
+                style={{
+                  fontSize: 'var(--text-2xl)', fontWeight: 700,
+                  fontFamily: 'var(--font-mono)', color: 'var(--text-primary)', lineHeight: 1.2,
+                }}
+              >
+                {metrics.avgFindings.toFixed(1)}
+              </div>
+              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-xs)' }}>
+                last 7 days
+              </div>
+            </div>
+
+            <div style={cardStyle}>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-xs)' }}>
+                Top category
+              </div>
+              <div
+                style={{
+                  fontSize: 'var(--text-base)', fontWeight: 600,
+                  color: 'var(--text-primary)', lineHeight: 1.2,
+                  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                }}
+                title={metrics.topCategory ?? undefined}
+              >
+                {metrics.topCategory ?? '—'}
+              </div>
+              <div style={{ fontSize: 'var(--text-2xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-xs)' }}>
+                last 7 days
+              </div>
+            </div>
+          </div>
+
+          {/* Verdict over time (sparkline) + FP rate */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-sm)' }}>
+            <div style={cardStyle}>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-sm)' }}>
+                Reviews over last 14 days
+              </div>
+              <Sparkline data={metrics.daily} />
+            </div>
+
+            <div style={cardStyle}>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-sm)' }}>
+                False-positive rate
+              </div>
+              {metrics.hasDismissals ? (
+                <div
+                  style={{
+                    fontSize: 'var(--text-lg)', fontWeight: 600,
+                    fontFamily: 'var(--font-mono)', color: 'var(--text-primary)',
+                  }}
+                >
+                  {metrics.fpRate.toFixed(1)}%
+                  <span
+                    style={{
+                      marginLeft: 'var(--space-sm)',
+                      fontSize: 'var(--text-xs)', fontWeight: 400,
+                      color: 'var(--text-tertiary)',
+                    }}
+                  >
+                    ({metrics.dismissed} of {metrics.totalFindings} findings dismissed)
+                  </span>
+                </div>
+              ) : (
+                <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-tertiary)' }}>
+                  No dismissals yet — waiting for signal.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Recent reviews table */}
+          <div style={{ ...cardStyle, padding: 0, overflow: 'hidden' }}>
+            <table
+              style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-sm)' }}
+              aria-label="Recent reviews"
+            >
+              <thead>
+                <tr>
+                  {['PR', 'Verdict', 'Findings', 'Age'].map((header, idx) => (
+                    <th
+                      key={header}
+                      scope="col"
+                      style={{
+                        textAlign: idx === 0 ? 'left' : idx === 3 ? 'right' : 'left',
+                        padding: '10px 14px',
+                        fontSize: 'var(--text-xs)',
+                        fontWeight: 500,
+                        color: 'var(--text-tertiary)',
+                        borderBottom: '1px solid var(--separator)',
+                        background: 'var(--bg-elevated-3)',
+                      }}
+                    >
+                      {header}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {recentReviews.map((r, i) => {
+                  const sc = r.severityCounts;
+                  const blockerCount = sc.blocker ?? 0;
+                  const errorCount = sc.error ?? 0;
+                  const warnCount = sc.warn ?? 0;
+                  return (
+                    <tr
+                      key={r.reviewId}
+                      tabIndex={0}
+                      role="link"
+                      aria-label={`Open review for ${r.prTitle}`}
+                      onClick={() => handleRowClick(r.reviewId)}
+                      onKeyDown={(e) => handleRowKeyDown(e, r.reviewId)}
+                      style={{
+                        background: i % 2 === 1 ? 'rgba(255,255,255,0.015)' : 'transparent',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <td
+                        style={{
+                          padding: '10px 14px',
+                          color: 'var(--text-primary)',
+                          maxWidth: 0,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                        title={r.prTitle}
+                      >
+                        {r.prTitle}
+                      </td>
+                      <td style={{ padding: '10px 14px' }}>
+                        <VerdictBadge verdict={r.verdict} />
+                      </td>
+                      <td
+                        style={{
+                          padding: '10px 14px',
+                          fontSize: 'var(--text-xs)',
+                          fontFamily: 'var(--font-mono)',
+                          color: 'var(--text-secondary)',
+                          display: 'flex',
+                          gap: 'var(--space-sm)',
+                        }}
+                      >
+                        {blockerCount > 0 && (
+                          <span style={{ color: 'var(--color-error)' }} title="Blockers">
+                            B:{blockerCount}
+                          </span>
+                        )}
+                        {errorCount > 0 && (
+                          <span style={{ color: 'var(--color-error)' }} title="Errors">
+                            E:{errorCount}
+                          </span>
+                        )}
+                        {warnCount > 0 && (
+                          <span style={{ color: 'var(--color-warning)' }} title="Warnings">
+                            W:{warnCount}
+                          </span>
+                        )}
+                        {blockerCount + errorCount + warnCount === 0 && (
+                          <span style={{ color: 'var(--text-tertiary)' }}>—</span>
+                        )}
+                      </td>
+                      <td
+                        style={{
+                          padding: '10px 14px',
+                          textAlign: 'right',
+                          fontSize: 'var(--text-xs)',
+                          fontFamily: 'var(--font-mono)',
+                          color: 'var(--text-tertiary)',
+                        }}
+                      >
+                        {formatAge(r.createdAt)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }
 

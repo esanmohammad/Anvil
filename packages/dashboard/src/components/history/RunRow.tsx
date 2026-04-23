@@ -89,7 +89,10 @@ export function RunRow({ run, isSelected, onClick }: RunRowProps) {
         </span>
       )}
 
-      <span style={{ flex: 1, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+      <span
+        title={run.feature}
+        style={{ flex: 1, minWidth: 0, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+      >
         {run.feature}
       </span>
 

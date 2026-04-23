@@ -110,10 +110,21 @@ function loadPersonaPromptSync(personaName: string): string {
     return content;
   }
 
-  // Bundled prompts — navigate from dashboard/server/ to cli/src/personas/prompts/
+  // Resolution paths in order of likelihood. The CLI bundles prompts into
+  // `cli/dist/personas/prompts/`; the monorepo dev tree keeps them in
+  // `cli/src/personas/prompts/`. `__dirname` at runtime is either
+  // `cli/dist/dashboard/server/` (bundled) or the original source tree.
   const bundledPaths = [
+    // Bundled: cli/dist/dashboard/server/ → ../../personas/prompts/
+    join(__dirname, '..', '..', 'personas', 'prompts', `${personaName}.md`),
+    // Dev (from source): dashboard/server/ → ../../cli/src/personas/prompts/
     join(__dirname, '..', '..', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
+    // Monorepo tree: dashboard/server/ → ../../../packages/cli/src/personas/prompts/
     join(__dirname, '..', '..', '..', 'packages', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
+    // Bundled-but-deeper: cli/dist/dashboard/server/ → ../../../../packages/cli/src/personas/prompts/
+    join(__dirname, '..', '..', '..', '..', 'packages', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
+    // Bundled running from cli/dist: cli/dist/dashboard/server/ → ../../../src/personas/prompts/ (when src still present)
+    join(__dirname, '..', '..', '..', 'src', 'personas', 'prompts', `${personaName}.md`),
   ];
 
   for (const p of bundledPaths) {
@@ -124,7 +135,7 @@ function loadPersonaPromptSync(personaName: string): string {
     }
   }
 
-  console.warn(`[pipeline] Persona prompt not found for "${personaName}", using fallback`);
+  console.warn(`[pipeline] Persona prompt not found for "${personaName}", using fallback. Checked: ${bundledPaths.join(', ')}`);
   return '';
 }
 
@@ -159,6 +170,9 @@ const STAGES: StageDefinition[] = [
   { index: 6, name: 'validate',          label: 'Testing',              persona: 'tester',    perRepo: true },
   { index: 7, name: 'ship',              label: 'Shipping',             persona: 'engineer',  perRepo: false },
 ];
+
+/** Stages whose artifacts can be fully derived from a Plan — skipped when planSeed is provided. */
+const PLAN_DERIVED_STAGES: string[] = ['requirements', 'repo-requirements', 'specs', 'tasks'];
 
 // ── Per-repo agent tracking ───────────────────────────────────────────
 
@@ -223,6 +237,20 @@ export interface PipelineConfig {
   modelTier?: ModelTier;     // cost-aware tier — overrides single model with per-stage routing
   baseBranch?: string;       // base branch to checkout/PR against (default: auto-detect main/master)
   skipClarify?: boolean;
+  /** When set and skipClarify=true, this replaces the Clarify artifact fed to the next stage. Used by the Plan flow. */
+  clarifySeedArtifact?: string;
+  /**
+   * When set, stages 1–4 (requirements, repo-requirements, specs, tasks) are
+   * derived deterministically from this Plan instead of running agents.
+   * The Plan flow uses this to skip straight to Build.
+   */
+  planSeed?: {
+    project: string;
+    slug: string;
+    version: number;
+    /** Snapshot of the plan JSON (so changes after execute don't affect the run). */
+    plan: import('./plan-store.js').Plan;
+  };
   skipShip?: boolean;
   deploy?: 'local' | 'remote' | false;  // deploy after shipping
   repos?: string[];          // explicit repo list (overrides auto-detection)
@@ -611,9 +639,21 @@ export class PipelineRunner extends EventEmitter {
 
         // Skip stages if configured
         if (stage.name === 'clarify' && this.config.skipClarify) {
+          const seed = this.config.clarifySeedArtifact ?? 'Clarification skipped.';
           this.state.stages[i].status = 'skipped';
-          this.state.stages[i].artifact = 'Clarification skipped.';
-          prevArtifact = 'Clarification skipped.';
+          this.state.stages[i].artifact = seed;
+          prevArtifact = seed;
+          // Persist seed as CLARIFICATION.md so downstream resume picks it up.
+          if (this.config.clarifySeedArtifact) {
+            try {
+              this.featureStore.writeArtifact(
+                this.config.project,
+                this.state.featureSlug,
+                'CLARIFICATION.md',
+                this.config.clarifySeedArtifact,
+              );
+            } catch { /* not fatal */ }
+          }
           this.broadcastState();
           this.checkpoint();
           continue;
@@ -624,6 +664,66 @@ export class PipelineRunner extends EventEmitter {
           this.checkpoint();
           continue;
         }
+
+        // Plan-seed skip: stages 1–4 derive deterministically from the plan.
+        if (this.config.planSeed && PLAN_DERIVED_STAGES.includes(stage.name)) {
+          const { plan } = this.config.planSeed;
+          const { renderRequirements, renderRepoRequirements, renderRepoSpecs, renderRepoTasks }
+            = await import('./plan-to-artifacts.js');
+
+          const project = this.config.project;
+          const slug = this.state.featureSlug;
+
+          if (stage.name === 'requirements') {
+            const artifact = renderRequirements(plan);
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = artifact;
+            prevArtifact = artifact;
+            try { this.featureStore.writeArtifact(project, slug, 'REQUIREMENTS.md', artifact); } catch { /* non-fatal */ }
+          } else {
+            // Per-repo: write one artifact per repo + populate repos[] entries
+            const filenameByStage: Record<string, string> = {
+              'repo-requirements': 'REQUIREMENTS.md',
+              specs: 'SPECS.md',
+              tasks: 'TASKS.md',
+            };
+            const rendererByStage: Record<string, (p: typeof plan, r: string) => string> = {
+              'repo-requirements': renderRepoRequirements,
+              specs: renderRepoSpecs,
+              tasks: renderRepoTasks,
+            };
+            const filename = filenameByStage[stage.name];
+            const renderer = rendererByStage[stage.name];
+
+            const combined: string[] = [];
+            this.state.stages[i].repos = this.state.repoNames.map((repoName) => {
+              const artifact = renderer(plan, repoName);
+              try {
+                this.featureStore.writeArtifact(project, slug, `repos/${repoName}/${filename}`, artifact);
+              } catch { /* non-fatal */ }
+              combined.push(`## ${repoName}\n${artifact}`);
+              return {
+                repoName,
+                agentId: null,
+                status: 'completed' as const,
+                cost: 0,
+                artifact,
+                error: null,
+              };
+            });
+
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = combined.join('\n\n');
+            prevArtifact = this.state.stages[i].artifact;
+          }
+
+          this.state.stages[i].completedAt = new Date().toISOString();
+          this.broadcastState();
+          this.checkpoint();
+          continue;
+        }
+
+        console.log(`[pipeline] Entering stage "${stage.name}" (${i + 1}/${STAGES.length})`);
 
         // Ensure Claude CLI auth is valid before spawning agents
         await this.ensureAuth(stage.name);
@@ -672,6 +772,40 @@ export class PipelineRunner extends EventEmitter {
           // Write artifact to feature folder
           this.writeStageArtifact(i, stage, result.artifact);
 
+          // After build (plan-seeded runs only): capture what Build actually did
+          // vs what the plan claimed. Feeds plan-learner.
+          if (stage.name === 'build' && this.config.planSeed && !this.cancelled) {
+            try {
+              const { captureDeviation, updateLearnings } = await import('./plan-deviation.js');
+              const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
+              const repoLocalPaths: Record<string, string> = {};
+              for (const r of this.state.repoNames) repoLocalPaths[r] = this.repoPaths[r] ?? '';
+              const deviation = captureDeviation(this.config.planSeed.plan, {
+                featureDir,
+                repoLocalPaths,
+                baseBranch: this.config.baseBranch ?? 'main',
+                branch: `anvil/${this.state.featureSlug}`,
+              });
+              const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME
+                || (await import('node:os')).homedir() + '/.anvil';
+              updateLearnings(
+                anvilHome,
+                this.config.project,
+                deviation,
+                this.state.totalCost,
+                this.config.planSeed.plan.estimate.usd,
+              );
+              this.emit('artifact-written', {
+                stage: 'build',
+                file: `${featureDir}/plan-deviation.json`,
+                summary: `Plan match rate: ${(deviation.summary.matchRate * 100).toFixed(0)}%`,
+                content: JSON.stringify(deviation, null, 2),
+              });
+            } catch (err) {
+              console.warn('[pipeline] Plan deviation capture failed:', err);
+            }
+          }
+
           // After ship stage, optionally deploy to remote sandbox
           if (stage.name === 'ship' && this.config.deploy && !this.cancelled) {
             this.deployToRemote();
@@ -713,6 +847,10 @@ export class PipelineRunner extends EventEmitter {
             if (this.hasValidationFailures(validateArtifact)) {
               console.warn(`[pipeline] Validation still failing after ${MAX_FIX_ATTEMPTS} fix attempts`);
               // Don't fail the pipeline — ship stage will do a final check
+            } else if (fixAttempts > 0) {
+              console.log(`[pipeline] Validation recovered after ${fixAttempts} fix attempt(s)`);
+            } else {
+              console.log(`[pipeline] Validation clean — proceeding to Ship`);
             }
 
             prevArtifact = validateArtifact;
@@ -1252,9 +1390,27 @@ export class PipelineRunner extends EventEmitter {
   /** Check if validation artifact indicates failures */
   private hasValidationFailures(artifact: string): boolean {
     if (!artifact) return false;
-    return /VERDICT:\s*FAIL/i.test(artifact) ||
-           /UNRESOLVED/i.test(artifact) ||
-           /(?:build|lint|test).*(?:fail|error)/i.test(artifact);
+
+    // Explicit markers always win.
+    if (/VERDICT:\s*FAIL/i.test(artifact)) return true;
+    if (/\bUNRESOLVED\b/i.test(artifact)) return true;
+
+    // Otherwise, check each line. A failure line looks like "tests failed",
+    // "build failed", "typecheck failed", "lint errored" — tightly scoped,
+    // NOT cross-line. Lines with PASS markers are explicitly excluded.
+    for (const rawLine of artifact.split('\n')) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      // Tables / bullets with PASS are healthy.
+      if (/\bPASS\b/.test(line) && !/\bFAIL\b/.test(line)) continue;
+      // Explicit failure phrases near build/lint/test/typecheck subjects.
+      if (/\b(?:build|lint|linting|typecheck|type[- ]?check|tests?)\s+(?:failed|failing|errored|broken|has\s+errors?|exits?\s+non-?zero)\b/i.test(line)) return true;
+      // Common failure glyphs in CI output.
+      if (/(?:^|\s)(?:✗|✖|❌|FAILED:|FAIL:)/.test(line)) return true;
+      // Jest/Vitest-style "N failed" or "N failing" count summaries.
+      if (/\b[1-9]\d*\s+(?:failed|failing)\b/i.test(line)) return true;
+    }
+    return false;
   }
 
   /** Run engineer agents to fix validation issues, then return */

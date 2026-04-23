@@ -13,6 +13,7 @@ import { KnowledgeGraphPage } from './components/knowledge-graph/KnowledgeGraphP
 import { ReviewPage } from './components/review/ReviewPage.js';
 import { TestGenPage } from './components/test-gen/TestGenPage.js';
 import { PlanPage } from './components/plan/PlanPage.js';
+import { PlanCompare } from './components/plan/PlanCompare.js';
 import { SettingsPage } from './components/settings/SettingsPage.js';
 import type { ActivityEntry } from './components/output/ActivityLine.js';
 import { OutputPanel } from './components/output/OutputPanel.js';
@@ -949,7 +950,18 @@ function App() {
                   }}>
                     {r.type === 'spike' ? 'research' : r.type}
                   </span>
-                  <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>{r.description}</span>
+                  <span
+                    title={r.description}
+                    style={{
+                      flex: 1,
+                      minWidth: 0,
+                      fontSize: 13, fontWeight: 500,
+                      color: 'var(--text-primary)',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >{r.description}</span>
                   <span style={{
                     fontSize: 11, color: 'var(--text-tertiary)',
                     fontFamily: 'var(--font-mono)',
@@ -1071,19 +1083,23 @@ function App() {
         );
 
       case 'review':
-        return <ComingSoonOverlay label="Review"><ReviewPage project={currentProject?.name ?? null} ws={wsRef.current} /></ComingSoonOverlay>;
+        return <ReviewPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'test-gen':
         return <ComingSoonOverlay label="Test Generation"><TestGenPage project={currentProject?.name ?? null} ws={wsRef.current} /></ComingSoonOverlay>;
 
       case 'plan':
-        return <ComingSoonOverlay label="Plan"><PlanPage project={currentProject?.name ?? null} ws={wsRef.current} /></ComingSoonOverlay>;
+        return <PlanPage project={currentProject?.name ?? null} ws={wsRef.current} />;
+
+      case 'plan-compare':
+        return <PlanCompare ws={wsRef.current} />;
 
       case 'settings':
         return <SettingsPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'history':
         return <RunHistoryList
+          ws={wsRef.current}
           runs={runs}
           initialSelectedId={historySelectedRunId}
           getRunStages={(runId: string) => {

@@ -17,9 +17,10 @@ export const routes: RouteConfig[] = [
   { path: '/', id: 'home', label: 'Home', primary: true },
   { path: '/runs', id: 'runs', label: 'Active Runs', primary: true },
   { path: '/pr-board', id: 'pr-board', label: 'Pull Requests', primary: true },
-  { path: '/review', id: 'review', label: 'Review', primary: true, comingSoon: true },
+  { path: '/review', id: 'review', label: 'Review', primary: true },
   { path: '/test-gen', id: 'test-gen', label: 'Test Gen', primary: true, comingSoon: true },
-  { path: '/plan', id: 'plan', label: 'Plan', primary: true, comingSoon: true },
+  { path: '/plan', id: 'plan', label: 'Plan', primary: true },
+  { path: '/plan/compare', id: 'plan-compare', label: 'Compare plans' },
   { path: '/history', id: 'history', label: 'History', secondary: true },
   { path: '/insights', id: 'insights', label: 'Insights', secondary: true },
   { path: '/project', id: 'project', label: 'Project', secondary: true },
@@ -56,10 +57,13 @@ export function useHashRouter() {
   // Support parameterized routes like /run/:id
   const runMatch = hash.match(/^\/run\/(.+)$/);
 
+  // Strip query string for route lookup (e.g. /plan/compare?project=x → /plan/compare)
+  const pathOnly = hash.split('?')[0];
+
   // Support legacy routes — redirect stats→insights, overview→project
-  let effectiveHash = hash;
-  if (hash === '/stats') effectiveHash = '/insights';
-  if (hash === '/overview') effectiveHash = '/project';
+  let effectiveHash = pathOnly;
+  if (pathOnly === '/stats') effectiveHash = '/insights';
+  if (pathOnly === '/overview') effectiveHash = '/project';
 
   const currentRoute = runMatch
     ? { path: hash, id: 'run', label: 'Run' }

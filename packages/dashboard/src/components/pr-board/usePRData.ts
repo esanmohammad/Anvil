@@ -2,6 +2,16 @@ import { useState, useCallback } from 'react';
 
 export type PRStatus = 'draft' | 'open' | 'in_review' | 'merged' | 'closed';
 
+export interface PRReviewSummary {
+  reviewId: string;
+  verdict: 'approve' | 'request-changes' | 'comment';
+  blockers: number;
+  errors: number;
+  warnings: number;
+  summary: string;           // short text for tooltip
+  reviewedAt: number;        // epoch ms
+}
+
 export interface PRData {
   id: string;
   title: string;
@@ -15,6 +25,7 @@ export interface PRData {
   deletions: number;
   reviewers: string[];
   labels: string[];
+  review?: PRReviewSummary | null;
 }
 
 export function usePRData() {

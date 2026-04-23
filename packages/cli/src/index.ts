@@ -6,6 +6,8 @@ import { registerGlobalFlags } from './flags.js';
 import { initCommand } from './commands/init.js';
 import { doctorCommand } from './commands/doctor.js';
 import { dashboardCommand } from './commands/dashboard.js';
+import { planCommand } from './commands/plan.js';
+import { reviewCommand } from './commands/review.js';
 
 const program = new Command();
 
@@ -20,6 +22,8 @@ registerGlobalFlags(program);
 program.addCommand(initCommand);
 program.addCommand(doctorCommand);
 program.addCommand(dashboardCommand);
+program.addCommand(planCommand);
+program.addCommand(reviewCommand);
 
 // ── Future CLI commands (disabled for MVP 1) ─────────────────────────
 const comingSoon = (name: string, desc: string) => {
@@ -35,7 +39,6 @@ const comingSoon = (name: string, desc: string) => {
 
 program.addCommand(comingSoon('run', 'Run a feature pipeline'));
 program.addCommand(comingSoon('fix', 'Fix a bug'));
-program.addCommand(comingSoon('review', 'Review code'));
 program.addCommand(comingSoon('resume', 'Resume a pipeline'));
 program.addCommand(comingSoon('status', 'Show pipeline status'));
 program.addCommand(comingSoon('runs', 'List pipeline runs'));
@@ -44,7 +47,6 @@ program.addCommand(comingSoon('ship', 'Ship changes and create PRs'));
 program.addCommand(comingSoon('memory', 'Manage project memory'));
 program.addCommand(comingSoon('search', 'Search the knowledge base'));
 program.addCommand(comingSoon('learn', 'Learn conventions from codebase'));
-program.addCommand(comingSoon('plan', 'Generate a feature plan'));
 program.addCommand(comingSoon('diff', 'AI-powered diff analysis'));
 program.addCommand(comingSoon('test-gen', 'Generate tests'));
 program.addCommand(comingSoon('watch', 'Watch for changes'));
