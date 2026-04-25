@@ -386,7 +386,30 @@ export function loadPolicy(projectSlug: string, anvilHome?: string): PipelinePol
   if (!existsSync(path)) return null;
   const raw = readFileSync(path, 'utf-8');
   const node = parseYaml(raw);
-  return shapePolicy(node);
+  const policy = shapePolicy(node);
+
+  // Layer dashboard-managed overlay (Settings → policy editor) on top of YAML.
+  // Stored at `pipeline-policy.overlay.json` so the YAML's comments stay intact.
+  const overlayPath = join(home, 'projects', projectSlug, 'pipeline-policy.overlay.json');
+  if (existsSync(overlayPath)) {
+    try {
+      const overlay = JSON.parse(readFileSync(overlayPath, 'utf-8')) as { cost?: Record<string, unknown> };
+      if (overlay.cost && typeof overlay.cost === 'object') {
+        const cost = (policy.cost ??= {}) as NonNullable<PipelinePolicy['cost']>;
+        const ov = overlay.cost as { onBreach?: 'ask' | 'auto-approve' | 'auto-reject'; autoApproveBelow?: number; graceWindowSeconds?: number; limits?: { perRun?: number; perProjectDaily?: number } };
+        if (ov.onBreach) cost.onBreach = ov.onBreach;
+        if (typeof ov.autoApproveBelow === 'number') cost.autoApproveBelow = ov.autoApproveBelow;
+        if (typeof ov.graceWindowSeconds === 'number') cost.graceWindowSeconds = ov.graceWindowSeconds;
+        if (ov.limits) {
+          const lim = (cost.limits ??= {});
+          if (typeof ov.limits.perRun === 'number') lim.perRun = ov.limits.perRun;
+          if (typeof ov.limits.perProjectDaily === 'number') lim.perProjectDaily = ov.limits.perProjectDaily;
+        }
+      }
+    } catch { /* malformed overlay — ignore, fall back to YAML */ }
+  }
+
+  return policy;
 }
 
 export function defaultPolicy(): PipelinePolicy {

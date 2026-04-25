@@ -13,5 +13,5 @@
     "outDir": "./out",
     "rootDir": "."
   },
-  "include": ["*.ts", "adapters/*.ts", "plan-validator-rules/*.ts", "review-rules/*.ts", "review-verifier-test-generators/*.ts", "__tests__/*.ts"]
+  "include": ["*.ts", "adapters/*.ts", "incident-parsers/*.ts", "plan-validator-rules/*.ts", "review-checks/*.ts", "review-rules/*.ts", "review-verifier-test-generators/*.ts", "__tests__/*.ts"]
 }

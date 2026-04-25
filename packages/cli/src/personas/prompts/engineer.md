@@ -115,26 +115,29 @@ When a knowledge graph is provided above, use it to quickly locate relevant file
 
 ## Output Format
 
-Your output is the code itself, organized by file. Present changes as:
+Your textual response is a tight summary, NOT a code dump. The actual code edits live in the workspace (made via Edit/Write); a separate validate stage will run the build/tests against them. Do NOT include full file contents in your output — that wastes tokens and duplicates what's already on disk.
+
+Emit exactly this:
 
 ```markdown
 ## Implementation: [Task ID] — [Task Title]
 
 ### Files Changed
-
-#### [path/to/file.go] (new / modified)
-[Complete file content or diff]
-
-#### [path/to/file_test.go] (new / modified)
-[Complete file content or diff]
+- `path/to/file.go` — new | modified | deleted (≤1 line description)
+- `path/to/file_test.go` — new | modified | deleted (≤1 line description)
 
 ### Acceptance Criteria Verification
-- [x] [Criterion 1] — [How it's satisfied]
-- [x] [Criterion 2] — [How it's satisfied]
+- [x] [Criterion 1] — [How it's satisfied, ≤1 line]
+- [x] [Criterion 2] — [How it's satisfied, ≤1 line]
 
 ### Test Results
-[Summary of test execution: tests run, passed, failed]
+[One line: e.g. "12 tests, all pass" or "5 failed — see UNRESOLVED"]
 
 ### Notes
-[Any observations, discovered issues, or flags for the Tester persona]
+[Optional. Only include flags for the Tester persona, discovered issues, or scope concerns. Skip if none.]
 ```
+
+Hard rules:
+- No `diff --git` blocks, no fenced code blocks containing file contents.
+- No multi-paragraph explanations of what each function does — the code is already on disk and the validate stage will see it.
+- If you genuinely cannot satisfy a criterion, mark it `- [ ] ... — UNRESOLVED: <reason>`.

@@ -30,6 +30,12 @@ import type { ProjectInfo } from './context/ProjectContext.js';
 import type { RunSummary } from './components/history/RunRow.js';
 import type { OutputChunk } from '../server/types.js';
 import { ArrowLeft, Square, RotateCcw, Play } from 'lucide-react';
+import { CostBreachModal } from './components/pipeline/CostBreachModal.js';
+import type { CostBreachModalBreach } from './components/pipeline/CostBreachModal.js';
+import { CostBreachToast } from './components/pipeline/CostBreachToast.js';
+import { CostMeter } from './components/pipeline/CostMeter.js';
+import { StageSpendPanel } from './components/pipeline/StageSpendPanel.js';
+import { CostBreachHistoryPage } from './components/cost-breaches/CostBreachHistoryPage.js';
 
 // ---------------------------------------------------------------------------
 // Raw content cleaner — strips JSON, tool inputs, commands from Claude's text
@@ -273,6 +279,10 @@ function App() {
     id: string; type: string; project: string; description: string;
     model: string; status: string; startedAt: number; activityCount: number;
   }>>([]);
+  const [pendingBreach, setPendingBreach] = useState<(CostBreachModalBreach & { runId: string; project: string }) | null>(null);
+  const [breachModalOpen, setBreachModalOpen] = useState<boolean>(false);
+  const [breachDismissed, setBreachDismissed] = useState<boolean>(false);
+  const [runCost, setRunCost] = useState<{ runId: string; usd: number; limitUsd?: number; perStageUsd: Record<string, number> } | null>(null);
   const [viewingRunActivities, setViewingRunActivities] = useState<ActivityEntry[]>([]);
   const [overviewData, setOverviewData] = useState<{
     memories: Array<{ id: string; key: string; value: string; category: string; timestamp: number }>;
@@ -454,6 +464,35 @@ function App() {
       case 'active-runs':
         if (Array.isArray(msg.payload)) setActiveRunsList(msg.payload);
         break;
+
+      case 'cost-snapshot': {
+        const snap = (msg.payload && typeof msg.payload === 'object') ? msg.payload as {
+          pendingBreach?: CostBreachModalBreach & { runId: string };
+          project?: string;
+          runId?: string;
+          run?: { usd: number; limitUsd?: number; perStageUsd: Record<string, number> };
+        } : null;
+        const pending = snap?.pendingBreach;
+        setPendingBreach(() => pending ?? null);
+        if (!pending) setBreachDismissed(() => false);
+        if (snap?.runId && snap.run) {
+          const runId = snap.runId;
+          const run = snap.run;
+          setRunCost(() => ({ runId, usd: run.usd, limitUsd: run.limitUsd, perStageUsd: run.perStageUsd }));
+        }
+        break;
+      }
+
+      case 'cost-breach': {
+        const payload = msg.payload as { breach?: { status?: string; runId?: string; project?: string } } | undefined;
+        const status = payload?.breach?.status;
+        // When breach resolves (raised/rejected/auto-resolved), close modal + toast.
+        if (status && status !== 'pending') {
+          setPendingBreach(() => null);
+          setBreachDismissed(() => false);
+        }
+        break;
+      }
 
       case 'agent-spawned': {
         // Don't clear actionPending here — wait for first agent-output
@@ -656,6 +695,49 @@ function App() {
       sendWs({ action: 'get-state' });
     }
   }, [urlRunId]);
+
+  // Subscribe to per-project cost-snapshot push so the modal/toast/meter all
+  // see breaches the moment the backend emits them. Server pushes a fresh
+  // snapshot on every cost ledger entry + every breach state change. Subscribe
+  // at the project level (no runId) so we catch breaches across all runs.
+  useEffect(() => {
+    const project = currentProject?.name;
+    if (!project) return;
+    sendWs({ action: 'subscribe-cost', project });
+    return () => { sendWs({ action: 'unsubscribe-cost', project }); };
+  }, [currentProject?.name]);
+
+  // Run-scoped subscription — when viewing /run/:id, also subscribe to that
+  // specific run so the run header CostMeter and StageSpendPanel get fresh
+  // per-run data on every cost ledger record.
+  useEffect(() => {
+    const project = currentProject?.name;
+    if (!project || !urlRunId) {
+      setRunCost(() => null);
+      return;
+    }
+    sendWs({ action: 'subscribe-cost', project, runId: urlRunId });
+    return () => { sendWs({ action: 'unsubscribe-cost', project, runId: urlRunId }); };
+  }, [currentProject?.name, urlRunId]);
+
+  // Tab-title pulse — when a breach is pending and the page isn't focused,
+  // prepend a marker so users in other tabs notice. Restored on resolve.
+  useEffect(() => {
+    const baseTitle = 'Anvil';
+    if (pendingBreach) {
+      document.title = `⚠ Cost breach · ${baseTitle}`;
+    } else {
+      document.title = baseTitle;
+    }
+    return () => { document.title = baseTitle; };
+  }, [pendingBreach]);
+
+  // Auto-open modal whenever a fresh breach lands (unless user explicitly
+  // dismissed it for this lifecycle — they can still re-open from the toast).
+  useEffect(() => {
+    if (pendingBreach && !breachDismissed) setBreachModalOpen(true);
+    if (!pendingBreach) setBreachModalOpen(false);
+  }, [pendingBreach, breachDismissed]);
 
   // Global keyboard shortcut
   useEffect(() => {
@@ -926,7 +1008,12 @@ function App() {
               </button>
             )}
             <div className="stagger" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {activeRunsList.map((r) => (
+              {[...activeRunsList].sort((a, b) => {
+                // Sort: running > paused > failed > completed; within same bucket, newest first.
+                const rank = (s: string) => s === 'running' ? 0 : s === 'paused' ? 1 : s === 'failed' ? 2 : 3;
+                const dr = rank(a.status) - rank(b.status);
+                return dr !== 0 ? dr : b.startedAt - a.startedAt;
+              }).map((r) => (
                 <button
                   key={r.id}
                   onClick={() => {
@@ -1030,8 +1117,26 @@ function App() {
           );
         }
 
+        const showCostMeter = runCost && runCost.runId === urlRunId && (runCost.limitUsd ?? 0) > 0;
+        const showStageSpend = runCost && runCost.runId === urlRunId && Object.values(runCost.perStageUsd).some((v) => v > 0);
         return (
-          <div style={{ height: '100%', overflow: 'hidden' }}>
+          <div style={{ height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {(showCostMeter || showStageSpend) && (
+              <div style={{
+                padding: '8px 16px', borderBottom: '1px solid var(--separator)',
+                display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0,
+                background: 'var(--bg-elevated-1)',
+              }}>
+                {showCostMeter && runCost && runCost.limitUsd !== undefined && (
+                  <CostMeter totalUsd={runCost.usd} limitUsd={runCost.limitUsd} compact />
+                )}
+                {showStageSpend && runCost && (
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <StageSpendPanel perStageUsd={runCost.perStageUsd} totalUsd={runCost.usd} defaultCollapsed />
+                  </div>
+                )}
+              </div>
+            )}
             {runActivities.length === 0 ? (
               <PendingView label="Waiting for output..." />
             ) : (
@@ -1073,8 +1178,12 @@ function App() {
             features={features}
             projects={projects.map((s) => ({ name: s.name, repoCount: s.repoCount ?? 0 }))}
             prs={prs.map((p) => ({ status: p.status, repo: p.repo }))}
+            ws={wsRef.current}
           />
         );
+
+      case 'cost-breaches':
+        return <CostBreachHistoryPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'pr-board':
         return (
@@ -1135,13 +1244,17 @@ function App() {
       label: r.label,
       path: r.path,
       primary: true,
-      badge: r.id === 'runs' ? activeRunsList.length || undefined : undefined,
+      comingSoon: r.comingSoon,
+      badge: r.id === 'runs'
+        ? activeRunsList.filter((run) => run.status === 'running' || run.status === 'paused').length || undefined
+        : undefined,
     })),
     ...secondaryRoutes.map((r) => ({
       id: r.id,
       label: r.label,
       path: r.path,
       secondary: true,
+      comingSoon: r.comingSoon,
     })),
   ];
 
@@ -1291,6 +1404,42 @@ function App() {
         </div>
       </DashboardLayout>
       <CommandPalette commands={commands} isOpen={cmdPaletteOpen} onClose={() => setCmdPaletteOpen(false)} />
+      {pendingBreach && breachModalOpen && (
+        <CostBreachModal
+          breach={pendingBreach}
+          onRaise={(deltaUsd: number) => {
+            sendWs({ action: 'respond-cost-breach', runId: pendingBreach.runId, decision: 'raise', deltaUsd });
+            setBreachModalOpen(() => false);
+          }}
+          onReject={() => {
+            sendWs({ action: 'respond-cost-breach', runId: pendingBreach.runId, decision: 'reject' });
+            setBreachModalOpen(() => false);
+          }}
+          onExtend={(seconds: number) => {
+            sendWs({ action: 'respond-cost-breach', runId: pendingBreach.runId, decision: 'extend', extendSeconds: seconds });
+          }}
+          onClose={() => {
+            setBreachModalOpen(() => false);
+            setBreachDismissed(() => true);
+          }}
+        />
+      )}
+      {pendingBreach && !breachModalOpen && (
+        <CostBreachToast
+          breach={{
+            runId: pendingBreach.runId,
+            project: pendingBreach.project,
+            currentUsd: pendingBreach.currentUsd,
+            limitUsd: pendingBreach.limitUsd,
+            graceEndsAt: pendingBreach.graceEndsAt,
+          }}
+          onOpen={() => {
+            setBreachDismissed(() => false);
+            setBreachModalOpen(() => true);
+          }}
+          onDismiss={() => setBreachDismissed(() => true)}
+        />
+      )}
     </ProjectProvider>
   );
 }

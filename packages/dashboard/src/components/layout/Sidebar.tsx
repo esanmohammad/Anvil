@@ -4,6 +4,7 @@ import {
   Clock, BarChart3, Server, Brain,
   PanelLeftClose, PanelLeft, ChevronDown,
   GitCompareArrows, TestTube, Map, Settings,
+  Shield, FileCode, AlertTriangle, DollarSign,
   Anvil,
 } from 'lucide-react';
 
@@ -44,8 +45,12 @@ const iconMap: Record<string, React.ComponentType<{ size?: number; strokeWidth?:
   project: Server,
   'knowledge-graph': Brain,
   'review': GitCompareArrows,
-  'test-gen': TestTube,
+  'tests': TestTube,
+  'guards': Shield,
+  'contracts': FileCode,
+  'triage': AlertTriangle,
   'plan': Map,
+  'cost-breaches': DollarSign,
   'settings': Settings,
 };
 

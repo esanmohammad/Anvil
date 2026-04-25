@@ -23,6 +23,11 @@ import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import { estimateTokens, getModelTokenLimit, budgetPromptContext } from './context-budget.js';
 import { resolveModelByTier } from './model-tier-resolver.js';
+import { parseTasks, bundleFiles, groupTasksForExecution } from './engineer-task-bundler.js';
+import type { ParsedTask } from './engineer-task-bundler.js';
+import { sliceSpecForRefs } from './engineer-spec-slicer.js';
+import { enforceBudget } from './prompt-budget.js';
+import type { PromptSection } from './prompt-budget.js';
 
 // ── Claude CLI binary ────────────────────────────────────────────────
 
@@ -479,6 +484,44 @@ export class PipelineRunner extends EventEmitter {
 
     // 3. Tier-based routing — resolve from provider registry
     return resolveModelByTier(tier, stageName, this.config.model);
+  }
+
+  /**
+   * Soft guardrail (P12): warn if a system prompt exceeds 60KB. Caching
+   * efficiency degrades when prefixes balloon, so this fires a project-event
+   * to flag regressions before they pile up. Pure telemetry — does not trim.
+   */
+  private warnIfSystemPromptOversized(label: string, projectPrompt: string): void {
+    const bytes = Buffer.byteLength(projectPrompt, 'utf8');
+    if (bytes > 60_000) {
+      this.emit('project-event', {
+        source: 'context-budget',
+        message: `[${label}] system prompt is ${(bytes / 1024).toFixed(1)}KB (>60KB) — review KB tier and memory blocks`,
+        level: 'warn',
+      });
+    }
+  }
+
+  /**
+   * Pick how much KB context to inject for a given (persona, stage) pair (P2).
+   *
+   * - 'full'         — index + target repo + cross-repo + query context (design stages)
+   * - 'repo-focused' — just the target repo's graph report (coding/test stages)
+   * - 'index-only'   — just the cross-repo index (clarifier — needs the big picture
+   *                    but doesn't need to dig into any single repo's internals)
+   * - 'none'         — skip KB entirely (ship — git operations don't need it)
+   *
+   * Coding stages stay narrow on purpose: it shrinks the system prompt enough to
+   * matter for prompt caching, and the engineer/tester already have the
+   * authoritative source on disk plus a pre-bundled <files> block.
+   */
+  private kbTierForStage(persona: string, stageName: string): 'full' | 'repo-focused' | 'index-only' | 'none' {
+    if (stageName === 'ship') return 'none';
+    if (stageName === 'clarify') return 'index-only';
+    if (persona === 'engineer' || persona === 'tester' || persona === 'test-author') {
+      return 'repo-focused';
+    }
+    return 'full';
   }
 
   /** Persist pipeline state to disk for crash recovery */
@@ -1261,12 +1304,43 @@ export class PipelineRunner extends EventEmitter {
         this.state.stages[index].repos[r].status = 'running';
       }
 
-      const prompt = this.buildRepoStagePrompt(stage, repoName, prevArtifact);
       const projectPrompt = this.buildRepoProjectPrompt(stage, repoName);
 
-      // Non-engineer/tester personas cannot write files — only engineers and testers modify code
-      const noWriteTools = (stage.persona !== 'engineer' && stage.persona !== 'tester')
-        ? ['Write', 'Edit', 'NotebookEdit', 'Bash'] : undefined;
+      // ── Build stage: per-task spawning (P5) ──
+      // When the engineer's repo has parseable TASKS.md, spawn one engineer per task
+      // (in dependency-aware groups) instead of one engineer for the whole repo.
+      // Each per-task spawn shares the same stable system prompt, which lets the
+      // Claude CLI prompt cache hit across spawns.
+      if (stage.name === 'build' && stage.persona === 'engineer') {
+        const repoIdx = r;
+        promises.push(
+          this.runBuildForRepo(index, repoIdx, stage, repoName, repoPath, projectPrompt)
+            .then((res) => ({ repoName, artifact: res.artifact, cost: res.cost }))
+            .catch((err) => {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              const repoState = this.state.stages[index].repos[repoIdx];
+              if (repoState) {
+                repoState.status = 'failed';
+                repoState.error = errorMsg;
+              }
+              this.broadcastState();
+              return { repoName, artifact: '', cost: 0 };
+            }),
+        );
+        continue;
+      }
+
+      const prompt = this.buildRepoStagePrompt(stage, repoName, prevArtifact);
+
+      // Non-engineer/tester personas cannot write files — only engineers and testers modify code.
+      // All non-clarifier personas have Agent disabled (P8) — sub-agents inherit context and
+      // double the token cost; nothing in the pipeline benefits from them.
+      let disallowedTools: string[] | undefined;
+      if (stage.persona !== 'engineer' && stage.persona !== 'tester') {
+        disallowedTools = ['Write', 'Edit', 'NotebookEdit', 'Bash', 'Agent'];
+      } else {
+        disallowedTools = ['Agent'];
+      }
 
       const agent = this.agentManager.spawn({
         name: `${stage.persona}-${repoName}`,
@@ -1278,7 +1352,7 @@ export class PipelineRunner extends EventEmitter {
         cwd: repoPath,
         projectPrompt,
         permissionMode: 'bypassPermissions',
-        disallowedTools: noWriteTools,
+        disallowedTools,
       });
 
       if (this.state.stages[index].repos[r]) {
@@ -1335,6 +1409,225 @@ export class PipelineRunner extends EventEmitter {
     return { artifact: combined, cost: totalCost };
   }
 
+  // ── Build stage: per-task spawning ─────────────────────────────────
+
+  /**
+   * Run the build stage for one repo by spawning one engineer per task,
+   * grouped into parallel batches by `groupTasksForExecution`.
+   *
+   * Falls back to a single repo-wide spawn when TASKS.md isn't parseable.
+   * The fallback path keeps Read/Grep/Glob/Agent disabled (P1) so behaviour
+   * matches the prior bundle-per-repo flow.
+   */
+  private async runBuildForRepo(
+    stageIndex: number,
+    repoIdx: number,
+    stage: StageDefinition,
+    repoName: string,
+    repoPath: string,
+    projectPrompt: string,
+  ): Promise<{ artifact: string; cost: number }> {
+    const repoArtifacts = this.loadRepoArtifacts(repoName);
+    const tasks = repoArtifacts.tasks ? parseTasks(repoArtifacts.tasks) : [];
+
+    if (tasks.length === 0) {
+      // Fallback: no parseable tasks → single repo-wide spawn (the existing P1 path).
+      const prompt = this.buildRepoStagePrompt(stage, repoName, '');
+      const agent = this.agentManager.spawn({
+        name: `${stage.persona}-${repoName}`,
+        persona: stage.persona,
+        project: this.config.project,
+        stage: `${stage.name}:${repoName}`,
+        prompt,
+        model: this.resolveModelForStage(stage.name),
+        cwd: repoPath,
+        projectPrompt,
+        permissionMode: 'bypassPermissions',
+        disallowedTools: ['Read', 'Grep', 'Glob', 'Agent'],
+      });
+      const repoStateForFallback = this.state.stages[stageIndex].repos[repoIdx];
+      if (repoStateForFallback) repoStateForFallback.agentId = agent.id;
+      this.broadcastState();
+      const res = await this.waitForAgent(agent.id);
+      const repoStateAfter = this.state.stages[stageIndex].repos[repoIdx];
+      if (repoStateAfter) {
+        repoStateAfter.status = 'completed';
+        repoStateAfter.cost = res.cost;
+        repoStateAfter.artifact = res.artifact;
+      }
+      this.broadcastState();
+      this.checkpoint();
+      this.writeRepoArtifact(stage, repoName, res.artifact);
+      return res;
+    }
+
+    const groups = groupTasksForExecution(tasks);
+    this.emit('project-event', {
+      source: 'pipeline',
+      message: `[build] ${repoName}: ${tasks.length} task${tasks.length === 1 ? '' : 's'} in ${groups.length} group${groups.length === 1 ? '' : 's'} (per-task spawning)`,
+    });
+
+    const taskOutputs: { id: string; title: string; artifact: string }[] = [];
+    let totalCost = 0;
+
+    for (const group of groups) {
+      if (this.cancelled) throw new Error('Pipeline cancelled');
+
+      const groupPromises = group.tasks.map((task) => {
+        const prompt = this.buildPerTaskPrompt(stage, repoName, repoPath, task, repoArtifacts.specs);
+        const agent = this.agentManager.spawn({
+          name: `engineer-${repoName}-${task.id}`,
+          persona: stage.persona,
+          project: this.config.project,
+          stage: `${stage.name}:${repoName}:${task.id}`,
+          prompt,
+          model: this.resolveModelForStage(stage.name),
+          cwd: repoPath,
+          projectPrompt,
+          permissionMode: 'bypassPermissions',
+          disallowedTools: ['Read', 'Grep', 'Glob', 'Agent'],
+        });
+
+        const repoStateForSpawn = this.state.stages[stageIndex].repos[repoIdx];
+        if (repoStateForSpawn) repoStateForSpawn.agentId = agent.id;
+        this.broadcastState();
+
+        return this.waitForAgent(agent.id)
+          .then((res) => {
+            totalCost += res.cost;
+            taskOutputs.push({ id: task.id, title: task.title, artifact: res.artifact });
+            this.emit('project-event', {
+              source: 'pipeline',
+              message: `[build] ${repoName} ${task.id} done (${(res.cost * 100).toFixed(2)}¢)`,
+            });
+          })
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            taskOutputs.push({
+              id: task.id,
+              title: task.title,
+              artifact: `## Implementation: ${task.id} — ${task.title}\n\nUNRESOLVED: ${msg}\n`,
+            });
+            this.emit('project-event', {
+              source: 'pipeline',
+              message: `[build] ${repoName} ${task.id} failed: ${msg}`,
+              level: 'warn',
+            });
+          });
+      });
+
+      await Promise.all(groupPromises);
+    }
+
+    // Sort outputs by original task order so the artifact reads top-to-bottom.
+    const idOrder = new Map(tasks.map((t, i) => [t.id, i]));
+    taskOutputs.sort((a, b) => (idOrder.get(a.id) ?? 0) - (idOrder.get(b.id) ?? 0));
+    const combined = taskOutputs.map((t) => t.artifact.trim()).join('\n\n---\n\n');
+
+    const repoStateDone = this.state.stages[stageIndex].repos[repoIdx];
+    if (repoStateDone) {
+      repoStateDone.status = 'completed';
+      repoStateDone.cost = totalCost;
+      repoStateDone.artifact = combined;
+    }
+    this.broadcastState();
+    this.checkpoint();
+    this.writeRepoArtifact(stage, repoName, combined);
+
+    return { artifact: combined, cost: totalCost };
+  }
+
+  /**
+   * Build the user prompt for ONE task: the task's own markdown block, the
+   * spec sections it references, and the files it touches pre-bundled.
+   */
+  private buildPerTaskPrompt(
+    _stage: StageDefinition,
+    repoName: string,
+    repoPath: string,
+    task: ParsedTask,
+    specsMd: string,
+  ): string {
+    // Header — feature + context. Always kept (non-truncatable, top priority).
+    const headerLines: string[] = [
+      `Feature: "${this.config.feature}"`,
+      ``,
+      `## Context`,
+      `- Repository: "${repoName}" at ${repoPath}`,
+      `- Feature branch: anvil/${this.state.featureSlug}`,
+      `- You are implementing exactly one task: ${task.id}.`,
+    ];
+    if (task.prerequisites.length > 0) {
+      headerLines.push(`- Prerequisite tasks already complete: ${task.prerequisites.join(', ')}.`);
+    }
+
+    // Build each block as its own enforceBudget section so we can drop/truncate
+    // selectively when over budget. Priorities: header/instructions=100, task=90,
+    // files=80, spec slice=60, retry context=70.
+    const sections: PromptSection[] = [];
+    sections.push({ id: 'header', text: headerLines.join('\n'), priority: 100 });
+    sections.push({ id: 'task', text: `## Your task\n${task.block}`, priority: 90 });
+
+    if (task.specRef && specsMd) {
+      const slice = sliceSpecForRefs(specsMd, [task.specRef], { maxBytes: 8000, includeOverview: false });
+      if (slice.text) {
+        sections.push({ id: 'spec-slice', text: slice.text, priority: 60, truncatable: true });
+      }
+    }
+
+    if (task.files.length > 0) {
+      const bundle = bundleFiles({ repoPath, files: task.files, maxBytes: 80_000 });
+      if (bundle.included.length > 0) {
+        sections.push({
+          id: 'files',
+          text: `## Files for this task (pre-bundled — do NOT re-read)\n${bundle.block}`,
+          priority: 80,
+          truncatable: true,
+        });
+      }
+      if (bundle.skipped.length > 0) {
+        const lines = bundle.skipped.map((s) => `- ${s.path} (${s.reason})`).join('\n');
+        sections.push({
+          id: 'files-skipped',
+          text: `## Files NOT in bundle\nIf you need any of these, output \`NEED_FILE: path\` and stop. Do not guess contents.\n${lines}`,
+          priority: 75,
+        });
+      }
+    }
+
+    if (this.config.failureContext) {
+      sections.push({
+        id: 'retry-context',
+        text: `IMPORTANT — This is a RETRY. Previous failure:\n${this.config.failureContext}`,
+        priority: 70,
+        truncatable: true,
+      });
+    }
+
+    const instructionLines: string[] = [
+      `## Instructions`,
+      `Implement only ${task.id}. Read/Grep/Glob/Agent are disabled — every file you may need is in the <files> block above.`,
+      `- Use Edit/Write to modify files; use Bash only to run tests/build.`,
+      `- Bash discipline: run only the focused test for this task (e.g. \`npx vitest run path/to/file.test.ts\`, \`go test ./pkg/foo -run TestX\`). Do NOT run the full suite. Pipe verbose output through \`tail -50\` so the result fits in context.`,
+      `- If a file you need is missing from the bundle, output \`NEED_FILE: <path>\` on its own line and stop.`,
+      `- Output the tight summary format from your persona spec — do NOT dump file contents.`,
+      `- Do NOT make git commits — that happens in the ship stage.`,
+      `- Do NOT modify scope outside the files listed for this task. If you discover the task needs out-of-scope changes, flag them in the Notes section and stop.`,
+    ];
+    sections.push({ id: 'instructions', text: instructionLines.join('\n'), priority: 100 });
+
+    const result = enforceBudget(sections, { maxBytes: 120_000 });
+    if (result.trimmed) {
+      const dropped = result.decisions.filter((d) => d.action !== 'kept').map((d) => `${d.id}=${d.action}`).join(', ');
+      this.emit('project-event', {
+        source: 'context-budget',
+        message: `[build] ${repoName} ${task.id}: prompt over 120KB — ${dropped}`,
+        level: 'warn',
+      });
+    }
+    return result.text;
+  }
+
   // ── Single-agent stage execution ───────────────────────────────────
 
   private async runSingleStage(
@@ -1345,9 +1638,10 @@ export class PipelineRunner extends EventEmitter {
     const prompt = this.buildStagePrompt(stage, prevArtifact);
     const projectPrompt = this.buildProjectPrompt(stage);
 
-    // Non-engineer/tester personas cannot write files
-    const noWriteTools = (stage.persona !== 'engineer' && stage.persona !== 'tester')
-      ? ['Write', 'Edit', 'NotebookEdit'] : undefined;
+    // Non-engineer/tester personas cannot write files. Agent tool always disabled (P8).
+    const disallowedTools = (stage.persona !== 'engineer' && stage.persona !== 'tester')
+      ? ['Write', 'Edit', 'NotebookEdit', 'Agent']
+      : ['Agent'];
 
     const agent = this.agentManager.spawn({
       name: `${stage.persona}-${this.config.project}`,
@@ -1359,7 +1653,7 @@ export class PipelineRunner extends EventEmitter {
       cwd: this.workspaceDir,
       projectPrompt,
       permissionMode: 'bypassPermissions',
-      disallowedTools: noWriteTools,
+      disallowedTools,
     });
 
     this.state.stages[index].agentId = agent.id;
@@ -1627,6 +1921,10 @@ export class PipelineRunner extends EventEmitter {
   }
 
   /** Run engineer agents to fix validation issues, then return */
+  /** Per-repo agent ids carried across fix-loop attempts so attempt 2+ resumes the prior session (P9). */
+  private fixLoopAgentByRepo: Map<string, string> = new Map();
+  private fixLoopAgentSingle: string | null = null;
+
   private async runFixLoop(
     _validateStageIndex: number,
     validateArtifact: string,
@@ -1637,8 +1935,15 @@ export class PipelineRunner extends EventEmitter {
     let totalCost = 0;
 
     if (repos.length === 0) {
-      // Single-agent fix
-      const prompt = `The validation stage found issues that need to be fixed (attempt ${attempt}):\n\n${validateArtifact.slice(0, 6000)}\n\nFix ALL build errors, lint errors, and test failures. Run the build and tests again to verify. Do NOT make git commits.`;
+      // Single-agent fix — resume the prior session on attempt ≥ 2 (P9).
+      const issuesBlock = validateArtifact.slice(0, 6000);
+      const priorId = this.fixLoopAgentSingle;
+      if (priorId && attempt > 1 && this.agentManager.getAgent(priorId)) {
+        const followUp = `Validation still failing after your last fix (attempt ${attempt}). Issues:\n\n${issuesBlock}\n\nFix the remaining errors and re-run tests.`;
+        this.agentManager.sendInput(priorId, followUp);
+        return this.waitForAgent(priorId);
+      }
+      const prompt = `The validation stage found issues that need to be fixed (attempt ${attempt}):\n\n${issuesBlock}\n\nFix ALL build errors, lint errors, and test failures. Run the build and tests again to verify. Do NOT make git commits.`;
       const agent = this.agentManager.spawn({
         name: `fixer-${this.config.project}-${attempt}`,
         persona: 'engineer',
@@ -1649,10 +1954,10 @@ export class PipelineRunner extends EventEmitter {
         cwd: this.workspaceDir,
         projectPrompt: this.buildProjectPrompt(buildStage),
         permissionMode: 'bypassPermissions',
+        disallowedTools: ['Agent'],
       });
-
-      const result = await this.waitForAgent(agent.id);
-      return result;
+      this.fixLoopAgentSingle = agent.id;
+      return this.waitForAgent(agent.id);
     }
 
     // Per-repo fix
@@ -1665,7 +1970,15 @@ export class PipelineRunner extends EventEmitter {
         return { artifact: '', cost: 0 };  // this repo is fine
       }
 
-      const prompt = `The validation stage found issues in "${repoName}" that need to be fixed (attempt ${attempt}):\n\n${repoSection.slice(0, 4000)}\n\nFix ALL build errors, lint errors, and test failures in this repo. Run the build and tests again to verify. Do NOT make git commits.`;
+      const issuesBlock = repoSection.slice(0, 4000);
+      const priorId = this.fixLoopAgentByRepo.get(repoName);
+      if (priorId && attempt > 1 && this.agentManager.getAgent(priorId)) {
+        const followUp = `Validation still failing in "${repoName}" after your last fix (attempt ${attempt}). Issues:\n\n${issuesBlock}\n\nFix the remaining errors and re-run tests.`;
+        this.agentManager.sendInput(priorId, followUp);
+        return this.waitForAgent(priorId);
+      }
+
+      const prompt = `The validation stage found issues in "${repoName}" that need to be fixed (attempt ${attempt}):\n\n${issuesBlock}\n\nFix ALL build errors, lint errors, and test failures in this repo. Run the build and tests again to verify. Do NOT make git commits.`;
       const agent = this.agentManager.spawn({
         name: `fixer-${repoName}-${attempt}`,
         persona: 'engineer',
@@ -1676,8 +1989,9 @@ export class PipelineRunner extends EventEmitter {
         cwd: repoPath,
         projectPrompt: this.buildRepoProjectPrompt(buildStage, repoName),
         permissionMode: 'bypassPermissions',
+        disallowedTools: ['Agent'],
       });
-
+      this.fixLoopAgentByRepo.set(repoName, agent.id);
       return this.waitForAgent(agent.id);
     });
 
@@ -2061,10 +2375,11 @@ export class PipelineRunner extends EventEmitter {
         ? this.state.repoNames.join(', ')
         : '(single-repo or monorepo)';
 
-      // Load persistent memory for this project
+      // Load persistent memory for this project (P10: cap at 4KB, P11: drop placeholder)
       const projectMemory = this.memoryStore.formatForPrompt(this.config.project, 'memory');
       const userProfile = this.memoryStore.formatForPrompt(this.config.project, 'user');
-      const memoryBlock = [projectMemory, userProfile].filter(Boolean).join('\n\n') || '(no prior memories)';
+      const memoryRaw = [projectMemory, userProfile].filter(Boolean).join('\n\n');
+      const memoryBlock = memoryRaw.length > 4000 ? memoryRaw.slice(0, 4000) + '\n... [memory truncated]' : memoryRaw;
 
       // Load knowledge graph — prefer compact index + query-matched context over full blob
       let knowledgeGraph = '';
@@ -2124,16 +2439,15 @@ export class PipelineRunner extends EventEmitter {
       const tokenInfo = `[Context: ~${Math.round(budgeted.totalTokens / 1000)}K / ${Math.round(budgeted.limit / 1000)}K tokens]`;
       console.log(`[pipeline] ${stage.name} prompt ${tokenInfo}`);
 
+      // P11: drop empty-state placeholders.
       const injected = injectTemplateVars(personaPrompt, {
-        project_yaml: budgeted.projectYaml || '(not available)',
+        project_yaml: budgeted.projectYaml,
         task: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nRepositories: ${repoList}`,
-        conventions: '(use existing project conventions found in the codebase)',
-        memories: budgeted.memory || '(no prior memories)',
-        knowledge_graph: budgeted.knowledgeBase || '(no knowledge base available — run "Refresh Knowledge Base" from the dashboard)',
+        conventions: '',
+        memories: budgeted.memory,
+        knowledge_graph: budgeted.knowledgeBase,
         repo_context: `Project: ${this.config.project}\nRepositories: ${repoList}\nWorkspace: ${this.workspaceDir}`,
-        existing_code: budgeted.knowledgeBase
-          ? '(see Knowledge Graph section for codebase structure — explore specific files as needed)'
-          : '(explore the codebase to discover relevant code)',
+        existing_code: budgeted.knowledgeBase ? '(see Knowledge Graph section above)' : '',
       });
 
       // Append pipeline-specific overrides
@@ -2171,7 +2485,9 @@ A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Gra
         overrides.push('CRITICAL: You MUST fix ALL build errors, lint errors, and test failures before completing. Iterate until the codebase is clean. End your output with "VERDICT: PASS" or "VERDICT: FAIL" so the pipeline knows whether to proceed to shipping.');
       }
 
-      return injected + (overrides.length > 0 ? '\n\n' + overrides.join('\n') : '');
+      const finalPrompt = injected + (overrides.length > 0 ? '\n\n' + overrides.join('\n') : '');
+      this.warnIfSystemPromptOversized(`${stage.persona}/${stage.name}`, finalPrompt);
+      return finalPrompt;
     }
 
     // Fallback if prompt file not found
@@ -2189,29 +2505,46 @@ A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Gra
       : `Repository: ${repoName}`;
 
     if (personaPrompt) {
+      // Memories: cap to ~4KB total and drop the empty-state placeholder (P10/P11).
       const projectMemory = this.memoryStore.formatForPrompt(this.config.project, 'memory');
       const userProfile = this.memoryStore.formatForPrompt(this.config.project, 'user');
-      const memoryBlock = [projectMemory, userProfile].filter(Boolean).join('\n\n') || '(no prior memories)';
+      const memoryRaw = [projectMemory, userProfile].filter(Boolean).join('\n\n');
+      const memoryBlock = memoryRaw.length > 4000 ? memoryRaw.slice(0, 4000) + '\n... [memory truncated]' : memoryRaw;
 
-      // Load KB — prefer index + query-matched context, with target repo prominently
+      // Load KB. Tier picked by (persona, stage) — see kbTierForStage (P2).
+      // Coding personas get only the focused per-repo KB to keep the system
+      // prompt small and cache-stable; design-stage personas get the full
+      // index + per-repo + cross-repo + query context for breadth.
+      const tier = this.kbTierForStage(stage.persona, stage.name);
       let knowledgeGraph = '';
-      const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
-      if (indexPrompt) {
+      let kbSourceLabel: 'none' | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob' = 'none';
+      if (tier !== 'none') {
+        const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
         const repoKB = this.kbManager?.getGraphReport(this.config.project, repoName) || '';
-        const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
-        knowledgeGraph = `${indexPrompt}\n\n---\n\n## YOUR TARGET REPO: ${repoName}\n\n${repoKB || '(no repo-specific KB)'}\n\n---\n\n${queryContext}`;
-      } else {
-        // Fallback: full blob approach
-        const repoKB = this.kbManager?.getGraphReport(this.config.project, repoName) || '';
-        const fullKB = this.kbManager?.getAllGraphReports(this.config.project) || '';
-        if (repoKB) {
-          knowledgeGraph += `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}`;
-          const otherRepos = fullKB.split('\n\n---\n\n').filter((s) => !s.includes(`## ${repoName}\n`));
-          if (otherRepos.length > 0) {
-            knowledgeGraph += `\n\n---\n\n## OTHER REPOS (for cross-repo context)\n\n${otherRepos.join('\n\n---\n\n')}`;
-          }
+        if (tier === 'repo-focused') {
+          knowledgeGraph = repoKB ? `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}` : '';
+          if (knowledgeGraph) kbSourceLabel = 'repo-focused';
+        } else if (tier === 'index-only') {
+          knowledgeGraph = indexPrompt;
+          if (knowledgeGraph) kbSourceLabel = 'index-only';
+        } else if (indexPrompt) {
+          // tier === 'full'
+          const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
+          knowledgeGraph = `${indexPrompt}\n\n---\n\n## YOUR TARGET REPO: ${repoName}\n\n${repoKB || '(no repo-specific KB)'}\n\n---\n\n${queryContext}`;
+          kbSourceLabel = 'full-with-index';
         } else {
-          knowledgeGraph = fullKB;
+          // Fallback: full blob approach when no index exists
+          const fullKB = this.kbManager?.getAllGraphReports(this.config.project) || '';
+          if (repoKB) {
+            knowledgeGraph += `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}`;
+            const otherRepos = fullKB.split('\n\n---\n\n').filter((s) => !s.includes(`## ${repoName}\n`));
+            if (otherRepos.length > 0) {
+              knowledgeGraph += `\n\n---\n\n## OTHER REPOS (for cross-repo context)\n\n${otherRepos.join('\n\n---\n\n')}`;
+            }
+          } else {
+            knowledgeGraph = fullKB;
+          }
+          if (knowledgeGraph) kbSourceLabel = 'full-blob';
         }
       }
 
@@ -2219,9 +2552,9 @@ A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Gra
       if (knowledgeGraph) {
         this.emit('project-event', {
           source: 'knowledge-base',
-          message: `Knowledge Base loaded for repo "${repoName}" (${knowledgeGraph.length} chars, ${indexPrompt ? 'index + query-matched' : 'full blob'}) → injecting into ${stage.persona} agent`,
+          message: `Knowledge Base loaded for repo "${repoName}" (${knowledgeGraph.length} chars, tier=${kbSourceLabel}) → injecting into ${stage.persona} agent`,
         });
-      } else {
+      } else if (tier !== 'none') {
         this.emit('project-event', {
           source: 'knowledge-base',
           message: `No Knowledge Base available for repo "${repoName}" — ${stage.persona} agent will explore codebase manually`,
@@ -2235,16 +2568,19 @@ A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Gra
         });
       }
 
+      // Empty-placeholder strings are dropped (P11) — they're noise that the
+      // model has to read every spawn. The persona prompt already documents
+      // what each block contains; an empty value is self-evident.
       const injected = injectTemplateVars(personaPrompt, {
-        project_yaml: this.projectYaml.slice(0, 4000) || '(not available)',
+        project_yaml: this.projectYaml.slice(0, 4000),
         task: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nTarget repository: ${repoName}`,
-        conventions: '(use existing project conventions found in the codebase)',
+        conventions: '',
         memories: memoryBlock,
-        knowledge_graph: knowledgeGraph || '(no knowledge base available for this repo)',
+        knowledge_graph: knowledgeGraph,
         repo_context: repoContext,
         existing_code: knowledgeGraph
-          ? '(see Knowledge Graph section for codebase structure — explore specific files as needed)'
-          : '(explore the codebase to discover relevant code)',
+          ? '(see Knowledge Graph section above)'
+          : '',
       });
 
       // Append pipeline-specific overrides
@@ -2276,7 +2612,9 @@ The Knowledge Base above contains your target repo "${repoName}" (labeled "YOUR 
         overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
       }
 
-      return injected + '\n\n' + overrides.join('\n');
+      const finalPrompt = injected + '\n\n' + overrides.join('\n');
+      this.warnIfSystemPromptOversized(`${stage.persona}/${stage.name}:${repoName}`, finalPrompt);
+      return finalPrompt;
     }
 
     // Fallback if prompt file not found
@@ -2403,7 +2741,6 @@ ${questionFormat}`;
 
   private buildRepoStagePrompt(stage: StageDefinition, repoName: string, prevArtifact: string): string {
     const feature = `Feature: "${this.config.feature}"`;
-    const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
     const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
 
     const resumeCtx = this.config.failureContext
@@ -2445,44 +2782,67 @@ ${questionFormat}`;
       }
 
       case 'build': {
+        // Token-efficiency strategy (P1+P4): rather than dumping requirements +
+        // full specs + tasks + hlReqs and telling the engineer to "explore the
+        // codebase", we (a) inject only the slice of SPECS.md referenced by
+        // tasks, (b) pre-read every file in TASK Scope lines and inject them
+        // as a <files> block, and (c) instruct the engineer not to read or
+        // grep — Read/Grep/Glob are disabled at spawn (see runPerRepoStage).
         const sections: string[] = [feature];
 
         sections.push(`\n## Context`);
-        sections.push(`- You are working in the "${repoName}" repository at: ${repoPath}`);
+        sections.push(`- Repository: "${repoName}" at ${repoPath}`);
         sections.push(`- Feature branch: anvil/${this.state.featureSlug}`);
-        sections.push(`- Planning artifacts are in: ${featureDir}/repos/${repoName}/`);
-        sections.push(`- Other repos in this project: ${this.state.repoNames.filter(r => r !== repoName).join(', ') || '(none)'}`);
 
-        // Inject all available repo-specific artifacts
-        if (repoArtifacts.requirements) {
-          sections.push(`\n## Requirements for ${repoName}\n${repoArtifacts.requirements}`);
+        const parsedTasks = repoArtifacts.tasks ? parseTasks(repoArtifacts.tasks) : [];
+        const taskFiles: string[] = [];
+        const seen = new Set<string>();
+        for (const t of parsedTasks) {
+          for (const f of t.files) {
+            if (!seen.has(f)) { seen.add(f); taskFiles.push(f); }
+          }
         }
-        if (repoArtifacts.specs) {
-          sections.push(`\n## Technical Specification for ${repoName}\n${repoArtifacts.specs}`);
-        }
+        const specRefs = parsedTasks.map((t) => t.specRef).filter((r): r is string => !!r);
+
         if (repoArtifacts.tasks) {
           sections.push(`\n## Implementation Tasks for ${repoName}\n${repoArtifacts.tasks}`);
         }
 
-        // Always include high-level requirements as additional context
-        if (hlReqs && !repoArtifacts.requirements) {
-          sections.push(`\n## High-Level Feature Requirements\n${hlReqs.slice(0, 6000)}`);
+        if (repoArtifacts.specs && specRefs.length > 0) {
+          const slice = sliceSpecForRefs(repoArtifacts.specs, specRefs, { maxBytes: 20000 });
+          if (slice.text) sections.push(`\n${slice.text}`);
+        } else if (repoArtifacts.specs && !repoArtifacts.tasks) {
+          // Fallback: tasks not parseable, send the spec verbatim.
+          sections.push(`\n## Technical Specification for ${repoName}\n${repoArtifacts.specs}`);
         }
 
-        // If no repo-specific artifacts at all, fall back to prevArtifact
-        if (!repoArtifacts.tasks && !repoArtifacts.specs && !repoArtifacts.requirements && prevArtifact) {
+        if (taskFiles.length > 0) {
+          const bundle = bundleFiles({ repoPath, files: taskFiles, maxBytes: 200_000 });
+          if (bundle.included.length > 0) {
+            sections.push(`\n## Files referenced by tasks (pre-bundled — do NOT re-read)\n${bundle.block}`);
+          }
+          if (bundle.skipped.length > 0) {
+            const lines = bundle.skipped
+              .map((s) => `- ${s.path} (${s.reason})`)
+              .join('\n');
+            sections.push(`\n## Task files NOT in bundle\nIf you need any of these, output \`NEED_FILE: path\` and stop. Do not guess contents.\n${lines}`);
+          }
+        }
+
+        // Last-resort fallback when there are no parseable tasks or specs.
+        if (!repoArtifacts.tasks && !repoArtifacts.specs && prevArtifact) {
           sections.push(`\n## Prior stage output\n${prevArtifact.slice(0, 12000)}`);
         }
 
         sections.push(`\n## Instructions`);
-        sections.push(`Implement the feature for the "${repoName}" repository based on the requirements, specs, and tasks above.`);
-        sections.push(`- Explore the existing codebase FIRST to understand current patterns and conventions.`);
-        sections.push(`- Write real, production-quality code. Do NOT output pseudocode or placeholders.`);
-        sections.push(`- If a task list is provided above, implement each task in order.`);
-        sections.push(`- If no explicit task list is available, derive the implementation steps from the requirements and specs, then implement them.`);
-        sections.push(`- Run the build/compile step to verify your changes work.`);
+        sections.push(`Implement each task in order. Read/Grep/Glob/Agent are disabled — every file you may need is in the <files> block above.`);
+        sections.push(`- Use Edit/Write to modify files; use Bash only to run tests/build.`);
+        sections.push(`- Bash discipline: prefer focused test commands (single file or test name). Pipe verbose output through \`tail -50\`. Do NOT run a whole monorepo suite at once.`);
+        sections.push(`- If a file you need is missing from the bundle, output \`NEED_FILE: <path>\` on its own line and stop.`);
+        sections.push(`- Write production-quality code; no pseudocode or placeholders.`);
+        sections.push(`- Run the build/test step to verify your changes work.`);
         sections.push(`- Do NOT make git commits — that happens in the ship stage.`);
-        sections.push(`- Do NOT ask for clarification or say you are missing information. Use the context above and the codebase to make informed decisions and proceed.`);
+        sections.push(`- Do NOT ask for clarification. Decide from the context above and proceed.`);
 
         if (resumeCtx) sections.push(resumeCtx);
         return sections.join('\n');

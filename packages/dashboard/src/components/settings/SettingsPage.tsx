@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Settings, Key, DollarSign, GitBranch, Bell, Check, AlertTriangle } from 'lucide-react';
 
 export interface SettingsPageProps {
@@ -61,12 +61,27 @@ export function SettingsPage({ project, ws }: SettingsPageProps) {
   const [budgetSaved, setBudgetSaved] = useState(false);
   const [alertFired, setAlertFired] = useState(false);
 
+  // Cost policy overlay state — fields managed via dashboard, written to
+  // `pipeline-policy.overlay.json` so the YAML's comments stay intact.
+  const [policyDraft, setPolicyDraft] = useState<{
+    onBreach: 'ask' | 'auto-approve' | 'auto-reject';
+    autoApproveBelow: number;
+    graceWindowSeconds: number;
+    perRun: number;
+    perProjectDaily: number;
+  } | null>(null);
+  const [policyOriginal, setPolicyOriginal] = useState<typeof policyDraft>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const policyDraftRef = useRef(policyDraft);
+  useEffect(() => { policyDraftRef.current = policyDraft; }, [policyDraft]);
+
   // Fetch data on mount
   useEffect(() => {
     if (!ws) return;
     ws.send(JSON.stringify({ action: 'get-providers' }));
     if (project) {
       ws.send(JSON.stringify({ action: 'get-budget-status', project }));
+      ws.send(JSON.stringify({ action: 'get-pipeline-policy', project }));
     }
   }, [ws, project]);
 
@@ -123,6 +138,26 @@ export function SettingsPage({ project, ws }: SettingsPageProps) {
         if (msg.type === 'budget-saved') {
           setBudgetSaved(true);
           setTimeout(() => setBudgetSaved(false), 2000);
+        }
+        if (msg.type === 'pipeline-policy' && msg.payload) {
+          const p = (msg.payload as { policy?: { cost?: { onBreach?: 'ask' | 'auto-approve' | 'auto-reject'; autoApproveBelow?: number; graceWindowSeconds?: number; limits?: { perRun?: number; perProjectDaily?: number } } } }).policy;
+          const cost = p?.cost ?? {};
+          const draft = {
+            onBreach: (cost.onBreach ?? 'ask') as 'ask' | 'auto-approve' | 'auto-reject',
+            autoApproveBelow: cost.autoApproveBelow ?? 0.15,
+            graceWindowSeconds: cost.graceWindowSeconds ?? 60,
+            perRun: cost.limits?.perRun ?? 10,
+            perProjectDaily: cost.limits?.perProjectDaily ?? 30,
+          };
+          setPolicyDraft(() => draft);
+          setPolicyOriginal(() => draft);
+        }
+        if (msg.type === 'pipeline-policy-updated') {
+          setPolicyOriginal(() => policyDraftRef.current);
+          setPolicyError(() => null);
+        }
+        if (msg.type === 'cost-error' && msg.payload?.message) {
+          setPolicyError(() => msg.payload.message);
         }
         if (msg.type === 'auth-test-result' && msg.payload) {
           setTestingProvider(null);
@@ -408,6 +443,110 @@ export function SettingsPage({ project, ws }: SettingsPageProps) {
                 Sends a browser notification to test the alert
               </span>
             </div>
+
+            {/* Cost Policy (overlay) — managed by dashboard, written to pipeline-policy.overlay.json */}
+            {policyDraft && (
+              <div style={{
+                padding: 16,
+                background: 'var(--bg-elevated-2)',
+                border: '1px solid var(--separator)',
+                borderRadius: 'var(--radius-md)',
+              }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 12 }}>
+                  Cost Approval Policy
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 16 }}>
+                  Overlay layered on top of <code style={{ fontFamily: 'var(--font-mono)' }}>pipeline-policy.yaml</code> — your inline comments stay intact.
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                  <Field label="On breach" hint="Behavior when a run exceeds a cost limit">
+                    <select
+                      value={policyDraft.onBreach}
+                      onChange={(e) => setPolicyDraft((prev) => prev ? { ...prev, onBreach: e.target.value as 'ask' | 'auto-approve' | 'auto-reject' } : prev)}
+                      style={selectStyle}
+                    >
+                      <option value="ask">ask — prompt the user</option>
+                      <option value="auto-approve">auto-approve — silently raise</option>
+                      <option value="auto-reject">auto-reject — kill the run</option>
+                    </select>
+                  </Field>
+
+                  <Field label="Auto-approve below ($)" hint="Tiny overages cleared silently">
+                    <input
+                      type="number" step="0.01" min={0}
+                      value={policyDraft.autoApproveBelow}
+                      onChange={(e) => setPolicyDraft((prev) => prev ? { ...prev, autoApproveBelow: Number(e.target.value) } : prev)}
+                      style={inputStyle}
+                    />
+                  </Field>
+
+                  <Field label="Grace window (s)" hint="How long the modal waits before auto-resolving (10–600)">
+                    <input
+                      type="number" step="1" min={10} max={600}
+                      value={policyDraft.graceWindowSeconds}
+                      onChange={(e) => setPolicyDraft((prev) => prev ? { ...prev, graceWindowSeconds: Number(e.target.value) } : prev)}
+                      style={inputStyle}
+                    />
+                  </Field>
+
+                  <Field label="Per-run cap ($)" hint="Hard ceiling for a single pipeline run">
+                    <input
+                      type="number" step="0.01" min={0}
+                      value={policyDraft.perRun}
+                      onChange={(e) => setPolicyDraft((prev) => prev ? { ...prev, perRun: Number(e.target.value) } : prev)}
+                      style={inputStyle}
+                    />
+                  </Field>
+
+                  <Field label="Daily project cap ($)" hint="Hard ceiling across all runs in this project, today">
+                    <input
+                      type="number" step="0.01" min={0}
+                      value={policyDraft.perProjectDaily}
+                      onChange={(e) => setPolicyDraft((prev) => prev ? { ...prev, perProjectDaily: Number(e.target.value) } : prev)}
+                      style={inputStyle}
+                    />
+                  </Field>
+                </div>
+
+                {policyError && (
+                  <div style={{ marginTop: 12, fontSize: 12, color: 'var(--color-error)' }}>
+                    {policyError}
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+                  <button
+                    style={primaryBtnStyle}
+                    disabled={!policyDraft || JSON.stringify(policyDraft) === JSON.stringify(policyOriginal)}
+                    onClick={() => {
+                      if (!ws || !project || !policyDraft) return;
+                      ws.send(JSON.stringify({
+                        action: 'update-pipeline-policy',
+                        project,
+                        patch: {
+                          cost: {
+                            onBreach: policyDraft.onBreach,
+                            autoApproveBelow: policyDraft.autoApproveBelow,
+                            graceWindowSeconds: policyDraft.graceWindowSeconds,
+                            limits: { perRun: policyDraft.perRun, perProjectDaily: policyDraft.perProjectDaily },
+                          },
+                        },
+                      }));
+                    }}
+                  >
+                    Save policy
+                  </button>
+                  <button
+                    style={secondaryBtnStyle}
+                    onClick={() => setPolicyDraft(() => policyOriginal)}
+                    disabled={JSON.stringify(policyDraft) === JSON.stringify(policyOriginal)}
+                  >
+                    Reset
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -780,5 +919,37 @@ const primaryBtnStyle: React.CSSProperties = {
   borderRadius: 'var(--radius-sm)', cursor: 'pointer',
   fontFamily: 'var(--font-sans)',
 };
+
+const secondaryBtnStyle: React.CSSProperties = {
+  display: 'inline-flex', alignItems: 'center', gap: 6,
+  padding: '6px 16px', fontSize: 12, fontWeight: 500,
+  background: 'transparent', color: 'var(--text-secondary)',
+  border: '1px solid var(--separator)',
+  borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+  fontFamily: 'var(--font-sans)',
+};
+
+const inputStyle: React.CSSProperties = {
+  width: '100%', padding: '6px 10px', fontSize: 12,
+  background: 'var(--bg-base)', color: 'var(--text-primary)',
+  border: '1px solid var(--separator)',
+  borderRadius: 'var(--radius-sm)',
+  fontFamily: 'var(--font-mono)',
+};
+
+const selectStyle: React.CSSProperties = {
+  ...inputStyle,
+  fontFamily: 'var(--font-sans)',
+};
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span style={{ fontSize: 11, fontWeight: 500, color: 'var(--text-secondary)' }}>{label}</span>
+      {children}
+      {hint && <span style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>{hint}</span>}
+    </label>
+  );
+}
 
 export default SettingsPage;

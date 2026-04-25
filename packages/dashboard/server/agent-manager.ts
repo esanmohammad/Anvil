@@ -11,6 +11,13 @@ import { randomBytes } from 'node:crypto';
 import { AgentProcess, CostInfo, AgentActivity } from './agent-process.js';
 import type { AgentProcessConfig } from './agent-process.js';
 
+// Re-export the checkpoint-gating wrapper so callers using AgentManager have a
+// matching helper for one-shot agent calls outside the manager (e.g. small
+// deterministic stages that still want crash-safe caching). The wrapper lives
+// in its own module to keep AgentManager free of CheckpointStore deps.
+export { runWithCheckpoint } from './agent-runner-wrapper.js';
+export type { WrappedAgentOpts } from './agent-runner-wrapper.js';
+
 // ── Types ────────────────────────────────────────────────────────────────
 
 export interface AgentState {

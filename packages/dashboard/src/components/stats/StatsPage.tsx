@@ -1,7 +1,8 @@
 import React, { useMemo, useEffect, useState, useCallback } from 'react';
-import { BarChart3, TrendingUp, TrendingDown, DollarSign, Clock, CheckCircle2, AlertCircle, MessageCircle, GitPullRequest } from 'lucide-react';
+import { BarChart3, TrendingUp, TrendingDown, DollarSign, Clock, CheckCircle2, AlertCircle, MessageCircle, GitPullRequest, CalendarClock } from 'lucide-react';
 import type { RunSummary } from '../history/RunRow.js';
 import { useSystem } from '../../context/ProjectContext.js';
+import { costTier, fmtUsd } from '../../lib/cost-tier.js';
 
 export interface StatsPageProps {
   runs: RunSummary[];
@@ -15,6 +16,14 @@ export interface StatsPageProps {
   }>;
   projects: Array<{ name: string; repoCount: number }>;
   prs: Array<{ status: string; repo: string }>;
+  /** Live WebSocket reference used to subscribe to per-project cost snapshots. */
+  ws?: WebSocket | null;
+}
+
+interface TodayCost {
+  usd: number;
+  limitUsd: number;
+  alertAt?: number;
 }
 
 /* ─── Helpers ──────────────────────────────────────────────── */
@@ -448,8 +457,23 @@ function ProjectBreakdownSection({
   );
 }
 
-function CostTimelineSection({ dailyCosts }: { dailyCosts: Array<{ label: string; cost: number }> }) {
-  const maxCost = Math.max(...dailyCosts.map((d) => d.cost), 0.01);
+function CostTimelineSection({
+  dailyCosts,
+  dailyLimit,
+  alertAt,
+}: {
+  dailyCosts: Array<{ label: string; cost: number }>;
+  dailyLimit?: number;
+  alertAt?: number;
+}) {
+  const hasLimit = typeof dailyLimit === 'number' && dailyLimit > 0;
+  const maxCost = Math.max(
+    ...dailyCosts.map((d) => d.cost),
+    hasLimit ? (dailyLimit as number) : 0,
+    0.01,
+  );
+  const limitTopPct = hasLimit ? 100 - ((dailyLimit as number) / maxCost) * 100 : 0;
+  const alertFraction = typeof alertAt === 'number' && alertAt > 0 ? alertAt : 0.6;
 
   return (
     <section aria-label="Daily cost timeline">
@@ -457,14 +481,36 @@ function CostTimelineSection({ dailyCosts }: { dailyCosts: Array<{ label: string
       <div style={{ ...cardStyle, padding: 'var(--space-md)' }}>
         <div
           style={{
+            position: 'relative',
             display: 'flex',
             alignItems: 'flex-end',
             gap: 3,
             height: 80,
           }}
         >
+          {hasLimit && (
+            <div
+              aria-hidden="true"
+              style={{
+                position: 'absolute',
+                left: 0,
+                right: 0,
+                top: `${Math.max(0, Math.min(100, limitTopPct))}%`,
+                height: 0,
+                borderTop: '1px dashed var(--color-warning)',
+                opacity: 0.6,
+                pointerEvents: 'none',
+              }}
+            />
+          )}
           {dailyCosts.map((day, i) => {
             const barHeight = maxCost > 0 ? (day.cost / maxCost) * 100 : 0;
+            let barColor = 'var(--accent)';
+            if (hasLimit && day.cost > 0) {
+              const limit = dailyLimit as number;
+              if (day.cost >= limit) barColor = 'var(--color-error)';
+              else if (day.cost >= limit * alertFraction) barColor = 'var(--color-warning)';
+            }
             return (
               <div
                 key={i}
@@ -482,7 +528,7 @@ function CostTimelineSection({ dailyCosts }: { dailyCosts: Array<{ label: string
                   style={{
                     width: '100%',
                     height: `${Math.max(barHeight, day.cost > 0 ? 3 : 0)}%`,
-                    background: day.cost > 0 ? 'var(--accent)' : 'transparent',
+                    background: day.cost > 0 ? barColor : 'transparent',
                     borderRadius: '2px 2px 0 0',
                     opacity: day.cost > 0 ? 0.7 : 0,
                     transition: 'height var(--duration-slow) ease-out',
@@ -504,6 +550,30 @@ function CostTimelineSection({ dailyCosts }: { dailyCosts: Array<{ label: string
           <span>{dailyCosts[0]?.label}</span>
           <span>{dailyCosts[dailyCosts.length - 1]?.label}</span>
         </div>
+        {hasLimit && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 'var(--text-2xs)',
+              color: 'var(--text-tertiary)',
+              marginTop: 'var(--space-xs)',
+            }}
+          >
+            <span
+              aria-hidden="true"
+              style={{
+                display: 'inline-block',
+                width: 18,
+                height: 0,
+                borderTop: '1px dashed var(--color-warning)',
+                opacity: 0.6,
+              }}
+            />
+            <span>daily cap {fmtUsd(dailyLimit as number)}</span>
+          </div>
+        )}
       </div>
     </section>
   );
@@ -536,7 +606,185 @@ function EmptyState() {
 
 /* ─── Main Component ───────────────────────────────────────── */
 
-export function StatsPage({ runs, features, projects, prs: _prs }: StatsPageProps) {
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function parseHashProject(): string | null {
+  if (typeof window === 'undefined') return null;
+  const hash = window.location.hash || '';
+  const queryStart = hash.indexOf('?');
+  if (queryStart === -1) return null;
+  const params = new URLSearchParams(hash.slice(queryStart + 1));
+  return params.get('project');
+}
+
+function formatRemaining(hours: number): string {
+  if (!Number.isFinite(hours) || hours <= 0) return '0m';
+  const totalMinutes = Math.max(0, Math.round(hours * 60));
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  if (h <= 0) return `${m}m`;
+  return `${h}h ${m}m`;
+}
+
+function TimeToExhaustionStrip({ today }: { today: TodayCost | null }) {
+  if (!today) return null;
+  const { usd, limitUsd } = today;
+  if (!(limitUsd > 0) || !(usd > 0)) return null;
+
+  if (usd >= limitUsd) {
+    return (
+      <div
+        role="status"
+        style={{
+          fontSize: 'var(--text-xs)',
+          color: 'var(--color-error)',
+          marginBottom: 'var(--space-sm)',
+          fontFamily: 'var(--font-mono)',
+        }}
+      >
+        Today's budget already exhausted.
+      </div>
+    );
+  }
+
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const hoursElapsed = (now.getTime() - startOfDay) / 3_600_000;
+  if (!(hoursElapsed > 0)) return null;
+  const usdPerHour = usd / hoursElapsed;
+  if (!(usdPerHour > 0)) return null;
+  const hoursRemaining = (limitUsd - usd) / usdPerHour;
+  if (!Number.isFinite(hoursRemaining) || hoursRemaining <= 0) return null;
+
+  if (hoursRemaining > 24) {
+    return (
+      <div
+        style={{
+          fontSize: 'var(--text-xs)',
+          color: 'var(--text-tertiary)',
+          marginBottom: 'var(--space-sm)',
+        }}
+      >
+        Today's budget on track.
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        fontSize: 'var(--text-xs)',
+        color: 'var(--text-tertiary)',
+        marginBottom: 'var(--space-sm)',
+      }}
+    >
+      At current pace, today's budget exhausts in {formatRemaining(hoursRemaining)}.
+    </div>
+  );
+}
+
+function TodayBudgetBar({ today }: { today: TodayCost | null }) {
+  if (!today || !(today.limitUsd > 0)) return null;
+  const { usd, limitUsd, alertAt } = today;
+  const tier = costTier(usd, limitUsd, alertAt);
+  const pct = Math.max(0, Math.min(1, usd / limitUsd));
+
+  let fill: string;
+  if (tier === 'safe') fill = 'var(--color-success)';
+  else if (tier === 'warning') fill = 'var(--color-warning)';
+  else fill = 'var(--color-error)';
+
+  const breachStripes =
+    tier === 'breach'
+      ? 'repeating-linear-gradient(45deg, var(--color-error) 0 4px, rgba(255,255,255,0.25) 4px 8px)'
+      : undefined;
+
+  return (
+    <div
+      role="img"
+      aria-label={`Today: ${fmtUsd(usd)} of ${fmtUsd(limitUsd)} (${Math.round(pct * 100)}%)`}
+      style={{
+        height: 3,
+        borderRadius: 'var(--radius-full)',
+        background: 'var(--bg-elevated-3)',
+        overflow: 'hidden',
+        marginTop: 'var(--space-xs)',
+      }}
+    >
+      <div
+        style={{
+          height: '100%',
+          width: `${Math.max(pct * 100, usd > 0 ? 2 : 0)}%`,
+          background: breachStripes ?? fill,
+          borderRadius: 'var(--radius-full)',
+          transition: 'width var(--duration-slow) ease-out',
+        }}
+      />
+    </div>
+  );
+}
+
+export function StatsPage({ runs, features, projects, prs: _prs, ws }: StatsPageProps) {
+  const { currentProject, projects: ctxProjects } = useSystem();
+
+  // Resolve which project's budget to subscribe to.
+  const activeProject = useMemo<string | null>(() => {
+    const fromHash = parseHashProject();
+    if (fromHash) return fromHash;
+    if (currentProject?.name) return currentProject.name;
+    if (ctxProjects.length > 0) return ctxProjects[0].name;
+    if (projects.length > 0) return projects[0].name;
+    return null;
+  }, [currentProject, ctxProjects, projects]);
+
+  const [today, setToday] = useState<TodayCost | null>(null);
+
+  // Subscribe to per-project cost snapshots while mounted / project active.
+  useEffect(() => {
+    if (!ws || !activeProject) return;
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ action: 'subscribe-cost', project: activeProject }));
+    return () => {
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'unsubscribe-cost', project: activeProject }));
+        }
+      } catch {
+        /* noop */
+      }
+    };
+  }, [ws, activeProject]);
+
+  // Listen for cost-snapshot messages and capture today's spend + limit.
+  useEffect(() => {
+    if (!ws) return;
+    const handler = (event: MessageEvent): void => {
+      let msg: { type?: string; payload?: unknown };
+      try { msg = JSON.parse(event.data as string); } catch { return; }
+      if (msg.type !== 'cost-snapshot') return;
+      if (!isRecord(msg.payload)) return;
+      const payload = msg.payload;
+      if (typeof payload.project === 'string' && activeProject && payload.project !== activeProject) {
+        return;
+      }
+      const t = isRecord(payload.today) ? payload.today : null;
+      if (!t) return;
+      const nextUsd = typeof t.usd === 'number' ? t.usd : 0;
+      const nextLimit = typeof t.limitUsd === 'number' ? t.limitUsd : 0;
+      const nextAlert = typeof t.alertAt === 'number' ? t.alertAt : undefined;
+      setToday(() => ({ usd: nextUsd, limitUsd: nextLimit, alertAt: nextAlert }));
+    };
+    ws.addEventListener('message', handler);
+    return () => ws.removeEventListener('message', handler);
+  }, [ws, activeProject]);
+
+  // Reset today's data when project changes so we don't render stale numbers.
+  useEffect(() => {
+    setToday(() => null);
+  }, [activeProject]);
+
   const totalFeatures = features.length;
   const completed = features.filter((f) => f.status === 'completed').length;
   const failed = features.filter((f) => f.status === 'failed').length;
@@ -652,12 +900,15 @@ export function StatsPage({ runs, features, projects, prs: _prs }: StatsPageProp
         Insights
       </h2>
 
+      {/* ── Time-to-exhaustion strip ── */}
+      <TimeToExhaustionStrip today={today} />
+
       {/* ── Top Metric Cards ── */}
       <div
         className="stagger"
         style={{
           display: 'grid',
-          gridTemplateColumns: 'repeat(4, 1fr)',
+          gridTemplateColumns: 'repeat(5, 1fr)',
           gap: 'var(--space-sm)',
           marginBottom: 'var(--space-xl)',
         }}
@@ -685,6 +936,20 @@ export function StatsPage({ runs, features, projects, prs: _prs }: StatsPageProp
           subtitle={`$${dailyAvgCost.toFixed(2)} daily avg`}
           icon={<DollarSign size={16} strokeWidth={1.5} aria-hidden="true" />}
         />
+
+        <div>
+          <MetricCard
+            label="Today"
+            value={fmtUsd(today?.usd ?? 0)}
+            subtitle={
+              today && today.limitUsd > 0
+                ? `/ ${fmtUsd(today.limitUsd)}`
+                : 'no daily cap configured'
+            }
+            icon={<CalendarClock size={16} strokeWidth={1.5} aria-hidden="true" />}
+          />
+          <TodayBudgetBar today={today} />
+        </div>
 
         <MetricCard
           label="Avg Duration"
@@ -718,7 +983,11 @@ export function StatsPage({ runs, features, projects, prs: _prs }: StatsPageProp
       {/* ── Cost Timeline ── */}
       {hasAnyCost && (
         <div style={{ marginBottom: 'var(--space-xl)' }}>
-          <CostTimelineSection dailyCosts={dailyCosts} />
+          <CostTimelineSection
+            dailyCosts={dailyCosts}
+            dailyLimit={today && today.limitUsd > 0 ? today.limitUsd : undefined}
+            alertAt={today?.alertAt}
+          />
         </div>
       )}
 

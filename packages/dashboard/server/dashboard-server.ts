@@ -25,6 +25,7 @@ import {
   watch as fsWatch,
   appendFileSync,
   statSync,
+  readdirSync,
 } from 'node:fs';
 import { join, extname, resolve } from 'node:path';
 import { spawn, execSync, ChildProcess } from 'node:child_process';
@@ -422,6 +423,7 @@ interface WebhookDeps {
   agentManager: AgentManager;
   projectLoader: ProjectLoader;
   broadcast: (msg: unknown) => void;
+  enqueueReplay: (incidentId: string, project: string) => { queueDepth: number };
   pauseStore?: PipelinePauseStore;
   approvalSecret?: string;
   kbManager?: KnowledgeBaseManager;
@@ -519,25 +521,15 @@ function serveStatic(
               const incident = deps.incidentStore.ingest(project, parsed.source, parsed.externalId, parsed);
               deps.broadcast({ type: 'incident-ingested', payload: { incident } });
               if (autoReplay) {
-                // Fire-and-forget replay
-                (async () => {
-                  try {
-                    const { runReplayPipeline } = await import('./replay-pipeline.js');
-                    const repoLocalPaths = deps.projectLoader.getRepoLocalPaths(project);
-                    const result = await runReplayPipeline({
-                      incidentStore: deps.incidentStore, replayStore: deps.replayStore,
-                      specStore: deps.testSpecStore, caseStore: deps.testCaseStore, learningsStore: deps.testLearningsStore,
-                      agentManager: deps.agentManager, project, incidentId: incident.id, repoLocalPaths,
-                      onStep: (step, state) => deps.broadcast({ type: 'replay-step', payload: { incidentId: incident.id, step, state } }),
-                    });
-                    if (result.boundFilePath) {
-                      try { deps.boundTestsStore.appendBound(project, { filePath: result.boundFilePath, incidentId: incident.id, replayId: result.attempt.id, addedAt: new Date().toISOString() }); } catch { /* ok */ }
-                    }
-                    deps.broadcast({ type: 'replay-complete', payload: { result, incidentId: incident.id, attempt: result.attempt, boundFilePath: result.boundFilePath } });
-                  } catch (err) {
-                    deps.broadcast({ type: 'replay-error', payload: { incidentId: incident.id, message: err instanceof Error ? err.message : String(err) } });
-                  }
-                })();
+                // Enqueue rather than fire-and-forget: the queue caps concurrency,
+                // dedupes (incidentId, project), retries on failure, and survives
+                // restarts (mirrored to ~/.anvil/incidents/queue.json). The pump
+                // loop set up at boot will pick it up.
+                const { queueDepth } = deps.enqueueReplay(incident.id, project);
+                deps.broadcast({
+                  type: 'replay-queued',
+                  payload: { incidentId: incident.id, project, queueDepth },
+                });
               }
             } catch (err) {
               console.warn('[incidents] webhook onIncident failed:', err);
@@ -823,6 +815,9 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const ciTriageStore = new CiTriageStore(ANVIL_HOME);
   const reviewDismissalStore = new ReviewDismissalStore(ANVIL_HOME);
   const reviewCalibrationStore = new ReviewCalibrationStore(ANVIL_HOME);
+  // Auto-replay queue — crash-safe FIFO for incident → bug-replay-pipeline jobs.
+  const { AutoReplayQueue } = await import('./auto-replay-queue.js');
+  const autoReplayQueue = new AutoReplayQueue(ANVIL_HOME, { maxConcurrent: 2, maxAttempts: 3 });
   kbManagerRef.current = kbManager;
 
   // ── Clean up stale "running" state from previous crashes ────────────
@@ -1002,6 +997,104 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
   /** Map agentId → runId for quick action agents */
   const agentToRunId = new Map<string, string>();
+
+  /** Cost-snapshot subscriptions per WS — `${project}::${runId || '*'}` set per client. */
+  const costSubsByClient = new WeakMap<WebSocket, Set<string>>();
+  function costSubKey(project: string, runId?: string | null): string {
+    return `${project}::${runId ?? '*'}`;
+  }
+  function getOrInitSubs(client: WebSocket): Set<string> {
+    let s = costSubsByClient.get(client);
+    if (!s) { s = new Set(); costSubsByClient.set(client, s); }
+    return s;
+  }
+
+  /** Compute a unified cost snapshot for (project, runId?) at this moment. */
+  function computeCostSnapshot(project: string, runId?: string | null): unknown {
+    const policy = (() => { try { return loadPolicy(project, ANVIL_HOME); } catch { return null; } })();
+    const budget = (() => { try { return projectLoader.getBudgetConfig(project); } catch { return {} as Record<string, unknown>; } })();
+    const policyLimits = policy?.cost?.limits ?? {};
+    const perRunLimit = policyLimits.perRun ?? (typeof budget.max_per_run === 'number' ? budget.max_per_run : undefined);
+    const dailyLimit = policyLimits.perProjectDaily ?? (typeof budget.max_per_day === 'number' ? budget.max_per_day : undefined);
+    const alertAtUsd = typeof budget.alert_at === 'number' ? budget.alert_at : undefined;
+    const alertAtFraction = (alertAtUsd && dailyLimit && dailyLimit > 0) ? alertAtUsd / dailyLimit : 0.6;
+
+    const todayUsd = (() => { try { return costLedger.projectDailyTotal(project); } catch { return 0; } })();
+
+    const runBlock = runId ? (() => {
+      try {
+        const sum = costLedger.summarize(runId, project);
+        return {
+          usd: sum.totalUsd,
+          limitUsd: perRunLimit,
+          perStageUsd: sum.byStage,
+        };
+      } catch { return undefined; }
+    })() : undefined;
+
+    const breach = runId ? (() => {
+      try {
+        const b = costBreachHandler.getBreach(runId);
+        if (!b || b.status !== 'pending') return undefined;
+        const topSpenders = (() => {
+          try {
+            const sum = costLedger.summarize(runId, project);
+            return Object.entries(sum.byStage)
+              .map(([stage, usd]) => ({ stage, usd: usd as number }))
+              .sort((a, b) => b.usd - a.usd)
+              .slice(0, 3);
+          } catch { return []; }
+        })();
+        return {
+          runId: b.runId,
+          project: b.project,
+          currentUsd: b.currentUsdAtBreach,
+          limitUsd: b.limitUsdAtBreach,
+          projectedUsd: b.currentUsdAtBreach * 1.2,
+          graceEndsAt: b.graceEndsAt,
+          topSpenders,
+          extensionsUsed: b.extensionsUsed,
+        };
+      } catch { return undefined; }
+    })() : undefined;
+
+    return {
+      project,
+      runId: runId ?? undefined,
+      run: runBlock,
+      today: { usd: todayUsd, limitUsd: dailyLimit, alertAt: alertAtFraction },
+      pendingBreach: breach,
+      recentBreaches: { count30d: 0, decisions: { raise: 0, reject: 0, extend: 0, autoResolved: 0 } },
+      computedAt: new Date().toISOString(),
+    };
+  }
+
+  /** Push a fresh snapshot to every client subscribed to (project, runId or wildcard). */
+  function broadcastCostSnapshot(project: string, runId?: string | null): void {
+    const targetedKey = costSubKey(project, runId);
+    const wildcardKey = costSubKey(project, undefined);
+    let snap: unknown | null = null;
+    let snapWildcard: unknown | null = null;
+    for (const client of clients) {
+      const subs = costSubsByClient.get(client);
+      if (!subs || subs.size === 0) continue;
+      if (client.readyState !== WebSocket.OPEN) continue;
+      if (subs.has(targetedKey)) {
+        if (snap === null) snap = computeCostSnapshot(project, runId);
+        client.send(JSON.stringify({ type: 'cost-snapshot', payload: snap }));
+        continue;
+      }
+      if (runId && subs.has(wildcardKey)) {
+        // Client subscribed to whole project — also send the run-scoped snapshot.
+        if (snap === null) snap = computeCostSnapshot(project, runId);
+        client.send(JSON.stringify({ type: 'cost-snapshot', payload: snap }));
+      }
+      if (subs.has(wildcardKey)) {
+        if (snapWildcard === null) snapWildcard = computeCostSnapshot(project);
+        client.send(JSON.stringify({ type: 'cost-snapshot', payload: snapWildcard }));
+      }
+    }
+  }
 
   function broadcastActiveRuns(): void {
     const list = Array.from(activeRuns.values()).map((r) => ({
@@ -1201,12 +1294,40 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     }
   }
 
+  // Auto-replay queue: pump every 15s. Each pass dispatches up to maxConcurrent
+  // jobs to the bug-replay pipeline. Failures are retried with backoff via
+  // the queue's internal `attempts` counter; jobs that exceed maxAttempts drop.
+  const autoReplayPumpHandle = setInterval(() => {
+    void autoReplayQueue.pump(async (job) => {
+      const { runReplayPipeline } = await import('./replay-pipeline.js');
+      const repoLocalPaths = projectLoader.getRepoLocalPaths(job.project);
+      const result = await runReplayPipeline({
+        incidentStore, replayStore,
+        specStore: testSpecStore, caseStore: testCaseStore, learningsStore: testLearningsStore,
+        agentManager, project: job.project, incidentId: job.incidentId, repoLocalPaths,
+        onStep: (step, state) => broadcast({ type: 'replay-step', payload: { incidentId: job.incidentId, step, state } }),
+      });
+      if (result.boundFilePath) {
+        try { boundTestsStore.appendBound(job.project, { filePath: result.boundFilePath, incidentId: job.incidentId, replayId: result.attempt.id, addedAt: new Date().toISOString() }); } catch { /* ok */ }
+      }
+      broadcast({ type: 'replay-complete', payload: { result, incidentId: job.incidentId, attempt: result.attempt, boundFilePath: result.boundFilePath } });
+    }).catch((err) => {
+      console.warn('[auto-replay] pump cycle failed:', err);
+    });
+  }, 15_000);
+  // unref so the interval doesn't block process exit during tests / SIGTERM.
+  if (typeof autoReplayPumpHandle.unref === 'function') autoReplayPumpHandle.unref();
+
   // Populate the webhook-deps ref for the static handler (see /api/incidents/webhook/*).
   webhookDepsRef.current = {
     incidentStore, replayStore,
     testSpecStore, testCaseStore, testLearningsStore,
     boundTestsStore, agentManager, projectLoader,
     broadcast: (m: unknown) => broadcast(m as ServerMessage),
+    enqueueReplay: (incidentId: string, project: string) => {
+      autoReplayQueue.enqueue(incidentId, project);
+      return { queueDepth: autoReplayQueue.snapshot().length };
+    },
     pauseStore, approvalSecret,
     kbManager, ciTriageStore,
   };
@@ -1243,6 +1364,8 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         graceEndsAt: state.graceEndsAt,
         topSpenders,
       });
+      // Push the new snapshot so subscribers' modals/meters reflect the breach.
+      try { broadcastCostSnapshot(state.project, state.runId); } catch { /* ok */ }
     },
     onRejectStop: (runId) => {
       broadcast({ type: 'run-rejected', payload: { runId } } as ServerMessage);
@@ -3027,6 +3150,13 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         break;
       }
 
+      case 'list-replay-queue': {
+        const jobs = autoReplayQueue.snapshot();
+        const filtered = msg.project ? jobs.filter((j) => j.project === msg.project) : jobs;
+        ws.send(JSON.stringify({ type: 'replay-queue', payload: { jobs: filtered } }));
+        break;
+      }
+
       case 'get-incident': {
         const incidentId = (msg as { incidentId?: string }).incidentId;
         if (!msg.project || !incidentId) break;
@@ -3879,9 +4009,139 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           break;
         }
         try {
-          const updated = costBreachHandler.respond(runId, decision, deltaUsd, extendSeconds);
+          const updated = await costBreachHandler.respond(runId, decision, deltaUsd, extendSeconds);
           ws.send(JSON.stringify({ type: 'cost-breach-response', payload: { ok: true, breach: updated } }));
           broadcast({ type: 'cost-breach', payload: { breach: updated } } as ServerMessage);
+          // Telemetry: append decision to NDJSON for tuning hints.
+          try {
+            const dir = join(ANVIL_HOME, 'cost-breaches');
+            if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+            const dec = {
+              runId, project: updated.project, decision,
+              deltaUsdApproved: decision === 'raise' ? (deltaUsd ?? 0) : 0,
+              autoResolved: false,
+              decisionLatencyMs: Math.max(0, Date.parse(updated.decisionAt ?? new Date().toISOString()) - Date.parse(updated.breachedAt)),
+              at: new Date().toISOString(),
+            };
+            appendFileSync(join(dir, 'decisions.ndjson'), JSON.stringify(dec) + '\n', 'utf-8');
+          } catch { /* telemetry best-effort */ }
+          // Push fresh snapshot so the modal/meter reflect the resolved state.
+          broadcastCostSnapshot(updated.project, runId);
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
+        }
+        break;
+      }
+
+      case 'subscribe-cost': {
+        const { project, runId } = msg as { project?: string; runId?: string };
+        if (!project) break;
+        const subs = getOrInitSubs(ws);
+        subs.add(costSubKey(project, runId));
+        // Send an initial snapshot immediately so the client doesn't wait for a mutation.
+        try {
+          ws.send(JSON.stringify({ type: 'cost-snapshot', payload: computeCostSnapshot(project, runId) }));
+        } catch { /* ok */ }
+        break;
+      }
+
+      case 'unsubscribe-cost': {
+        const { project, runId } = msg as { project?: string; runId?: string };
+        if (!project) break;
+        const subs = costSubsByClient.get(ws);
+        if (subs) subs.delete(costSubKey(project, runId));
+        break;
+      }
+
+      case 'list-pending-breaches': {
+        try {
+          const all = costBreachHandler.listPending?.() ?? [];
+          ws.send(JSON.stringify({ type: 'pending-breaches', payload: { breaches: all } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
+        }
+        break;
+      }
+
+      case 'get-pipeline-policy': {
+        const project = (msg as { project?: string }).project;
+        if (!project) {
+          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: 'project required' } }));
+          break;
+        }
+        try {
+          const policy = loadPolicy(project, ANVIL_HOME);
+          const overlayPath = join(ANVIL_HOME, 'projects', project, 'pipeline-policy.overlay.json');
+          const overlay = existsSync(overlayPath) ? JSON.parse(readFileSync(overlayPath, 'utf-8')) : null;
+          ws.send(JSON.stringify({ type: 'pipeline-policy', payload: { project, policy, overlay } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
+        }
+        break;
+      }
+
+      case 'update-pipeline-policy': {
+        const { project, patch } = msg as {
+          project?: string;
+          patch?: { cost?: { onBreach?: 'ask' | 'auto-approve' | 'auto-reject'; autoApproveBelow?: number; graceWindowSeconds?: number; limits?: { perRun?: number; perProjectDaily?: number } } };
+        };
+        if (!project || !patch) {
+          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: 'project + patch required' } }));
+          break;
+        }
+        try {
+          // Validation guards.
+          const cost = patch.cost ?? {};
+          if (cost.graceWindowSeconds !== undefined && (cost.graceWindowSeconds < 10 || cost.graceWindowSeconds > 600)) {
+            ws.send(JSON.stringify({ type: 'cost-error', payload: { message: 'graceWindowSeconds must be in [10, 600]' } }));
+            break;
+          }
+          if (cost.autoApproveBelow !== undefined && cost.autoApproveBelow < 0) {
+            ws.send(JSON.stringify({ type: 'cost-error', payload: { message: 'autoApproveBelow must be >= 0' } }));
+            break;
+          }
+          const projDir = join(ANVIL_HOME, 'projects', project);
+          if (!existsSync(projDir)) mkdirSync(projDir, { recursive: true });
+          const overlayPath = join(projDir, 'pipeline-policy.overlay.json');
+          const existing = existsSync(overlayPath) ? JSON.parse(readFileSync(overlayPath, 'utf-8')) : {};
+          const merged = {
+            ...existing,
+            cost: {
+              ...(existing.cost ?? {}),
+              ...cost,
+              limits: { ...(existing.cost?.limits ?? {}), ...(cost.limits ?? {}) },
+            },
+          };
+          writeFileSync(overlayPath, JSON.stringify(merged, null, 2), 'utf-8');
+          ws.send(JSON.stringify({ type: 'pipeline-policy-updated', payload: { project, overlay: merged } }));
+          // Push fresh snapshot so any meters reading limits see new ceilings.
+          try { broadcastCostSnapshot(project); } catch { /* ok */ }
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
+        }
+        break;
+      }
+
+      case 'list-cost-breaches': {
+        const project = (msg as { project?: string }).project;
+        try {
+          const dir = join(ANVIL_HOME, 'cost-breaches');
+          const out: unknown[] = [];
+          if (existsSync(dir)) {
+            const projects = project ? [project] : readdirSync(dir).filter((n: string) => !n.includes('.'));
+            for (const p of projects) {
+              const projDir = join(dir, p);
+              if (!existsSync(projDir)) continue;
+              for (const f of readdirSync(projDir)) {
+                if (!f.endsWith('.json')) continue;
+                try {
+                  const raw = readFileSync(join(projDir, f), 'utf-8');
+                  out.push(JSON.parse(raw));
+                } catch { /* skip */ }
+              }
+            }
+          }
+          ws.send(JSON.stringify({ type: 'cost-breaches', payload: { breaches: out } }));
         } catch (err) {
           ws.send(JSON.stringify({ type: 'cost-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
         }
@@ -4480,6 +4740,10 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
             });
           }
         } catch { /* ignore */ }
+        // Push fresh snapshot so meters / cards / modal stay live.
+        if (info.project && info.runId) {
+          try { broadcastCostSnapshot(info.project, info.runId); } catch { /* ok */ }
+        }
       });
     }
 
@@ -5682,6 +5946,38 @@ Findings array may be empty. No prose outside the JSON block.`;
       reviewStore.appendFindings(project, prId, prepassFindings);
     }
 
+    // ── R5: KB context + ripple summary ─────────────────────────────
+    // Best-effort: load each repo's graph.json from ~/.anvil/knowledge-base, compute
+    // ripple impact for each changed symbol, and broadcast a compact summary the
+    // dashboard can render. Failures are non-fatal (graph may not exist yet).
+    try {
+      const { computeKbContext } = await import('./review-kb-context.js');
+      const { summarizeForPrompt } = await import('./review-kb-summarizer.js');
+      const repoLocalPaths = projectLoader.getRepoLocalPaths(project);
+      const repoNames = Object.keys(repoLocalPaths);
+      const repoGraphs: Record<string, unknown> = {};
+      for (const repoName of repoNames) {
+        const graphPath = join(ANVIL_HOME, 'knowledge-base', project, repoName, 'graph.json');
+        if (!existsSync(graphPath)) continue;
+        try { repoGraphs[repoName] = JSON.parse(readFileSync(graphPath, 'utf-8')); }
+        catch { /* skip unreadable graph */ }
+      }
+      if (Object.keys(repoGraphs).length > 0) {
+        // Map each diff file to its repo (single-repo default uses first repo).
+        const defaultRepo = repoNames[0];
+        const changed = diffInfo.files.map((f) => ({
+          repoName: defaultRepo,
+          filePath: f.path,
+        }));
+        const report = computeKbContext(changed, repoGraphs);
+        const summary = summarizeForPrompt(report);
+        broadcast({
+          type: 'review-kb-summary',
+          payload: { reviewId: prId, summary, changedSymbols: report.changedSymbols.length, orphans: report.orphans.length },
+        });
+      }
+    } catch (err) { console.warn('[review] kb-context summary failed:', err); }
+
     // ── Spawn LLM reviewers (one per persona) in parallel ──────────
     const currentForPrompt = reviewStore.readCurrent(project, prId) ?? baseReview;
     const learnings = formatLearningsForPrompt(ANVIL_HOME, project);
@@ -5816,6 +6112,33 @@ Findings array may be empty. No prose outside the JSON block.`;
       } catch (err) { console.warn('[review] evidence gate failed:', err); }
     }
 
+    // R3 — Executable verifier: actually run a micro-test against each finding
+    // and drop the ones that don't reproduce. Off by default (slow, runs Node /
+    // tsc / pytest / go test in a sandbox); enable with ANVIL_REVIEW_VERIFIER=on.
+    if (process.env.ANVIL_REVIEW_VERIFIER === 'on' && ctx.repoLocalPath && ctx.fileContents) {
+      try {
+        const { verifyFindings } = await import('./review-verifier.js');
+        const summary = await verifyFindings(filteredFindings, {
+          repoLocalPath: ctx.repoLocalPath,
+          fileContents: ctx.fileContents,
+        }, { timeoutMs: 10_000, concurrency: 3 });
+        const keptIds = new Set((summary.verified as Array<{ id?: string }>).map((f) => f.id));
+        filteredFindings = filteredFindings.filter((f) => keptIds.has(f.id));
+      } catch (err) { console.warn('[review] R3 verifier failed:', err); }
+    }
+
+    // R-scope — Out-of-scope persona findings (e.g. security on a CSS file).
+    // Pure path-based filter, no LLM, fast — always on.
+    try {
+      const { matches } = await import('./review-scope-matcher.js');
+      filteredFindings = filteredFindings.filter((f) => {
+        const persona = f.persona ?? ctx.persona;
+        if (!persona || !f.file) return true;
+        // If matcher returns true → in-scope, keep. If false → out-of-scope, drop.
+        return matches(persona, f.file);
+      });
+    } catch (err) { console.warn('[review] scope matcher failed:', err); }
+
     // R6 — Convention filter: drop / demote findings that contradict detected
     // project conventions (e.g. arguing for semicolons when the project doesn't use them).
     try {
@@ -5884,11 +6207,51 @@ Findings array may be empty. No prose outside the JSON block.`;
         const anyStillRunning = Array.from(reviewAgentContext.values()).some((c) => c.reviewId === ctx.reviewId);
         if (!anyStillRunning) {
           broadcast({ type: 'review-created', payload: { review: final } });
+
+          // Auto-publish verdict + findings to the PR when ANVIL_REVIEW_PUBLISH=on.
+          // Off by default to avoid hammering GitHub during local development.
+          if (process.env.ANVIL_REVIEW_PUBLISH === 'on' && final.pr?.url) {
+            (async () => {
+              try {
+                const { postReviewAnnotations } = await import('./review-github-annotator.js');
+                const { synthesizeVerdict } = await import('./review-synthesizer.js');
+                const verdict = synthesizeVerdict(final.findings as never);
+                const annotations = final.findings.map((f) => ({
+                  findingId: f.id,
+                  severity: severityToAnnotation(f.severity),
+                  filePath: f.file,
+                  line: f.line || 1,
+                  body: f.description,
+                }));
+                const result = await postReviewAnnotations({
+                  prUrl: final.pr.url,
+                  annotations,
+                  verdictHeadline: verdict.headline,
+                  verdictLevel: verdict.level,
+                });
+                broadcast({
+                  type: 'review-published',
+                  payload: { reviewId: ctx.reviewId, ...result },
+                });
+              } catch (err) {
+                console.warn('[review] github annotator failed:', err);
+              }
+            })();
+          }
         }
       }
     } catch (err) {
       broadcast({ type: 'review-error', payload: { message: err instanceof Error ? err.message : String(err), reviewId: ctx.reviewId } });
     }
+  }
+
+  /** Map ReviewFinding severity onto the annotator's narrower severity ladder. */
+  function severityToAnnotation(s: Severity): 'blocker' | 'high' | 'medium' | 'low' | 'info' {
+    if (s === 'blocker') return 'blocker';
+    if (s === 'error') return 'high';
+    if (s === 'warn') return 'medium';
+    if (s === 'nit') return 'low';
+    return 'info';
   }
 
   /**
