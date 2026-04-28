@@ -83,6 +83,8 @@ import { CostBreachSweeper } from './cost-breach-sweeper.js';
 import { BlobStore } from './checkpoint-blob-store.js';
 import { CheckpointStore } from './checkpoint-store.js';
 import { computeKey as computeCheckpointKey } from './checkpoint-key.js';
+import { CheckpointSimilarityIndex } from './checkpoint-similarity-index.js';
+import { embedPrompt } from './prompt-similarity.js';
 import { loadPolicy, evaluatePolicy } from './pipeline-policy.js';
 import type { PipelinePolicy } from './pipeline-policy-types.js';
 import {
@@ -4842,15 +4844,38 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
     // ── Feature-flagged checkpoint cache ──
     if (process.env.ANVIL_CHECKPOINTS_ENABLED === '1') {
+      // Phase 7 — when ANVIL_CHECKPOINT_SIMILARITY_ENABLED is also set, the
+      // lookup falls through to a near-edit similarity match if the exact
+      // hash misses. Index files live alongside the per-project checkpoint
+      // tree, one instance per project to keep load() linear in that
+      // project's history. Default off (per the plan's rollback section).
+      const similarityEnabled = process.env.ANVIL_CHECKPOINT_SIMILARITY_ENABLED === '1';
+      const similarityThreshold = (() => {
+        const raw = Number(process.env.ANVIL_CHECKPOINT_SIMILARITY_THRESHOLD);
+        return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : 0.95;
+      })();
+      const similarityIndices = new Map<string, CheckpointSimilarityIndex>();
+      const getSimilarityIndex = (project: string): CheckpointSimilarityIndex => {
+        let idx = similarityIndices.get(project);
+        if (!idx) {
+          idx = new CheckpointSimilarityIndex({ anvilHome: ANVIL_HOME, project });
+          similarityIndices.set(project, idx);
+        }
+        return idx;
+      };
+
       agentManager.setCheckpointHook({
         lookup: (input) => {
           try {
             const runFamily = input.runFamily ?? 'unknown';
+            const stage = input.stage as 'plan'|'implement'|'review'|'test'|'ship';
+            const taskId = `${input.persona}:${input.stage}`;
+            const promptVersion = '1';
             const key = computeCheckpointKey(runFamily, {
-              stage: (input.stage as 'plan'|'implement'|'review'|'test'|'ship'),
-              taskId: `${input.persona}:${input.stage}`,
+              stage,
+              taskId,
               inputs: { prompt: input.prompt },
-              promptVersion: '1',
+              promptVersion,
               model: input.model,
             });
             const rec = checkpointStore.get(input.project, runFamily, key);
@@ -4858,18 +4883,40 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
               const blob = blobStore.read(rec.outputRef);
               if (blob) return { hit: true, output: blob.toString('utf-8') };
             }
+            // Phase 7 — fall through to similarity match within the same slot.
+            if (similarityEnabled) {
+              const vec = embedPrompt(input.prompt);
+              const match = getSimilarityIndex(input.project).nearest(
+                { runFamily, stage, taskId, model: input.model, promptVersion },
+                vec,
+                similarityThreshold,
+              );
+              if (match) {
+                const blob = blobStore.read(match.entry.outputRef);
+                if (blob) {
+                  process.stderr.write(
+                    `[checkpoint-similarity] hit project=${input.project} stage=${stage} ` +
+                      `taskId=${taskId} score=${match.score.toFixed(4)}\n`,
+                  );
+                  return { hit: true, output: blob.toString('utf-8') };
+                }
+              }
+            }
           } catch { /* cache miss on error */ }
           return { hit: false };
         },
         record: (input) => {
           try {
             const runFamily = input.runFamily ?? 'unknown';
+            const stage = input.stage as 'plan'|'implement'|'review'|'test'|'ship';
+            const taskId = `${input.persona}:${input.stage}`;
+            const promptVersion = '1';
             const { sha } = blobStore.write(input.output);
             const key = computeCheckpointKey(runFamily, {
-              stage: (input.stage as 'plan'|'implement'|'review'|'test'|'ship'),
-              taskId: `${input.persona}:${input.stage}`,
+              stage,
+              taskId,
               inputs: { prompt: input.prompt },
-              promptVersion: '1',
+              promptVersion,
               model: input.model,
             });
             checkpointStore.write(input.project, {
@@ -4886,6 +4933,28 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
               completedAt: new Date().toISOString(),
               durationMs: input.cost.durationMs,
             });
+            // Phase 7 — mirror into the similarity index so the next near-edit
+            // run can find this output via cosine, not just exact hash.
+            if (similarityEnabled) {
+              try {
+                getSimilarityIndex(input.project).add({
+                  runFamily,
+                  stage,
+                  taskId,
+                  model: input.model,
+                  promptVersion,
+                  vec: embedPrompt(input.prompt),
+                  outputRef: sha,
+                  hash: key.hash,
+                  cost: {
+                    usd: input.cost.totalUsd,
+                    tokensIn: input.cost.inputTokens,
+                    tokensOut: input.cost.outputTokens,
+                  },
+                  recordedAt: new Date().toISOString(),
+                });
+              } catch { /* similarity persistence best-effort */ }
+            }
           } catch { /* persistence best-effort */ }
         },
       });
