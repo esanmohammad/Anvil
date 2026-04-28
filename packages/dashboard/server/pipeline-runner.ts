@@ -198,6 +198,50 @@ const STAGES: StageDefinition[] = [
 /** Stages whose artifacts can be fully derived from a Plan — skipped when planSeed is provided. */
 const PLAN_DERIVED_STAGES: string[] = ['requirements', 'repo-requirements', 'specs', 'tasks'];
 
+/**
+ * Per-stage output-token ceilings (Phase 3 — TOKEN-OPTIMIZATION-PLAN).
+ *
+ * Caps how many tokens each stage's agent is allowed to emit so that artifact
+ * bloat (50KB BUILD.md narratives, recap dumps in REQUIREMENTS.md) stops
+ * costing output tokens. The numbers below are conservative starting points
+ * tuned to typical artifact sizes in this repo:
+ *
+ *   - clarify / ship — short Q-and-A or git ops, ≤ 2K
+ *   - requirements / repo-requirements / validate — bullet lists, ≤ 4K
+ *   - specs — APIs + schema + behaviors, ≤ 6K
+ *   - tasks — task breakdown, ≤ 8K
+ *   - test — generated tests across files, ≤ 12K
+ *   - build — real codegen, ≤ 16K (highest because the engineer writes diffs)
+ *
+ * Adapter behavior:
+ *   - api-adapter: passes `max_tokens` in the request body.
+ *   - claude-adapter / gemini-cli-adapter: capabilities.maxOutputTokens=false
+ *     today (CLIs don't expose a flag) — the call is a no-op.
+ *
+ * STAGE_OUTPUT_LIMIT_FALLBACK is used for any stage not present in the table.
+ */
+export const STAGE_OUTPUT_LIMITS: Record<string, number> = {
+  clarify: 2000,
+  requirements: 4000,
+  'repo-requirements': 4000,
+  specs: 6000,
+  tasks: 8000,
+  build: 16000,
+  test: 12000,
+  validate: 4000,
+  ship: 2000,
+};
+export const STAGE_OUTPUT_LIMIT_FALLBACK = 8000;
+
+export function maxOutputTokensForStage(stageName: string): number {
+  return STAGE_OUTPUT_LIMITS[stageName] ?? STAGE_OUTPUT_LIMIT_FALLBACK;
+}
+
+/** Exposed for tests — read-only snapshot of pipeline stage names. */
+export function listStageNames(): string[] {
+  return STAGES.map((s) => s.name);
+}
+
 // ── Per-repo agent tracking ───────────────────────────────────────────
 
 export interface RepoAgentState {
@@ -1546,6 +1590,7 @@ export class PipelineRunner extends EventEmitter {
       projectPrompt,
       permissionMode: 'bypassPermissions',
       disallowedTools: ['Write', 'Edit', 'NotebookEdit', 'Bash'],
+      maxOutputTokens: maxOutputTokensForStage('clarify'),
     });
 
     this.state.stages[index].agentId = agent.id;
@@ -1710,6 +1755,7 @@ export class PipelineRunner extends EventEmitter {
         projectPrompt,
         permissionMode: 'bypassPermissions',
         disallowedTools,
+        maxOutputTokens: maxOutputTokensForStage(stage.name),
       });
 
       if (this.state.stages[index].repos[r]) {
@@ -1801,6 +1847,7 @@ export class PipelineRunner extends EventEmitter {
         projectPrompt,
         permissionMode: 'bypassPermissions',
         disallowedTools: ['Read', 'Grep', 'Glob', 'Agent'],
+        maxOutputTokens: maxOutputTokensForStage(stage.name),
       });
       const repoStateForFallback = this.state.stages[stageIndex].repos[repoIdx];
       if (repoStateForFallback) repoStateForFallback.agentId = agent.id;
@@ -1843,6 +1890,7 @@ export class PipelineRunner extends EventEmitter {
           projectPrompt,
           permissionMode: 'bypassPermissions',
           disallowedTools: ['Read', 'Grep', 'Glob', 'Agent'],
+          maxOutputTokens: maxOutputTokensForStage(stage.name),
         });
 
         const repoStateForSpawn = this.state.stages[stageIndex].repos[repoIdx];
@@ -2011,6 +2059,7 @@ export class PipelineRunner extends EventEmitter {
       projectPrompt,
       permissionMode: 'bypassPermissions',
       disallowedTools,
+      maxOutputTokens: maxOutputTokensForStage(stage.name),
     });
 
     this.state.stages[index].agentId = agent.id;
@@ -2098,6 +2147,13 @@ export class PipelineRunner extends EventEmitter {
         if (!current) return reject(new Error('Agent disappeared'));
 
         if (current.status === 'done') {
+          // Phase 3 — surface output truncation when the model hit max_tokens.
+          // We log unconditionally (single-line) and emit a project-event so
+          // the dashboard can show the warning. Tuning the limits up lives
+          // in STAGE_OUTPUT_LIMITS, not in caller code.
+          if (current.cost.stopReason === 'max_tokens') {
+            this.handleOutputTruncation(current.name, current.cost.outputTokens);
+          }
           resolve({
             artifact: current.output,
             cost: current.cost.totalUsd,
@@ -2110,6 +2166,27 @@ export class PipelineRunner extends EventEmitter {
       };
       checkDone();
     });
+  }
+
+  /**
+   * Phase 3 — Output-truncation telemetry hook. Called when an agent's
+   * stop_reason indicates the max-tokens ceiling was reached. Surfaces a
+   * warning so users can raise the per-stage limit in STAGE_OUTPUT_LIMITS
+   * if a stage repeatedly hits its cap. No-op when no stopReason is set.
+   */
+  private handleOutputTruncation(agentName: string, outputTokens: number): void {
+    const message = `[pipeline] Output truncated for ${agentName} at ${outputTokens} tokens (max_tokens reached). Consider raising STAGE_OUTPUT_LIMITS.`;
+    if (process.env.ANVIL_LOG_OUTPUT_TRUNCATIONS === '1') {
+      console.warn(message);
+    }
+    try {
+      this.emit('project-event', {
+        source: 'pipeline',
+        message,
+      });
+    } catch {
+      /* defensive — emit must never break the run */
+    }
   }
 
   // ── Validate-fix helpers ────────────────────────────────────────────
@@ -2312,6 +2389,7 @@ export class PipelineRunner extends EventEmitter {
         projectPrompt: this.buildProjectPrompt(buildStage),
         permissionMode: 'bypassPermissions',
         disallowedTools: ['Agent'],
+        maxOutputTokens: maxOutputTokensForStage('build'),
       });
       this.fixLoopAgentSingle = agent.id;
       return this.waitForAgent(agent.id);
@@ -2347,6 +2425,7 @@ export class PipelineRunner extends EventEmitter {
         projectPrompt: this.buildRepoProjectPrompt(buildStage, repoName),
         permissionMode: 'bypassPermissions',
         disallowedTools: ['Agent'],
+        maxOutputTokens: maxOutputTokensForStage('build'),
       });
       this.fixLoopAgentByRepo.set(repoName, agent.id);
       return this.waitForAgent(agent.id);

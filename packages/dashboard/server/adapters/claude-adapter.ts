@@ -21,7 +21,11 @@ interface StreamContentBlock {
 interface StreamMessage {
   type: string;
   subtype?: string;
-  message?: { content?: StreamContentBlock[] };
+  message?: {
+    content?: StreamContentBlock[];
+    /** Anthropic stream-json: emitted on the assistant message. */
+    stop_reason?: string;
+  };
   result?: string;
   total_cost_usd?: number;
   usage?: {
@@ -37,6 +41,12 @@ interface StreamMessage {
 export class ClaudeAdapter extends BaseAdapter {
   private proc: ChildProcess | null = null;
   private buffer = '';
+  /**
+   * Phase 3 — captured stop reason from the most recent assistant message.
+   * Anthropic stream-json puts this on the assistant frame, not the result
+   * frame, so we cache it and stamp it onto the cost when 'result' fires.
+   */
+  private lastStopReason: string | undefined;
 
   constructor(config: AdapterConfig) {
     super(config);
@@ -208,6 +218,7 @@ export class ClaudeAdapter extends BaseAdapter {
           cacheReadTokens: msg.usage?.cache_read_input_tokens ?? 0,
           cacheWriteTokens: msg.usage?.cache_creation_input_tokens ?? 0,
           durationMs: msg.duration_ms ?? 0,
+          stopReason: this.lastStopReason,
         };
         this.emit('result', {
           result: msg.result ?? '',
@@ -219,6 +230,7 @@ export class ClaudeAdapter extends BaseAdapter {
 
       // Assistant message with content blocks
       if (msg.type === 'assistant' && msg.message?.content) {
+        if (msg.message.stop_reason) this.lastStopReason = msg.message.stop_reason;
         for (const block of msg.message.content) {
           if (block.type === 'text' && block.text) {
             this.emit('content', block.text);

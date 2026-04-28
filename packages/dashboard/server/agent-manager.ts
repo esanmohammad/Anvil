@@ -51,6 +51,12 @@ export interface SpawnConfig {
   runId?: string;
   /** Stable cross-retry id for the checkpoint cache. Defaults to runId. */
   runFamily?: string;
+  /**
+   * Phase 3 — output-token ceiling for this stage's call. Forwarded to the
+   * adapter via setMaxOutputTokens(). Caller (pipeline-runner) is the
+   * source of truth via STAGE_OUTPUT_LIMITS.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface AgentManagerEvents {
@@ -232,6 +238,7 @@ export class AgentManager extends EventEmitter {
       permissionMode: config.permissionMode,
       disallowedTools: config.disallowedTools,
       allowedTools: config.allowedTools,
+      maxOutputTokens: config.maxOutputTokens,
     });
 
     this.wireEvents(agentId, agent, proc);
@@ -269,6 +276,7 @@ export class AgentManager extends EventEmitter {
       sessionId: agent.sessionId,
       cwd: process.cwd(),
       resume: true,
+      maxOutputTokens: entry.spawnConfig?.maxOutputTokens,
     });
 
     this.wireEvents(agentId, agent, resumeProcess);
@@ -336,7 +344,9 @@ export class AgentManager extends EventEmitter {
       agent.finishedAt = Date.now();
       agent.sessionId = sid;
 
-      // Accumulate cost across resume calls
+      // Accumulate cost across resume calls. stopReason is the LAST signal
+      // from the provider (a multi-turn resume can re-emit), so prefer the
+      // freshly reported value and fall back to whatever we had before.
       agent.cost = {
         totalUsd: agent.cost.totalUsd + cost.totalUsd,
         inputTokens: agent.cost.inputTokens + cost.inputTokens,
@@ -344,6 +354,7 @@ export class AgentManager extends EventEmitter {
         cacheReadTokens: agent.cost.cacheReadTokens + cost.cacheReadTokens,
         cacheWriteTokens: agent.cost.cacheWriteTokens + cost.cacheWriteTokens,
         durationMs: agent.cost.durationMs + cost.durationMs,
+        stopReason: cost.stopReason ?? agent.cost.stopReason,
       };
 
       if (result) {

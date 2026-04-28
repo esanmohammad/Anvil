@@ -50,6 +50,15 @@ export interface AdapterCostInfo {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   durationMs: number;
+  /**
+   * Phase 3 — provider's stop reason for the call. Common values:
+   *   - 'end_turn' / 'stop'        — natural completion
+   *   - 'max_tokens' / 'length'    — output ceiling hit (TRUNCATION)
+   *   - 'tool_use'                 — agent paused for a tool call
+   *
+   * Optional: heuristic adapters that don't expose a reason leave it undefined.
+   */
+  stopReason?: string;
 }
 
 export interface AdapterActivity {
@@ -146,6 +155,7 @@ export abstract class BaseAdapter extends EventEmitter {
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       durationMs: 0,
+      stopReason: undefined,
     };
   }
 

@@ -22,6 +22,12 @@ export interface AgentProcessConfig {
   permissionMode?: string;
   disallowedTools?: string[];
   allowedTools?: string[];
+  /**
+   * Phase 3 — output-token ceiling for this run. Forwarded to the adapter
+   * via setMaxOutputTokens() before start(). No-op when the adapter's
+   * capabilities.maxOutputTokens is false.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface CostInfo {
@@ -31,6 +37,8 @@ export interface CostInfo {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   durationMs: number;
+  /** Phase 3 — provider stop reason ('max_tokens' indicates truncation). */
+  stopReason?: string;
 }
 
 export interface AgentActivity {
@@ -81,6 +89,12 @@ export class AgentProcess extends EventEmitter {
 
   start(): void {
     this.adapter = createAdapter(this.config);
+
+    // Phase 3: forward the output-token ceiling to the adapter before start().
+    // Adapters that don't support it (Claude CLI, Gemini CLI today) ignore it.
+    if (typeof this.config.maxOutputTokens === 'number' && this.config.maxOutputTokens > 0) {
+      this.adapter.setMaxOutputTokens(this.config.maxOutputTokens);
+    }
 
     // Pipe all adapter events through to AgentProcess
     this.adapter.on('content', (text) => this.emit('content', text));

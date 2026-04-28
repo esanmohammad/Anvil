@@ -185,6 +185,7 @@ export class ApiAdapter extends BaseAdapter {
     let fullContent = '';
     let inputTokens = 0;
     let outputTokens = 0;
+    let finishReason: string | undefined;
 
     try {
       while (true) {
@@ -214,6 +215,12 @@ export class ApiAdapter extends BaseAdapter {
               fullContent += delta;
               this.emit('content', delta);
             }
+
+            // Capture finish_reason from the terminating chunk so the pipeline
+            // can detect truncation (`length` == 'max_tokens' hit). Only the
+            // last chunk in a stream populates this field.
+            const fr = chunk.choices?.[0]?.finish_reason;
+            if (fr) finishReason = fr;
 
             // Extract usage from final chunk (some providers include it)
             if (chunk.usage) {
@@ -246,7 +253,10 @@ export class ApiAdapter extends BaseAdapter {
       });
     }
 
-    // Emit result
+    // Emit result. Normalize 'length' (OpenAI/OpenRouter wording for the
+    // max-tokens cap) to 'max_tokens' so downstream truncation telemetry is
+    // provider-agnostic.
+    const stopReason = finishReason === 'length' ? 'max_tokens' : finishReason;
     const cost: AdapterCostInfo = {
       totalUsd: 0, // We don't have exact pricing
       inputTokens,
@@ -254,6 +264,7 @@ export class ApiAdapter extends BaseAdapter {
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
       durationMs,
+      stopReason,
     };
 
     this.emit('result', {
