@@ -16,8 +16,22 @@ import type { ModelInfo, DiscoveryResult } from './provider-registry.js';
 
 export type ModelTier = 'fast' | 'balanced' | 'thorough';
 
-// Weight class = the performance tier from the provider registry
-type WeightClass = 'fast' | 'balanced' | 'powerful';
+// Weight class = the performance tier from the provider registry.
+// 'local' is the Phase 5 zero-cost tier (Ollama) — only resolved for
+// fast-tier clarify/ship when ANVIL_LOCAL_TIER_ENABLED is set, with a
+// fallback to 'fast' when no local model is available.
+type WeightClass = 'fast' | 'balanced' | 'powerful' | 'local';
+
+/**
+ * Phase 5 — env flag gating local-tier routing.
+ * Default off until Ollama detection is broadly reliable. When the flag is
+ * unset or '0'/'false', the resolver behaves exactly as before (no 'local'
+ * lookups happen, regardless of what models discovery returned).
+ */
+function localTierEnabled(): boolean {
+  const v = process.env.ANVIL_LOCAL_TIER_ENABLED;
+  return v === '1' || v === 'true';
+}
 
 /**
  * Per-stage weight class assignments for each user-selected tier.
@@ -78,8 +92,20 @@ export function setDiscoveryResult(result: DiscoveryResult): void {
 /**
  * Find the best available agentic model for a given weight class.
  * Prefers CLI providers (agentic capability) since pipeline stages need tool use.
+ *
+ * For weight='local' the agentic filter is dropped: Ollama models go through
+ * the chat-only API adapter and don't carry the 'agentic' capability. They
+ * still work for short clarify/ship stages because those stages are single-
+ * turn prompts, not tool-using agent loops.
  */
 function findModelForWeight(weight: WeightClass, models: ModelInfo[]): string | null {
+  if (weight === 'local') {
+    const local = models.find(m => m.tier === 'local' && m.capabilities.includes('chat'));
+    if (local) return local.id;
+    // No local model — caller falls through to remote-fast.
+    return null;
+  }
+
   // Only consider models with agentic capability (CLI providers)
   const agentic = models.filter(m => m.capabilities.includes('agentic'));
 
@@ -89,7 +115,7 @@ function findModelForWeight(weight: WeightClass, models: ModelInfo[]): string | 
 
   // Fallback: if no exact match, try adjacent tiers
   // e.g., if no 'balanced' agentic model, try 'powerful' then 'fast'
-  const fallbackOrder: Record<WeightClass, WeightClass[]> = {
+  const fallbackOrder: Record<Exclude<WeightClass, 'local'>, WeightClass[]> = {
     fast: ['balanced', 'powerful'],
     balanced: ['powerful', 'fast'],
     powerful: ['balanced', 'fast'],
@@ -119,16 +145,37 @@ export function resolveModelByTier(
 ): string {
   // Determine which weight class this stage needs
   const stageWeights = STAGE_WEIGHTS[tier];
-  const weight = stageWeights[stageName] ?? 'balanced';
+  let weight = stageWeights[stageName] ?? 'balanced';
+
+  // Phase 5 — escalate fast-tier clarify/ship to the local weight class when
+  // the env flag is set. Both stages are short, single-turn prompts that the
+  // local API adapter can handle. If no local model is discovered, the
+  // findModelForWeight('local', ...) call returns null and we drop back to
+  // the configured fast-tier weight below — no error, no behavior change.
+  if (
+    localTierEnabled()
+    && tier === 'fast'
+    && (stageName === 'clarify' || stageName === 'ship')
+  ) {
+    weight = 'local';
+  }
 
   // If we have a cached discovery result, resolve dynamically
   if (lastDiscoveryResult) {
-    const cacheKey = `${tier}:${weight}`;
+    const cacheKey = `${tier}:${weight}:${stageName}`;
 
     if (!resolvedCache) resolvedCache = new Map();
     if (resolvedCache.has(cacheKey)) return resolvedCache.get(cacheKey)!;
 
-    const resolved = findModelForWeight(weight, lastDiscoveryResult.models);
+    let resolved = findModelForWeight(weight, lastDiscoveryResult.models);
+
+    // Local lookup miss → fall back to the original (non-local) weight for
+    // this stage so the run still proceeds against a remote model.
+    if (!resolved && weight === 'local') {
+      const remoteWeight = stageWeights[stageName] ?? 'balanced';
+      resolved = findModelForWeight(remoteWeight, lastDiscoveryResult.models);
+    }
+
     if (resolved) {
       resolvedCache.set(cacheKey, resolved);
       return resolved;

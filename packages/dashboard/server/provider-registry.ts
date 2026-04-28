@@ -33,7 +33,12 @@ export interface ModelInfo {
   displayName: string;    // e.g. 'Claude Sonnet 4.6', 'GPT-4o'
   provider: string;       // provider name
   capabilities: Capability[];
-  tier?: 'fast' | 'balanced' | 'powerful';  // rough performance tier
+  /**
+   * Rough performance/cost tier. `'local'` is the Phase 5 zero-cost tier —
+   * fully on-device (Ollama). Distinguished from `'fast'` so the resolver
+   * can prefer it for clarify/ship without disturbing remote-fast routing.
+   */
+  tier?: 'fast' | 'balanced' | 'powerful' | 'local';
 }
 
 export interface DiscoveryResult {
@@ -271,12 +276,14 @@ async function detectOllamaModels(): Promise<{ available: boolean; models: Model
       const caps: Capability[] = ['chat'];
       if (name.includes('embed') || name.includes('bge')) caps.push('embedding');
       if (name.includes('qwen') || name.includes('rerank')) caps.push('reranking');
+      // Phase 5: Ollama models are the local tier. Anything served from
+      // localhost is zero-cost and fastest-to-first-byte for short stages.
       return {
         id: name,
         displayName: name,
         provider: 'ollama',
         capabilities: caps,
-        tier: 'balanced' as const,
+        tier: 'local' as const,
       };
     });
 
