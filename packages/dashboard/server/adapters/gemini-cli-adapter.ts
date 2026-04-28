@@ -10,7 +10,7 @@
  */
 
 import { spawn, ChildProcess } from 'node:child_process';
-import { BaseAdapter, type AdapterConfig } from './base-adapter.js';
+import { BaseAdapter, type AdapterCapabilities, type AdapterConfig } from './base-adapter.js';
 
 const GEMINI_BIN = process.env.GEMINI_BIN ?? 'gemini';
 
@@ -21,6 +21,20 @@ export class GeminiCliAdapter extends BaseAdapter {
 
   constructor(config: AdapterConfig) {
     super(config);
+  }
+
+  override get capabilities(): AdapterCapabilities {
+    // Gemini supports explicit CachedContent objects but the CLI surface
+    // doesn't expose either prompt cache markers or a max-tokens flag today;
+    // treat caching as auto (markers are no-ops) and report
+    // maxOutputTokens=false so BaseAdapter's no-op setter stands.
+    return {
+      promptCache: 'auto',
+      countTokens: 'heuristic',
+      structuredOutput: 'strict',
+      cacheTtlSeconds: 300,
+      maxOutputTokens: false,
+    };
   }
 
   start(): void {

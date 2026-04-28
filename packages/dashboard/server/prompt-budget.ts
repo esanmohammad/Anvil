@@ -1,5 +1,7 @@
 // Byte-budget enforcer for agent prompt sections — guards against context regressions.
 
+import { heuristicTokenCount, heuristicTokenCountFromBytes } from './token-util.js';
+
 export interface PromptSection {
   /** Stable identifier — used for trace logging. */
   id: string;
@@ -185,10 +187,14 @@ export function enforceBudget(sections: PromptSection[], opts: BudgetOptions): B
 }
 
 /**
- * Convenience: estimate token count using the rough 4-bytes-per-token heuristic
- * used elsewhere in this repo (estimateTokens lives in context-budget.ts; this
- * one is a smaller equivalent for callers that don't need the full module).
+ * Convenience: estimate token count using the heuristic in `token-util`.
+ *
+ * NOTE: `prompt-budget` works in BYTES (UTF-8) and uses byte-length here so
+ * the result is consistent with the rest of this module's accounting.
+ * Callers with an active adapter should use `countTokens(adapter, text)`
+ * directly for higher accuracy.
  */
 export function estimateBudgetTokens(text: string): number {
-  return Math.ceil(byteLen(text) / 4);
+  if (!text) return heuristicTokenCount('');
+  return heuristicTokenCountFromBytes(byteLen(text));
 }

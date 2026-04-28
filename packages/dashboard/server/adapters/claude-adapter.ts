@@ -6,7 +6,7 @@
  */
 
 import { spawn, ChildProcess } from 'node:child_process';
-import { BaseAdapter, type AdapterConfig, type AdapterCostInfo } from './base-adapter.js';
+import { BaseAdapter, type AdapterCapabilities, type AdapterConfig, type AdapterCostInfo } from './base-adapter.js';
 
 const CLAUDE_BIN = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? process.env.CLAUDE_BIN ?? 'claude';
 
@@ -40,6 +40,28 @@ export class ClaudeAdapter extends BaseAdapter {
 
   constructor(config: AdapterConfig) {
     super(config);
+  }
+
+  override get capabilities(): AdapterCapabilities {
+    // The Claude CLI doesn't expose a max-tokens flag today, so we report
+    // maxOutputTokens=false and let BaseAdapter's no-op setter stand. Phase 3
+    // can flip this once the CLI surface supports it.
+    return {
+      promptCache: 'explicit',
+      countTokens: 'heuristic',
+      structuredOutput: 'tool-shim',
+      cacheTtlSeconds: 300,
+      maxOutputTokens: false,
+    };
+  }
+
+  override markCacheBreakpoint(prompt: string, position: number): string {
+    // The Claude CLI consumes a single string prompt; it doesn't surface
+    // cache_control directly. We emit a sentinel comment that downstream
+    // prompt-restructure code can verify; real cache behavior depends on
+    // byte-stable prefixes (Phase 1 enforces that).
+    const safe = Math.max(0, Math.min(prompt.length, position));
+    return prompt.slice(0, safe) + '\n<!-- anvil:cache-breakpoint -->\n' + prompt.slice(safe);
   }
 
   start(): void {

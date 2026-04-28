@@ -9,6 +9,7 @@
  */
 
 import { getContextWindow, getMaxOutput } from './model-catalog.js';
+import { heuristicTokenCount } from './token-util.js';
 
 /** Get the token limit for a model (input context window). */
 export function getModelTokenLimit(modelId: string): number {
@@ -17,10 +18,13 @@ export function getModelTokenLimit(modelId: string): number {
 
 // ── Token estimation ──────────────────────────────────────────────────
 
-/** Estimate token count from a string (chars/4 heuristic, good within ~10%) */
+/**
+ * Estimate token count from a string. Routes through `token-util` so a
+ * single seam owns the heuristic; callers with an active adapter should
+ * prefer `countTokens(adapter, text)` directly.
+ */
 export function estimateTokens(text: string): number {
-  if (!text) return 0;
-  return Math.ceil(text.length / 4);
+  return heuristicTokenCount(text);
 }
 
 // ── Context components with priority ──────────────────────────────────

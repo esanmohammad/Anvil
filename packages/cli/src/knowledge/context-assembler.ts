@@ -15,6 +15,10 @@ import { loadProjectGraph, formatProjectGraphForPrompt } from './project-graph-b
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Heuristic-only estimator: this module runs during KB indexing (no adapter
+// in scope). Mirrors `heuristicTokenCount` in
+// `packages/dashboard/server/token-util.ts`. If an adapter ever becomes
+// available here, prefer routing through `BaseAdapter.countTokens`.
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }

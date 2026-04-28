@@ -10,7 +10,7 @@
  *   - Cost is estimated from token counts, not exact
  */
 
-import { BaseAdapter, type AdapterConfig, type AdapterCostInfo } from './base-adapter.js';
+import { BaseAdapter, type AdapterCapabilities, type AdapterConfig, type AdapterCostInfo } from './base-adapter.js';
 
 type ApiProvider = 'openai' | 'gemini-api' | 'openrouter' | 'ollama';
 
@@ -46,10 +46,36 @@ export class ApiAdapter extends BaseAdapter {
   private abortController: AbortController | null = null;
   private isKilled = false;
   private startTime = 0;
+  private maxOutputTokens = 16384;
 
   constructor(config: AdapterConfig, provider: ApiProvider) {
     super(config);
     this.provider = provider;
+  }
+
+  override get capabilities(): AdapterCapabilities {
+    // OpenAI / OpenRouter / Gemini-API auto-cache stable prefixes ≥1024 tokens.
+    // Ollama is local: no API cache, but the hot model state behaves similarly
+    // for stable prefixes. Mark as 'auto' for the API providers; 'none' for ollama.
+    if (this.provider === 'ollama') {
+      return {
+        promptCache: 'none',
+        countTokens: 'heuristic',
+        structuredOutput: 'best-effort',
+        maxOutputTokens: true,
+      };
+    }
+    return {
+      promptCache: 'auto',
+      countTokens: 'heuristic',
+      structuredOutput: 'strict',
+      cacheTtlSeconds: 600,
+      maxOutputTokens: true,
+    };
+  }
+
+  override setMaxOutputTokens(n: number): void {
+    if (n > 0) this.maxOutputTokens = n;
   }
 
   start(): void {
@@ -120,7 +146,7 @@ export class ApiAdapter extends BaseAdapter {
       messages,
       stream: true,
       temperature: 0.1,
-      max_tokens: 16384,
+      max_tokens: this.maxOutputTokens,
     });
 
     let response: Response;
