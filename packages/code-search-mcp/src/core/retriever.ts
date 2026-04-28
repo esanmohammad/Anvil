@@ -12,8 +12,8 @@ import type { ScoredChunk, RetrievalResult, EmbeddingProvider } from '@anvil/kno
 import type { VectorStore } from './vector-store.js';
 import type { ProjectGraphBuilder } from './project-graph-builder.js';
 import type { Reranker } from './reranker.js';
-import type { QueryRouter } from './query-router.js';
-import { classifyQuery } from './query-classifier.js';
+import type { QueryRouter } from '@anvil/knowledge-core';
+import { classifyQuery } from '@anvil/knowledge-core';
 
 export type RetrievalMode = 'vector' | 'bm25' | 'vector+bm25' | 'vector+graph' | 'vector+bm25+graph';
 

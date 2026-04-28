@@ -2,24 +2,24 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSy
 import { execSync } from 'node:child_process';
 import { join, basename } from 'node:path';
 
-import { chunkRepo, chunkChangedFiles } from './chunker.js';
-import type { FileIndexEntry } from './chunker.js';
+import { chunkRepo, chunkChangedFiles } from '@anvil/knowledge-core';
+import type { FileIndexEntry } from '@anvil/knowledge-core';
 import { buildAstGraph, generateGraphReport, incrementalGraphUpdate } from './ast-graph-builder.js';
-import { getAllChanges, getChangedFilesList, getDeletedFilesList } from './git-diff.js';
-import type { GitDiff } from './git-diff.js';
+import { getAllChanges, getChangedFilesList, getDeletedFilesList } from '@anvil/knowledge-core';
+import type { GitDiff } from '@anvil/knowledge-core';
 import { createEmbeddingProvider } from './embedder.js';
 import { VectorStore } from './vector-store.js';
 import { ProjectGraphBuilder } from './project-graph-builder.js';
-import { detectCrossRepoEdges } from './cross-repo-detector.js';
-import { detectWorkspace } from './workspace-detector.js';
+import { detectCrossRepoEdges } from '@anvil/knowledge-core';
+import { detectWorkspace } from '@anvil/knowledge-core';
 import { HybridRetriever } from './retriever.js';
-import { loadKnowledgeConfig, getKnowledgeBasePath, DEFAULT_CONFIG } from './config.js';
-import type { KnowledgeConfig } from './config.js';
+import { loadKnowledgeConfig, getKnowledgeBasePath, DEFAULT_CONFIG } from '@anvil/knowledge-core';
+import type { KnowledgeConfig } from '@anvil/knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap } from '@anvil/knowledge-core';
 import { profileProject, loadAllProfiles } from './repo-profiler.js';
 import { inferServiceMesh } from './service-mesh-inferrer.js';
-import { computeStructuralHashes, deduplicateByStructure } from './structural-hasher.js';
-import { createQueryRouter } from './query-router.js';
+import { computeStructuralHashes, deduplicateByStructure } from '@anvil/knowledge-core';
+import { createQueryRouter } from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // SHA-based staleness detection

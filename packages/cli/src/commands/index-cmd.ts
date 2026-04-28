@@ -307,7 +307,7 @@ export const indexCommand = new Command('index')
 
     try {
       const { KnowledgeIndexer } = await import('../knowledge/indexer.js');
-      const { loadKnowledgeConfig } = await import('../knowledge/config.js');
+      const { loadKnowledgeConfig } = await import('@anvil/knowledge-core');
 
       const kConfig = loadKnowledgeConfig(projectName);
 

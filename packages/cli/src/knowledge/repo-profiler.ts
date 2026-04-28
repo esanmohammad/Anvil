@@ -12,7 +12,7 @@ import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 import { runLLM } from './claude-runner.js';
 import type { RepoProfile } from '@anvil/knowledge-core';
-import { getKnowledgeBasePath } from './config.js';
+import { getKnowledgeBasePath } from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // Types (internal)

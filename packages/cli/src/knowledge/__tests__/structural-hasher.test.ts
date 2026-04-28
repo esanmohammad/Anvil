@@ -8,7 +8,7 @@ import {
   computeStructuralHash,
   computeStructuralHashes,
   deduplicateByStructure,
-} from '../structural-hasher.js';
+} from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // computeStructuralHash

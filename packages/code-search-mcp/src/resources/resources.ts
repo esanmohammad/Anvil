@@ -5,7 +5,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
-import { getKnowledgeBasePath } from '../core/config.js';
+import { getKnowledgeBasePath } from '@anvil/knowledge-core';
 import { loadAllProfiles } from '../core/repo-profiler.js';
 import { loadProfile } from '../core/repo-profiler.js';
 

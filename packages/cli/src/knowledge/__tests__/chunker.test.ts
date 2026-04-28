@@ -13,7 +13,7 @@ import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
-import { chunkRepo } from '../chunker.js';
+import { chunkRepo } from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // Helpers

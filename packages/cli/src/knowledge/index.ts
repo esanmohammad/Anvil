@@ -2,7 +2,7 @@
 // Only project-level graph and context assembly. Code search moved to @anvil-dev/code-search-mcp.
 
 export * from '@anvil/knowledge-core';
-export * from './config.js';
+export * from '@anvil/knowledge-core';
 export { ProjectGraphBuilder } from './project-graph-builder.js';
 export {
   assembleKnowledgeContext,
@@ -22,4 +22,4 @@ export {
   renderProjectSummary,
   formatProjectGraphForPrompt,
 } from './project-graph-builder.js';
-export { walkDir, langFromExt, extractImports, extractNamedImports, SOURCE_EXTENSIONS, SKIP_DIRS } from './file-walker.js';
+export { walkDir, langFromExt, extractImports, extractNamedImports, SOURCE_EXTENSIONS, SKIP_DIRS } from '@anvil/knowledge-core';

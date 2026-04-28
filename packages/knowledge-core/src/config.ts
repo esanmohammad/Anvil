@@ -89,8 +89,19 @@ function parseKnowledgeSection(yaml: string): KnowledgeConfig {
   return config;
 }
 
-/** Get the knowledge base storage path for a project */
+/**
+ * Get the knowledge base storage path for a project.
+ *
+ * Resolution order (matches both consumer behaviors):
+ *   1. CODE_SEARCH_DATA_DIR — used by mcp's docker / production deployments
+ *   2. ANVIL_HOME / 'knowledge-base' — cli's default
+ *   3. ~/.anvil/knowledge-base — fallback when neither env var is set
+ */
 export function getKnowledgeBasePath(project: string): string {
+  // CODE_SEARCH_DATA_DIR takes priority (Docker / production)
+  const dataDir = process.env.CODE_SEARCH_DATA_DIR;
+  if (dataDir) return join(dataDir, project);
+
   const anvilHome = process.env.ANVIL_HOME || join(homedir(), '.anvil');
   return join(anvilHome, 'knowledge-base', project);
 }

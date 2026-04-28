@@ -12,7 +12,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DEFAULT_CONFIG } from '../config.js';
+import { DEFAULT_CONFIG } from '@anvil/knowledge-core';
 import { createReranker } from '../reranker.js';
 
 describe('knowledge defaults — Phase 6', () => {

@@ -20,10 +20,10 @@
 
 import { readFileSync } from 'node:fs';
 import { relative, extname, dirname, resolve, basename, join } from 'node:path';
-import { walkDir, langFromExt, extractImports, extractNamedImports } from './file-walker.js';
+import { walkDir, langFromExt, extractImports, extractNamedImports } from '@anvil/knowledge-core';
 import type { GraphifyNode, GraphifyEdge, GraphifyOutput, WorkspaceMap } from '@anvil/knowledge-core';
-import { initTreeSitter, parseFile as tsParseFile, supportedLanguages } from './tree-sitter-parser.js';
-import type { FileParseResult, TreeSitterEntity } from './tree-sitter-parser.js';
+import { initTreeSitter, parseFile as tsParseFile, supportedLanguages } from '@anvil/knowledge-core';
+import type { FileParseResult, TreeSitterEntity } from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // Tree-sitter integration — use AST parsing when available, regex fallback

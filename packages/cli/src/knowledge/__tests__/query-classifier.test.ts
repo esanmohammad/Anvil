@@ -4,7 +4,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyQuery, routeQueryToRepos } from '../query-classifier.js';
+import { classifyQuery, routeQueryToRepos } from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // classifyQuery
