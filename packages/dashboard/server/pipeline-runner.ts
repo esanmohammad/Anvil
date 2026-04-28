@@ -29,6 +29,23 @@ import { sliceSpecForRefs } from './engineer-spec-slicer.js';
 import { enforceBudget } from './prompt-budget.js';
 import type { PromptSection } from './prompt-budget.js';
 import { scorePlan, computeRiskTier } from './plan-risk-scorer.js';
+import {
+  FeatureManifestStore,
+  renderManifestForPrompt,
+  type PlannedFile,
+  type TestBehavior,
+} from './feature-manifest.js';
+import {
+  extractAcceptanceCriteria,
+  extractAffectedRepos,
+  extractApiEndpoints,
+  extractChangeBrief,
+  extractFilesPlanned,
+  extractOpenQuestions,
+  extractTablesTouched,
+  extractTestBehaviors,
+  type ManifestExtractor,
+} from './feature-manifest-extractors.js';
 
 // ── Claude CLI binary ────────────────────────────────────────────────
 
@@ -373,6 +390,7 @@ export class PipelineRunner extends EventEmitter {
   private agentManager: AgentManager;
   private projectLoader: ProjectLoader;
   private featureStore: FeatureStore;
+  private manifestStore: FeatureManifestStore;
   private state: PipelineRunState;
   private config: PipelineConfig;
   private workspaceDir: string;
@@ -383,6 +401,13 @@ export class PipelineRunner extends EventEmitter {
   private memoryStore: MemoryStore;
   private kbManager: KnowledgeBaseManager | null;
   private afterStageHook: AfterStageHook | null = null;
+  /**
+   * Phase 2: feature manifest is rendered into the projectPrompt of every
+   * stage so downstream agents stop re-deriving fields earlier stages already
+   * produced. Memoised per-snapshot — invalidated whenever a stage patches
+   * the manifest. Bytes are stable for all spawns of the same stage.
+   */
+  private cachedManifestBlock: string | null = null;
 
   setAfterStageHook(hook: AfterStageHook | null): void { this.afterStageHook = hook; }
 
@@ -566,6 +591,129 @@ export class PipelineRunner extends EventEmitter {
     return { content, sourceLabel };
   }
 
+  // ── Phase 2 manifest helpers ────────────────────────────────────────
+
+  /**
+   * Render the current feature manifest as a stable text block. Cached
+   * within a stage so multiple per-repo spawns reuse the same bytes; the
+   * cache is invalidated whenever the manifest is patched.
+   */
+  private getStableManifestBlock(): string {
+    if (this.cachedManifestBlock !== null) return this.cachedManifestBlock;
+    try {
+      const m = this.manifestStore.read(this.config.project, this.state.featureSlug);
+      this.cachedManifestBlock = renderManifestForPrompt(m);
+    } catch {
+      this.cachedManifestBlock = '';
+    }
+    return this.cachedManifestBlock;
+  }
+
+  /** Discard the cached render so the next read picks up patched fields. */
+  private invalidateManifestBlock(): void {
+    this.cachedManifestBlock = null;
+  }
+
+  /**
+   * Pre-fill the manifest from a plan seed. Called before stage 5 (build)
+   * runs so engineers see acceptance criteria, repo impact, planned files,
+   * and test behaviors as `final` and don't re-derive them. Plans don't
+   * always have explicit API/table sections, so those are left `unset`.
+   */
+  private populateManifestFromPlan(plan: import('./plan-store.js').Plan): void {
+    const project = this.config.project;
+    const slug = this.state.featureSlug;
+    this.manifestStore.ensure(project, slug, this.config.feature);
+
+    const writer = 'plan-seed';
+
+    // Acceptance criteria — derived from the plan's in-scope list when present.
+    if (plan.scope?.inScope?.length) {
+      this.manifestStore.patchField(
+        project, slug, 'acceptanceCriteria', 'final',
+        plan.scope.inScope.slice(),
+        writer,
+      );
+    }
+
+    // Affected repos — directly from plan.repos[].name.
+    const repoNames = (plan.repos ?? []).map((r) => r.name).filter((n): n is string => !!n);
+    if (repoNames.length > 0) {
+      this.manifestStore.patchField(
+        project, slug, 'affectedRepos', 'final',
+        repoNames,
+        writer,
+      );
+    }
+
+    // Files planned — flatten plan.repos[].files into PlannedFile entries.
+    // Plans don't track create/modify/delete kinds, so default to 'modify'.
+    const filesPlanned: PlannedFile[] = [];
+    for (const repo of plan.repos ?? []) {
+      for (const file of repo.files ?? []) {
+        filesPlanned.push({ repo: repo.name, path: file, kind: 'modify' });
+      }
+    }
+    if (filesPlanned.length > 0) {
+      this.manifestStore.patchField(
+        project, slug, 'filesPlanned', 'final',
+        filesPlanned,
+        writer,
+      );
+    }
+
+    // Test behaviors — synthesize from plan.tests buckets.
+    const testBehaviors: TestBehavior[] = [];
+    for (const desc of plan.tests?.unit ?? []) testBehaviors.push({ description: desc });
+    for (const desc of plan.tests?.integration ?? []) testBehaviors.push({ description: desc });
+    for (const desc of plan.tests?.manual ?? []) testBehaviors.push({ description: desc });
+    if (testBehaviors.length > 0) {
+      this.manifestStore.patchField(
+        project, slug, 'testBehaviors', 'final',
+        testBehaviors,
+        writer,
+      );
+    }
+
+    this.invalidateManifestBlock();
+  }
+
+  /**
+   * After a stage's artifact lands, extract structured fields and patch the
+   * manifest. Uses a heuristic deterministic parser today — the cheap-model
+   * extraction call is wired through later phases so we avoid an extra spawn
+   * per stage while still capturing the obvious wins from plan-seeded runs
+   * and from artifacts that already use predictable headings.
+   */
+  private async extractAndUpdateManifest(stage: StageDefinition, artifact: string): Promise<void> {
+    const fieldsForStage: Partial<Record<string, ManifestExtractor[]>> = {
+      requirements: [extractAcceptanceCriteria, extractAffectedRepos],
+      specs: [extractApiEndpoints, extractTablesTouched, extractTestBehaviors],
+      tasks: [extractFilesPlanned],
+      build: [extractChangeBrief],
+      validate: [extractOpenQuestions],
+    };
+    const extractors = fieldsForStage[stage.name];
+    if (!extractors || extractors.length === 0) return;
+
+    let mutated = false;
+    for (const extractor of extractors) {
+      try {
+        const result = extractor(artifact);
+        if (!result) continue;
+        this.manifestStore.patchField(
+          this.config.project, this.state.featureSlug,
+          result.field, result.status, result.value as never,
+          stage.name,
+        );
+        mutated = true;
+      } catch (err) {
+        console.warn(`[pipeline] manifest extractor ${stage.name} failed:`, err);
+      }
+    }
+    if (mutated) this.invalidateManifestBlock();
+  }
+
   // For interactive clarify — resolves when user provides input
   private inputResolve: ((text: string) => void) | null = null;
 
@@ -581,6 +729,7 @@ export class PipelineRunner extends EventEmitter {
     this.agentManager = agentManager;
     this.projectLoader = projectLoader;
     this.featureStore = featureStore;
+    this.manifestStore = new FeatureManifestStore(featureStore);
     this.config = config;
     this.memoryStore = memoryStore ?? new MemoryStore();
     this.kbManager = kbManager ?? null;
@@ -840,6 +989,18 @@ export class PipelineRunner extends EventEmitter {
         this.state.featureSlug = featureRecord.slug;
       }
 
+      // Phase 2: ensure a manifest exists for the feature, then pre-fill from
+      // the plan seed when present so stage 5 (build) sees acceptanceCriteria,
+      // affectedRepos, filesPlanned, and testBehaviors as `final`.
+      this.manifestStore.ensure(this.config.project, this.state.featureSlug, this.config.feature);
+      if (this.config.planSeed?.plan) {
+        try {
+          this.populateManifestFromPlan(this.config.planSeed.plan);
+        } catch (err) {
+          console.warn('[pipeline] populateManifestFromPlan failed:', err);
+        }
+      }
+
       // Load prior artifacts if resuming
       let prevArtifact = '';
       const resumeStage = this.config.resumeFromStage ?? 0;
@@ -1077,6 +1238,15 @@ export class PipelineRunner extends EventEmitter {
 
           // Write artifact to feature folder
           this.writeStageArtifact(i, stage, result.artifact);
+
+          // Phase 2: extract structured fields from this stage's artifact and
+          // patch the manifest. Best-effort — extractor failures degrade to
+          // "field stays unset" rather than aborting the run.
+          try {
+            await this.extractAndUpdateManifest(stage, result.artifact);
+          } catch (err) {
+            console.warn(`[pipeline] manifest extraction at ${stage.name} failed:`, err);
+          }
 
           // After build (plan-seeded runs only): capture what Build actually did
           // vs what the plan claimed. Feeds plan-learner.
@@ -2664,13 +2834,40 @@ A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Gra
         overrides.push('CRITICAL: You MUST fix ALL build errors, lint errors, and test failures before completing. Iterate until the codebase is clean. End your output with "VERDICT: PASS" or "VERDICT: FAIL" so the pipeline knows whether to proceed to shipping.');
       }
 
-      const finalPrompt = injected + (overrides.length > 0 ? '\n\n' + overrides.join('\n') : '');
+      const manifestPrefix = this.buildManifestPrefix();
+      const finalPrompt = manifestPrefix
+        + injected
+        + (overrides.length > 0 ? '\n\n' + overrides.join('\n') : '');
       this.warnIfSystemPromptOversized(`${stage.persona}/${stage.name}`, finalPrompt);
       return finalPrompt;
     }
 
     // Fallback if prompt file not found
     return `You are the ${stage.persona} agent in an Anvil pipeline for the "${this.config.project}" project.\n\nProject YAML:\n${this.projectYaml.slice(0, 4000)}`;
+  }
+
+  /**
+   * Build the manifest-prefix block prepended to every system prompt.
+   * Combines the rendered manifest with the "consult before derive" rule
+   * so agents read both as one unit. Returns '' (no extra bytes) when the
+   * manifest is empty so prompt cache hits remain stable on early stages.
+   */
+  private buildManifestPrefix(): string {
+    const block = this.getStableManifestBlock();
+    if (!block) return '';
+    const discipline = [
+      'Manifest discipline:',
+      '- The feature manifest below is authoritative. If a field you would otherwise derive is already marked [final], use that value verbatim.',
+      '- Do not re-justify, re-validate, or paraphrase final fields. Move on to the unset/partial fields.',
+      "- If you find the manifest contradicts your reasoning, note the contradiction in `openQuestions` (don't silently override).",
+    ].join('\n');
+    const prefix = `## Feature manifest\n${block}\n\n${discipline}\n\n`;
+    // Telemetry — Phase 2 acceptance asks for visible variable-bytes signal so
+    // re-runs with a populated manifest can be compared to cold runs.
+    if (process.env.ANVIL_LOG_MANIFEST_BYTES === '1') {
+      console.log(`[pipeline] manifest prefix: ${Buffer.byteLength(prefix, 'utf8')} bytes`);
+    }
+    return prefix;
   }
 
   private buildRepoProjectPrompt(stage: StageDefinition, repoName: string): string {
@@ -2756,7 +2953,8 @@ The Knowledge Base above contains your target repo "${repoName}" (labeled "YOUR 
         overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
       }
 
-      const finalPrompt = injected + '\n\n' + overrides.join('\n');
+      const manifestPrefix = this.buildManifestPrefix();
+      const finalPrompt = manifestPrefix + injected + '\n\n' + overrides.join('\n');
       this.warnIfSystemPromptOversized(`${stage.persona}/${stage.name}:${repoName}`, finalPrompt);
       return finalPrompt;
     }
