@@ -28,6 +28,7 @@ import type { ParsedTask } from './engineer-task-bundler.js';
 import { sliceSpecForRefs } from './engineer-spec-slicer.js';
 import { enforceBudget } from './prompt-budget.js';
 import type { PromptSection } from './prompt-budget.js';
+import { scorePlan, computeRiskTier } from './plan-risk-scorer.js';
 
 // ── Claude CLI binary ────────────────────────────────────────────────
 
@@ -363,6 +364,8 @@ export interface AfterStageHook {
     cost: number;
     totalCost: number;
     touchedFiles?: string[];
+    riskTier?: 'low' | 'med' | 'high';
+    confidence?: number;
   }): Promise<void>;
 }
 
@@ -382,6 +385,53 @@ export class PipelineRunner extends EventEmitter {
   private afterStageHook: AfterStageHook | null = null;
 
   setAfterStageHook(hook: AfterStageHook | null): void { this.afterStageHook = hook; }
+
+  /**
+   * Best-effort list of files modified by this run so far, prefixed with the
+   * repo name so policy globs like `backend/internal/db/**` can match across
+   * a multi-repo workspace. Uses `git status --porcelain` per repo and
+   * silently skips repos that error.
+   */
+  private getTouchedFiles(): string[] {
+    const files: string[] = [];
+    for (const [repoName, repoPath] of Object.entries(this.repoPaths)) {
+      if (!repoPath) continue;
+      try {
+        const out = execSync('git status --porcelain', {
+          cwd: repoPath, encoding: 'utf-8', timeout: 10_000,
+        });
+        for (const line of out.split('\n')) {
+          if (line.length < 4) continue;
+          const path = (line.slice(3).trim().split(' -> ').pop() ?? '').trim();
+          if (path) files.push(`${repoName}/${path}`);
+        }
+      } catch { /* per-repo best-effort */ }
+    }
+    return files;
+  }
+
+  /**
+   * Risk tier + confidence from the plan seed (when present). Computed once
+   * at runtime so every stage sees the same numbers; undefined when no plan
+   * is available (the policy evaluator falls back to defaults).
+   */
+  private cachedRisk: { tier: 'low' | 'med' | 'high'; confidence: number } | null = null;
+  private getPlanRisk(): { tier?: 'low' | 'med' | 'high'; confidence?: number } {
+    if (this.cachedRisk) return this.cachedRisk;
+    const seed = this.config.planSeed;
+    if (!seed?.plan) return {};
+    try {
+      const score = scorePlan(seed.plan);
+      const confidence = (seed.plan as unknown as { confidence?: number }).confidence;
+      this.cachedRisk = {
+        tier: computeRiskTier(score.overall),
+        confidence: typeof confidence === 'number' ? confidence : 0.5,
+      };
+      return this.cachedRisk;
+    } catch {
+      return {};
+    }
+  }
 
   // For interactive clarify — resolves when user provides input
   private inputResolve: ((text: string) => void) | null = null;
@@ -871,6 +921,7 @@ export class PipelineRunner extends EventEmitter {
           // ── After-stage hook — policy-driven pause / learning / etc. ──
           if (this.afterStageHook) {
             try {
+              const risk = this.getPlanRisk();
               await this.afterStageHook({
                 runId: this.state.runId,
                 project: this.config.project,
@@ -879,6 +930,9 @@ export class PipelineRunner extends EventEmitter {
                 artifact: result.artifact,
                 cost: result.cost,
                 totalCost: this.state.totalCost,
+                touchedFiles: this.getTouchedFiles(),
+                riskTier: risk.tier,
+                confidence: risk.confidence,
               });
               if (this.cancelled) break;
             } catch (err) {

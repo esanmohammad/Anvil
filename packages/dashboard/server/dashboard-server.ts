@@ -78,11 +78,13 @@ import { PipelineAuditLog } from './pipeline-audit-log.js';
 import { PipelineLearningsStore } from './pipeline-learnings-store.js';
 import { CostLedger } from './cost-ledger.js';
 import { CostBreachHandler } from './cost-breach-handler.js';
+import type { BreachState } from './cost-types.js';
 import { CostBreachSweeper } from './cost-breach-sweeper.js';
 import { BlobStore } from './checkpoint-blob-store.js';
 import { CheckpointStore } from './checkpoint-store.js';
 import { computeKey as computeCheckpointKey } from './checkpoint-key.js';
-import { loadPolicy, defaultPolicy, evaluatePolicy } from './pipeline-policy.js';
+import { loadPolicy, evaluatePolicy } from './pipeline-policy.js';
+import type { PipelinePolicy } from './pipeline-policy-types.js';
 import {
   notifyPipelinePaused, notifyCostBreach,
 } from './pipeline-notifier.js';
@@ -841,7 +843,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     title: string;
     repo: string;
     author: string;
-    status: 'draft' | 'open' | 'in_review' | 'merged';
+    status: 'draft' | 'open' | 'in_review' | 'merged' | 'closed';
     url: string;
     createdAt: number;
     updatedAt: number;
@@ -872,8 +874,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       let status: TrackedPR['status'] = 'open';
       if (data.isDraft) status = 'draft';
       else if (data.state === 'MERGED') status = 'merged';
-      else if (data.state === 'CLOSED') status = 'closed' as TrackedPR['status'];
-      else if (data.reviewDecision === 'APPROVED' || data.reviewDecision === 'CHANGES_REQUESTED' ||
+      else if (data.state === 'CLOSED') status = 'closed';
+      // 'in_review' = actively waiting on a reviewer. APPROVED PRs are ready
+      // to merge — leave them in 'open' so the board doesn't park them in
+      // a column that implies action by reviewers.
+      else if (data.reviewDecision === 'CHANGES_REQUESTED' ||
                (data.reviewRequests && data.reviewRequests.length > 0)) status = 'in_review';
 
       const repoName = data.headRepository?.name ??
@@ -899,6 +904,59 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     }
   }
 
+  /**
+   * Build a prUrl → PRReviewSummary map by joining tracked PRs against the
+   * review store. Latest review per PR wins (listReviews returns desc by
+   * createdAt). Filesystem-bound but cheap at the dashboard's broadcast
+   * cadence (~30s for refreshes; on-demand otherwise).
+   */
+  function reviewMapByPrUrl(): Map<string, {
+    reviewId: string;
+    verdict: 'approve' | 'request-changes' | 'comment';
+    blockers: number;
+    errors: number;
+    warnings: number;
+    summary: string;
+    reviewedAt: number;
+  }> {
+    const m = new Map<string, ReturnType<typeof reviewMapByPrUrl> extends Map<string, infer V> ? V : never>();
+    try {
+      const all = reviewStore.listReviews(undefined, 500);
+      for (const r of all) {
+        if (m.has(r.prUrl)) continue;
+        const sev = r.severityCounts;
+        const blockers = sev.blocker ?? 0;
+        const errors = sev.error ?? 0;
+        const warnings = sev.warn ?? 0;
+        const issueCount = blockers + errors;
+        const summary = r.verdict === 'approve'
+          ? 'Approved — no blocking issues'
+          : r.verdict === 'request-changes'
+            ? `${issueCount} issue${issueCount === 1 ? '' : 's'}${blockers > 0 ? ` (${blockers} blocker${blockers === 1 ? '' : 's'})` : ''}`
+            : 'Comments only';
+        m.set(r.prUrl, {
+          reviewId: r.reviewId,
+          verdict: r.verdict,
+          blockers, errors, warnings,
+          summary,
+          reviewedAt: Date.parse(r.createdAt) || Date.now(),
+        });
+      }
+    } catch { /* review store best-effort */ }
+    return m;
+  }
+
+  /** Tracked PRs joined with their latest review for broadcast/serialization. */
+  function trackedPRsForBroadcast(): Array<TrackedPR & {
+    review: ReturnType<typeof reviewMapByPrUrl> extends Map<string, infer V> ? V | null : never;
+  }> {
+    const reviewMap = reviewMapByPrUrl();
+    return Array.from(trackedPRs.values()).map((pr) => ({
+      ...pr,
+      review: reviewMap.get(pr.url) ?? null,
+    }));
+  }
+
   /** Refresh all tracked PRs and broadcast updates */
   async function refreshTrackedPRs(): Promise<void> {
     if (trackedPRs.size === 0) return;
@@ -916,7 +974,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     }
 
     if (changed) {
-      broadcast({ type: 'prs', payload: Array.from(trackedPRs.values()) });
+      broadcast({ type: 'prs', payload: trackedPRsForBroadcast() });
     }
   }
 
@@ -927,7 +985,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     const pr = await fetchPRDetails(prUrl);
     if (pr) {
       trackedPRs.set(prUrl, pr);
-      broadcast({ type: 'prs', payload: Array.from(trackedPRs.values()) });
+      broadcast({ type: 'prs', payload: trackedPRsForBroadcast() });
     }
   }
 
@@ -1032,13 +1090,19 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       } catch { return undefined; }
     })() : undefined;
 
-    const breach = runId ? (() => {
+    const breach = (() => {
       try {
-        const b = costBreachHandler.getBreach(runId);
+        let b: BreachState | null | undefined;
+        if (runId) {
+          b = costBreachHandler.getBreach(runId);
+        } else {
+          const pendings = costBreachHandler.listPending?.() ?? [];
+          b = pendings.find((p) => p.project === project) ?? null;
+        }
         if (!b || b.status !== 'pending') return undefined;
         const topSpenders = (() => {
           try {
-            const sum = costLedger.summarize(runId, project);
+            const sum = costLedger.summarize(b.runId, project);
             return Object.entries(sum.byStage)
               .map(([stage, usd]) => ({ stage, usd: usd as number }))
               .sort((a, b) => b.usd - a.usd)
@@ -1056,7 +1120,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           extensionsUsed: b.extensionsUsed,
         };
       } catch { return undefined; }
-    })() : undefined;
+    })();
 
     return {
       project,
@@ -1368,9 +1432,22 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       try { broadcastCostSnapshot(state.project, state.runId); } catch { /* ok */ }
     },
     onRejectStop: (runId) => {
+      const run = activeRuns.get(runId);
+      if (run) {
+        if (run.agentId) {
+          try { agentManager.kill(run.agentId); } catch { /* ok */ }
+        }
+        if (run.type === 'build' && activePipelineRunner) {
+          try { activePipelineRunner.cancel(); } catch { /* ok */ }
+        }
+        for (const [agentId, rid] of agentToRunId.entries()) {
+          if (rid === runId) {
+            try { agentManager.kill(agentId); } catch { /* ok */ }
+          }
+        }
+        run.status = 'failed';
+      }
       broadcast({ type: 'run-rejected', payload: { runId } } as ServerMessage);
-      // Integration with agent-manager SIGTERM + checkpoint flush happens
-      // in pipeline-runner — this broadcast is the UI signal.
     },
   });
   const costBreachSweeper = new CostBreachSweeper(costBreachHandler, { intervalMs: 5000 });
@@ -1419,7 +1496,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         type: 'init',
         payload: {
           projects: projectInfos, runs, state, features,
-          prs: Array.from(trackedPRs.values()),
+          prs: trackedPRsForBroadcast(),
           activeRuns: Array.from(activeRuns.values()).map((r) => ({
             id: r.id, type: r.type, project: r.project, description: r.description,
             model: r.model, status: r.status, startedAt: r.startedAt,
@@ -1933,7 +2010,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
       case 'refresh-prs': {
         refreshTrackedPRs().then(() => {
-          ws.send(JSON.stringify({ type: 'prs', payload: Array.from(trackedPRs.values()) }));
+          ws.send(JSON.stringify({ type: 'prs', payload: trackedPRsForBroadcast() }));
         }).catch(() => {});
         break;
       }
@@ -2406,6 +2483,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       case 'publish-review': {
         const reviewId = (msg as { reviewId?: string }).reviewId;
         if (!msg.project || !reviewId) break;
+        // Barrier: yield the event loop so any in-flight `resolve-review-finding`
+        // handlers that were queued just before this publish get to run + persist
+        // first. Without this, a publish dispatched immediately after a dismiss
+        // can read a stale review and post the just-dismissed finding.
+        await new Promise((r) => setImmediate(r));
         const review = reviewStore.readCurrent(msg.project, reviewId);
         if (!review) {
           ws.send(JSON.stringify({ type: 'error', payload: { message: `Review ${reviewId} not found` } }));
@@ -4656,9 +4738,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     }, memoryStore, kbManager);
 
     // ── Feature-flagged policy hook: pause after configured stages ──
-    if (process.env.ANVIL_POLICY_ENABLED === '1') {
+    {
       runner.setAfterStageHook(async (info) => {
-        const policy = loadPolicy(info.project, ANVIL_HOME) ?? defaultPolicy();
+        // Gate purely on the project's policy YAML — no env var. Projects
+        // without a pipeline-policy.yaml get no pauses.
+        const policy = loadPolicy(info.project, ANVIL_HOME);
         if (!policy) return;
         const stageAsPipelineStage = (
           ['plan', 'implement', 'review', 'test', 'ship'].includes(info.stageName)
@@ -4668,6 +4752,8 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         const decision = evaluatePolicy(policy, {
           stage: stageAsPipelineStage,
           touchedFiles: info.touchedFiles ?? [],
+          riskTier: info.riskTier,
+          confidence: info.confidence,
         });
         if (!decision.pause) return;
 
@@ -4712,10 +4798,19 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       });
     }
 
-    // ── Feature-flagged cost ledger hook ──
-    if (process.env.ANVIL_COST_LIMITS_ENABLED === '1') {
+    // ── Cost ledger hook — gated per-project by policy.cost in pipeline-policy.yaml ──
+    {
       agentManager.setCostHook((info) => {
         if (!info.project || !info.runId) return;
+        // Read policy first — if no cost block, skip the entire hook for this project.
+        let policy: PipelinePolicy | null;
+        try {
+          policy = loadPolicy(info.project, ANVIL_HOME);
+        } catch {
+          policy = null;
+        }
+        if (!policy?.cost) return;
+
         const stage = (
           ['plan', 'implement', 'review', 'test', 'ship'].includes(info.stage ?? '')
             ? info.stage
@@ -4728,17 +4823,13 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
             tokensIn: info.tokensIn, tokensOut: info.tokensOut,
           });
         } catch { /* ledger best-effort */ }
-        // Evaluate breach against the current project policy.
         try {
-          const policy = loadPolicy(info.project, ANVIL_HOME) ?? defaultPolicy();
-          if (policy?.cost) {
-            void costBreachHandler.evaluate(info.runId, info.project, {
-              limits: policy.cost.limits,
-              graceWindowSeconds: policy.cost.graceWindowSeconds,
-              onBreach: policy.cost.onBreach,
-              autoApproveBelow: policy.cost.autoApproveBelow,
-            });
-          }
+          void costBreachHandler.evaluate(info.runId, info.project, {
+            limits: policy.cost.limits,
+            graceWindowSeconds: policy.cost.graceWindowSeconds,
+            onBreach: policy.cost.onBreach,
+            autoApproveBelow: policy.cost.autoApproveBelow,
+          });
         } catch { /* ignore */ }
         // Push fresh snapshot so meters / cards / modal stay live.
         if (info.project && info.runId) {

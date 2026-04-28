@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type {
+  PathRule,
   PipelinePolicy,
   PipelineStage,
   PolicyDecision,
@@ -425,16 +426,28 @@ export function evaluatePolicy(policy: PipelinePolicy, input: PolicyEvaluationIn
   const matchedRules: string[] = [];
   const reviewers = new Set<string>();
 
-  // 1. Path rules — first matching rule with pauseAfter including stage wins.
+  // 1. Path rules — for each touched file, the FIRST matching rule decides
+  //    that file's verdict (autoApprove vs. pauseAfter). Reviewers from any
+  //    matching rule are still unioned across all files.
   let pathPause = false;
   let pathMatchGlob: string | null = null;
-  for (const rule of policy.paths) {
-    const anyHit = input.touchedFiles.some((f) => matchesGlob(rule.match, f));
-    if (!anyHit) continue;
-    if (rule.reviewers) for (const u of rule.reviewers) reviewers.add(u);
-    if (!pathPause && rule.pauseAfter?.includes(input.stage)) {
+  let autoApproveGlob: string | null = null;
+  const autoApprovedFiles = new Set<string>();
+  for (const file of input.touchedFiles) {
+    let firstMatch: PathRule | null = null;
+    for (const rule of policy.paths) {
+      if (!matchesGlob(rule.match, file)) continue;
+      if (rule.reviewers) for (const u of rule.reviewers) reviewers.add(u);
+      if (firstMatch === null) firstMatch = rule;
+    }
+    if (firstMatch?.autoApprove === true) {
+      autoApprovedFiles.add(file);
+      if (autoApproveGlob === null) autoApproveGlob = firstMatch.match;
+      continue;
+    }
+    if (firstMatch?.pauseAfter?.includes(input.stage) && !pathPause) {
       pathPause = true;
-      pathMatchGlob = rule.match;
+      pathMatchGlob = firstMatch.match;
     }
   }
 
@@ -452,6 +465,21 @@ export function evaluatePolicy(policy: PipelinePolicy, input: PolicyEvaluationIn
     return {
       pause: true,
       reason: `path-rule:${pathMatchGlob}`,
+      matchedRules,
+      reviewers: [...reviewers],
+    };
+  }
+
+  // Path-level auto-approve: every touched file was claimed by an autoApprove
+  // rule, so defaults don't apply (the user explicitly opted out for this
+  // change set).
+  const allAutoApproved = input.touchedFiles.length > 0
+    && autoApprovedFiles.size === input.touchedFiles.length;
+  if (allAutoApproved && autoApproveGlob) {
+    matchedRules.push(autoApproveGlob);
+    return {
+      pause: false,
+      reason: `auto-approve-path:${autoApproveGlob}`,
       matchedRules,
       reviewers: [...reviewers],
     };

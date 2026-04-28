@@ -220,18 +220,23 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
     return () => document.removeEventListener('mousedown', handler);
   }, [personasOpen]);
 
-  // Rehydrate from query string on mount.
+  // Rehydrate from the hash query on mount AND on every hashchange — the page
+  // is persistently mounted, so navigating between reviewIds via the PR badge
+  // would otherwise leave us showing the previous review.
   useEffect(() => {
     if (!ws || !project) return;
-    const params = new URLSearchParams(window.location.hash.includes('?')
-      ? window.location.hash.split('?')[1]
-      : window.location.search);
-    const reviewId = params.get('reviewId');
-    if (reviewId) {
-      ws.send(JSON.stringify({ action: 'get-review', project, reviewId }));
-    }
-    // Only run once on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const fetchFromHash = (): void => {
+      const params = new URLSearchParams(window.location.hash.includes('?')
+        ? window.location.hash.split('?')[1]
+        : window.location.search);
+      const reviewId = params.get('reviewId');
+      if (reviewId) {
+        ws.send(JSON.stringify({ action: 'get-review', project, reviewId }));
+      }
+    };
+    fetchFromHash();
+    window.addEventListener('hashchange', fetchFromHash);
+    return () => window.removeEventListener('hashchange', fetchFromHash);
   }, [ws, project]);
 
   const togglePersona = useCallback((p: Persona) => {
@@ -718,7 +723,7 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
             <VerdictBanner
               review={review}
               sevCounts={sevCounts!}
-              publishing={publishing}
+              publishing={publishing || resolvingId !== null}
               rereviewing={rereviewing}
               onPublish={handlePublish}
               onRereview={handleRereview}

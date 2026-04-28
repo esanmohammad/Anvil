@@ -272,6 +272,7 @@ function App() {
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const [changes, setChanges] = useState<ChangeEntry[]>([]);
   const [prs, setPrs] = useState<import('./components/pr-board/usePRData.js').PRData[]>([]);
+  const [prsLoading, setPrsLoading] = useState(false);
   const [historySelectedRunId, setHistorySelectedRunId] = useState<string | null>(null);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [actionPending, setActionPending] = useState<string | null>(null); // 'build' | 'fix' | 'research' | null
@@ -427,6 +428,7 @@ function App() {
 
       case 'prs':
         if (Array.isArray(msg.payload)) setPrs(msg.payload);
+        setPrsLoading(false);
         break;
 
       case 'overview':
@@ -473,8 +475,16 @@ function App() {
           run?: { usd: number; limitUsd?: number; perStageUsd: Record<string, number> };
         } : null;
         const pending = snap?.pendingBreach;
-        setPendingBreach(() => pending ?? null);
-        if (!pending) setBreachDismissed(() => false);
+        if (pending) {
+          setPendingBreach(() => pending);
+        } else if (snap && snap.runId === undefined) {
+          // Wildcard snapshot is project-wide truth — clear if it reports no breach.
+          setPendingBreach(() => null);
+          setBreachDismissed(() => false);
+        } else if (snap?.runId) {
+          // Run-scoped snapshot only authoritative for its own run.
+          setPendingBreach((prev) => (prev?.runId === snap.runId ? null : prev));
+        }
         if (snap?.runId && snap.run) {
           const runId = snap.runId;
           const run = snap.run;
@@ -1117,24 +1127,18 @@ function App() {
           );
         }
 
-        const showCostMeter = runCost && runCost.runId === urlRunId && (runCost.limitUsd ?? 0) > 0;
         const showStageSpend = runCost && runCost.runId === urlRunId && Object.values(runCost.perStageUsd).some((v) => v > 0);
         return (
           <div style={{ height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-            {(showCostMeter || showStageSpend) && (
+            {showStageSpend && runCost && (
               <div style={{
                 padding: '8px 16px', borderBottom: '1px solid var(--separator)',
                 display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0,
                 background: 'var(--bg-elevated-1)',
               }}>
-                {showCostMeter && runCost && runCost.limitUsd !== undefined && (
-                  <CostMeter totalUsd={runCost.usd} limitUsd={runCost.limitUsd} compact />
-                )}
-                {showStageSpend && runCost && (
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <StageSpendPanel perStageUsd={runCost.perStageUsd} totalUsd={runCost.usd} defaultCollapsed />
-                  </div>
-                )}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <StageSpendPanel perStageUsd={runCost.perStageUsd} totalUsd={runCost.usd} defaultCollapsed />
+                </div>
               </div>
             )}
             {runActivities.length === 0 ? (
@@ -1189,7 +1193,7 @@ function App() {
         return (
           <PRBoardContainer
             prs={prs}
-            loading={false}
+            loading={prsLoading}
             onPRClick={(pr) => { if (pr.url) window.open(pr.url, '_blank'); }}
           />
         );
@@ -1261,7 +1265,7 @@ function App() {
   const handleNavigation = useCallback((item: NavItem) => {
     navigate(item.path);
     if (item.id === 'runs') sendWs({ action: 'get-active-runs' });
-    if (item.id === 'pr-board') sendWs({ action: 'refresh-prs' });
+    if (item.id === 'pr-board') { setPrsLoading(true); sendWs({ action: 'refresh-prs' }); }
     if (item.id === 'project') sendWs({ action: 'get-overview', project: currentProject?.name });
     if (item.id === 'knowledge-graph') sendWs({ action: 'get-kb-status', project: currentProject?.name });
   }, [navigate, currentProject]);
@@ -1291,13 +1295,16 @@ function App() {
     </>
   ) : null;
 
+  const showGlobalCostChip = !isRunView && runCost && (runCost.limitUsd ?? 0) > 0;
   const headerRight = isRunView ? (
     <>
-      {activePipeline?.totalCost != null && activePipeline.totalCost > 0 && (
+      {runCost && runCost.runId === urlRunId && (runCost.limitUsd ?? 0) > 0 ? (
+        <CostMeter totalUsd={runCost.usd} limitUsd={runCost.limitUsd!} compact />
+      ) : activePipeline?.totalCost != null && activePipeline.totalCost > 0 ? (
         <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)' }}>
           ${activePipeline.totalCost.toFixed(2)}
         </span>
-      )}
+      ) : null}
       {isPipelineLive && (
         <button
           onClick={() => {
@@ -1334,6 +1341,15 @@ function App() {
         </button>
       )}
     </>
+  ) : showGlobalCostChip && runCost ? (
+    <button
+      type="button"
+      onClick={() => navigate(`/run/${runCost.runId}`)}
+      title="Open run"
+      style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer' }}
+    >
+      <CostMeter totalUsd={runCost.usd} limitUsd={runCost.limitUsd!} compact />
+    </button>
   ) : null;
 
   return (

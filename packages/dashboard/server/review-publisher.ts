@@ -41,8 +41,16 @@ export async function publishReview(review: Review, opts: PublishOptions = {}): 
 
   // 1. Delete prior Anvil comments on this PR (so re-publishes don't stack).
   try {
-    const deleted = await deletePriorAnvilComments(review.pr.repo, review.pr.number, opts.dryRun);
-    if (deleted > 0) result.replaced = true;
+    const report = await deletePriorAnvilComments(review.pr.repo, review.pr.number, opts.dryRun);
+    if (report.deleted > 0) result.replaced = true;
+    for (const f of report.failed) {
+      // Surface each failure — the prior comment is still on the PR. If it
+      // belonged to a now-dismissed finding, the user will see the stale
+      // comment until it is removed manually.
+      result.errors.push(
+        `Could not delete prior ${f.kind} comment ${f.id} (still on PR): ${f.reason}`,
+      );
+    }
   } catch (err) {
     result.errors.push(`Failed to clear prior Anvil comments: ${errorMessage(err)}`);
   }
@@ -211,7 +219,13 @@ async function postInlineComment(review: Review, finding: ReviewFinding): Promis
   ]);
 }
 
-async function deletePriorAnvilComments(repo: string, prNumber: number, dryRun = false): Promise<number> {
+interface DeletionReport {
+  attempted: number;
+  deleted: number;
+  failed: Array<{ id: number; kind: 'issue' | 'review'; reason: string }>;
+}
+
+async function deletePriorAnvilComments(repo: string, prNumber: number, dryRun = false): Promise<DeletionReport> {
   // Fetch prior issue comments (summary) + review comments (inline)
   const [issueComments, reviewComments] = await Promise.all([
     gh(['api', `repos/${repo}/issues/${prNumber}/comments`, '--paginate', '--jq', '.[] | {id, body}']),
@@ -228,18 +242,38 @@ async function deletePriorAnvilComments(repo: string, prNumber: number, dryRun =
     ...parseNdjson(reviewComments).filter((c) => c.body?.includes(MARKER_PREFIX)).map((c) => ({ id: c.id, kind: 'review' as const })),
   ];
 
-  if (dryRun) return toDelete.length;
+  const report: DeletionReport = { attempted: toDelete.length, deleted: 0, failed: [] };
+  if (dryRun) {
+    report.deleted = toDelete.length;
+    return report;
+  }
 
   for (const c of toDelete) {
     const endpoint = c.kind === 'issue'
       ? `repos/${repo}/issues/comments/${c.id}`
       : `repos/${repo}/pulls/comments/${c.id}`;
-    try {
-      await gh(['api', endpoint, '-X', 'DELETE']);
-    } catch { /* ignore — comment may have been deleted by a human */ }
+    let lastErr: string | null = null;
+    // One retry with a small backoff handles transient rate limits / network blips.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await gh(['api', endpoint, '-X', 'DELETE']);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = errorMessage(err);
+        // 404 = comment already gone (deleted by a human). Treat as success.
+        if (lastErr.includes('404') || lastErr.toLowerCase().includes('not found')) {
+          lastErr = null;
+          break;
+        }
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    if (lastErr === null) report.deleted++;
+    else report.failed.push({ id: c.id, kind: c.kind, reason: lastErr });
   }
 
-  return toDelete.length;
+  return report;
 }
 
 function errorMessage(err: unknown): string {

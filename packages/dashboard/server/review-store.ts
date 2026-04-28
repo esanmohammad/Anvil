@@ -257,7 +257,11 @@ export class ReviewStore {
     });
   }
 
-  /** Update a single finding's resolution without bumping version. */
+  /**
+   * Update a single finding's resolution. Bumps the review version so the
+   * resolution change is captured in the audit trail and so verdict
+   * recomputation has a versioned anchor. Cheap (one JSON write).
+   */
   setResolution(project: string, id: string, findingId: string, resolution: Resolution): Review | null {
     const current = this.readCurrent(project, id);
     if (!current) return null;

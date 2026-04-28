@@ -42,12 +42,13 @@ export interface CostPolicy {
   limits?: {
     perRun?: number;
     perProjectDaily?: number;
+    perStage?: Partial<Record<CostStage, number>>;
   };
   graceWindowSeconds?: number;
   onBreach?: 'ask' | 'auto-approve' | 'auto-reject';
   /**
-   * Only meaningful when `onBreach === 'auto-approve'`. If the overage is at
-   * or below this value the breach is auto-raised silently.
+   * USD overage at or below this value is auto-raised silently in any mode
+   * except `auto-reject` — the noise floor for typo-level overspend.
    */
   autoApproveBelow?: number;
 }
@@ -127,14 +128,29 @@ class CostBreachHandler {
     const summary = this.ledger.summarize(runId, project);
     const perRunLimit = policy.limits?.perRun;
     const perDayLimit = policy.limits?.perProjectDaily;
+    const perStageLimits = policy.limits?.perStage;
 
-    // Run-level check
+    // Stage-level check (lowest priority — overridden by run/day below).
     let effectiveLimit: number | undefined;
     let overage = 0;
     let currentSpend = summary.totalUsd;
+    if (perStageLimits) {
+      for (const [stage, lim] of Object.entries(perStageLimits) as Array<[CostStage, number | undefined]>) {
+        if (typeof lim !== 'number') continue;
+        const spent = summary.byStage[stage] ?? 0;
+        if (spent > lim) {
+          effectiveLimit = lim;
+          overage = spent - lim;
+          currentSpend = spent;
+          break;
+        }
+      }
+    }
+    // Run-level check (overrides stage).
     if (typeof perRunLimit === 'number' && summary.totalUsd > perRunLimit) {
       effectiveLimit = perRunLimit;
       overage = summary.totalUsd - perRunLimit;
+      currentSpend = summary.totalUsd;
     }
     // Project-daily check: if exceeded, it trumps the per-run limit.
     if (typeof perDayLimit === 'number') {
@@ -178,6 +194,20 @@ class CostBreachHandler {
       status: 'pending',
     };
 
+    // Silently absorb tiny overages regardless of mode — never bother the user
+    // for typo-level spend. Only the explicit auto-reject mode skips this.
+    const autoApproveThreshold = policy.autoApproveBelow ?? 0;
+    if (mode !== 'auto-reject' && autoApproveThreshold > 0 && overage <= autoApproveThreshold) {
+      const next: BreachState = {
+        ...base,
+        status: 'raised',
+        decision: 'raise',
+        decisionAt: now.toISOString(),
+        deltaUsdApproved: round6(overage),
+      };
+      return this.writeState(next);
+    }
+
     if (mode === 'auto-reject') {
       const next: BreachState = {
         ...base,
@@ -191,21 +221,17 @@ class CostBreachHandler {
     }
 
     if (mode === 'auto-approve') {
-      const threshold = policy.autoApproveBelow ?? 0;
-      if (overage <= threshold) {
-        const next: BreachState = {
-          ...base,
-          status: 'raised',
-          decision: 'raise',
-          decisionAt: now.toISOString(),
-          deltaUsdApproved: round6(overage),
-        };
-        return this.writeState(next);
-      }
-      // overage > auto-approve threshold — fall through to asking the user.
+      const next: BreachState = {
+        ...base,
+        status: 'raised',
+        decision: 'raise',
+        decisionAt: now.toISOString(),
+        deltaUsdApproved: round6(overage),
+      };
+      return this.writeState(next);
     }
 
-    // ask (or auto-approve that didn't fit) — persist pending + notify.
+    // ask — persist pending + notify.
     this.writeState(base);
     const top = this.ledger.topSpenders(runId, 3);
     await this.safeInvoke(() => this.onNotify(base, top));
