@@ -10,6 +10,7 @@
 
 import { getContextWindow, getMaxOutput } from './model-catalog.js';
 import { heuristicTokenCount } from './token-util.js';
+import { structurallyTruncate, looksLikeCode } from './structural-truncator.js';
 
 /** Get the token limit for a model (input context window). */
 export function getModelTokenLimit(modelId: string): number {
@@ -34,6 +35,13 @@ export interface ContextComponent {
   content: string;
   tokens: number;
   priority: number; // 1 = essential (never drop), 2 = important, 3 = nice-to-have, 4 = droppable
+  /**
+   * Phase 4 — explicit code/prose hint so the truncator can pick the right
+   * strategy. When omitted, `looksLikeCode` sniffs the content. Path/extension
+   * hint (e.g. "user-service.ts") is used only to select the language.
+   */
+  kind?: 'code' | 'prose';
+  languageHint?: string;
 }
 
 export interface BudgetResult {
@@ -106,8 +114,7 @@ export function applyBudget(
     // Truncate to fit
     const targetTokens = Math.max(current.tokens - excess, Math.min(current.tokens, 500)); // Keep at least 500 tokens
     if (targetTokens < current.tokens) {
-      const targetChars = targetTokens * 4;
-      current.content = smartTruncate(current.content, targetChars);
+      current.content = truncateForBudget(current.content, targetTokens, comp);
       const oldTokens = current.tokens;
       current.tokens = estimateTokens(current.content);
       totalTokens -= (oldTokens - current.tokens);
@@ -136,6 +143,32 @@ export function applyBudget(
 }
 
 // ── Smart truncation ──────────────────────────────────────────────────
+
+/**
+ * Routing wrapper — code goes through `structurallyTruncate` (preserves
+ * imports + signatures), prose goes through middle-cut.
+ */
+function truncateForBudget(
+  text: string,
+  targetTokens: number,
+  comp: Pick<ContextComponent, 'kind' | 'languageHint' | 'name'>,
+): string {
+  const explicit = comp.kind;
+  const isCode = explicit === 'code'
+    || (explicit === undefined && looksLikeCode(text, comp.languageHint ?? comp.name));
+
+  if (isCode) {
+    const out = structurallyTruncate(text, {
+      budgetTokens: targetTokens,
+      languageHint: comp.languageHint ?? comp.name,
+    });
+    // The truncator returns the input unchanged when it couldn't structure it
+    // (unknown language, no boundaries) — fall through to middle-cut so we
+    // still respect the budget.
+    if (estimateTokens(out) <= targetTokens) return out;
+  }
+  return smartTruncate(text, targetTokens * 4);
+}
 
 /**
  * Truncate text intelligently:
