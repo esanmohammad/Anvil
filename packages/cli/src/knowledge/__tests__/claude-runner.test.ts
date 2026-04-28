@@ -82,14 +82,14 @@ exit ${exitCode}
 
 describe('claude-runner exports', () => {
   it('exports runLLM, runClaude, runGemini as functions', async () => {
-    const mod = await import('../claude-runner.js');
+    const mod = await import('@anvil/knowledge-core');
     assert.equal(typeof mod.runLLM, 'function');
     assert.equal(typeof mod.runClaude, 'function');
     assert.equal(typeof mod.runGemini, 'function');
   });
 
   it('runLLM accepts provider option without type error', async () => {
-    const mod = await import('../claude-runner.js');
+    const mod = await import('@anvil/knowledge-core');
     // Verify the function signature by checking it does not throw
     // a synchronous error when called with various option shapes.
     // We do NOT await — just verify the call itself is valid.
@@ -102,7 +102,7 @@ describe('claude-runner exports', () => {
   });
 
   it('runLLM accepts provider=gemini option', async () => {
-    const mod = await import('../claude-runner.js');
+    const mod = await import('@anvil/knowledge-core');
     const p = mod.runLLM('test', 'system', { provider: 'gemini', timeoutMs: 1 });
     assert.ok(p instanceof Promise);
     p.catch(() => {});
@@ -177,7 +177,7 @@ describe('runLLM provider routing', () => {
     // Verify the contract structurally: runLLM with no provider option
     // returns a Promise (same as runClaude). We can't test binary dispatch
     // without mocking, so we verify the function accepts the call shape.
-    const mod = await import('../claude-runner.js');
+    const mod = await import('@anvil/knowledge-core');
 
     // Both return Promises — verify the interface
     const p1 = mod.runLLM('test', 'sys', { timeoutMs: 1 });
@@ -190,7 +190,7 @@ describe('runLLM provider routing', () => {
   });
 
   it('provider=gemini routes to runGemini', async () => {
-    const mod = await import('../claude-runner.js');
+    const mod = await import('@anvil/knowledge-core');
 
     const [geminiViaLLM, geminiDirect] = await Promise.all([
       mod.runLLM('p', 's', { provider: 'gemini', timeoutMs: 500 }).catch((e: Error) => e),
@@ -209,7 +209,7 @@ describe('runLLM provider routing', () => {
 
 describe('timeout option', () => {
   it('timeoutMs is accepted by runClaude', async () => {
-    const mod = await import('../claude-runner.js');
+    const mod = await import('@anvil/knowledge-core');
     // Calling with a very short timeout should cause it to reject quickly
     // (either from timeout or from the process erroring out).
     const start = Date.now();
@@ -224,7 +224,7 @@ describe('timeout option', () => {
   });
 
   it('timeoutMs is accepted by runGemini', async () => {
-    const mod = await import('../claude-runner.js');
+    const mod = await import('@anvil/knowledge-core');
     const start = Date.now();
     try {
       await mod.runGemini('prompt', 'system', { timeoutMs: 200 });

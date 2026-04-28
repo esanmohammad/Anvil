@@ -62,6 +62,18 @@ export interface ScoredChunk {
   source: 'vector' | 'bm25' | 'graph' | 'fused';
 }
 
+/**
+ * Retrieval mode flag passed by callers (eval harness, CLI tooling). Lives on
+ * the shared types module so consumers like `rag-evaluator` can reference it
+ * without depending on the still-local `retriever.ts`.
+ */
+export type RetrievalMode =
+  | 'vector'
+  | 'bm25'
+  | 'vector+bm25'
+  | 'vector+graph'
+  | 'vector+bm25+graph';
+
 // Full retrieval result
 export interface RetrievalResult {
   chunks: ScoredChunk[];

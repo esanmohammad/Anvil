@@ -6,9 +6,9 @@
  * stream-json output parsed for result + cost.
  */
 
+import { runLLM } from './claude-runner.js';
 import type { ScoredChunk } from '@anvil/knowledge-core';
-import type { RetrievalMode } from './retriever.js';
-import { runClaude, type ClaudeResult } from './claude-runner.js';
+import type { RetrievalMode } from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -44,8 +44,6 @@ export interface JudgeResult {
   model: string;
 }
 
-// Claude CLI helper is now shared via claude-runner.ts
-
 // ---------------------------------------------------------------------------
 // Answer Generation
 // ---------------------------------------------------------------------------
@@ -63,7 +61,7 @@ export async function generateAnswer(
   query: string,
   chunks: ScoredChunk[],
   graphContext: string,
-  opts?: { model?: string },
+  opts?: { model?: string; provider?: 'claude' | 'gemini' },
 ): Promise<AnswerResult> {
   // Build context for --project-prompt (long, goes in project prompt)
   const contextParts: string[] = [];
@@ -83,7 +81,7 @@ export async function generateAnswer(
   // Short instruction via -p
   const prompt = `Answer this question using ONLY the code context in your project prompt:\n\n${query}`;
 
-  const result = await runClaude(prompt, projectPrompt, { model: opts?.model });
+  const result = await runLLM(prompt, projectPrompt, { model: opts?.model, provider: opts?.provider });
 
   return {
     answer: result.result,
@@ -91,7 +89,7 @@ export async function generateAnswer(
     outputTokens: result.outputTokens,
     costUsd: result.costUsd,
     durationMs: result.durationMs,
-    model: opts?.model ?? 'sonnet',
+    model: opts?.model ?? 'claude-sonnet-4-6',
     contextTokens,
   };
 }
@@ -112,7 +110,7 @@ export async function judgeAnswers(
   query: string,
   answers: Record<string, string>,
   referenceAnswer?: string,
-  opts?: { model?: string },
+  opts?: { model?: string; provider?: 'claude' | 'gemini' },
 ): Promise<JudgeResult> {
   const answerSection = Object.entries(answers)
     .map(([mode, answer]) => `### ${MODE_LABELS[mode] ?? mode}\n${answer}`)
@@ -142,7 +140,7 @@ Respond with ONLY valid JSON:
   ${Object.keys(answers).map((mode) => `"${mode}": { "correctness": <1-10>, "completeness": <1-10>, "groundedness": <1-10>${similarityJson}, "reasoning": "<1-2 sentences>" }`).join(',\n  ')}
 }`;
 
-  const result = await runClaude(prompt, projectPrompt, { model: opts?.model });
+  const result = await runLLM(prompt, projectPrompt, { model: opts?.model, provider: opts?.provider });
 
   // Parse JSON from response
   let scoresRaw = result.result.trim();
@@ -181,7 +179,7 @@ Respond with ONLY valid JSON:
     outputTokens: result.outputTokens,
     costUsd: result.costUsd,
     durationMs: result.durationMs,
-    model: opts?.model ?? 'sonnet',
+    model: opts?.model ?? 'claude-sonnet-4-6',
   };
 }
 
@@ -217,7 +215,7 @@ export async function expertJudge(
   query: string,
   answers: Record<string, string>,
   expertChunks: ScoredChunk[],
-  opts?: { model?: string },
+  opts?: { model?: string; provider?: 'claude' | 'gemini' },
 ): Promise<JudgeResult> {
   // Build code context for the judge
   const codeContext = expertChunks
@@ -240,7 +238,7 @@ Respond with ONLY this JSON structure:
   ${Object.keys(answers).map((mode) => `"${mode}": { "correctness": <1-10>, "completeness": <1-10>, "groundedness": <1-10>, "hallucination_count": <0-N>, "reasoning": "<2-3 sentences comparing to source code>" }`).join(',\n  ')}
 }`;
 
-  const result = await runClaude(prompt, projectPrompt, { model: opts?.model });
+  const result = await runLLM(prompt, projectPrompt, { model: opts?.model, provider: opts?.provider });
 
   // Parse JSON
   let scoresRaw = result.result.trim();
@@ -289,6 +287,6 @@ Respond with ONLY this JSON structure:
     outputTokens: result.outputTokens,
     costUsd: result.costUsd,
     durationMs: result.durationMs,
-    model: opts?.model ?? 'sonnet',
+    model: opts?.model ?? 'claude-sonnet-4-6',
   };
 }

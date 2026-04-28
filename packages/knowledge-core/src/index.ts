@@ -25,6 +25,10 @@ export * from './workspace-detector.js';
 export * from './embedder.js';
 export * from './vector-store.js';
 export * from './reranker.js';
+export * from './claude-runner.js';
+export * from './repo-profiler.js';
+export * from './service-mesh-inferrer.js';
+export * from './rag-evaluator.js';
 
 // `tree-sitter-parser` exports a `computeStructuralHash` that collides with
 // `structural-hasher`'s function of the same name (different signatures, used

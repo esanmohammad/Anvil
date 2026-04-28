@@ -16,8 +16,8 @@ import { HybridRetriever } from './retriever.js';
 import { loadKnowledgeConfig, getKnowledgeBasePath, DEFAULT_CONFIG } from '@anvil/knowledge-core';
 import type { KnowledgeConfig } from '@anvil/knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap } from '@anvil/knowledge-core';
-import { profileProject, loadAllProfiles } from './repo-profiler.js';
-import { inferServiceMesh } from './service-mesh-inferrer.js';
+import { profileProject, loadAllProfiles } from '@anvil/knowledge-core';
+import { inferServiceMesh } from '@anvil/knowledge-core';
 import { computeStructuralHashes, deduplicateByStructure } from '@anvil/knowledge-core';
 import { createQueryRouter } from '@anvil/knowledge-core';
 
