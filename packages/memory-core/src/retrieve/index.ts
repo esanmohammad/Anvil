@@ -11,3 +11,19 @@ export {
   type FusionOptions,
 } from './fusion.js';
 export { hybridSearch, type HybridSearchOptions } from './hybrid.js';
+export {
+  personalizedPageRank,
+  type PprAdjacency,
+  type PprNeighbor,
+  type PprOptions,
+  type PprResult,
+} from './ppr.js';
+export {
+  extractNamespaceSubgraph,
+  type NamespaceSubgraph,
+} from './subgraph.js';
+export {
+  pprSearch,
+  type PprSearchOptions,
+  type PprSearchResult,
+} from './ppr-search.js';
