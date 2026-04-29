@@ -1,6 +1,6 @@
 # Plan: Extract `@anvil/agent-core` shared workspace package
 
-> **Status: Proposed.** Self-contained executable plan — does not require prior conversation context. Companion to [`KNOWLEDGE-CORE-EXTRACT-PLAN.md`](./KNOWLEDGE-CORE-EXTRACT-PLAN.md) (already shipped). Sibling plans in this initiative: [`AGENT-OBSERVABILITY-PLAN.md`](./AGENT-OBSERVABILITY-PLAN.md) (executes after this), [`AGENT-HARNESS-PLAN.md`](./AGENT-HARNESS-PLAN.md) (executes after observability).
+> **Status: Shipped (2026-04-29).** Phases 0–10 landed across 11 commits on `feat/plan-generation` (commits `6c49f8c..ae11c60`). See [`AGENT-CORE-ADR.md`](./AGENT-CORE-ADR.md) §9 for the per-phase ship log + plan deviations + plan corrections to back-port. Self-contained executable plan — does not require prior conversation context. Companion to [`KNOWLEDGE-CORE-EXTRACT-PLAN.md`](./KNOWLEDGE-CORE-EXTRACT-PLAN.md) (already shipped). Sibling plans in this initiative: [`AGENT-OBSERVABILITY-PLAN.md`](./AGENT-OBSERVABILITY-PLAN.md) (executes after this), [`AGENT-HARNESS-PLAN.md`](./AGENT-HARNESS-PLAN.md) (executes after observability).
 
 ---
 
