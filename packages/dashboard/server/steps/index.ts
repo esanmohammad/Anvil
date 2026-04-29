@@ -52,3 +52,9 @@ export type {
   CostBudgetHookOptions,
   CostBudgetHookHandle,
 } from './cost-budget.hook.js';
+export { spawnAndWait, waitForAgent } from './agent-spawner.js';
+export type {
+  SpawnAndWaitOptions,
+  SpawnAndWaitResult,
+  WaitForAgentOptions,
+} from './agent-spawner.js';

@@ -36,6 +36,10 @@ import {
   type TestBehavior,
 } from './feature-manifest.js';
 import {
+  spawnAndWait,
+  waitForAgent as waitForAgentHelper,
+} from './steps/agent-spawner.js';
+import {
   extractAcceptanceCriteria,
   extractAffectedRepos,
   extractApiEndpoints,
@@ -2048,25 +2052,32 @@ export class PipelineRunner extends EventEmitter {
       ? ['Write', 'Edit', 'NotebookEdit', 'Agent']
       : ['Agent'];
 
-    const agent = this.agentManager.spawn({
-      name: `${stage.persona}-${this.config.project}`,
-      persona: stage.persona,
-      project: this.config.project,
-      stage: stage.name,
-      prompt,
-      model: this.resolveModelForStage(stage.name),
-      cwd: this.workspaceDir,
-      projectPrompt,
-      permissionMode: 'bypassPermissions',
-      disallowedTools,
-      maxOutputTokens: maxOutputTokensForStage(stage.name),
+    const { artifact, cost } = await spawnAndWait({
+      agentManager: this.agentManager,
+      spec: {
+        name: `${stage.persona}-${this.config.project}`,
+        persona: stage.persona,
+        project: this.config.project,
+        stage: stage.name,
+        prompt,
+        model: this.resolveModelForStage(stage.name),
+        cwd: this.workspaceDir,
+        projectPrompt,
+        permissionMode: 'bypassPermissions',
+        disallowedTools,
+        maxOutputTokens: maxOutputTokensForStage(stage.name),
+      },
+      isCancelled: () => this.cancelled,
+      onSpawn: (agentId) => {
+        this.state.stages[index].agentId = agentId;
+        this.broadcastState();
+        this.emit('stage-start', index, agentId);
+      },
+      onTruncation: (agentName, outputTokens) => {
+        this.handleOutputTruncation(agentName, outputTokens);
+      },
     });
-
-    this.state.stages[index].agentId = agent.id;
-    this.broadcastState();
-    this.emit('stage-start', index, agent.id);
-
-    return this.waitForAgent(agent.id);
+    return { artifact, cost };
   }
 
   // ── Auth helper ──────────────────────────────────────────────────────
@@ -2139,32 +2150,12 @@ export class PipelineRunner extends EventEmitter {
   // ── Agent completion helper ────────────────────────────────────────
 
   private waitForAgent(agentId: string): Promise<{ artifact: string; cost: number }> {
-    return new Promise((resolve, reject) => {
-      const checkDone = () => {
-        if (this.cancelled) return reject(new Error('Pipeline cancelled'));
-
-        const current = this.agentManager.getAgent(agentId);
-        if (!current) return reject(new Error('Agent disappeared'));
-
-        if (current.status === 'done') {
-          // Phase 3 — surface output truncation when the model hit max_tokens.
-          // We log unconditionally (single-line) and emit a project-event so
-          // the dashboard can show the warning. Tuning the limits up lives
-          // in STAGE_OUTPUT_LIMITS, not in caller code.
-          if (current.cost.stopReason === 'max_tokens') {
-            this.handleOutputTruncation(current.name, current.cost.outputTokens);
-          }
-          resolve({
-            artifact: current.output,
-            cost: current.cost.totalUsd,
-          });
-        } else if (current.status === 'error' || current.status === 'killed') {
-          reject(new Error(current.error ?? 'Agent failed'));
-        } else {
-          setTimeout(checkDone, 500);
-        }
-      };
-      checkDone();
+    return waitForAgentHelper({
+      agentId,
+      agentManager: this.agentManager,
+      isCancelled: () => this.cancelled,
+      onTruncation: (agentName, outputTokens) =>
+        this.handleOutputTruncation(agentName, outputTokens),
     });
   }
 
