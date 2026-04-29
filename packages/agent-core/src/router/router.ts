@@ -18,6 +18,7 @@ import type { LanguageModel, LanguageModelInvokeOptions, InvokeResult } from '..
 import { RouterError, classifyError } from './errors.js';
 import { DEFAULT_RETRY_POLICY, runWithRetry } from './retry.js';
 import { TokenBucketRateLimiter } from './rate-limiter.js';
+import { SpendLedger } from './spend-ledger.js';
 
 export interface AdapterResolver {
   /** Resolve a model id to an executor. */
@@ -36,6 +37,14 @@ export interface LlmRouterDeps {
    * TokenBucketRateLimiter from `config.rateLimit`.
    */
   rateLimiter?: TokenBucketRateLimiter;
+  /**
+   * Spend ledger. If omitted, no rows are recorded (useful for tests or
+   * embedded scenarios). Pass `new SpendLedger()` to use the default
+   * `~/.anvil/router/spend.sqlite` file.
+   */
+  ledger?: SpendLedger;
+  /** Generate ledger row ids — injectable for deterministic tests. */
+  newId?: () => string;
   /** Time source for deterministic tests. */
   now?: () => number;
   /** Sleep — injectable for deterministic tests. */
@@ -50,6 +59,8 @@ export class LlmRouter {
   protected readonly config: RouterConfig;
   protected readonly resolver?: AdapterResolver;
   protected readonly rateLimiter: TokenBucketRateLimiter;
+  protected readonly ledger?: SpendLedger;
+  protected readonly newId: () => string;
   protected readonly now: () => number;
   protected readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   protected readonly random?: () => number;
@@ -58,6 +69,8 @@ export class LlmRouter {
   constructor(deps: LlmRouterDeps) {
     this.config = deps.config;
     this.resolver = deps.resolver;
+    this.ledger = deps.ledger;
+    this.newId = deps.newId ?? defaultNewId;
     this.now = deps.now ?? Date.now;
     this.sleep = deps.sleep;
     this.random = deps.random;
@@ -91,6 +104,9 @@ export class LlmRouter {
       throw new Error('LlmRouter.invoke requires an AdapterResolver (deps.resolver)');
     }
     const adapter = this.resolver.resolve(modelId);
+
+    // Pre-flight budget enforcement (Phase 4)
+    this.enforceBudgetPreflight(opts);
 
     const llmOpts = this.buildInvokeOpts(opts, modelId);
     const estimatedTokens = this.estimateTokens(llmOpts);
@@ -136,18 +152,97 @@ export class LlmRouter {
     if (retryRun.result) {
       const last = attempts[attempts.length - 1];
       if (last) last.costUsd = retryRun.result.costUsd;
-      return {
+      this.recordSpend(opts, adapter.provider, modelId, attempts, retryRun.result, undefined);
+      const outcome: RouteOutcome = {
         result: retryRun.result,
         attempts,
         totalDurationMs,
         totalCostUsd: retryRun.result.costUsd,
       };
+      this.populateBudgetRemaining(outcome, opts);
+      return outcome;
     }
 
     const err = retryRun.error ?? new Error('LlmRouter: unknown failure');
+    this.recordSpend(opts, adapter.provider, modelId, attempts, undefined, err);
     throw new RouterError(`route '${opts.tag}' failed: ${err.message}`, {
       attempts,
       cause: err,
+    });
+  }
+
+  // ── Budget + ledger helpers ────────────────────────────────────────────
+
+  protected enforceBudgetPreflight(opts: InvokeOpts): void {
+    if (!this.ledger || !this.config.budgets) return;
+    const remaining = this.computeRemainingBudget(opts);
+    if (remaining === undefined) return;
+    if (remaining > 0) return;
+    const breach = this.config.budgets.onBreach;
+    if (breach === 'fail') {
+      throw new Error(`LlmRouter: budget exhausted for tag='${opts.tag}' (run='${opts.runId ?? ''}')`);
+    }
+    if (breach === 'queue') {
+      throw new Error(`LlmRouter: budget exhausted; queue mode not yet implemented`);
+    }
+    // 'downgrade' — Phase 5 will pick a cheaper fallback. Phase 4 lets the call
+    // through and trusts the per-call cap.
+  }
+
+  protected computeRemainingBudget(opts: InvokeOpts): number | undefined {
+    if (!this.ledger || !this.config.budgets) return undefined;
+    const b = this.config.budgets;
+    let remaining: number | undefined;
+    const setMin = (val: number) => {
+      remaining = remaining === undefined ? val : Math.min(remaining, val);
+    };
+    if (b.dailyUsd !== undefined) {
+      const since = startOfTodayIso();
+      setMin(b.dailyUsd - this.ledger.totalUsd({ since }));
+    }
+    if (b.perRunUsd !== undefined && opts.runId) {
+      setMin(b.perRunUsd - this.ledger.totalUsd({ runId: opts.runId }));
+    }
+    const tagCap = b.perTagUsd?.[opts.tag];
+    if (tagCap !== undefined) {
+      setMin(tagCap - this.ledger.totalUsd({ tag: opts.tag }));
+    }
+    return remaining;
+  }
+
+  protected populateBudgetRemaining(outcome: RouteOutcome, opts: InvokeOpts): void {
+    const r = this.computeRemainingBudget(opts);
+    if (r !== undefined) outcome.budgetRemainingUsd = r;
+  }
+
+  protected recordSpend(
+    opts: InvokeOpts,
+    provider: string,
+    modelId: string,
+    attempts: ReadonlyArray<RouteAttempt>,
+    result: InvokeResult | undefined,
+    err: Error | undefined,
+  ): void {
+    if (!this.ledger) return;
+    const last = attempts[attempts.length - 1];
+    this.ledger.record({
+      id: this.newId(),
+      ts: new Date(this.now()).toISOString(),
+      runId: opts.runId,
+      project: opts.project,
+      user: opts.user,
+      tag: opts.tag,
+      provider,
+      model: modelId,
+      inputTokens: result?.usage.inputTokens ?? 0,
+      outputTokens: result?.usage.outputTokens ?? 0,
+      cacheReadTokens: result?.usage.cacheReadTokens ?? 0,
+      cacheWriteTokens: result?.usage.cacheWriteTokens ?? 0,
+      costUsd: result?.costUsd ?? 0,
+      durationMs: attempts.reduce((a, x) => a + x.durationMs, 0),
+      fallbackIndex: last?.fallbackIndex ?? 0,
+      attemptCount: attempts.length,
+      errorClass: err ? (last?.errorClass ?? 'unknown') : undefined,
     });
   }
 
@@ -173,6 +268,8 @@ export class LlmRouter {
     return promptTokens + responseTokens;
   }
 
+  // ── Build invoke options for the underlying adapter ───────────────────
+
   protected buildInvokeOpts(opts: InvokeOpts, modelId: string): LanguageModelInvokeOptions {
     const messages =
       typeof opts.prompt === 'string'
@@ -189,4 +286,19 @@ export class LlmRouter {
       signal: opts.signal,
     };
   }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+
+function startOfTodayIso(): string {
+  const d = new Date();
+  d.setUTCHours(0, 0, 0, 0);
+  return d.toISOString();
+}
+
+function defaultNewId(): string {
+  // Cheap monotonic id — Date.now in base36 + a 6-char random suffix.
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `s-${ts}-${rand}`;
 }

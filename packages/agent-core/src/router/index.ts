@@ -30,3 +30,9 @@ export {
   DEFAULT_RATE_LIMITS,
 } from './rate-limiter.js';
 export type { RateLimiterDeps } from './rate-limiter.js';
+export {
+  SpendLedger,
+  SPEND_LEDGER_SCHEMA_SQL,
+  defaultSpendLedgerPath,
+} from './spend-ledger.js';
+export type { SpendRow, SpendQueryOpts } from './spend-ledger.js';
