@@ -20,5 +20,7 @@ export type {
 } from './types.js';
 export { ALL_ERROR_CLASSES } from './types.js';
 export { LlmRouter } from './router.js';
-export type { LlmRouterDeps } from './router.js';
+export type { LlmRouterDeps, AdapterResolver } from './router.js';
 export { RouterError, classifyError, parseRetryAfterMs } from './errors.js';
+export { runWithRetry, DEFAULT_RETRY_POLICY } from './retry.js';
+export type { RetryAttempt, RunWithRetryDeps, RunWithRetryResult } from './retry.js';

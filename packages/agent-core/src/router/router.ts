@@ -2,40 +2,157 @@
  * `LlmRouter` — single source of truth for routing, retries, fallbacks,
  * rate-limits, spend tracking, and circuit breaking.
  *
- * Phase 1 ships only the type-safe skeleton. Subsequent phases fill in:
- *   - Phase 2 — per-error retry engine
- *   - Phase 3 — token-bucket rate limiter
- *   - Phase 4 — SQLite spend ledger
- *   - Phase 5 — fallback chain walker
- *   - Phase 6 — circuit breaker
- *   - Phase 7 — YAML config loader
- *   - Phase 8 — OTel parent/child spans
+ * Phase 2: per-error retry engine wired against a single caller-supplied
+ * adapter. No fallback chain yet — that lands in Phase 5.
  */
 
-import type { InvokeOpts, RouteOutcome, RouterConfig } from './types.js';
+import type {
+  ErrorClass,
+  InvokeOpts,
+  RetryPolicy,
+  RouteAttempt,
+  RouteOutcome,
+  RouterConfig,
+} from './types.js';
+import type { LanguageModel, LanguageModelInvokeOptions, InvokeResult } from '../types.js';
+import { RouterError, classifyError } from './errors.js';
+import { DEFAULT_RETRY_POLICY, runWithRetry } from './retry.js';
+
+export interface AdapterResolver {
+  /** Resolve a model id to an executor. */
+  resolve(modelId: string): LanguageModel;
+}
 
 export interface LlmRouterDeps {
   config: RouterConfig;
+  /**
+   * Resolves a model id → executor. Phase 5 wires this to ProviderRegistry.
+   * Tests inject fakes directly.
+   */
+  resolver?: AdapterResolver;
+  /** Time source for deterministic tests. */
+  now?: () => number;
+  /** Sleep — injectable for deterministic tests. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Random source for jitter. */
+  random?: () => number;
+  /** Adapter-specific error classifiers (per-provider override). */
+  errorClassifiers?: Record<string, (err: unknown) => ErrorClass | undefined>;
 }
 
 export class LlmRouter {
   protected readonly config: RouterConfig;
+  protected readonly resolver?: AdapterResolver;
+  protected readonly now: () => number;
+  protected readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  protected readonly random?: () => number;
+  protected readonly errorClassifiers: Record<string, (err: unknown) => ErrorClass | undefined>;
 
   constructor(deps: LlmRouterDeps) {
     this.config = deps.config;
-  }
-
-  /**
-   * Resolve a tag (or pinned model id) and execute the route walk.
-   *
-   * @throws RouterError with full attempt history on terminal failure.
-   */
-  async invoke(_opts: InvokeOpts): Promise<RouteOutcome> {
-    throw new Error('LlmRouter.invoke not implemented (Phase 1 stub)');
+    this.resolver = deps.resolver;
+    this.now = deps.now ?? Date.now;
+    this.sleep = deps.sleep;
+    this.random = deps.random;
+    this.errorClassifiers = deps.errorClassifiers ?? {};
   }
 
   /** Inspect the active config (immutable snapshot). */
   getConfig(): Readonly<RouterConfig> {
     return this.config;
+  }
+
+  /**
+   * Resolve the route for a tag (or pinned model) and execute the call
+   * under the configured retry policy. Phase 2 is single-adapter scope —
+   * the primary model is invoked, and on terminal failure the call fails.
+   */
+  async invoke(opts: InvokeOpts): Promise<RouteOutcome> {
+    const startedAt = this.now();
+    const modelId = this.resolveModelId(opts);
+    if (!this.resolver) {
+      throw new Error('LlmRouter.invoke requires an AdapterResolver (deps.resolver)');
+    }
+    const adapter = this.resolver.resolve(modelId);
+
+    const llmOpts = this.buildInvokeOpts(opts, modelId);
+
+    const policyFor = (cls: ErrorClass): RetryPolicy =>
+      this.config.retryPolicy[cls] ?? DEFAULT_RETRY_POLICY[cls];
+
+    const classify = (err: unknown): ErrorClass | undefined => {
+      const provider = adapter.provider;
+      const override = this.errorClassifiers[provider];
+      const overrideResult = override?.(err);
+      if (overrideResult) return overrideResult;
+      return classifyError(err);
+    };
+
+    const retryRun = await runWithRetry<InvokeResult>(
+      () => adapter.invoke(llmOpts),
+      {
+        policyFor,
+        classify,
+        sleep: this.sleep,
+        now: this.now,
+        random: this.random,
+        signal: opts.signal,
+      },
+    );
+
+    const attempts: RouteAttempt[] = retryRun.attempts.map((a) => ({
+      model: modelId,
+      provider: adapter.provider,
+      attemptIndex: a.index,
+      fallbackIndex: 0,
+      errorClass: a.errorClass,
+      durationMs: a.durationMs,
+      costUsd: undefined,
+    }));
+
+    const totalDurationMs = Math.max(0, this.now() - startedAt);
+
+    if (retryRun.result) {
+      const last = attempts[attempts.length - 1];
+      if (last) last.costUsd = retryRun.result.costUsd;
+      return {
+        result: retryRun.result,
+        attempts,
+        totalDurationMs,
+        totalCostUsd: retryRun.result.costUsd,
+      };
+    }
+
+    const err = retryRun.error ?? new Error('LlmRouter: unknown failure');
+    throw new RouterError(`route '${opts.tag}' failed: ${err.message}`, {
+      attempts,
+      cause: err,
+    });
+  }
+
+  protected resolveModelId(opts: InvokeOpts): string {
+    if (opts.model) return opts.model;
+    const route = this.config.routes.find((r) => r.tag === opts.tag);
+    if (!route) {
+      throw new Error(`LlmRouter: no route for tag '${opts.tag}' (and no opts.model pin)`);
+    }
+    return route.primary;
+  }
+
+  protected buildInvokeOpts(opts: InvokeOpts, modelId: string): LanguageModelInvokeOptions {
+    const messages =
+      typeof opts.prompt === 'string'
+        ? [{ role: 'user' as const, content: opts.prompt }]
+        : opts.prompt.map((m) => ({ role: m.role, content: m.content }));
+    return {
+      model: modelId,
+      messages,
+      tools: opts.tools,
+      maxTokens: opts.maxTokens,
+      temperature: opts.temperature,
+      cacheBreakpoint: opts.cacheBreakpoint,
+      providerOptions: opts.providerOptions,
+      signal: opts.signal,
+    };
   }
 }

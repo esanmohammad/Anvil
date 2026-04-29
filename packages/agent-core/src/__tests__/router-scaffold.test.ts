@@ -56,7 +56,7 @@ describe('LlmRouter scaffold', () => {
     assert.deepEqual(snapshot.retryPolicy, defaultRetryPolicy);
   });
 
-  it('throws "not implemented" from the Phase 1 stub invoke', async () => {
+  it('rejects invoke when no AdapterResolver is wired', async () => {
     const router = new LlmRouter({
       config: {
         routes: [{ tag: 'noop', primary: 'm' }],
@@ -65,7 +65,7 @@ describe('LlmRouter scaffold', () => {
     });
     await assert.rejects(
       router.invoke({ tag: 'noop', prompt: 'hi' }),
-      /not implemented/,
+      /AdapterResolver/,
     );
   });
 });
