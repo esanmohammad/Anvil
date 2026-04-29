@@ -174,6 +174,152 @@ Adapter-specific env vars (read by individual adapters, not yet aliased to
 `ANVIL_*`): `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENROUTER_API_KEY`,
 `OPENROUTER_BASE_URL`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `OLLAMA_HOST`.
 
+## Telemetry (OpenTelemetry)
+
+Every LLM call routed through `@anvil/agent-core` emits an OpenTelemetry
+span using the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/llm-spans/).
+**Default behaviour with zero config = no spans exported** — there is no
+hard dep on any vendor SDK. Vendors plug in via the standard OTLP HTTP
+exporter; backend swap is a one-line env-var change.
+
+### Span attributes emitted
+
+| Attribute | Source | When |
+|---|---|---|
+| `gen_ai.system` | adapter `provider` | always |
+| `gen_ai.request.model` | invoke options / config | always |
+| `gen_ai.usage.input_tokens` / `output_tokens` | provider response | always |
+| `gen_ai.usage.cost_usd` | central cost table (`cost.ts`) | always; falls back to adapter's costUsd for unknown models |
+| `gen_ai.usage.cost_{input,output,cache_read,cache_write}_usd` | breakdown | always (zero when component absent) |
+| `gen_ai.usage.cache_read_tokens` / `cache_write_tokens` / `cache_hit_ratio` | per-provider extraction | when adapter surfaces cache data (Anthropic, OpenAI, Gemini) |
+| `gen_ai.reasoning.tokens` | provider response | when reasoning tokens > 0 |
+| `gen_ai.response.tool_call_count` | stream parsing | when adapter counts tool calls |
+| `gen_ai.response.id` | provider session id | when present |
+| `gen_ai.prompt` / `gen_ai.completion` | request/result text (truncated to 8 KB) | only with `ANVIL_OTEL_RECORD_CONTENT=1` |
+| `anvil.{stage,persona,duration_ms,session.resume,transport}` | Anvil-extension | always |
+
+Spans set `OK` status on success, `ERROR` on adapter throws (with
+`recordException` populating the exception event).
+
+### Backend recipes
+
+#### No-op (default)
+
+No env vars set → no spans exported, zero overhead.
+
+#### Console (debug)
+
+```sh
+ANVIL_OTEL_CONSOLE=1 anvil index ./fixture
+```
+
+Each finished span is dumped to stderr as JSON. Useful for verifying
+attributes locally before pointing at a real backend.
+
+#### Langfuse cloud
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=https://cloud.langfuse.com/api/public/otel/v1/traces \
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(echo -n pk-lf-xxx:sk-lf-xxx | base64)" \
+anvil index ./fixture
+```
+
+#### Self-hosted Langfuse (Helm / docker-compose)
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=https://langfuse.your-cluster/api/public/otel/v1/traces \
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(pk:sk)>" \
+anvil index ./fixture
+```
+
+A turnkey local stack lives at [`scripts/otel-stack.yaml`](./scripts/otel-stack.yaml):
+
+```sh
+docker compose -f packages/agent-core/scripts/otel-stack.yaml up -d
+# open http://localhost:3000, sign up, create project, copy pk + sk
+ANVIL_OTEL_CONSOLE=1 \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel/v1/traces \
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(echo -n pk-lf-xxx:sk-lf-xxx | base64)" \
+ANVIL_OTEL_RECORD_CONTENT=1 \
+anvil index ./fixture
+```
+
+#### Self-hosted Phoenix (Arize, OSS)
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:6006/v1/traces \
+anvil index ./fixture
+```
+
+#### Honeycomb
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io/v1/traces \
+OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=YOUR_KEY" \
+anvil index ./fixture
+```
+
+#### Datadog (LLM Observability)
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=https://trace.agent.datadoghq.com/v1/traces \
+OTEL_EXPORTER_OTLP_HEADERS="DD-API-KEY=YOUR_KEY" \
+anvil index ./fixture
+```
+
+#### Self-hosted Tempo / Jaeger / OTel Collector
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318/v1/traces \
+anvil index ./fixture
+```
+
+### Privacy: prompt + completion content
+
+By default **prompts and completions are NOT included in spans**. This
+prevents secrets, API keys, and customer data from leaking into trace
+backends. To opt in:
+
+```sh
+ANVIL_OTEL_RECORD_CONTENT=1
+```
+
+Even with the flag set, content is truncated to 8 KB per attribute. The
+flag is a property of the run, not the span — toggling it requires
+restarting the process.
+
+### Sampling
+
+OTel's standard environment variables control sampling. To trace 10 % of
+calls:
+
+```sh
+OTEL_TRACES_SAMPLER=traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.1
+```
+
+### Kill-switch
+
+```sh
+ANVIL_OTEL_DISABLED=1   # forces noop, even if OTEL_EXPORTER_OTLP_ENDPOINT is set
+```
+
+### Adding a new exporter
+
+The configurable exporters are `noop` (default), `console`, and `otlp`
+(HTTP/Protobuf via `@opentelemetry/exporter-trace-otlp-http`). To add a
+gRPC or other transport, edit
+[`src/telemetry/exporters.ts`](./src/telemetry/exporters.ts) — the
+`buildExporter(config)` factory is the seam.
+
+### Lock-in surface (telemetry)
+
+- **No vendor SDK** in the dep tree (`@langfuse/*`, `@helicone/*`,
+  `langsmith`, `@traceloop/*` — none).
+- Only `@opentelemetry/*` packages, which are the OTel SIG's reference
+  implementation.
+- Backend swap is an env-var change.
+
 ## Refresh the cost table
 
 ```sh

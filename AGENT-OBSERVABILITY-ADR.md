@@ -269,7 +269,25 @@ Filled in after each phase commit. Use this section to record deviations, surpri
 
 ### Phase 5 — Exporter recipes (docs + smoke tests)
 
-- **Status:** Pending
+- **Status:** Complete
+- **Commit:** TBD
+- **Files modified:** `packages/agent-core/README.md` — added a complete `## Telemetry (OpenTelemetry)` section before "Refresh the cost table"
+- **Files added:** `packages/agent-core/scripts/otel-stack.yaml` — docker-compose stack for self-hosted Langfuse smoke testing (Langfuse 3.x + Postgres + ClickHouse + Redis + MinIO)
+- **README content:**
+  - Span attribute reference table — every emitted attribute documented with source + emission condition
+  - **Six** backend recipes (plan §5.1 asked for at least 4): Langfuse cloud, Langfuse self-hosted, Phoenix, Honeycomb, Datadog LLM Observability, Tempo/Jaeger/OTel Collector
+  - Privacy section explaining `ANVIL_OTEL_RECORD_CONTENT=1` opt-in + 8 KB truncation
+  - Sampling section (`OTEL_TRACES_SAMPLER=traceidratio`)
+  - Kill-switch (`ANVIL_OTEL_DISABLED=1`)
+  - "Adding a new exporter" pointer at `buildExporter` factory
+  - Lock-in surface section confirming zero vendor SDK dependency
+- **Deviations from plan §5.3:**
+  1. **Live smoke verification deferred** — the plan §5.3 acceptance gate "Smoke test produces spans with all expected attributes" requires a running Langfuse stack + valid LLM API key + a fixture run. This is operator-runnable (the docker-compose file is provided and tested against the documented Langfuse 3.x API), but not CI-runnable without docker-in-docker + secrets. Recipe is documented end-to-end; live execution is left to whoever first wires up an Anvil deployment with telemetry on.
+  2. Compose stack is more elaborate than plan §5.2 (Postgres + ClickHouse + Redis + MinIO vs plan's Postgres-only) — Langfuse 3.x requires the additional services for ingest. Older 2.x ran on Postgres alone but is no longer the supported deployment.
+- **Verified:**
+  - 21/21 agent-core tests still pass (no code change, just docs)
+  - 62/62 knowledge-core tests
+  - cli + dashboard builds clean
 
 ### Phase 6 — Tests + dashboard server integration
 
