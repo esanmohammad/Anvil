@@ -366,8 +366,8 @@ Plan ships in 15 phases (0 through 14). Updated incrementally as phases land.
 
 | Phase | Status | Commit | Deviations |
 |---|---|---|---|
-| 0 — Audit + decisions | ✅ shipped 2026-04-29 | _this commit_ | none |
-| 1 — Scaffold `@anvil/memory-core` | pending | — | — |
+| 0 — Audit + decisions | ✅ shipped 2026-04-29 | 578d590 | none |
+| 1 — Scaffold `@anvil/memory-core` | ✅ shipped 2026-04-29 | _this commit_ | Skipped plan §1.3 step "add `@anvil/memory-core: '*'` to cli, knowledge-core, dashboard" — premature in Phase 1 since no consumer imports memory-core yet; workspace symlink materializes via `npm install` from `packages/*` discovery. Phase 2 wires consumer deps when imports actually start. Added `ulid@^2.3.0` per ADR §7.10. `better-sqlite3@^11.7.0` native binding compiled successfully on darwin/arm64. Phase 1 ships canonical types only (per ADR §7) — no functional surface yet, so the runtime barrel exports only `VERSION`. |
 | 2 — Hoist `cli/memory/` into memory-core | pending | — | — |
 | 3 — Hybrid storage: JSONL + SQLite hot index | pending | — | — |
 | 4 — Five-type taxonomy + namespace API | pending | — | — |

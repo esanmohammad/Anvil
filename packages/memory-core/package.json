@@ -1,0 +1,38 @@
+{
+  "name": "@anvil/memory-core",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Long-term memory layer for Anvil — five-type taxonomy (working/episodic/semantic/procedural/profile), bi-temporal facts, code-fact drift detection, sleeptime ratification, PR-as-episode primitives.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b --watch",
+    "test": "tsc -b && node --test dist/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "@anvil/agent-core": "*",
+    "@anvil/knowledge-core": "*",
+    "better-sqlite3": "^11.7.0",
+    "ulid": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.15.2"
+  }
+}
