@@ -135,7 +135,7 @@ Plan ships in 7 phases (0 through 6). Updated incrementally as phases land.
 | Phase | Status | Commit | Deviations |
 |---|---|---|---|
 | 0 — Audit + decisions | landed | `6d4fa89` | — |
-| 1 — agent-core adapter consolidation | pending | — | — |
+| 1 — agent-core adapter consolidation | landed | `9c4ce19` | Phase 1.4 risk widened: in addition to the planned `cache` capability bit, `ProviderCapabilities` also gained `cacheTtlSeconds` / `structuredOutput` / `maxOutputTokens` and `ModelAdapterConfig` gained `maxOutputTokens`, `ModelAdapterResult` gained `stopReason`. All additive — no breaking change. The dashboard's per-stage output ceiling + finish_reason normalization moved from `ApiAdapter` into agent-core's `OpenAIAdapter` so behavior survives the cutover. |
 | 2 — core-pipeline EventBus subscription | pending | — | — |
 | 3 — Cost-ledger ↔ spend-ledger bridge | pending | — | — |
 | 4 — Lift pipeline-runner features into Steps | pending | — | — |
