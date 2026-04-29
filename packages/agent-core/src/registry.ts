@@ -7,7 +7,14 @@
  * of all registered providers.
  */
 
-import type { ModelAdapter, ProviderName, ProviderTier } from '@anvil/agent-core';
+import type { ModelAdapter, ProviderName, ProviderTier } from './types.js';
+import { ClaudeAdapter } from './claude-adapter.js';
+import { OpenAIAdapter } from './openai-adapter.js';
+import { GeminiAdapter } from './gemini-adapter.js';
+import { OpenRouterAdapter } from './openrouter-adapter.js';
+import { OllamaAdapter } from './ollama-adapter.js';
+import { GeminiCliAdapter } from './gemini-cli-adapter.js';
+import { AdkAdapter } from './adk-adapter.js';
 
 const AGENTIC_STAGES = new Set(['build', 'validate', 'ship']);
 
@@ -197,50 +204,20 @@ export class ProviderRegistry {
 
   private registerDefaults(): void {
     this.initialized = true;
-
-    // Synchronous imports — each adapter is just a class definition with no
-    // heavy side effects. We wrap each in try/catch so a missing optional
-    // dependency doesn't crash the whole registry.
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { ClaudeAdapter } = require('./claude-adapter.js');
-      this.register(new ClaudeAdapter());
-    } catch { /* claude adapter unavailable */ }
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { OpenAIAdapter } = require('./openai-adapter.js');
-      this.register(new OpenAIAdapter());
-    } catch { /* openai adapter unavailable */ }
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { GeminiAdapter } = require('./gemini-adapter.js');
-      this.register(new GeminiAdapter());
-    } catch { /* gemini adapter unavailable */ }
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { OpenRouterAdapter } = require('./openrouter-adapter.js');
-      this.register(new OpenRouterAdapter());
-    } catch { /* openrouter adapter unavailable */ }
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { OllamaAdapter } = require('./ollama-adapter.js');
-      this.register(new OllamaAdapter());
-    } catch { /* ollama adapter unavailable */ }
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { GeminiCliAdapter } = require('./gemini-cli-adapter.js');
-      this.register(new GeminiCliAdapter());
-    } catch { /* gemini-cli adapter unavailable */ }
-
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { AdkAdapter } = require('./adk-adapter.js');
-      this.register(new AdkAdapter());
-    } catch { /* adk adapter unavailable */ }
+    // Static ESM imports — adapters are class definitions with no heavy
+    // module-load side effects. Optional runtime deps (e.g. ADK's `@google/adk`
+    // package) are lazy-loaded inside the adapter's checkAvailability/run paths,
+    // so module-load is always safe.
+    //
+    // Pre-2026-04-29 this used `require('./X-adapter.js')` wrapped in try/catch.
+    // That never worked under ESM (`require is not defined`) — the silent
+    // failure surfaced when the registry got tested in isolation post-extract.
+    this.register(new ClaudeAdapter());
+    this.register(new OpenAIAdapter());
+    this.register(new GeminiAdapter());
+    this.register(new OpenRouterAdapter());
+    this.register(new OllamaAdapter());
+    this.register(new GeminiCliAdapter());
+    this.register(new AdkAdapter());
   }
 }

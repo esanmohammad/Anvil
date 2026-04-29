@@ -13,8 +13,8 @@ import type {
   ModelAdapterResult,
   ProviderCapabilities,
   ProviderName,
-} from '@anvil/agent-core';
-import { emitContent } from '@anvil/agent-core';
+} from './types.js';
+import { emitContent } from './stream-format.js';
 
 // ---------------------------------------------------------------------------
 // Helpers

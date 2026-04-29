@@ -10,8 +10,8 @@ import type {
   ModelAdapterConfig,
   ModelAdapterResult,
   ProviderCapabilities,
-} from '@anvil/agent-core';
-import { emitContent, emitResult } from '@anvil/agent-core';
+} from './types.js';
+import { emitContent, emitResult } from './stream-format.js';
 
 function getBaseUrl(): string {
   return (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');

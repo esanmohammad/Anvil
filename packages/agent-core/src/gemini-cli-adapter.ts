@@ -14,8 +14,8 @@ import type {
   ModelAdapterResult,
   ProviderCapabilities,
   ProviderName,
-} from '@anvil/agent-core';
-import { emitContent, emitResult } from '@anvil/agent-core';
+} from './types.js';
+import { emitContent, emitResult } from './stream-format.js';
 
 // ---------------------------------------------------------------------------
 // Pricing table — [inputPer1M, outputPer1M]
