@@ -29,4 +29,5 @@ export { FallbackAdapter } from './fallback-adapter.js';
 export * from './single-shot.js';
 export * from './agent/index.js';
 export * from './cost.js';
+export * from './telemetry/index.js';
 export { VERSION } from './version.js';

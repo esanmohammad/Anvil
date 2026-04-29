@@ -187,8 +187,23 @@ Filled in after each phase commit. Use this section to record deviations, surpri
 
 ### Phase 1 — Scaffold OTel infrastructure
 
-- **Status:** Pending
-- **Anticipated deviation:** SDK packages pin to `^2.0.0` (current stable) instead of plan's `^1.30.0`. Documented in §5.
+- **Status:** Complete
+- **Commit:** TBD
+- **Files added:** `packages/agent-core/src/telemetry/{index,tracer,attributes,config,exporters}.ts` (5 files)
+- **Files modified:** `packages/agent-core/package.json` (+6 deps), `packages/agent-core/src/index.ts` (+1 export line), `package-lock.json`
+- **Deviations from plan §1.4:**
+  1. SDK packages pin to `^2.0.0` (plan said `^1.30.0`). Upstream is at 2.7.0; OTel SDK shipped 2.x stable since plan was written.
+  2. Tracer uses **`resourceFromAttributes()`** instead of `new Resource(...)` — SDK 2.x removed the constructor.
+  3. Tracer uses **`spanProcessors` constructor option** instead of `provider.addSpanProcessor(...)` — SDK 2.x removed the method.
+  4. Service-name attribute key uses **`ATTR_SERVICE_NAME`** const instead of `SemanticResourceAttributes.SERVICE_NAME` — semconv 1.40 deprecated the namespace object in favor of standalone constants.
+  5. Added an **`ANVIL_OTEL_DISABLED=1`** kill-switch (highest precedence in config resolution) — Phase 6 §6.3 documents it but Phase 1 was the natural place to wire it in.
+  6. `resetTracer()` is **async** (awaits `forceFlush` + `shutdown`) so tests can ensure spans flush before assertion. Plan §1.4 had it sync.
+- **Verified:**
+  - `npm install` clean (34 transitive packages added)
+  - `npm -w @anvil/agent-core run build` clean
+  - 9/9 existing tests pass
+  - Config resolution validated across all 5 modes (noop, console, otlp+headers, recordContent flag, kill switch)
+  - Smoke: console tracer registers + emits span + shuts down clean
 
 ### Phase 2 — Instrument LanguageModel.invoke / invokeStream
 
