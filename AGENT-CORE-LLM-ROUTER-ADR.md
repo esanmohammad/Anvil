@@ -136,7 +136,7 @@ Plan ships in 11 phases (0 through 10). Updated incrementally as phases land.
 | 2 — Per-error retry engine | shipped | c898cbe | 12 retry tests; agent-core 104/104; deterministic clock + override classifiers |
 | 3 — Rate limiter | shipped | b4870f0 | 8 rate-limiter tests; agent-core 112/112; cross-process SQLite mode deferred |
 | 4 — Spend ledger | shipped | 88ad285 | 8 ledger tests; agent-core 120/120; perRunUsd budget pre-flight wired; perRun/perTag/daily aggregations |
-| 5 — Fallback chain + degradation | pending | — | — |
+| 5 — Fallback chain + degradation | shipped | 8fb5d76 | 7 fallback tests; agent-core 127/127; auth/content_policy short-circuit; per-fallback `on` gates |
 | 6 — Circuit breaker | pending | — | — |
 | 7 — YAML route config | pending | — | — |
 | 8 — OTel telemetry reposition | pending | — | — |
