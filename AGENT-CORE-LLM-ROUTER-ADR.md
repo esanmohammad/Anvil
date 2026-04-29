@@ -140,5 +140,5 @@ Plan ships in 11 phases (0 through 10). Updated incrementally as phases land.
 | 6 — Circuit breaker | shipped | 135aa10 | 11 CB tests; agent-core 138/138; auth/content_policy do not trip; CB-skip + priorAttempted flag enables unconditional fallback |
 | 7 — YAML route config | shipped | f78051e | 11 config-loader tests; agent-core 149/149; ${env:VAR} substitution; layered merge with defaults |
 | 8 — OTel telemetry reposition | shipped | 04bf2c6 | 3 telemetry tests; agent-core 152/152; wrapper-style invokeWithSpans keeps router class pure |
-| 9 — `FallbackAdapter` shim + caller migration | pending | — | — |
+| 9 — `FallbackAdapter` shim + caller migration | shipped | f9d5766 | zero external callers found; @deprecated + migration recipe added; class kept functional for any out-of-tree consumer |
 | 10 — Tests + docs + ADR finalize | pending | — | — |
