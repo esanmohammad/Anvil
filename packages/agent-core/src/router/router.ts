@@ -17,6 +17,7 @@ import type {
 import type { LanguageModel, LanguageModelInvokeOptions, InvokeResult } from '../types.js';
 import { RouterError, classifyError } from './errors.js';
 import { DEFAULT_RETRY_POLICY, runWithRetry } from './retry.js';
+import { TokenBucketRateLimiter } from './rate-limiter.js';
 
 export interface AdapterResolver {
   /** Resolve a model id to an executor. */
@@ -30,6 +31,11 @@ export interface LlmRouterDeps {
    * Tests inject fakes directly.
    */
   resolver?: AdapterResolver;
+  /**
+   * Pre-flight rate limiter. If omitted, the router constructs an internal
+   * TokenBucketRateLimiter from `config.rateLimit`.
+   */
+  rateLimiter?: TokenBucketRateLimiter;
   /** Time source for deterministic tests. */
   now?: () => number;
   /** Sleep — injectable for deterministic tests. */
@@ -43,6 +49,7 @@ export interface LlmRouterDeps {
 export class LlmRouter {
   protected readonly config: RouterConfig;
   protected readonly resolver?: AdapterResolver;
+  protected readonly rateLimiter: TokenBucketRateLimiter;
   protected readonly now: () => number;
   protected readonly sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   protected readonly random?: () => number;
@@ -55,6 +62,16 @@ export class LlmRouter {
     this.sleep = deps.sleep;
     this.random = deps.random;
     this.errorClassifiers = deps.errorClassifiers ?? {};
+    this.rateLimiter =
+      deps.rateLimiter ??
+      new TokenBucketRateLimiter({
+        config: deps.config.rateLimit,
+        now: deps.now,
+        sleep: deps.sleep
+          ? (ms: number) => deps.sleep!(ms)
+          : undefined,
+        onRateLimit: deps.config.onRateLimit,
+      });
   }
 
   /** Inspect the active config (immutable snapshot). */
@@ -76,6 +93,7 @@ export class LlmRouter {
     const adapter = this.resolver.resolve(modelId);
 
     const llmOpts = this.buildInvokeOpts(opts, modelId);
+    const estimatedTokens = this.estimateTokens(llmOpts);
 
     const policyFor = (cls: ErrorClass): RetryPolicy =>
       this.config.retryPolicy[cls] ?? DEFAULT_RETRY_POLICY[cls];
@@ -89,7 +107,10 @@ export class LlmRouter {
     };
 
     const retryRun = await runWithRetry<InvokeResult>(
-      () => adapter.invoke(llmOpts),
+      async () => {
+        await this.rateLimiter.acquire(adapter.provider, estimatedTokens);
+        return adapter.invoke(llmOpts);
+      },
       {
         policyFor,
         classify,
@@ -137,6 +158,19 @@ export class LlmRouter {
       throw new Error(`LlmRouter: no route for tag '${opts.tag}' (and no opts.model pin)`);
     }
     return route.primary;
+  }
+
+  /**
+   * Rough token estimate for pre-flight rate-limit checks. Uses the
+   * standard ~4-chars-per-token heuristic over message content. We bias
+   * slightly high (with maxTokens) so the bucket reserves enough room
+   * for the response too.
+   */
+  protected estimateTokens(opts: LanguageModelInvokeOptions): number {
+    const promptChars = opts.messages.reduce((acc, m) => acc + m.content.length, 0);
+    const promptTokens = Math.ceil(promptChars / 4);
+    const responseTokens = opts.maxTokens ?? 1024;
+    return promptTokens + responseTokens;
   }
 
   protected buildInvokeOpts(opts: InvokeOpts, modelId: string): LanguageModelInvokeOptions {

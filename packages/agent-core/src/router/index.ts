@@ -24,3 +24,9 @@ export type { LlmRouterDeps, AdapterResolver } from './router.js';
 export { RouterError, classifyError, parseRetryAfterMs } from './errors.js';
 export { runWithRetry, DEFAULT_RETRY_POLICY } from './retry.js';
 export type { RetryAttempt, RunWithRetryDeps, RunWithRetryResult } from './retry.js';
+export {
+  TokenBucketRateLimiter,
+  RateLimitedError,
+  DEFAULT_RATE_LIMITS,
+} from './rate-limiter.js';
+export type { RateLimiterDeps } from './rate-limiter.js';
