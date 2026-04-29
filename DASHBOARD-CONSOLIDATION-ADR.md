@@ -137,7 +137,7 @@ Plan ships in 7 phases (0 through 6). Updated incrementally as phases land.
 | 0 — Audit + decisions | landed | `6d4fa89` | — |
 | 1 — agent-core adapter consolidation | landed | `9c4ce19` | Phase 1.4 risk widened: in addition to the planned `cache` capability bit, `ProviderCapabilities` also gained `cacheTtlSeconds` / `structuredOutput` / `maxOutputTokens` and `ModelAdapterConfig` gained `maxOutputTokens`, `ModelAdapterResult` gained `stopReason`. All additive — no breaking change. The dashboard's per-stage output ceiling + finish_reason normalization moved from `ApiAdapter` into agent-core's `OpenAIAdapter` so behavior survives the cutover. |
 | 2 — core-pipeline EventBus subscription | landed | `7455089` | Wiring is in place but no publishers yet — pipeline-runner.ts still runs the legacy in-process orchestrator. Phase 4 swaps publishers onto the bus. |
-| 3 — Cost-ledger ↔ spend-ledger bridge | pending | — | — |
+| 3 — Cost-ledger ↔ spend-ledger bridge | landed | `02fea5c` | `BridgedCostLedger` lands as a `CostLedger` subclass so the existing `CostBreachHandler` and 6 read sites are unchanged. Mirroring is one-way (dashboard → SpendLedger); the plan's symmetric `onRecord` hook on the router side is deferred — no current cli writer is producing rows the dashboard would want to mirror back, so the reverse path can land lazily when needed. Provider is inferred from model id (claude → anthropic, gpt/o1/o3/o4 → openai, gemini → google, llama/mistral/qwen/phi → ollama) since `CostEntry` doesn't carry a provider field. |
 | 4 — Lift pipeline-runner features into Steps | pending | — | — |
 | 5 — MemoryStore → memory-core replacement | pending | — | — |
 | 6 — Tests + docs + ADR finalize | pending | — | — |
