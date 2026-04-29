@@ -141,4 +141,4 @@ Plan ships in 11 phases (0 through 10). Updated incrementally as phases land.
 | 7 — YAML route config | shipped | f78051e | 11 config-loader tests; agent-core 149/149; ${env:VAR} substitution; layered merge with defaults |
 | 8 — OTel telemetry reposition | shipped | 04bf2c6 | 3 telemetry tests; agent-core 152/152; wrapper-style invokeWithSpans keeps router class pure |
 | 9 — `FallbackAdapter` shim + caller migration | shipped | f9d5766 | zero external callers found; @deprecated + migration recipe added; class kept functional for any out-of-tree consumer |
-| 10 — Tests + docs + ADR finalize | pending | — | — |
+| 10 — Tests + docs + ADR finalize | shipped | 2076bd2 | README router section; final gates all green (agent-core 152/152, memory-core 119/119, knowledge-core 62/62, cli build) |
