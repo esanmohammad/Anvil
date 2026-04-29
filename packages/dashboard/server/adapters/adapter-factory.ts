@@ -1,92 +1,105 @@
 /**
- * Adapter factory — routes model ID to the correct provider adapter.
+ * Adapter factory — resolves a model id to an `@anvil/agent-core`
+ * `ModelAdapter` and wraps it in an `AgentCoreBridge` so the dashboard's
+ * `BaseAdapter` consumers (AgentManager, AgentProcess, prompt-envelope,
+ * token-util) keep their existing event-emit interface.
  *
- * Resolution order:
- *   1. Look up model in provider registry cache
- *   2. Apply naming heuristics (gemini-* → gemini-cli, gpt-* → openai, etc.)
- *   3. Fall back to Claude (safest default)
+ * Provider resolution preserves dashboard-specific behavior that
+ * agent-core's registry doesn't carry:
+ *   - `gemini-*` prefers the Gemini CLI when the binary is on PATH; if not,
+ *     falls back to the HTTP API adapter (`gemini`).
+ *   - Model ids containing `/` route to OpenRouter.
+ *   - Otherwise we delegate to `ProviderRegistry.resolveFromModelId` which
+ *     covers Claude / OpenAI / Gemini-API.
+ *
+ * Phase 1 of the dashboard consolidation. See DASHBOARD-CONSOLIDATION-PLAN.md.
  */
 
 import { execSync } from 'node:child_process';
+import { ProviderRegistry, type ModelAdapter, type ProviderName } from '@anvil/agent-core';
 import { BaseAdapter, type AdapterConfig } from './base-adapter.js';
-import { ClaudeAdapter } from './claude-adapter.js';
-import { GeminiCliAdapter } from './gemini-cli-adapter.js';
-import { ApiAdapter } from './api-adapter.js';
+import { AgentCoreBridge } from './agent-core-bridge.js';
+
+// ── Provider resolution ──────────────────────────────────────────────────
 
 /**
- * Resolve which provider a model ID belongs to.
+ * Resolve which agent-core provider should handle a given model id.
  *
- * Uses the provider registry cache if available, otherwise
- * falls back to naming heuristics.
+ * Mirrors the legacy dashboard heuristic so call sites that pre-compute the
+ * provider string (e.g., for logging) keep behaving the same.
  */
-/**
- * Resolve which provider a model ID belongs to.
- * Uses heuristics based on model naming conventions.
- */
-export function resolveProvider(modelId: string): string {
+export function resolveProvider(modelId: string): ProviderName {
   return resolveProviderByHeuristic(modelId);
 }
 
-/** Naming-convention-based provider resolution */
-export function resolveProviderByHeuristic(modelId: string): string {
-  // Gemini models
-  if (modelId.startsWith('gemini-')) {
-    // Check if Gemini CLI is available, otherwise use API
-    try {
-      execSync('which gemini', { stdio: 'pipe', timeout: 2000 });
-      return 'gemini-cli';
-    } catch {
-      return 'gemini-api';
-    }
+export function resolveProviderByHeuristic(modelId: string): ProviderName {
+  const id = modelId.toLowerCase();
+
+  // Gemini: prefer CLI when available, fall back to HTTP API.
+  if (id.startsWith('gemini-')) {
+    if (geminiCliAvailable()) return 'gemini-cli';
+    return 'gemini';
   }
 
-  // OpenAI models
-  if (modelId.startsWith('gpt-') || modelId.startsWith('o1') || modelId.startsWith('o3')) {
+  // OpenAI patterns
+  if (
+    id.startsWith('gpt-') ||
+    id.startsWith('o1') ||
+    id.startsWith('o3') ||
+    id.startsWith('o4') ||
+    id.startsWith('chatgpt-')
+  ) {
     return 'openai';
   }
 
-  // OpenRouter models (contain a slash: org/model)
-  if (modelId.includes('/')) {
+  // OpenRouter uses `org/model` format
+  if (id.includes('/')) {
     return 'openrouter';
   }
 
-  // Claude models (default)
-  if (modelId.startsWith('claude-')) {
-    return 'claude';
-  }
-
-  // Unknown — default to claude
+  // Claude (default)
   return 'claude';
 }
 
+// Cache the CLI probe so repeated factory calls don't fork a shell each time.
+let geminiCliCached: boolean | null = null;
+function geminiCliAvailable(): boolean {
+  if (geminiCliCached !== null) return geminiCliCached;
+  try {
+    execSync('which gemini', { stdio: 'pipe', timeout: 2000 });
+    geminiCliCached = true;
+  } catch {
+    geminiCliCached = false;
+  }
+  return geminiCliCached;
+}
+
+// ── Factory ──────────────────────────────────────────────────────────────
+
 /**
  * Create the appropriate adapter for a given config.
- * The model field in the config determines which provider to use.
+ * Returned adapter is always an `AgentCoreBridge` — the dashboard sees the
+ * familiar `BaseAdapter` event surface; agent-core handles the actual call.
  */
 export function createAdapter(config: AdapterConfig): BaseAdapter {
+  const registry = ProviderRegistry.getInstance();
   const provider = resolveProvider(config.model);
+  const adapter = resolveAdapterOrFallback(registry, provider);
+  return new AgentCoreBridge(config, adapter.adapter, adapter.provider);
+}
 
-  switch (provider) {
-    case 'claude':
-      return new ClaudeAdapter(config);
+function resolveAdapterOrFallback(
+  registry: ProviderRegistry,
+  provider: ProviderName,
+): { adapter: ModelAdapter; provider: ProviderName } {
+  const direct = registry.get(provider);
+  if (direct) return { adapter: direct, provider };
 
-    case 'gemini-cli':
-      return new GeminiCliAdapter(config);
+  // Claude is always registered by registerDefaults; treat as the safe fallback.
+  const claude = registry.get('claude');
+  if (claude) return { adapter: claude, provider: 'claude' };
 
-    case 'openai':
-      return new ApiAdapter(config, 'openai');
-
-    case 'gemini-api':
-      return new ApiAdapter(config, 'gemini-api');
-
-    case 'openrouter':
-      return new ApiAdapter(config, 'openrouter');
-
-    case 'ollama':
-      return new ApiAdapter(config, 'ollama');
-
-    default:
-      // Safe fallback — Claude handles most things
-      return new ClaudeAdapter(config);
-  }
+  throw new Error(
+    `No agent-core adapter available for provider "${provider}" and no "claude" fallback registered.`,
+  );
 }

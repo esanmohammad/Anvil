@@ -47,6 +47,13 @@ export class GeminiAdapter implements ModelAdapter {
     fileSystem: false,
     shellExecution: false,
     sessionResume: false,
+    promptCaching: true,
+    cache: 'auto',
+    cacheTtlSeconds: 600,
+    structuredOutput: 'strict',
+    // The Gemini HTTP API supports generationConfig.maxOutputTokens; today's
+    // adapter does not forward it. Flip to true once the adapter wires it up.
+    maxOutputTokens: false,
   };
 
   private abortController: AbortController | null = null;

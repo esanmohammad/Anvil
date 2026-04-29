@@ -67,6 +67,11 @@ export class GeminiCliAdapter implements ModelAdapter {
     fileSystem: true,
     shellExecution: true,
     sessionResume: false,
+    cache: 'auto',
+    cacheTtlSeconds: 300,
+    structuredOutput: 'strict',
+    // Gemini CLI doesn't expose a max-tokens flag today.
+    maxOutputTokens: false,
   };
 
   private child: ChildProcess | null = null;

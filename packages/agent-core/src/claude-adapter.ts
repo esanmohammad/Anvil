@@ -62,6 +62,13 @@ export class ClaudeAdapter implements ModelAdapter {
     fileSystem: true,
     shellExecution: true,
     sessionResume: true,
+    promptCaching: true,
+    cache: 'explicit',
+    cacheTtlSeconds: 300,
+    structuredOutput: 'tool-shim',
+    // Claude CLI doesn't expose a max-tokens flag today; bridges/router callers
+    // may pass it but the adapter ignores it.
+    maxOutputTokens: false,
   };
 
   private child: ChildProcess | null = null;
@@ -141,6 +148,10 @@ export class ClaudeAdapter implements ModelAdapter {
     let resultMsg: ResultMessage | null = null;
     let fullOutput = '';
     let toolCallCount = 0;
+    // Anthropic stream-json stamps stop_reason on the assistant frame, not
+    // the result frame, so we cache the most recent one and surface it on
+    // ModelAdapterResult below.
+    let lastStopReason: string | undefined;
 
     // We read stdout line-by-line to capture the result message while also
     // piping every line to the output writable unchanged.
@@ -160,6 +171,9 @@ export class ClaudeAdapter implements ModelAdapter {
           // Count tool_use blocks for telemetry; pure-pipe semantics preserved.
           for (const block of parsed.message.content) {
             if (block?.type === 'tool_use') toolCallCount += 1;
+          }
+          if (typeof parsed.message?.stop_reason === 'string') {
+            lastStopReason = parsed.message.stop_reason;
           }
         }
       } catch {
@@ -203,6 +217,7 @@ export class ClaudeAdapter implements ModelAdapter {
       cacheReadTokens,
       cacheWriteTokens,
       toolCallCount,
+      stopReason: lastStopReason,
     };
   }
 

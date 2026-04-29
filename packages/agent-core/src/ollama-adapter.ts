@@ -27,6 +27,9 @@ export class OllamaAdapter implements ModelAdapter {
     fileSystem: false,
     shellExecution: false,
     sessionResume: false,
+    cache: 'none',
+    structuredOutput: 'best-effort',
+    maxOutputTokens: false,
   };
 
   private abortController: AbortController | null = null;

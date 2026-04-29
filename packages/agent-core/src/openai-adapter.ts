@@ -42,6 +42,11 @@ export class OpenAIAdapter implements ModelAdapter {
     fileSystem: false,
     shellExecution: false,
     sessionResume: false,
+    promptCaching: true,
+    cache: 'auto',
+    cacheTtlSeconds: 600,
+    structuredOutput: 'strict',
+    maxOutputTokens: true,
   };
 
   /** Active AbortController — allows kill() to cancel an in-flight request. */
@@ -121,6 +126,7 @@ export class OpenAIAdapter implements ModelAdapter {
         outputTokens,
         cacheReadTokens,
         reasoningTokens,
+        finishReason,
       } = await this.consumeSSE(response, output);
 
       const durationMs = Date.now() - startMs;
@@ -137,6 +143,11 @@ export class OpenAIAdapter implements ModelAdapter {
         durationMs,
       });
 
+      // OpenAI / OpenRouter / Gemini-API report 'length' when the max-tokens
+      // ceiling was hit. Normalize to the provider-agnostic 'max_tokens' so
+      // downstream truncation telemetry is uniform.
+      const stopReason = finishReason === 'length' ? 'max_tokens' : finishReason;
+
       return {
         output: fullText,
         inputTokens,
@@ -147,6 +158,7 @@ export class OpenAIAdapter implements ModelAdapter {
         model: config.model,
         cacheReadTokens,
         reasoningTokens,
+        stopReason,
       };
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
@@ -168,12 +180,16 @@ export class OpenAIAdapter implements ModelAdapter {
     }
     messages.push({ role: 'user', content: config.userPrompt });
 
-    return {
+    const body: Record<string, unknown> = {
       model: config.model,
       messages,
       stream: true,
       stream_options: { include_usage: true },
     };
+    if (typeof config.maxOutputTokens === 'number' && config.maxOutputTokens > 0) {
+      body.max_tokens = config.maxOutputTokens;
+    }
+    return body;
   }
 
   protected async consumeSSE(
@@ -185,12 +201,14 @@ export class OpenAIAdapter implements ModelAdapter {
     outputTokens: number;
     cacheReadTokens: number;
     reasoningTokens: number;
+    finishReason: string | undefined;
   }> {
     let fullText = '';
     let inputTokens = 0;
     let outputTokens = 0;
     let cacheReadTokens = 0;
     let reasoningTokens = 0;
+    let finishReason: string | undefined;
 
     const reader = response.body?.getReader();
     if (!reader) throw new Error('Response body is not readable');
@@ -228,6 +246,12 @@ export class OpenAIAdapter implements ModelAdapter {
             emitContent(output, delta.content);
           }
 
+          // Capture finish_reason from the terminating chunk so callers can
+          // detect truncation (`length` / `max_tokens`). Only the last chunk
+          // in a stream populates this field.
+          const fr = chunk.choices?.[0]?.finish_reason;
+          if (typeof fr === 'string') finishReason = fr;
+
           // Extract usage from the final chunk
           if (chunk.usage) {
             inputTokens = chunk.usage.prompt_tokens ?? 0;
@@ -242,6 +266,6 @@ export class OpenAIAdapter implements ModelAdapter {
       }
     }
 
-    return { fullText, inputTokens, outputTokens, cacheReadTokens, reasoningTokens };
+    return { fullText, inputTokens, outputTokens, cacheReadTokens, reasoningTokens, finishReason };
   }
 }

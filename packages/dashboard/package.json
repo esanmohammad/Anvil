@@ -45,6 +45,7 @@
     "test:server": "npx tsc -p server/tsconfig.json && node --test server/out/__tests__/*.test.js"
   },
   "dependencies": {
+    "@anvil/agent-core": "*",
     "@anvil/knowledge-core": "*",
     "lucide-react": "1.8.0",
     "react": "^19.1.0",

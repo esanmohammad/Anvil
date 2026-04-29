@@ -1,14 +1,17 @@
 /**
- * Phase 3 — output-token ceiling.
+ * STAGE_OUTPUT_LIMITS table + AgentCoreBridge round-trip checks.
  *
- * Verifies the per-stage limit table covers every stage; that the api-adapter
- * sends `max_tokens` in the request body when setMaxOutputTokens() is called;
- * that finish_reason='length' is normalized to stop_reason='max_tokens'; and
- * that the claude-adapter captures stop_reason from assistant frames.
+ * The adapter-internals slice of this test (max_tokens body, finish_reason
+ * normalization, claude stop_reason capture) lives in agent-core now —
+ * `packages/agent-core/src/__tests__/openai-adapter-output.test.ts` and
+ * adapter-enrichment.test.ts. Phase 1 of the dashboard consolidation moved
+ * those concerns out of dashboard's local adapters.
  *
- * Truncation telemetry (the warning emit on max_tokens) is exercised by
- * unit-mocking the agent state in pipeline-runner indirectly via these
- * adapter-level checks — the runner simply forwards what the adapter reports.
+ * What stays here:
+ *   - STAGE_OUTPUT_LIMITS coverage of every pipeline stage (orthogonal to
+ *     adapter migration).
+ *   - Bridge-level checks that prove the dashboard's `BaseAdapter` contract
+ *     still works once `createAdapter()` returns an `AgentCoreBridge`.
  */
 
 import { describe, it } from 'node:test';
@@ -20,8 +23,16 @@ import {
   maxOutputTokensForStage,
   listStageNames,
 } from '../pipeline-runner.js';
-import { ApiAdapter } from '../adapters/api-adapter.js';
-import { ClaudeAdapter } from '../adapters/claude-adapter.js';
+import { AgentCoreBridge } from '../adapters/agent-core-bridge.js';
+import type { AdapterCostInfo } from '../adapters/base-adapter.js';
+import type {
+  ModelAdapter,
+  ModelAdapterConfig,
+  ModelAdapterResult,
+  ProviderCapabilities,
+} from '@anvil/agent-core';
+
+// ── STAGE_OUTPUT_LIMITS table ─────────────────────────────────────────────
 
 describe('STAGE_OUTPUT_LIMITS', () => {
   it('covers every pipeline stage', () => {
@@ -55,187 +66,165 @@ describe('STAGE_OUTPUT_LIMITS', () => {
   });
 });
 
-describe('ApiAdapter — output ceiling + truncation reporting', () => {
-  it('passes max_tokens in the request body when setMaxOutputTokens is called', async () => {
-    let capturedBody: Record<string, unknown> | null = null;
+// ── AgentCoreBridge contract ──────────────────────────────────────────────
 
-    // Stub fetch so we can inspect the outgoing body and feed back a single
-    // SSE chunk so the adapter completes cleanly.
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
-      capturedBody = init?.body ? JSON.parse(init.body as string) : null;
-      const sse =
-        'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}\n\n' +
-        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n' +
-        'data: [DONE]\n\n';
-      return new Response(sse, {
-        status: 200,
-        headers: { 'Content-Type': 'text/event-stream' },
-      });
-    }) as typeof fetch;
+/** Minimal in-memory ModelAdapter that records the config it was called with. */
+class FakeModelAdapter implements ModelAdapter {
+  readonly provider = 'claude' as const;
+  readonly capabilities: ProviderCapabilities;
+  lastConfig: ModelAdapterConfig | null = null;
+  result: ModelAdapterResult;
 
-    try {
-      const adapter = new ApiAdapter(
-        {
-          prompt: 'hello',
-          model: 'gpt-4o-mini',
-          sessionId: 'sess-test-1',
-          cwd: process.cwd(),
-        },
-        'openai',
-      );
-      // Force-supply API key so the adapter doesn't bail early.
-      process.env.OPENAI_API_KEY = 'test-key';
+  constructor(opts: {
+    capabilities: ProviderCapabilities;
+    result: ModelAdapterResult;
+    streamLines?: string[];
+  }) {
+    this.capabilities = opts.capabilities;
+    this.result = opts.result;
+    this.streamLines = opts.streamLines ?? [];
+  }
 
-      adapter.setMaxOutputTokens(1234);
+  private streamLines: string[];
 
-      await new Promise<void>((resolve) => {
-        adapter.on('exit', () => resolve());
-        adapter.start();
-      });
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+  supportsModel(): boolean {
+    return true;
+  }
 
-    assert.ok(capturedBody, 'fetch should have been called');
-    assert.equal((capturedBody as { max_tokens?: number }).max_tokens, 1234);
-  });
+  getModelPricing(): [number, number] | null {
+    return null;
+  }
 
-  it("normalizes finish_reason 'length' → stopReason 'max_tokens'", async () => {
-    let resultStopReason: string | undefined;
+  async checkAvailability(): Promise<{ available: boolean }> {
+    return { available: true };
+  }
 
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => {
-      const sse =
-        'data: {"choices":[{"delta":{"content":"truncated body"},"finish_reason":null}]}\n\n' +
-        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n' +
-        'data: [DONE]\n\n';
-      return new Response(sse, {
-        status: 200,
-        headers: { 'Content-Type': 'text/event-stream' },
-      });
-    }) as typeof fetch;
+  async run(config: ModelAdapterConfig, output: NodeJS.WritableStream): Promise<ModelAdapterResult> {
+    this.lastConfig = config;
+    for (const line of this.streamLines) output.write(line + '\n');
+    return this.result;
+  }
+}
 
-    try {
-      const adapter = new ApiAdapter(
-        {
-          prompt: 'hello',
-          model: 'gpt-4o-mini',
-          sessionId: 'sess-test-2',
-          cwd: process.cwd(),
-        },
-        'openai',
-      );
-      process.env.OPENAI_API_KEY = 'test-key';
-
-      await new Promise<void>((resolve) => {
-        adapter.on('result', (data) => {
-          resultStopReason = data.cost.stopReason;
-        });
-        adapter.on('exit', () => resolve());
-        adapter.start();
-      });
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-
-    assert.equal(resultStopReason, 'max_tokens');
-  });
-
-  it("preserves natural finish_reason 'stop' as-is on the cost object", async () => {
-    let resultStopReason: string | undefined;
-
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => {
-      const sse =
-        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n' +
-        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n' +
-        'data: [DONE]\n\n';
-      return new Response(sse, {
-        status: 200,
-        headers: { 'Content-Type': 'text/event-stream' },
-      });
-    }) as typeof fetch;
-
-    try {
-      const adapter = new ApiAdapter(
-        {
-          prompt: 'hi',
-          model: 'gpt-4o-mini',
-          sessionId: 'sess-test-3',
-          cwd: process.cwd(),
-        },
-        'openai',
-      );
-      process.env.OPENAI_API_KEY = 'test-key';
-
-      await new Promise<void>((resolve) => {
-        adapter.on('result', (data) => {
-          resultStopReason = data.cost.stopReason;
-        });
-        adapter.on('exit', () => resolve());
-        adapter.start();
-      });
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-
-    assert.equal(resultStopReason, 'stop');
-  });
-});
-
-describe('ClaudeAdapter — capabilities + stop_reason capture', () => {
-  it('reports capabilities.maxOutputTokens=false today (CLI lacks the flag)', () => {
-    const adapter = new ClaudeAdapter({
-      prompt: 'unused',
-      model: 'claude-sonnet-4-6',
-      sessionId: 'sess-claude',
-      cwd: process.cwd(),
+describe('AgentCoreBridge', () => {
+  it('forwards setMaxOutputTokens to the wrapped adapter via run() config', async () => {
+    const fake = new FakeModelAdapter({
+      capabilities: { tier: 'function-calling', streaming: true, toolUse: true, fileSystem: false, shellExecution: false, sessionResume: false, maxOutputTokens: true },
+      result: { output: '', inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0, provider: 'openai', model: 'gpt-4o-mini' },
     });
-    assert.equal(adapter.capabilities.maxOutputTokens, false);
-    // setMaxOutputTokens is therefore a no-op — must not throw.
-    assert.doesNotThrow(() => adapter.setMaxOutputTokens(1000));
-  });
+    const bridge = new AgentCoreBridge(
+      { prompt: 'hi', model: 'gpt-4o-mini', sessionId: 's1', cwd: process.cwd() },
+      fake,
+      'openai',
+    );
+    bridge.setMaxOutputTokens(1234);
 
-  it("captures stop_reason='max_tokens' from assistant frames and stamps onto cost", async () => {
-    // We simulate the parser by feeding a fake stream-json buffer through a
-    // fresh adapter instance. We avoid spawning the CLI by reaching into the
-    // private parseStreamJson via Object property access (test-only seam).
-    const adapter = new ClaudeAdapter({
-      prompt: 'unused',
-      model: 'claude-sonnet-4-6',
-      sessionId: 'sess-claude-stop',
-      cwd: process.cwd(),
+    await new Promise<void>((resolve) => {
+      bridge.on('exit', () => resolve());
+      bridge.start();
     });
 
-    let capturedStopReason: string | undefined;
-    adapter.on('result', (data) => {
-      capturedStopReason = data.cost.stopReason;
-    });
+    assert.equal(fake.lastConfig?.maxOutputTokens, 1234);
+  });
 
-    const assistantFrame = JSON.stringify({
-      type: 'assistant',
-      message: {
-        stop_reason: 'max_tokens',
-        content: [{ type: 'text', text: 'truncated' }],
+  it('surfaces stopReason from ModelAdapterResult onto the dashboard cost shape', async () => {
+    const fake = new FakeModelAdapter({
+      capabilities: { tier: 'function-calling', streaming: true, toolUse: true, fileSystem: false, shellExecution: false, sessionResume: false, maxOutputTokens: true },
+      result: {
+        output: 'truncated body',
+        inputTokens: 10,
+        outputTokens: 16000,
+        costUsd: 0,
+        durationMs: 12,
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        stopReason: 'max_tokens',
       },
     });
-    const resultFrame = JSON.stringify({
-      type: 'result',
-      result: 'truncated',
-      usage: { input_tokens: 10, output_tokens: 16000 },
-      total_cost_usd: 0,
-      duration_ms: 0,
-      session_id: 'sess-claude-stop',
+    const bridge = new AgentCoreBridge(
+      { prompt: 'hi', model: 'gpt-4o-mini', sessionId: 's2', cwd: process.cwd() },
+      fake,
+      'openai',
+    );
+
+    const captured: { cost: AdapterCostInfo | null } = { cost: null };
+    await new Promise<void>((resolve) => {
+      bridge.on('result', (data) => { captured.cost = data.cost; });
+      bridge.on('exit', () => resolve());
+      bridge.start();
     });
 
-    // Reach into the parser via a typed cast so we don't spawn a real CLI.
-    const parser = (adapter as unknown as {
-      parseStreamJson: (buf: Buffer) => void;
-    }).parseStreamJson.bind(adapter);
+    assert.ok(captured.cost, 'result event should fire');
+    assert.equal(captured.cost!.stopReason, 'max_tokens');
+    assert.equal(captured.cost!.outputTokens, 16000);
+  });
 
-    parser(Buffer.from(assistantFrame + '\n' + resultFrame + '\n'));
+  it("maps capabilities.cache='explicit' to AdapterCapabilities.promptCache='explicit'", () => {
+    const fake = new FakeModelAdapter({
+      capabilities: { tier: 'agentic', streaming: true, toolUse: true, fileSystem: true, shellExecution: true, sessionResume: true, cache: 'explicit', cacheTtlSeconds: 300, structuredOutput: 'tool-shim', maxOutputTokens: false },
+      result: { output: '', inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0, provider: 'claude', model: 'claude-sonnet-4-6' },
+    });
+    const bridge = new AgentCoreBridge(
+      { prompt: 'unused', model: 'claude-sonnet-4-6', sessionId: 's3', cwd: process.cwd() },
+      fake,
+      'claude',
+    );
+    assert.equal(bridge.capabilities.promptCache, 'explicit');
+    assert.equal(bridge.capabilities.cacheTtlSeconds, 300);
+    assert.equal(bridge.capabilities.maxOutputTokens, false);
+  });
 
-    assert.equal(capturedStopReason, 'max_tokens');
+  it('parses Anvil Stream Format assistant frames into content + activity events', async () => {
+    const assistantFrame = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'hello world' }] },
+    });
+    const fake = new FakeModelAdapter({
+      capabilities: { tier: 'function-calling', streaming: true, toolUse: false, fileSystem: false, shellExecution: false, sessionResume: false },
+      result: { output: 'hello world', inputTokens: 1, outputTokens: 2, costUsd: 0, durationMs: 1, provider: 'openai', model: 'gpt-4o-mini' },
+      streamLines: [assistantFrame],
+    });
+    const bridge = new AgentCoreBridge(
+      { prompt: 'hi', model: 'gpt-4o-mini', sessionId: 's4', cwd: process.cwd() },
+      fake,
+      'openai',
+    );
+
+    const contents: string[] = [];
+    const activities: Array<{ kind: string; summary: string }> = [];
+    await new Promise<void>((resolve) => {
+      bridge.on('content', (text: string) => contents.push(text));
+      bridge.on('activity', (a) => activities.push({ kind: a.kind, summary: a.summary }));
+      bridge.on('exit', () => resolve());
+      bridge.start();
+    });
+
+    assert.deepEqual(contents, ['hello world']);
+    assert.equal(activities.length, 1);
+    assert.equal(activities[0].kind, 'text');
+    assert.equal(activities[0].summary, 'hello world');
+  });
+
+  it('emits markCacheBreakpoint sentinel only when promptCache === explicit', () => {
+    const claude = new AgentCoreBridge(
+      { prompt: 'unused', model: 'claude-sonnet-4-6', sessionId: 's5', cwd: process.cwd() },
+      new FakeModelAdapter({
+        capabilities: { tier: 'agentic', streaming: true, toolUse: true, fileSystem: true, shellExecution: true, sessionResume: true, cache: 'explicit' },
+        result: { output: '', inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0, provider: 'claude', model: 'claude-sonnet-4-6' },
+      }),
+      'claude',
+    );
+    const openai = new AgentCoreBridge(
+      { prompt: 'unused', model: 'gpt-4o-mini', sessionId: 's6', cwd: process.cwd() },
+      new FakeModelAdapter({
+        capabilities: { tier: 'function-calling', streaming: true, toolUse: true, fileSystem: false, shellExecution: false, sessionResume: false, cache: 'auto' },
+        result: { output: '', inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0, provider: 'openai', model: 'gpt-4o-mini' },
+      }),
+      'openai',
+    );
+
+    const original = 'AAAAA';
+    assert.match(claude.markCacheBreakpoint(original, 3), /anvil:cache-breakpoint/);
+    assert.equal(openai.markCacheBreakpoint(original, 3), original);
   });
 });

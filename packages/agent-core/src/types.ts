@@ -43,6 +43,29 @@ export interface ProviderCapabilities {
   sessionResume: boolean;
   /** Whether the provider supports prompt caching (e.g. Anthropic ephemeral cache). */
   promptCaching?: boolean;
+  /**
+   * Prompt-cache marker semantics:
+   *   - 'auto'     — provider caches stable prefixes silently (e.g. OpenAI ≥1024 tok).
+   *   - 'explicit' — caller must place markers (e.g. Anthropic cache_control).
+   *   - 'none'     — no caching benefit; markers are no-ops.
+   * `undefined` means the adapter has not declared a stance — treat as 'none'.
+   */
+  cache?: 'auto' | 'explicit' | 'none';
+  /** Cache TTL in seconds when `cache !== 'none'`. Informational only. */
+  cacheTtlSeconds?: number;
+  /**
+   * Adapter honors `ModelAdapterConfig.maxOutputTokens` and forwards it to the
+   * provider. When false, callers may still pass it but the adapter ignores it.
+   */
+  maxOutputTokens?: boolean;
+  /**
+   * Structured-output (JSON-schema-constrained generation) support level.
+   *   - 'strict'      — provider enforces the schema server-side.
+   *   - 'tool-shim'   — caller emulates via tool calls (e.g. Claude's tool-use trick).
+   *   - 'best-effort' — prompt-only; provider doesn't constrain output.
+   *   - 'none'        — not supported.
+   */
+  structuredOutput?: 'strict' | 'tool-shim' | 'best-effort' | 'none';
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -153,6 +176,12 @@ export interface ModelAdapterConfig {
   allowedTools?: string[];
   disallowedTools?: string[];
   timeout?: number;
+  /**
+   * Cap on the number of output tokens the provider should emit for this
+   * call. Adapters whose `capabilities.maxOutputTokens === true` honor it
+   * (set the provider's `max_tokens` knob); others ignore it.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface ModelAdapterResult {
@@ -177,6 +206,16 @@ export interface ModelAdapterResult {
   reasoningTokens?: number;
   /** Count of tool_use / function-call invocations in this turn. */
   toolCallCount?: number;
+  /**
+   * Provider-reported reason the call ended. Common values:
+   *   - 'end_turn' / 'stop'     — natural completion
+   *   - 'max_tokens' / 'length' — output ceiling hit (truncation)
+   *   - 'tool_use'              — paused for a tool call
+   * Adapters that don't surface a reason leave it undefined. OpenAI-shape
+   * adapters normalize 'length' → 'max_tokens' so callers can detect
+   * truncation provider-agnostically.
+   */
+  stopReason?: string;
 }
 
 export interface ModelAdapter {

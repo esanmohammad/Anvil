@@ -55,6 +55,10 @@ export class AdkAdapter implements ModelAdapter {
     fileSystem: true,
     shellExecution: true,
     sessionResume: false,
+    cache: 'auto',
+    cacheTtlSeconds: 300,
+    structuredOutput: 'strict',
+    maxOutputTokens: false,
   };
 
   private geminiAdapter: GeminiCliAdapter;
