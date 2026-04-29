@@ -22,6 +22,7 @@ import type {
   DecayState,
   Memory,
   MemoryKind,
+  MemoryLink,
   MemoryNamespace,
   MemoryProvenance,
   SemanticSubtype,
@@ -76,12 +77,13 @@ export class SqliteHotIndex {
     return new Set(rows.map((r) => r.name));
   }
 
-  /** Idempotent insert / replace by id. Updates FTS + tag tables in lock-step. */
+  /** Idempotent insert / replace by id. Updates FTS + tag + edge tables in lock-step. */
   upsert(m: Memory): void {
     const tx = this.db.transaction((mem: Memory) => {
       this.upsertMemoryRow(mem);
       this.replaceTags(mem.id, mem.tags);
       this.replaceFts(mem.id, this.contentText(mem));
+      this.replaceEdges(mem.id, mem.links ?? [], mem.bitemporal.validAt);
     });
     tx(m);
   }
@@ -305,6 +307,18 @@ export class SqliteHotIndex {
     for (const t of tags) ins.run(memoryId, t);
   }
 
+  private replaceEdges(sourceId: string, links: MemoryLink[], validAt: string): void {
+    this.db.prepare(`DELETE FROM memory_edge WHERE source_id = ?`).run(sourceId);
+    if (links.length === 0) return;
+    const ins = this.db.prepare(
+      `INSERT OR REPLACE INTO memory_edge(source_id, target_id, relation, weight, valid_at, invalid_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+    );
+    for (const link of links) {
+      ins.run(sourceId, link.targetId, link.relation, link.weight, validAt);
+    }
+  }
+
   private replaceFts(memoryId: string, text: string): void {
     this.db.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(memoryId);
     this.db.prepare(`INSERT INTO memory_fts(id, content_text) VALUES (?, ?)`).run(memoryId, text);
@@ -398,6 +412,7 @@ export class SqliteHotIndex {
         lastVerifiedAt: (row.code_last_verified_at as string) ?? '',
       };
     }
+    const links = this.linksOf(row.id as string);
     return {
       id: row.id as string,
       namespace,
@@ -412,7 +427,52 @@ export class SqliteHotIndex {
       decay,
       codeBinding,
       provenance,
+      links: links.length > 0 ? links : undefined,
     };
+  }
+
+  /** Read every outgoing edge for a memory id. */
+  linksOf(memoryId: string): MemoryLink[] {
+    const rows = this.db
+      .prepare(
+        `SELECT target_id, relation, weight FROM memory_edge
+         WHERE source_id = ? AND invalid_at IS NULL`,
+      )
+      .all(memoryId) as Array<{ target_id: string; relation: string; weight: number }>;
+    return rows.map((r) => ({
+      targetId: r.target_id,
+      relation: r.relation,
+      weight: r.weight,
+    }));
+  }
+
+  /**
+   * 1-hop graph traversal (Phase 8 — plan §8.2.1.graph). Returns the
+   * memories that `seedIds` link out to, optionally filtered by relation.
+   */
+  neighborsOf(
+    seedIds: string[],
+    opts: { relation?: string; limit?: number } = {},
+  ): Memory[] {
+    if (seedIds.length === 0) return [];
+    const placeholders = seedIds.map(() => '?').join(',');
+    const relationClause = opts.relation ? ' AND relation = ?' : '';
+    const limitClause = opts.limit ? `LIMIT ${Number(opts.limit) | 0}` : '';
+    const sql = `
+      SELECT DISTINCT target_id FROM memory_edge
+      WHERE source_id IN (${placeholders})${relationClause}
+        AND invalid_at IS NULL
+      ${limitClause}
+    `;
+    const params: unknown[] = [...seedIds];
+    if (opts.relation) params.push(opts.relation);
+    const rows = this.db.prepare(sql).all(...params) as Array<{ target_id: string }>;
+    const out: Memory[] = [];
+    for (const { target_id } of rows) {
+      const m = this.findById(target_id);
+      if (m) out.push(m);
+    }
+    return out;
   }
 
   private namespaceClause(

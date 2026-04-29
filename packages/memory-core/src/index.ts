@@ -30,4 +30,5 @@ export * from './storage/index.js';
 export * from './namespace/index.js';
 export * from './drift/index.js';
 export * from './scrubber/index.js';
+export * from './retrieve/index.js';
 export { VERSION } from './version.js';

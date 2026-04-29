@@ -193,6 +193,11 @@ export class HybridMemoryStore {
     return this.sqlite.hardDeleteInvalidatedOlderThan(cutoff);
   }
 
+  /** Phase 8: 1-hop neighbor expansion for graph retrieval. */
+  neighborsOf(seedIds: string[], opts?: { relation?: string; limit?: number }): Memory[] {
+    return this.sqlite.neighborsOf(seedIds, opts);
+  }
+
   /**
    * Phase 4 namespace-scoped read with Phase 5 bi-temporal defaults. Picks
    * one of the underlying SqliteHotIndex queries based on which `opts`
