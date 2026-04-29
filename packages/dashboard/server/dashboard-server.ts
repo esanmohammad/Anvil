@@ -77,6 +77,7 @@ import { PipelineReviewersStore } from './pipeline-reviewers-store.js';
 import { PipelineAuditLog } from './pipeline-audit-log.js';
 import { PipelineLearningsStore } from './pipeline-learnings-store.js';
 import { CostLedger } from './cost-ledger.js';
+import { BridgedCostLedger } from './cost-bridge.js';
 import { CostBreachHandler } from './cost-breach-handler.js';
 import type { BreachState } from './cost-types.js';
 import { CostBreachSweeper } from './cost-breach-sweeper.js';
@@ -820,7 +821,10 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const reviewersStore = new PipelineReviewersStore(ANVIL_HOME);
   const auditLog = new PipelineAuditLog(ANVIL_HOME);
   const learningsStore = new PipelineLearningsStore(ANVIL_HOME);
-  const costLedger = new CostLedger(ANVIL_HOME);
+  // Phase 3: cost-bridge — every record() also writes a matching SpendRow
+  // to agent-core's SpendLedger so cli `cost summary` reads agree with the
+  // dashboard UI (storage layouts stay separate per D4).
+  const costLedger: CostLedger = new BridgedCostLedger(ANVIL_HOME);
   const blobStore = new BlobStore(ANVIL_HOME);
   const checkpointStore = new CheckpointStore({ anvilHome: ANVIL_HOME, blobStore });
   const approvalSecret = getOrCreateApprovalSecret(ANVIL_HOME);
