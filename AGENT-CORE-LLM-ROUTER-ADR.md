@@ -138,7 +138,7 @@ Plan ships in 11 phases (0 through 10). Updated incrementally as phases land.
 | 4 — Spend ledger | shipped | 88ad285 | 8 ledger tests; agent-core 120/120; perRunUsd budget pre-flight wired; perRun/perTag/daily aggregations |
 | 5 — Fallback chain + degradation | shipped | 8fb5d76 | 7 fallback tests; agent-core 127/127; auth/content_policy short-circuit; per-fallback `on` gates |
 | 6 — Circuit breaker | shipped | 135aa10 | 11 CB tests; agent-core 138/138; auth/content_policy do not trip; CB-skip + priorAttempted flag enables unconditional fallback |
-| 7 — YAML route config | pending | — | — |
+| 7 — YAML route config | shipped | f78051e | 11 config-loader tests; agent-core 149/149; ${env:VAR} substitution; layered merge with defaults |
 | 8 — OTel telemetry reposition | pending | — | — |
 | 9 — `FallbackAdapter` shim + caller migration | pending | — | — |
 | 10 — Tests + docs + ADR finalize | pending | — | — |
