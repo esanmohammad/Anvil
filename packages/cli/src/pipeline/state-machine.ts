@@ -1,18 +1,35 @@
 // Pipeline state machine
+//
+// Phase 2: now backed by `@anvil/core-pipeline`'s `InMemoryEventBus`. The
+// legacy `onEvent(listener)` API is preserved unchanged — Phase 3 wires the
+// orchestrator to also publish structured `step:*`/`pipeline:*` events on
+// the bus for new subscribers (audit-log, learners, dashboard-state, cost).
 
+import { InMemoryEventBus } from '@anvil/core-pipeline';
+import type { EventBus } from '@anvil/core-pipeline';
 import type { PipelineState, PipelineEvent } from './types.js';
 import { PIPELINE_STAGES } from './types.js';
 
 export class PipelineStateMachine {
   private state: PipelineState;
   private listeners: ((event: PipelineEvent) => void)[] = [];
+  private readonly bus: EventBus;
 
-  constructor(initialStage: number = 0) {
+  constructor(initialStage: number = 0, bus?: EventBus) {
     this.state = {
       currentStage: initialStage,
       status: 'pending',
       events: [],
     };
+    this.bus = bus ?? new InMemoryEventBus();
+  }
+
+  /**
+   * Returns the underlying core-pipeline `EventBus`. Phase 3+ subscribers
+   * (audit-log, learners, dashboard-state, cost-tracker) attach here.
+   */
+  getBus(): EventBus {
+    return this.bus;
   }
 
   getState(): PipelineState {

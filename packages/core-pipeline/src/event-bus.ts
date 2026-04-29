@@ -1,51 +1,85 @@
 /**
- * Minimal in-process EventBus — Phase 1 scaffold.
+ * In-process EventBus — Phase 2 mature impl.
  *
- * Phase 2 matures this with priority ordering, listener-isolation guarantees,
- * and adapter for cli's existing `state-machine.ts` emitter. This stub exists
- * so Pipeline + StepRegistry compile against it.
+ * Properties:
+ *   - `on(hook, listener, opts?)` — returns unsubscribe handle; supports priority
+ *   - `once(hook, listener, opts?)` — auto-unsubscribes after first emit
+ *   - `off(hook, listener)` — explicit removal
+ *   - `emit(event)` — awaits all listeners (back-pressure honored). Listener
+ *     errors are isolated: every listener runs even if one throws; emit
+ *     rejects with an AggregateError after all complete.
+ *   - `emitFireAndForget(event)` — sync return; listener errors swallowed.
+ *
+ * Listener invocation order: descending priority, then registration order.
+ * Default priority = 0. Higher priority runs first. Examples:
+ *   - audit-log hook   → priority 100 (must persist before learners read it)
+ *   - learners hook    → priority 50
+ *   - dashboard state  → priority 10
  */
 
 import type { EventBus, EventListener, PipelineEvent, StepHookPoint } from './types.js';
 
-export class InMemoryEventBus implements EventBus {
-  private readonly listeners = new Map<StepHookPoint, EventListener[]>();
+export interface OnOptions {
+  /** Higher priority runs first. Default 0. */
+  priority?: number;
+}
 
-  on(hook: StepHookPoint, listener: EventListener): () => void {
-    const arr = this.listeners.get(hook) ?? [];
-    arr.push(listener);
-    this.listeners.set(hook, arr);
+interface Entry {
+  listener: EventListener;
+  priority: number;
+  /** Monotonic seq for FIFO tie-break at equal priority. */
+  seq: number;
+}
+
+export class InMemoryEventBus implements EventBus {
+  private readonly entries = new Map<StepHookPoint, Entry[]>();
+  private seqCounter = 0;
+
+  on(hook: StepHookPoint, listener: EventListener, opts: OnOptions = {}): () => void {
+    const arr = this.entries.get(hook) ?? [];
+    arr.push({ listener, priority: opts.priority ?? 0, seq: this.seqCounter++ });
+    arr.sort(comparePriority);
+    this.entries.set(hook, arr);
     return () => this.off(hook, listener);
   }
 
-  once(hook: StepHookPoint, listener: EventListener): () => void {
+  once(hook: StepHookPoint, listener: EventListener, opts: OnOptions = {}): () => void {
     const wrapped: EventListener = async (e) => {
       this.off(hook, wrapped);
       await listener(e);
     };
-    return this.on(hook, wrapped);
+    return this.on(hook, wrapped, opts);
   }
 
   off(hook: StepHookPoint, listener: EventListener): void {
-    const arr = this.listeners.get(hook);
+    const arr = this.entries.get(hook);
     if (!arr) return;
-    const idx = arr.indexOf(listener);
+    const idx = arr.findIndex((entry) => entry.listener === listener);
     if (idx >= 0) arr.splice(idx, 1);
   }
 
   async emit(event: PipelineEvent): Promise<void> {
-    const arr = this.listeners.get(event.hook);
+    const arr = this.entries.get(event.hook);
     if (!arr || arr.length === 0) return;
     const snapshot = arr.slice();
-    for (const listener of snapshot) {
-      await listener(event);
+    const errors: unknown[] = [];
+    for (const { listener } of snapshot) {
+      try {
+        await listener(event);
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, `EventBus: ${errors.length} listener(s) failed for ${event.hook}`);
     }
   }
 
   emitFireAndForget(event: PipelineEvent): void {
-    const arr = this.listeners.get(event.hook);
+    const arr = this.entries.get(event.hook);
     if (!arr || arr.length === 0) return;
-    for (const listener of arr.slice()) {
+    for (const { listener } of arr.slice()) {
       try {
         const ret = listener(event);
         if (ret && typeof (ret as Promise<void>).then === 'function') {
@@ -58,4 +92,9 @@ export class InMemoryEventBus implements EventBus {
       }
     }
   }
+}
+
+function comparePriority(a: Entry, b: Entry): number {
+  if (a.priority !== b.priority) return b.priority - a.priority;
+  return a.seq - b.seq;
 }
