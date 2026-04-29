@@ -33,6 +33,7 @@
     "@opentelemetry/sdk-trace-base": "^2.0.0",
     "@opentelemetry/sdk-trace-node": "^2.0.0",
     "@opentelemetry/semantic-conventions": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
