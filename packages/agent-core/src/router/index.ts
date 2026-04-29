@@ -45,3 +45,9 @@ export {
   mergeWithDefaults,
 } from './config-loader.js';
 export type { LoadRouterConfigOptions } from './config-loader.js';
+export {
+  invokeWithSpans,
+  ROUTER_INVOKE_SPAN,
+  ROUTER_ATTEMPT_SPAN,
+  RouterAttr,
+} from './telemetry.js';
