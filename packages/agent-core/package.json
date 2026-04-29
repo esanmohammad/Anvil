@@ -21,9 +21,10 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && mkdir -p dist/data && cp src/data/model-prices.json dist/data/",
     "dev": "tsc -b --watch",
-    "test": "tsc -b && node --test dist/__tests__/*.test.js"
+    "test": "tsc -b && mkdir -p dist/data && cp src/data/model-prices.json dist/data/ && node --test dist/__tests__/*.test.js",
+    "refresh-cost-table": "node scripts/refresh-cost-table.mjs"
   },
   "dependencies": {},
   "devDependencies": {

@@ -28,4 +28,5 @@ export { AdkAdapter } from './adk-adapter.js';
 export { FallbackAdapter } from './fallback-adapter.js';
 export * from './single-shot.js';
 export * from './agent/index.js';
+export * from './cost.js';
 export { VERSION } from './version.js';
