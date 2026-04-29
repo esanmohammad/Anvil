@@ -26,4 +26,5 @@
  */
 
 export * from './types.js';
+export * from './storage/index.js';
 export { VERSION } from './version.js';
