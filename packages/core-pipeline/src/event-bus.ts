@@ -17,12 +17,13 @@
  *   - dashboard state  → priority 10
  */
 
-import type { EventBus, EventListener, PipelineEvent, StepHookPoint } from './types.js';
-
-export interface OnOptions {
-  /** Higher priority runs first. Default 0. */
-  priority?: number;
-}
+import type {
+  EventBus,
+  EventListener,
+  EventListenerOptions,
+  PipelineEvent,
+  StepHookPoint,
+} from './types.js';
 
 interface Entry {
   listener: EventListener;
@@ -35,7 +36,7 @@ export class InMemoryEventBus implements EventBus {
   private readonly entries = new Map<StepHookPoint, Entry[]>();
   private seqCounter = 0;
 
-  on(hook: StepHookPoint, listener: EventListener, opts: OnOptions = {}): () => void {
+  on(hook: StepHookPoint, listener: EventListener, opts: EventListenerOptions = {}): () => void {
     const arr = this.entries.get(hook) ?? [];
     arr.push({ listener, priority: opts.priority ?? 0, seq: this.seqCounter++ });
     arr.sort(comparePriority);
@@ -43,7 +44,7 @@ export class InMemoryEventBus implements EventBus {
     return () => this.off(hook, listener);
   }
 
-  once(hook: StepHookPoint, listener: EventListener, opts: OnOptions = {}): () => void {
+  once(hook: StepHookPoint, listener: EventListener, opts: EventListenerOptions = {}): () => void {
     const wrapped: EventListener = async (e) => {
       this.off(hook, wrapped);
       await listener(e);

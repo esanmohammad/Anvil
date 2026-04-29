@@ -91,11 +91,21 @@ export interface PipelineEvent<P = unknown> {
 // EventBus
 // ---------------------------------------------------------------------------
 
+export interface EventListenerOptions {
+  /**
+   * Higher priority runs first. Default 0. Convention:
+   *   - audit-log hook   → 100 (must persist before learners read it)
+   *   - learners hook    → 50
+   *   - dashboard state  → 10
+   */
+  priority?: number;
+}
+
 export interface EventBus {
   /** Subscribe; returns an unsubscribe handle. */
-  on(hook: StepHookPoint, listener: EventListener): () => void;
+  on(hook: StepHookPoint, listener: EventListener, opts?: EventListenerOptions): () => void;
   /** Subscribe once; auto-unsubscribes after first emit. */
-  once(hook: StepHookPoint, listener: EventListener): () => void;
+  once(hook: StepHookPoint, listener: EventListener, opts?: EventListenerOptions): () => void;
   /** Remove a previously-registered listener. */
   off(hook: StepHookPoint, listener: EventListener): void;
   /** Emit and await all listeners (back-pressure honored). */

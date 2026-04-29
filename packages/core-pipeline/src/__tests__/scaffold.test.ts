@@ -64,7 +64,7 @@ describe('scaffold (Phase 1)', () => {
     assert.deepEqual(reg.steps().map((s) => s.id), ['a', 'c', 'd']);
   });
 
-  it('Pipeline.run() is intentionally unimplemented in Phase 1', async () => {
+  it('Pipeline.run() runs an empty registry to clean success', async () => {
     const reg = new InMemoryStepRegistry();
     const bus = new InMemoryEventBus();
     const p = new Pipeline({
@@ -73,6 +73,9 @@ describe('scaffold (Phase 1)', () => {
       runId: 'r1',
       workspaceDir: '/tmp/ws',
     });
-    await assert.rejects(p.run(), /not implemented/);
+    const result = await p.run();
+    assert.equal(result.status, 'success');
+    assert.equal(result.runId, 'r1');
+    assert.deepEqual(result.completedSteps, []);
   });
 });
