@@ -15,7 +15,25 @@
 
 import { JsonlAppendLog } from './jsonl-store.js';
 import { SqliteHotIndex, type SearchOpts } from './sqlite-store.js';
-import type { Memory } from '../types.js';
+import type { Memory, MemoryNamespace } from '../types.js';
+
+/**
+ * Phase 4 (plan §4.2.2) namespace-scoped query options. A `query(ns, opts)`
+ * call must restrict to memories whose namespace matches `ns` exactly on
+ * every defined field — undefined fields are wildcards, just like the
+ * underlying `SearchOpts.namespace` filter, but with `ns` provided
+ * up-front so callers can't forget.
+ */
+export interface NamespaceQueryOpts {
+  /** Filter by tags (OR semantics, like SqliteHotIndex.searchByTags). */
+  tags?: string[];
+  /** FTS5 BM25-ranked text search. */
+  text?: string;
+  /** Bi-temporal slice: memories valid at this ISO timestamp. */
+  validAt?: string;
+  /** Max rows to return. */
+  limit?: number;
+}
 
 export interface OpenHybridOptions {
   jsonlPath: string;
@@ -82,6 +100,76 @@ export class HybridMemoryStore {
 
   pruneExpired(now?: string): number {
     return this.sqlite.pruneExpired(now);
+  }
+
+  /**
+   * Phase 4 namespace-scoped read. Picks one of the underlying
+   * SqliteHotIndex queries based on which `opts` field is set, applying
+   * the namespace filter to every candidate path. Precedence: `text` →
+   * `tags` → `validAt` → "all in namespace".
+   */
+  query(ns: MemoryNamespace, opts: NamespaceQueryOpts = {}): Memory[] {
+    const search: SearchOpts = { limit: opts.limit, namespace: ns };
+    if (opts.text && opts.text.trim().length > 0) {
+      return this.sqlite.searchByText(opts.text, search);
+    }
+    if (opts.tags && opts.tags.length > 0) {
+      return this.sqlite.searchByTags(opts.tags, search);
+    }
+    if (opts.validAt) {
+      return this.sqlite.validAtTime(opts.validAt, search);
+    }
+    return this.allInNamespace(ns, opts.limit);
+  }
+
+  /**
+   * Cross-namespace admin query — same shape as `query` but skips the
+   * namespace filter. Use for migrations, dashboards, and `--scope=*`
+   * cli flags.
+   */
+  queryAll(opts: NamespaceQueryOpts = {}): Memory[] {
+    const search: SearchOpts = { limit: opts.limit };
+    if (opts.text && opts.text.trim().length > 0) {
+      return this.sqlite.searchByText(opts.text, search);
+    }
+    if (opts.tags && opts.tags.length > 0) {
+      return this.sqlite.searchByTags(opts.tags, search);
+    }
+    if (opts.validAt) {
+      return this.sqlite.validAtTime(opts.validAt, search);
+    }
+    return this.allInNamespace(undefined, opts.limit);
+  }
+
+  private allInNamespace(ns: MemoryNamespace | undefined, limit?: number): Memory[] {
+    const conds: string[] = [];
+    const bind: unknown[] = [];
+    if (ns) {
+      conds.push('namespace_scope = ?');
+      bind.push(ns.scope);
+      if (ns.projectId) {
+        conds.push('namespace_project = ?');
+        bind.push(ns.projectId);
+      }
+      if (ns.repoId) {
+        conds.push('namespace_repo = ?');
+        bind.push(ns.repoId);
+      }
+      if (ns.userId) {
+        conds.push('namespace_user = ?');
+        bind.push(ns.userId);
+      }
+    }
+    const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const limitClause = limit ? `LIMIT ${Number(limit) | 0}` : '';
+    const sql = `SELECT id FROM memory ${where} ORDER BY confidence DESC, last_accessed DESC ${limitClause}`;
+    const rows = this.sqlite.db.prepare(sql).all(...bind) as Array<{ id: string }>;
+    const out: Memory[] = [];
+    for (const { id } of rows) {
+      const m = this.sqlite.findById(id);
+      if (m) out.push(m);
+    }
+    return out;
   }
 
   /**

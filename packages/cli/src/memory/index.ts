@@ -33,7 +33,7 @@ export {
 } from '@anvil/memory-core/legacy/index.js';
 
 // cli-specific
-export { resolveMemoryPath } from './paths.js';
+export { resolveMemoryPath, resolveNamespacePath } from './paths.js';
 export { injectMemories } from './injector.js';
 export { trackMemoryUsage } from './usage-tracker.js';
 
@@ -50,7 +50,8 @@ import type {
   MemoryKind,
   MemoryQueryOpts,
 } from '@anvil/memory-core/legacy/index.js';
-import { resolveMemoryPath } from './paths.js';
+import type { MemoryNamespace } from '@anvil/memory-core';
+import { resolveMemoryPath, resolveNamespacePath } from './paths.js';
 
 /**
  * A MemoryStore wrapper that auto-prunes on list/query.
@@ -72,15 +73,28 @@ class ManagedMemoryStore extends MemoryStore {
 /**
  * Factory: create a managed MemoryStore with auto-pruning.
  *
- * Path-aware wrapper around memory-core's `MemoryStore` — resolves the
- * project's `~/.anvil/memory/<project>/` directory before constructing.
+ * Accepts either a legacy positional project name (`createMemoryStore('foo')`)
+ * or a v2 `MemoryNamespace` tuple (`createMemoryStore({scope: 'global'})`).
+ * The path-aware resolver picks the correct on-disk directory under
+ * `~/.anvil/memory/` for each form.
  */
-export function createMemoryStore(project?: string): MemoryStore {
-  const memPath = resolveMemoryPath(project);
+export function createMemoryStore(target?: string | MemoryNamespace): MemoryStore {
+  const memPath = isNamespace(target)
+    ? resolveNamespacePath(target)
+    : resolveMemoryPath(target);
   const config: MemoryStoreConfig = {
     path: memPath,
     maxSizeBytes: MAX_SIZE_BYTES,
     defaultTTLDays: DEFAULT_TTL_DAYS,
   };
   return new ManagedMemoryStore(config);
+}
+
+function isNamespace(v: unknown): v is MemoryNamespace {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    'scope' in v &&
+    typeof (v as { scope?: unknown }).scope === 'string'
+  );
 }

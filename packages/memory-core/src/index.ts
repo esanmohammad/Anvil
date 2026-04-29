@@ -27,4 +27,5 @@
 
 export * from './types.js';
 export * from './storage/index.js';
+export * from './namespace/index.js';
 export { VERSION } from './version.js';

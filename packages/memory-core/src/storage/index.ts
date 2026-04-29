@@ -11,4 +11,5 @@ export {
   HybridMemoryStore,
   type OpenHybridOptions,
   type RebuildResult,
+  type NamespaceQueryOpts,
 } from './hybrid-store.js';
