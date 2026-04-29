@@ -27,3 +27,11 @@ export {
   PLAN_RISK_ARTIFACT_ID,
 } from './plan-risk.step.js';
 export type { PlanRiskStepOptions } from './plan-risk.step.js';
+export {
+  createTaskBundlerStep,
+  TASK_BUNDLES_ARTIFACT_ID,
+} from './task-bundler.step.js';
+export type {
+  TaskBundlerStepOptions,
+  TaskBundleOutput,
+} from './task-bundler.step.js';
