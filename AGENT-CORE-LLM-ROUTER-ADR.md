@@ -134,7 +134,7 @@ Plan ships in 11 phases (0 through 10). Updated incrementally as phases land.
 | 0 — Audit + decisions | shipped | 75960d5 | — |
 | 1 — Scaffold router/ + types | shipped | 4220b86 | 11 router-scaffold tests; agent-core 92/92 |
 | 2 — Per-error retry engine | shipped | c898cbe | 12 retry tests; agent-core 104/104; deterministic clock + override classifiers |
-| 3 — Rate limiter | pending | — | — |
+| 3 — Rate limiter | shipped | b4870f0 | 8 rate-limiter tests; agent-core 112/112; cross-process SQLite mode deferred |
 | 4 — Spend ledger | pending | — | — |
 | 5 — Fallback chain + degradation | pending | — | — |
 | 6 — Circuit breaker | pending | — | — |
