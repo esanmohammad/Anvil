@@ -22,3 +22,8 @@ export {
   FEATURE_MANIFEST_STAGES,
 } from './feature-manifest.step.js';
 export type { FeatureManifestStepOptions } from './feature-manifest.step.js';
+export {
+  createPlanRiskStep,
+  PLAN_RISK_ARTIFACT_ID,
+} from './plan-risk.step.js';
+export type { PlanRiskStepOptions } from './plan-risk.step.js';
