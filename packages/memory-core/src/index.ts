@@ -31,4 +31,5 @@ export * from './namespace/index.js';
 export * from './drift/index.js';
 export * from './scrubber/index.js';
 export * from './retrieve/index.js';
+export * from './sleeptime/index.js';
 export { VERSION } from './version.js';
