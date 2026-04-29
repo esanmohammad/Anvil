@@ -127,6 +127,17 @@ import { discoverProviders, invalidateProviderCache } from './provider-registry.
 import { setDiscoveryResult } from './model-tier-resolver.js';
 import { autoLearn } from './pipeline-learner.js';
 import { generateConventions, saveConventionRules, loadConventionRules } from './convention-generator.js';
+import {
+  InMemoryEventBus,
+  attachAuditLogHook,
+  attachCostTrackerHook,
+  attachDashboardStateHook,
+  attachLearnersHook,
+} from '@anvil/core-pipeline';
+import {
+  attachPipelineBusSubscriber,
+  type PipelineStepDescriptor,
+} from './pipeline-bus-subscriber.js';
 
 // ── Paths ───────────────────────────────────────────────────────────────
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
@@ -4735,6 +4746,48 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       planSeed: options?.planSeed,
     }, memoryStore, kbManager);
 
+    // ── Phase 2: core-pipeline EventBus + lifecycle hooks ───────────────
+    // The bus is constructed per-run. Phase 4 will rewrite pipeline-runner to
+    // emit through this bus; until then no publishers exist on it and the
+    // hooks sit idle. The wiring is in place so Phase 4 lands as a swap.
+    // State-file polling stays as the cross-process fallback.
+    const initialState = runner.getState();
+    const pipelineBus = new InMemoryEventBus();
+    const stepDescriptors: PipelineStepDescriptor[] = initialState.stages.map((s) => ({
+      id: s.name,
+      name: s.name,
+      label: s.label,
+      perRepo: s.perRepo,
+    }));
+    const auditLogPath = join(RUNS_DIR, initialState.runId, 'audit.jsonl');
+    const auditHook = attachAuditLogHook(pipelineBus, { path: auditLogPath });
+    const stateHook = attachDashboardStateHook(pipelineBus, { path: STATE_FILE });
+    const costHook = attachCostTrackerHook(pipelineBus);
+    const learnersHook = attachLearnersHook(pipelineBus, {
+      project,
+      onLearnEvent: (event) => {
+        const payload = event.payload as { state?: PipelineRunState } | undefined;
+        if (payload?.state) autoLearn(memoryStore, payload.state);
+      },
+    });
+    const busSubscriber = attachPipelineBusSubscriber(pipelineBus, {
+      project,
+      feature,
+      featureSlug: initialState.featureSlug,
+      model: initialState.model,
+      repoNames: initialState.repoNames,
+      steps: stepDescriptors,
+      broadcast,
+    });
+    const detachBus = (): void => {
+      busSubscriber.unsubscribe();
+      auditHook.unsubscribe();
+      stateHook.unsubscribe();
+      stateHook.flush();
+      costHook.unsubscribe();
+      learnersHook.unsubscribe();
+    };
+
     // ── Feature-flagged policy hook: pause after configured stages ──
     {
       runner.setAfterStageHook(async (info) => {
@@ -5196,6 +5249,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       const completedRun = activeRuns.get(pipelineRunId);
       if (completedRun) completedRun.status = 'completed';
       activeRuns.delete(pipelineRunId);
+      detachBus();
       broadcastActiveRuns();
       broadcastRuns();
     });
@@ -5208,6 +5262,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       const failedRun = activeRuns.get(pipelineRunId);
       if (failedRun) failedRun.status = 'failed';
       // Keep failed runs in activeRuns — they are resumable and should stay visible
+      detachBus();
       broadcastActiveRuns();
       broadcastRuns();
     });
@@ -5216,6 +5271,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     runner.run().catch((err) => {
       console.error('[dashboard] Pipeline failed:', err);
       activePipelineRunner = null;
+      detachBus();
     });
   }
 

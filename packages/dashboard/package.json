@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "@anvil/agent-core": "*",
+    "@anvil/core-pipeline": "*",
     "@anvil/knowledge-core": "*",
     "lucide-react": "1.8.0",
     "react": "^19.1.0",
