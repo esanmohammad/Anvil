@@ -329,8 +329,8 @@ If none of the above exists, `loadSkills()` returns `[]` and the skills block is
 | Phase | Status | Commit | Deviations |
 |---|---|---|---|
 | 0 — Audit + ADR | ✅ shipped 2026-04-29 | a1caa7e | none |
-| 1 — Skill loader scaffold | ✅ shipped 2026-04-29 | _this commit_ | Added unit tests (parser/loader/activator, 11 tests) inline rather than deferring to Phase 6, matching the cadence used by the observability initiative; Phase 6 still owns integration tests. Added `yaml@^2.8.3` as a direct dep of `agent-core` (already hoisted via cli) instead of relying on workspace hoisting. |
-| 2 — Skill → system prompt integration | pending | — | — |
+| 1 — Skill loader scaffold | ✅ shipped 2026-04-29 | 61b9e44 | Added unit tests (parser/loader/activator, 11 tests) inline rather than deferring to Phase 6, matching the cadence used by the observability initiative; Phase 6 still owns integration tests. Added `yaml@^2.8.3` as a direct dep of `agent-core` (already hoisted via cli) instead of relying on workspace hoisting. |
+| 2 — Skill → system prompt integration | ✅ shipped 2026-04-29 | _this commit_ | Plan §2.3 said wire into `agent-manager.ts`; in reality `agent-manager.ts` is subprocess-lifecycle (no system-prompt build path). Shipped the helper surface (`render` + `resolveSkillsDir` + `applyToolPolicy` + `composeSkillContext`) for Phase 4's `runAgent` to consume; existing `runClaude`/`runGemini` paths in single-shot.ts remain unchanged because their callers don't ask for skills today. |
 | 3 — MCP client at agent layer | pending | — | — |
 | 4 — Headless `runAgent` entry | pending | — | — |
 | 5 — Tests + fixtures | pending | — | — |
