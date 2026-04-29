@@ -157,7 +157,7 @@ Plan ships in 10 phases (0 through 9). Updated incrementally as phases land.
 | 3 — Hook subscribers (audit, dashboard, learners, cost) | shipped | 5475dcb | 9 new tests (5 Pipeline walker + 4 hooks); Pipeline.run walker with full lifecycle + abort; ANVIL_USE_NEW_PIPELINE flag deferred to Phase 4 (no stages registered yet) |
 | 4 — First stage as `Step` | shipped | f6b246e | clarify Step + buildDefaultPipelineRegistry + ANVIL_USE_NEW_PIPELINE flag; 7 StepRegistry contract tests + Step<I,O> walker integration; jest ignores node:test workspaces |
 | 5 — Port remaining 7 stages | shipped | 32172b4 | requirements/project-requirements/specs/tasks/build/validate/ship Steps; per-project parallelism hint preserved through registry; ship's typed prInfos[] supersedes stdout regex |
-| 6 — Custom-stage compat | pending | — | — |
+| 6 — Custom-stage compat | shipped | 1a3a9b0 | factory.yaml shim + 5 jest tests; insertBefore > insertAfter > legacy after > append precedence; ts-jest preset added so jest no longer chokes on `import type` |
 | 7 — Sub-step generalization (auto-fix) | pending | — | — |
 | 8 — Delete if-tree | pending | — | — |
 | 9 — Tests + docs + ADR finalize | pending | — | — |
