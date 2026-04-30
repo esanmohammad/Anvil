@@ -153,4 +153,68 @@ Plan ships in 7 phases (0 through 6). Updated incrementally as phases land.
 | 4f.6 — workspace-ops helpers (git/shell-side ops) | landed | `5bd427a` | New `steps/workspace-ops.ts` exports `pullBaseBranchForRepos` (auto-detect main → master fallback), `runPostBuildGuards` (factory.yaml commands first, then language-detected gofmt/golangci-lint, prettier/eslint, black/ruff), `deployProject` (factory.yaml > `ANVIL_DEPLOY_CMD` env > skip), `createFeatureBranches` (`anvil/<slug>` per-repo + workspace-root fallback), and the leaf helpers `runSilent` + `fileExists`. Every helper takes an injectable `ShellRunner` (defaults to a real `execSync` wrapper) so tests swap in a fake without invoking real git/format/lint tools. `pipeline-runner.pullLatestMain`, `runPostBuildGuards`, `deployToRemote`, `createFeatureBranches` shrink to thin closures (~10–20 LOC each); the legacy `runSilent` + `fileExists` private methods are removed. `setupWorkspace` keeps its dashboard-state mutations (`state.stages[].repos`, `repoPaths`, `broadcastState` / `checkpoint`) — only the deterministic git/shell side moves. pipeline-runner: 2,959 → 2,823 LOC (−136). Behavior parity: 6 pre-existing failures, 0 new regressions. |
 | 4f.7 — prompt-builders lift (system + user prompts) | landed | `0a479b2` | New `steps/prompt-builders.ts` exports `buildProjectPrompt`, `buildRepoProjectPrompt`, `buildClarifyExplorePrompt`, `buildStagePrompt`, `buildRepoStagePrompt`, `buildPerTaskPrompt`, `buildManifestPrefix`, `warnIfSystemPromptOversized`, plus the two pure helpers `loadPersonaPromptSync` + `injectTemplateVars`. Each builder takes a `PromptBuilderContext` that bundles every dependency the legacy reached through `this.*` (config + state + 5 cache getters + 2 per-repo loaders + `kbManager` + `emit`). PipelineRunner introduces a single `getPromptContext()` private method that returns the snapshot — every prompt-builder method now becomes a 2-line forwarding stub. Behavior parity is preserved verbatim: every persona override, KB-on/off branch, manifest prefix, resume context, ship-stage label flag, per-task budget enforcement, and Phase 1 cache stability invariant flow through unchanged because the context's getters are the same memoised instances. The lift does NOT achieve the original ≤300 LOC façade target — that requires Pipeline.run() checkpoint/resume support that doesn't exist in core-pipeline yet. **Realistic outcome**: pipeline-runner is now a dashboard-specific orchestration shell (cache management, state machine, resume logic, broadcastState, after-stage hooks) over Steps for every agent-spawn path. pipeline-runner: 2,823 → 2,250 LOC (−573 — biggest single cut). Behavior parity: 6 pre-existing failures, 0 new regressions. **4f sub-phase series complete.** |
 | 5 — MemoryStore → memory-core replacement | landed | `d51fc0f` | `memory-store.ts` rewritten as a thin façade over `@anvil/memory-core`'s `HybridMemoryStore` (JSONL canonical + SQLite hot index). The 5 public ops (`add`, `replace`, `remove`, `getEntriesWithMeta`, `formatForPrompt`) keep their legacy `MemoryActionResult` return shapes verbatim (D10). Mapping per D6: `target='memory'` → `kind='semantic'` `subtype='manual'` namespace `{scope:'project',projectId}`; `target='user'` → `kind='profile'` namespace `{scope:'user',projectId}`. Char limits (4000 / 2000), substring-match for replace/remove (with multi-match detection), and dedup-on-add stay in the façade — memory-core stays generic. Existing `~/.anvil/memories/<project>/{MEMORY.md,USER.md}` are migrated once on first read/write per project (preserving the `<!-- added:<iso> -->` timestamp headers); the project dir then moves under `~/.anvil/memories/_archive_<ts>/<project>/` so subsequent launches don't re-import. `replace` does soft-delete via `HybridMemoryStore.invalidate` + add — preserves the audit trail. Phase 14 of memory-core's importer (`importLegacyMemories`) reads the cli's `memories.jsonl` shape, NOT the dashboard's markdown — the inline migration in this façade is the dashboard-specific bridge. `@anvil/memory-core` added to dashboard's `dependencies`. Storage path: `~/.anvil/memories/v2/{memories.jsonl,index.sqlite}`. Behavior parity: 6 pre-existing failures, 0 new regressions. New 17 parity tests cover the 5 ops + dedup + char-limit + namespace isolation + markdown migration round-trip + idempotent re-launch + `_archive_` dir creation. |
-| 6 — Tests + docs + ADR finalize | pending | — | — |
+| 6 — Tests + docs + ADR finalize | landed | _pending hash_ | New `packages/dashboard/README.md` documents the consolidation status, storage layout (incl. `~/.anvil/memories/v2/`), the markdown→sqlite migration path, the cost-ledger bridge with provider inference table, and the `pipeline-runner.ts` Step-delegation surface (14 modules under `server/steps/`). Closing summary section appended to this ADR (§ Cumulative outcome). **Acceptance items deferred to a follow-up release-branch task** (out of scope for a code-and-tests PR): (a) end-to-end dashboard-server integration test exercising one full pipeline run — requires AgentManager mocking + WS transcript fixtures that don't exist yet; (b) release-branch smoke run comparing fixture pipeline transcripts to a pre-Phase-1 baseline. The 6 acceptance items that ARE landable in code (bridge tests pass, bus subscriber tests pass, every Step has a unit test, memory-core façade tests pass, README, ADR finalize) are all complete. |
+
+---
+
+## 6. Cumulative outcome
+
+The consolidation series ran from Phase 0 (ADR draft) through Phase 6 (close-out). Substantive code phases: 1, 2, 3, 4a–4f.7, 5, 6.
+
+**LOC delta — `pipeline-runner.ts`:**
+
+| Checkpoint | LOC | Cumulative |
+|---|---|---|
+| Pre-Phase-1 baseline | 3,315 | — |
+| End of Phase 4f.1 | 3,306 | −9 |
+| End of Phase 4f.2 | 3,300 | −15 |
+| End of Phase 4f.3 | 3,234 | −81 |
+| End of Phase 4f.4 | 3,151 | −164 |
+| End of Phase 4f.5 | 2,959 | −356 |
+| End of Phase 4f.6 | 2,823 | −492 |
+| End of Phase 4f.7 | 2,250 | **−1,065 (−32%)** |
+
+**New modules under `packages/dashboard/server/steps/` (Phase 4):**
+
+`agent-spawner.ts`, `per-repo-stage.step.ts`, `per-repo-build.step.ts`, `clarify.step.ts`, `clarify-stage.step.ts`, `feature-manifest.step.ts`, `plan-risk.step.ts`, `task-bundler.step.ts`, `test-gen-stage.step.ts`, `fix-loop.step.ts`, `workspace-ops.ts`, `prompt-builders.ts`, `cost-budget.hook.ts`, `build-registry.ts`.
+
+**Test coverage gain (parity tests added across phases):**
+
+| Phase | Tests | Cumulative |
+|---|---|---|
+| 3 (cost-bridge) | 13 | 13 |
+| 4a (per-repo fanout) | 7 | 20 |
+| 4a (steps scaffold) | 2 | 22 |
+| 4b (feature-manifest) | 13 | 35 |
+| 4c (plan-risk) | 7 | 42 |
+| 4d (task-bundler) | 7 | 49 |
+| 4e (clarify Q&A + cost-budget) | 12 + 8 | 69 |
+| 4f.1 (agent-spawner) | 6 | 75 |
+| 4f.2 (per-repo-stage) | 15 | 90 |
+| 4f.3 (per-repo-build) | 16 | 106 |
+| 4f.4 (clarify-stage) | 12 | 118 |
+| 4f.5 (test-gen + fix-loop) | 24 | 142 |
+| 4f.6 (workspace-ops) | 20 | 162 |
+| 4f.7 (prompt-builders) | 22 | 184 |
+| 5 (memory-store façade) | 17 | **201** |
+
+Dashboard server suite at end of Phase 6: **642 tests, 6 pre-existing failures, 0 new regressions** introduced by the consolidation. The 6 known failures (project-loader.getModelForStage, applyConventionFilter ×3, review-evidence-gate.precedent) predate Phase 1 and are tracked separately.
+
+**What's NOT done (deferred):**
+
+- **≤300 LOC façade target (Phase 4f.7).** Requires `Pipeline.run()` checkpoint/resume support that doesn't exist in `core-pipeline` yet — this is a real feature gap, not a refactor. The realistic end state is the current 2,250-LOC orchestration shell that delegates every spawn-and-wait, prompt build, and shell-side operation to a Step factory or pure helper.
+- **End-to-end dashboard-server integration test** (Phase 6 acceptance item). Requires AgentManager mocking + WebSocket transcript fixtures that aren't wired today.
+- **Release-branch smoke run** (Phase 6 acceptance item). Requires a recorded pre-Phase-1 fixture pipeline transcript to diff against — a manual operations task.
+
+**What's done:**
+
+- Every agent-spawn path goes through `spawnAndWait` (Phase 4f.1).
+- Every per-repo + per-task fanout goes through a Step factory with `parallelism: 'per-repo'` (Phases 4a, 4f.2, 4f.3).
+- Every prompt is built by a pure function in `prompt-builders.ts` (Phase 4f.7).
+- Every git/shell-side operation is routed through an injectable `ShellRunner` (Phase 4f.6).
+- Memory storage is JSONL + SQLite via `@anvil/memory-core`'s `HybridMemoryStore` (Phase 5). Markdown migrates once and archives.
+- Cost recording mirrors into both `CostLedger` (NDJSON) and `SpendLedger` (SQLite) via `BridgedCostLedger` (Phase 3).
+- Dashboard subscribes to `core-pipeline`'s `EventBus` for cross-cutting concerns (Phase 2).
+- Dashboard adapters are bridges over `@anvil/agent-core`'s `LanguageModel` (Phase 1).
+
+The dashboard is now a **consumer** of `@anvil/{agent-core, core-pipeline, knowledge-core, memory-core}` for every load-bearing concern. The remaining 2,250 LOC in `pipeline-runner.ts` is dashboard-specific orchestration that has no analogue elsewhere — the cache-stability state machine, the WebSocket event vocabulary, the resume-aware iteration loop, and the after-stage hook surface.
