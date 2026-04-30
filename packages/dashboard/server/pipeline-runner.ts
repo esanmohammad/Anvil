@@ -21,7 +21,6 @@ import type { ProjectInfo } from './project-loader.js';
 import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
-import { budgetPromptContext } from './context-budget.js';
 import { resolveModelByTier } from './model-tier-resolver.js';
 import { parseTasks, bundleFiles } from './engineer-task-bundler.js';
 import type { ParsedTask } from './engineer-task-bundler.js';
@@ -61,6 +60,15 @@ import {
   deployProject,
   createFeatureBranches as createFeatureBranchesHelper,
 } from './steps/workspace-ops.js';
+import {
+  buildProjectPrompt as buildProjectPromptHelper,
+  buildRepoProjectPrompt as buildRepoProjectPromptHelper,
+  buildClarifyExplorePrompt as buildClarifyExplorePromptHelper,
+  buildStagePrompt as buildStagePromptHelper,
+  buildRepoStagePrompt as buildRepoStagePromptHelper,
+  buildPerTaskPrompt as buildPerTaskPromptHelper,
+  type PromptBuilderContext,
+} from './steps/prompt-builders.js';
 import {
   extractAcceptanceCriteria,
   extractAffectedRepos,
@@ -134,70 +142,9 @@ function refreshClaudeAuth(timeoutMs = 120_000): Promise<boolean> {
   });
 }
 
-// ── Persona prompt loader ────────────────────────────────────────────
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-/** Persona prompt cache */
-const personaPromptCache = new Map<string, string>();
-
-/**
- * Load a persona prompt from the CLI persona prompts directory.
- * Checks user overrides at ~/.anvil/personas/ first,
- * then falls back to bundled prompts in packages/cli/src/personas/prompts/.
- */
-function loadPersonaPromptSync(personaName: string): string {
-  if (personaPromptCache.has(personaName)) return personaPromptCache.get(personaName)!;
-
-  const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil');
-
-  // User override
-  const userPath = join(anvilHome, 'personas', `${personaName}.md`);
-  if (existsSync(userPath)) {
-    const content = readFileSync(userPath, 'utf-8');
-    personaPromptCache.set(personaName, content);
-    return content;
-  }
-
-  // Resolution paths in order of likelihood. The CLI bundles prompts into
-  // `cli/dist/personas/prompts/`; the monorepo dev tree keeps them in
-  // `cli/src/personas/prompts/`. `__dirname` at runtime is either
-  // `cli/dist/dashboard/server/` (bundled) or the original source tree.
-  const bundledPaths = [
-    // Bundled: cli/dist/dashboard/server/ → ../../personas/prompts/
-    join(__dirname, '..', '..', 'personas', 'prompts', `${personaName}.md`),
-    // Dev (from source): dashboard/server/ → ../../cli/src/personas/prompts/
-    join(__dirname, '..', '..', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
-    // Monorepo tree: dashboard/server/ → ../../../packages/cli/src/personas/prompts/
-    join(__dirname, '..', '..', '..', 'packages', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
-    // Bundled-but-deeper: cli/dist/dashboard/server/ → ../../../../packages/cli/src/personas/prompts/
-    join(__dirname, '..', '..', '..', '..', 'packages', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
-    // Bundled running from cli/dist: cli/dist/dashboard/server/ → ../../../src/personas/prompts/ (when src still present)
-    join(__dirname, '..', '..', '..', 'src', 'personas', 'prompts', `${personaName}.md`),
-  ];
-
-  for (const p of bundledPaths) {
-    if (existsSync(p)) {
-      const content = readFileSync(p, 'utf-8');
-      personaPromptCache.set(personaName, content);
-      return content;
-    }
-  }
-
-  console.warn(`[pipeline] Persona prompt not found for "${personaName}", using fallback. Checked: ${bundledPaths.join(', ')}`);
-  return '';
-}
-
-/**
- * Inject template variables into a persona prompt.
- */
-function injectTemplateVars(prompt: string, vars: Record<string, string>): string {
-  let result = prompt;
-  for (const [key, value] of Object.entries(vars)) {
-    result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
-  }
-  return result;
-}
+// Phase 4f.7: Persona prompt loader + injectTemplateVars now live in
+// `./steps/prompt-builders.ts` so the lifted prompt-builder functions can
+// share them. Kept as a re-export below for legacy callsites until 4f.8+.
 
 // ── Stage definitions ─────────────────────────────────────────────────
 
@@ -893,15 +840,36 @@ export class PipelineRunner extends EventEmitter {
    * efficiency degrades when prefixes balloon, so this fires a project-event
    * to flag regressions before they pile up. Pure telemetry — does not trim.
    */
-  private warnIfSystemPromptOversized(label: string, projectPrompt: string): void {
-    const bytes = Buffer.byteLength(projectPrompt, 'utf8');
-    if (bytes > 60_000) {
-      this.emit('project-event', {
-        source: 'context-budget',
-        message: `[${label}] system prompt is ${(bytes / 1024).toFixed(1)}KB (>60KB) — review KB tier and memory blocks`,
-        level: 'warn',
-      });
-    }
+  /**
+   * Build the bundled-dependency snapshot the lifted prompt-builders
+   * (Phase 4f.7) consume. Closes over PipelineRunner state so the cache
+   * stability invariants (P1 — byte-identical bytes across stages of one
+   * run) flow through unchanged.
+   */
+  private getPromptContext(): PromptBuilderContext {
+    return {
+      project: this.config.project,
+      feature: this.config.feature,
+      model: this.config.model,
+      workspaceDir: this.workspaceDir,
+      baseBranch: this.getBaseBranch(),
+      failureContext: this.config.failureContext,
+      actionType: this.config.actionType,
+      repoNames: this.state.repoNames,
+      featureSlug: this.state.featureSlug,
+      projectYaml: this.projectYaml,
+      projectInfo: this.projectInfo,
+      repoPaths: this.repoPaths,
+      getStableMemoryBlock: () => this.getStableMemoryBlock(),
+      getStableProjectYamlSlice: (n) => this.getStableProjectYamlSlice(n),
+      getStableKbBlock: (tier, repoName) => this.getStableKbBlock(tier, repoName),
+      getStableManifestBlock: () => this.getStableManifestBlock(),
+      getLockedKbTier: (stage) => this.getLockedKbTier(stage as StageDefinition),
+      loadRepoArtifacts: (repoName) => this.loadRepoArtifacts(repoName),
+      loadHighLevelRequirements: () => this.loadHighLevelRequirements(),
+      kbManager: this.kbManager,
+      emit: (event, payload) => this.emit(event, payload),
+    };
   }
 
   /**
@@ -1782,84 +1750,7 @@ export class PipelineRunner extends EventEmitter {
     task: ParsedTask,
     specsMd: string,
   ): string {
-    // Header — feature + context. Always kept (non-truncatable, top priority).
-    const headerLines: string[] = [
-      `Feature: "${this.config.feature}"`,
-      ``,
-      `## Context`,
-      `- Repository: "${repoName}" at ${repoPath}`,
-      `- Feature branch: anvil/${this.state.featureSlug}`,
-      `- You are implementing exactly one task: ${task.id}.`,
-    ];
-    if (task.prerequisites.length > 0) {
-      headerLines.push(`- Prerequisite tasks already complete: ${task.prerequisites.join(', ')}.`);
-    }
-
-    // Build each block as its own enforceBudget section so we can drop/truncate
-    // selectively when over budget. Priorities: header/instructions=100, task=90,
-    // files=80, spec slice=60, retry context=70.
-    const sections: PromptSection[] = [];
-    sections.push({ id: 'header', text: headerLines.join('\n'), priority: 100 });
-    sections.push({ id: 'task', text: `## Your task\n${task.block}`, priority: 90 });
-
-    if (task.specRef && specsMd) {
-      const slice = sliceSpecForRefs(specsMd, [task.specRef], { maxBytes: 8000, includeOverview: false });
-      if (slice.text) {
-        sections.push({ id: 'spec-slice', text: slice.text, priority: 60, truncatable: true });
-      }
-    }
-
-    if (task.files.length > 0) {
-      const bundle = bundleFiles({ repoPath, files: task.files, maxBytes: 80_000 });
-      if (bundle.included.length > 0) {
-        sections.push({
-          id: 'files',
-          text: `## Files for this task (pre-bundled — do NOT re-read)\n${bundle.block}`,
-          priority: 80,
-          truncatable: true,
-        });
-      }
-      if (bundle.skipped.length > 0) {
-        const lines = bundle.skipped.map((s) => `- ${s.path} (${s.reason})`).join('\n');
-        sections.push({
-          id: 'files-skipped',
-          text: `## Files NOT in bundle\nIf you need any of these, output \`NEED_FILE: path\` and stop. Do not guess contents.\n${lines}`,
-          priority: 75,
-        });
-      }
-    }
-
-    if (this.config.failureContext) {
-      sections.push({
-        id: 'retry-context',
-        text: `IMPORTANT — This is a RETRY. Previous failure:\n${this.config.failureContext}`,
-        priority: 70,
-        truncatable: true,
-      });
-    }
-
-    const instructionLines: string[] = [
-      `## Instructions`,
-      `Implement only ${task.id}. Read/Grep/Glob/Agent are disabled — every file you may need is in the <files> block above.`,
-      `- Use Edit/Write to modify files; use Bash only to run tests/build.`,
-      `- Bash discipline: run only the focused test for this task (e.g. \`npx vitest run path/to/file.test.ts\`, \`go test ./pkg/foo -run TestX\`). Do NOT run the full suite. Pipe verbose output through \`tail -50\` so the result fits in context.`,
-      `- If a file you need is missing from the bundle, output \`NEED_FILE: <path>\` on its own line and stop.`,
-      `- Output the tight summary format from your persona spec — do NOT dump file contents.`,
-      `- Do NOT make git commits — that happens in the ship stage.`,
-      `- Do NOT modify scope outside the files listed for this task. If you discover the task needs out-of-scope changes, flag them in the Notes section and stop.`,
-    ];
-    sections.push({ id: 'instructions', text: instructionLines.join('\n'), priority: 100 });
-
-    const result = enforceBudget(sections, { maxBytes: 120_000 });
-    if (result.trimmed) {
-      const dropped = result.decisions.filter((d) => d.action !== 'kept').map((d) => `${d.id}=${d.action}`).join(', ');
-      this.emit('project-event', {
-        source: 'context-budget',
-        message: `[build] ${repoName} ${task.id}: prompt over 120KB — ${dropped}`,
-        level: 'warn',
-      });
-    }
-    return result.text;
+    return buildPerTaskPromptHelper(this.getPromptContext(), repoName, repoPath, task, specsMd);
   }
 
   // ── Single-agent stage execution ───────────────────────────────────
@@ -2310,338 +2201,19 @@ export class PipelineRunner extends EventEmitter {
   // ── Prompt building ─────────────────────────────────────────────────
 
   private buildProjectPrompt(stage: StageDefinition): string {
-    // Load the full persona prompt from the markdown file
-    const personaPrompt = loadPersonaPromptSync(stage.persona);
-
-    if (personaPrompt) {
-      // Inject template variables
-      const repoList = this.state.repoNames.length > 0
-        ? this.state.repoNames.join(', ')
-        : '(single-repo or monorepo)';
-
-      // Phase 1: stable subsections come from memoised getters so the bytes
-      // are byte-identical across stages of the same run (cache stability).
-      const memoryBlock = this.getStableMemoryBlock();
-
-      // Project-wide KB (no repo target). Locked tier within a run; clarify
-      // and ship retain their special tiers per getLockedKbTier().
-      const tier = this.getLockedKbTier(stage);
-      const kb = this.getStableKbBlock(tier);
-      const knowledgeGraph = kb.content;
-      console.log(`[pipeline] buildProjectPrompt("${stage.name}"): KB tier=${tier}, source=${kb.sourceLabel}, ${knowledgeGraph.length} chars`);
-
-      // Emit explicit integration events for the output panel
-      if (knowledgeGraph) {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `Knowledge Base loaded for "${this.config.project}" (${knowledgeGraph.length} chars, source=${kb.sourceLabel}) → injecting into ${stage.persona} agent`,
-        });
-      } else {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `No Knowledge Base available for "${this.config.project}" — ${stage.persona} agent will explore codebase manually`,
-          level: 'warn',
-        });
-      }
-      const projectYamlSlice = this.getStableProjectYamlSlice(8000);
-      if (this.projectYaml && this.projectYaml.length > 10) {
-        this.emit('project-event', {
-          source: 'project-context',
-          message: `Project config loaded for "${this.config.project}" (${projectYamlSlice.length} chars) → injecting into ${stage.persona} agent`,
-        });
-      }
-
-      // Apply context budget to avoid exceeding provider token limits
-      const budgeted = budgetPromptContext({
-        featureDescription: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nRepositories: ${repoList}`,
-        stagePrompt: personaPrompt,
-        knowledgeBase: knowledgeGraph,
-        priorArtifacts: '', // Prior artifacts are in the user prompt, not project prompt
-        memory: memoryBlock,
-        projectYaml: projectYamlSlice,
-        overrides: '', // Will be added after injection
-        modelId: this.config.model,
-      });
-
-      if (budgeted.warning) {
-        console.warn(`[pipeline] Context budget: ${budgeted.warning}`);
-        this.emit('project-event', {
-          source: 'context-budget',
-          message: budgeted.warning,
-          level: 'warn',
-        });
-      }
-
-      const tokenInfo = `[Context: ~${Math.round(budgeted.totalTokens / 1000)}K / ${Math.round(budgeted.limit / 1000)}K tokens]`;
-      console.log(`[pipeline] ${stage.name} prompt ${tokenInfo}`);
-
-      // P11: drop empty-state placeholders.
-      const injected = injectTemplateVars(personaPrompt, {
-        project_yaml: budgeted.projectYaml,
-        task: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nRepositories: ${repoList}`,
-        conventions: '',
-        memories: budgeted.memory,
-        knowledge_graph: budgeted.knowledgeBase,
-        repo_context: `Project: ${this.config.project}\nRepositories: ${repoList}\nWorkspace: ${this.workspaceDir}`,
-        existing_code: budgeted.knowledgeBase ? '(see Knowledge Graph section above)' : '',
-      });
-
-      // Append pipeline-specific overrides
-      const overrides: string[] = [];
-
-      // Non-coding personas must NOT write files — output text only, pipeline persists artifacts
-      if (stage.persona !== 'engineer') {
-        overrides.push('CRITICAL — NO FILE WRITES: Do NOT use the Write tool, do NOT create files, do NOT run mkdir. Output your documents as plain text in your response. The pipeline will persist your output automatically. The workspace repos must contain ONLY source code changes, never markdown artifacts.');
-      }
-
-      if (knowledgeGraph) {
-        overrides.push(`CRITICAL — KNOWLEDGE BASE USAGE:
-A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Graph" section above. It contains:
-1. **Project-level synthesis** (if available): Cross-repo dependencies, shared concepts, and architecture overview for the entire "${this.config.project}" project.
-2. **Per-repo analysis**: AST-extracted modules, functions, imports, call graphs, and community clusters for each repository.
-
-**You MUST follow this traversal strategy:**
-- START by reading the Project Knowledge Base section (if present) to understand how repos relate to each other.
-- THEN read the per-repo sections relevant to your task for detailed module/function information.
-- ONLY read specific source files when you need exact implementation details (API signatures, data model fields) not covered by the KB.
-- When you use KB information, explicitly state it: e.g., "From the Knowledge Base, I can see that module X in repo Y handles Z..."
-- Do NOT broadly explore files when the KB already provides the architectural map.`);
-        if (stage.persona === 'analyst') {
-          overrides.push('IMPORTANT — ANALYST DIRECTIVE: The Knowledge Base provides sufficient architectural context for writing requirements. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Reference specific KB findings in your requirements (e.g., "Based on KB analysis of module X..."). Only read a specific file if you need to verify a concrete implementation detail.');
-        }
-      }
-      if (stage.persona === 'clarifier') {
-        overrides.push('IMPORTANT: Format each clarifying question as a separate numbered item (1. 2. 3. etc). Each question will be shown to the user one at a time in an interactive Q&A flow. Keep each question self-contained. Do NOT combine multiple questions into one item.');
-      }
-      if (stage.persona === 'engineer') {
-        overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
-      }
-      if (stage.persona === 'tester') {
-        overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
-        overrides.push('CRITICAL: You MUST fix ALL build errors, lint errors, and test failures before completing. Iterate until the codebase is clean. End your output with "VERDICT: PASS" or "VERDICT: FAIL" so the pipeline knows whether to proceed to shipping.');
-      }
-
-      const manifestPrefix = this.buildManifestPrefix();
-      const finalPrompt = manifestPrefix
-        + injected
-        + (overrides.length > 0 ? '\n\n' + overrides.join('\n') : '');
-      this.warnIfSystemPromptOversized(`${stage.persona}/${stage.name}`, finalPrompt);
-      return finalPrompt;
-    }
-
-    // Fallback if prompt file not found
-    return `You are the ${stage.persona} agent in an Anvil pipeline for the "${this.config.project}" project.\n\nProject YAML:\n${this.projectYaml.slice(0, 4000)}`;
-  }
-
-  /**
-   * Build the manifest-prefix block prepended to every system prompt.
-   * Combines the rendered manifest with the "consult before derive" rule
-   * so agents read both as one unit. Returns '' (no extra bytes) when the
-   * manifest is empty so prompt cache hits remain stable on early stages.
-   */
-  private buildManifestPrefix(): string {
-    const block = this.getStableManifestBlock();
-    if (!block) return '';
-    const discipline = [
-      'Manifest discipline:',
-      '- The feature manifest below is authoritative. If a field you would otherwise derive is already marked [final], use that value verbatim.',
-      '- Do not re-justify, re-validate, or paraphrase final fields. Move on to the unset/partial fields.',
-      "- If you find the manifest contradicts your reasoning, note the contradiction in `openQuestions` (don't silently override).",
-    ].join('\n');
-    const prefix = `## Feature manifest\n${block}\n\n${discipline}\n\n`;
-    // Telemetry — Phase 2 acceptance asks for visible variable-bytes signal so
-    // re-runs with a populated manifest can be compared to cold runs.
-    if (process.env.ANVIL_LOG_MANIFEST_BYTES === '1') {
-      console.log(`[pipeline] manifest prefix: ${Buffer.byteLength(prefix, 'utf8')} bytes`);
-    }
-    return prefix;
+    return buildProjectPromptHelper(this.getPromptContext(), stage);
   }
 
   private buildRepoProjectPrompt(stage: StageDefinition, repoName: string): string {
-    // Load the full persona prompt from the markdown file
-    const personaPrompt = loadPersonaPromptSync(stage.persona);
-
-    // Find repo info from project data
-    const repoInfo = this.projectInfo?.repos.find((r) => r.name === repoName);
-    const repoContext = repoInfo
-      ? `Repository: ${repoName}\n- GitHub: ${repoInfo.github}\n- Language: ${repoInfo.language}\n- Kind: ${repoInfo.repoKind}\n- Description: ${repoInfo.description}`
-      : `Repository: ${repoName}`;
-
-    if (personaPrompt) {
-      // Phase 1 cache stability: stable subsections come from memoised
-      // getters so byte-identical content is sent across stages of a run.
-      const memoryBlock = this.getStableMemoryBlock();
-      const tier = this.getLockedKbTier(stage);
-      const kb = this.getStableKbBlock(tier, repoName);
-      const knowledgeGraph = kb.content;
-      const kbSourceLabel = kb.sourceLabel;
-
-      // Emit explicit integration events for per-repo prompt
-      if (knowledgeGraph) {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `Knowledge Base loaded for repo "${repoName}" (${knowledgeGraph.length} chars, tier=${kbSourceLabel}) → injecting into ${stage.persona} agent`,
-        });
-      } else if (tier !== 'none') {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `No Knowledge Base available for repo "${repoName}" — ${stage.persona} agent will explore codebase manually`,
-          level: 'warn',
-        });
-      }
-      if (this.projectYaml && this.projectYaml.length > 10) {
-        this.emit('project-event', {
-          source: 'project-context',
-          message: `Project config loaded for "${this.config.project}" → injecting into ${stage.persona}/${repoName} agent`,
-        });
-      }
-
-      // Empty-placeholder strings are dropped (P11) — they're noise that the
-      // model has to read every spawn. The persona prompt already documents
-      // what each block contains; an empty value is self-evident.
-      const injected = injectTemplateVars(personaPrompt, {
-        project_yaml: this.getStableProjectYamlSlice(4000),
-        task: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nTarget repository: ${repoName}`,
-        conventions: '',
-        memories: memoryBlock,
-        knowledge_graph: knowledgeGraph,
-        repo_context: repoContext,
-        existing_code: knowledgeGraph
-          ? '(see Knowledge Graph section above)'
-          : '',
-      });
-
-      // Append pipeline-specific overrides
-      const overrides: string[] = [
-        `You are working specifically on the "${repoName}" repository within the "${this.config.project}" project.`,
-      ];
-
-      // Non-coding personas must NOT write files — output text only, pipeline persists artifacts
-      if (stage.persona !== 'engineer') {
-        overrides.push('CRITICAL — NO FILE WRITES: Do NOT use the Write tool, do NOT create files, do NOT run mkdir. Output your documents as plain text in your response. The pipeline will persist your output automatically. The workspace repos must contain ONLY source code changes, never markdown artifacts.');
-      }
-
-      if (knowledgeGraph) {
-        overrides.push(`CRITICAL — KNOWLEDGE BASE USAGE:
-The Knowledge Base above contains your target repo "${repoName}" (labeled "YOUR TARGET REPO") as the primary section, plus the Project Knowledge Base and other repos for cross-repo context.
-
-**You MUST follow this traversal strategy:**
-- START with the Project Knowledge Base section (if present) to understand how "${repoName}" relates to other repos in "${this.config.project}".
-- THEN read the "${repoName}" section in depth — it has AST-extracted modules, functions, imports, call graphs, and community clusters.
-- USE the other repo sections to understand integration points, shared interfaces, and API contracts.
-- ONLY read specific source files when you need exact implementation details not covered by the KB.
-- When you use KB information, explicitly state it: e.g., "From the Knowledge Base, I can see that module X handles Z..."
-- Do NOT broadly explore files when the KB already provides the architectural map.`);
-        if (stage.persona === 'analyst') {
-          overrides.push(`IMPORTANT — ANALYST DIRECTIVE: The Knowledge Base for "${repoName}" provides sufficient architectural context. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Reference specific KB findings in your requirements. Refer to other repos' KB sections for API contracts and integration points. Only read a specific file if you need to verify a concrete implementation detail.`);
-        }
-      }
-      if (stage.persona === 'engineer' || stage.persona === 'tester') {
-        overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
-      }
-
-      const manifestPrefix = this.buildManifestPrefix();
-      const finalPrompt = manifestPrefix + injected + '\n\n' + overrides.join('\n');
-      this.warnIfSystemPromptOversized(`${stage.persona}/${stage.name}:${repoName}`, finalPrompt);
-      return finalPrompt;
-    }
-
-    // Fallback if prompt file not found
-    return `You are the ${stage.persona} agent working on "${repoName}" in the "${this.config.project}" project.\n\n${repoContext}\n\nProject YAML:\n${this.projectYaml.slice(0, 2000)}`;
+    return buildRepoProjectPromptHelper(this.getPromptContext(), stage, repoName);
   }
 
   private buildClarifyExplorePrompt(): string {
-    const repoList = this.state.repoNames.length > 0
-      ? this.state.repoNames.join(', ')
-      : '';
-
-    // Load knowledge graph — prefer index + query context
-    let kbReport = '';
-    const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
-    if (indexPrompt) {
-      const queryCtx = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
-      kbReport = `${indexPrompt}\n\n---\n\n${queryCtx}`;
-    } else {
-      kbReport = this.kbManager?.getAllGraphReports(this.config.project) || '';
-    }
-    const hasKB = kbReport.length > 100;
-    console.log(`[pipeline] Clarify KB for "${this.config.project}": ${hasKB ? `${kbReport.length} chars` : 'none'} (${indexPrompt ? 'index-based' : 'full blob'})`);
-
-    const questionFormat = `IMPORTANT: The user will answer each question one at a time in an interactive conversation. Format each question as a separate numbered item so they can be presented individually.
-
-Format your response EXACTLY like this — each question must start on its own line with a number:
-1. **[Question topic]**: Your specific question here?
-2. **[Question topic]**: Your specific question here?
-3. **[Question topic]**: Your specific question here?
-
-Keep each question self-contained and clear. Do not combine multiple questions into one numbered item. End with: "Please answer these questions so I can proceed with detailed requirements."`;
-
-    if (hasKB) {
-      return `Feature: "${this.config.feature}"
-Project: ${this.config.project}
-Repositories: ${repoList}
-
-## Codebase Knowledge Graph
-The following is a pre-computed architectural analysis of the codebase(s). It contains:
-- Module/file structure and key components
-- Function signatures, class definitions, and their relationships
-- Import dependencies and call graphs
-- Topological communities (clusters of related code)
-- Hub components (highly connected critical nodes)
-
-USE THIS AS YOUR PRIMARY SOURCE OF UNDERSTANDING. Do NOT re-explore the entire codebase.
-Only read specific files if you need to verify a detail or understand implementation specifics
-that the knowledge graph doesn't cover.
-
-### How to read the Knowledge Graph
-- **Graph Statistics**: Node count, edge count, density — gives scale of the codebase
-- **Communities**: Topologically clustered modules — each is a logical domain boundary
-- **Hub Components (God Nodes)**: Most-connected components — critical integration points
-- **Surprising Connections**: Unexpected dependencies that may indicate coupling risks
-
-${kbReport}
-
----
-
-Based on this architectural understanding, generate 3-5 specific, thoughtful clarifying questions about the feature request that will help produce better requirements.
-
-${questionFormat}`;
-    }
-
-    // Fallback: no KB available, use original exploration approach
-    return `Feature: "${this.config.feature}"${repoList ? `\n\nThis project contains these repositories: ${repoList}. Explore them to understand the architecture.` : ''}
-
-Explore the codebase thoroughly. Understand the architecture, key files, APIs, data flows, and patterns. Then generate 3-5 specific, thoughtful clarifying questions that will help produce better requirements.
-
-${questionFormat}`;
+    return buildClarifyExplorePromptHelper(this.getPromptContext());
   }
 
   private buildStagePrompt(stage: StageDefinition, prevArtifact: string): string {
-    const feature = `Feature: "${this.config.feature}"`;
-    const prev = prevArtifact ? `\n\n## Previous stage output:\n${prevArtifact.slice(0, 12000)}` : '';
-    const resumeCtx = this.config.failureContext
-      ? `\n\nIMPORTANT — This is a RETRY. The previous run failed:\n${this.config.failureContext}\nFix the issues and proceed. All prior stage artifacts are included above.`
-      : '';
-    const repoList = this.state.repoNames.length > 0
-      ? `\nRepositories: ${this.state.repoNames.join(', ')}`
-      : '';
-
-    switch (stage.name) {
-      case 'requirements':
-        return `${feature}${repoList}\n\nProduce high-level requirements for this feature across the entire project. Identify which repositories need changes and why. Include success criteria.${prev}${resumeCtx}`;
-      case 'ship': {
-        const prLabels = ['anvil'];
-        const at = this.config.actionType ?? 'feature';
-        if (at === 'bugfix' || at === 'fix') prLabels.push('bug');
-        else if (at === 'spike' || at === 'review') prLabels.push(at);
-        else prLabels.push('enhancement');
-        const labelFlags = prLabels.map((l) => `--label "${l}"`).join(' ');
-        const baseBranch = this.getBaseBranch();
-        return `${feature}${repoList}\n\nShip the changes for each repository. The code has been validated — build, lint, and tests all pass.\n\nThe code is already on a feature branch "anvil/${this.state.featureSlug}". For each repo with changes:\n1. Run a final quick check: build and lint to confirm everything is clean\n2. If ANY errors remain, fix them before proceeding\n3. Stage and commit all changes with a clear commit message: "[anvil] ${this.config.feature}"\n4. Push the feature branch to origin\n5. Create a PR from the feature branch to "${baseBranch}" using: gh pr create --base "${baseBranch}" --head "anvil/${this.state.featureSlug}" ${labelFlags}\n\nDo NOT merge to ${baseBranch}. Only create PRs. Do NOT create a PR if the code has unfixed errors.${prev}${resumeCtx}`;
-      }
-      default:
-        return `${feature}${repoList}${prev}${resumeCtx}`;
-    }
+    return buildStagePromptHelper(this.getPromptContext(), stage, prevArtifact);
   }
 
   /**
@@ -2669,152 +2241,7 @@ ${questionFormat}`;
   }
 
   private buildRepoStagePrompt(stage: StageDefinition, repoName: string, prevArtifact: string): string {
-    const feature = `Feature: "${this.config.feature}"`;
-    const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
-
-    const resumeCtx = this.config.failureContext
-      ? `\n\nIMPORTANT — This is a RETRY. The previous run failed:\n${this.config.failureContext}\nFix the issues and proceed.`
-      : '';
-
-    // For early stages (repo-requirements, specs, tasks), use the combined prevArtifact
-    const prev = prevArtifact ? `\n\n## Prior stage output:\n${prevArtifact.slice(0, 12000)}` : '';
-
-    // High-level requirements (shared)
-    const hlReqs = this.loadHighLevelRequirements();
-    const hlReqsBlock = hlReqs ? `\n\n## High-Level Requirements\n${hlReqs.slice(0, 4000)}` : '';
-
-    // For build/validate, load THIS repo's specific artifacts
-    const repoArtifacts = this.loadRepoArtifacts(repoName);
-
-    switch (stage.name) {
-      case 'repo-requirements':
-        return `${feature}\n\nProduce requirements specific to the "${repoName}" repository. What changes does THIS repo need for this feature? Include success criteria.${hlReqsBlock}${prev}`;
-
-      case 'specs': {
-        // Use THIS repo's requirements if available, not the combined blob
-        const repoReqsBlock = repoArtifacts.requirements
-          ? `\n\n## Requirements for ${repoName}\n${repoArtifacts.requirements}`
-          : prev;
-        return `${feature}\n\nProduce a detailed technical specification for changes in "${repoName}". Include file paths, function signatures, API changes, data model changes, and how components interact.${hlReqsBlock}${repoReqsBlock}`;
-      }
-
-      case 'tasks': {
-        // Use THIS repo's spec, falling back to requirements
-        const specsBlock = repoArtifacts.specs
-          ? `\n\n## Technical Specification for ${repoName}\n${repoArtifacts.specs}`
-          : '';
-        const repoReqsFallback = !specsBlock && repoArtifacts.requirements
-          ? `\n\n## Requirements for ${repoName}\n${repoArtifacts.requirements}`
-          : '';
-        const context = specsBlock || repoReqsFallback || prev;
-        return `${feature}\n\nBreak down the spec into ordered implementation tasks for "${repoName}". Each task should include: file path, description, acceptance criteria. Order tasks so dependencies come first.${hlReqsBlock}${context}`;
-      }
-
-      case 'build': {
-        // Token-efficiency strategy (P1+P4): rather than dumping requirements +
-        // full specs + tasks + hlReqs and telling the engineer to "explore the
-        // codebase", we (a) inject only the slice of SPECS.md referenced by
-        // tasks, (b) pre-read every file in TASK Scope lines and inject them
-        // as a <files> block, and (c) instruct the engineer not to read or
-        // grep — Read/Grep/Glob are disabled at spawn (see runPerRepoStage).
-        const sections: string[] = [feature];
-
-        sections.push(`\n## Context`);
-        sections.push(`- Repository: "${repoName}" at ${repoPath}`);
-        sections.push(`- Feature branch: anvil/${this.state.featureSlug}`);
-
-        const parsedTasks = repoArtifacts.tasks ? parseTasks(repoArtifacts.tasks) : [];
-        const taskFiles: string[] = [];
-        const seen = new Set<string>();
-        for (const t of parsedTasks) {
-          for (const f of t.files) {
-            if (!seen.has(f)) { seen.add(f); taskFiles.push(f); }
-          }
-        }
-        const specRefs = parsedTasks.map((t) => t.specRef).filter((r): r is string => !!r);
-
-        if (repoArtifacts.tasks) {
-          sections.push(`\n## Implementation Tasks for ${repoName}\n${repoArtifacts.tasks}`);
-        }
-
-        if (repoArtifacts.specs && specRefs.length > 0) {
-          const slice = sliceSpecForRefs(repoArtifacts.specs, specRefs, { maxBytes: 20000 });
-          if (slice.text) sections.push(`\n${slice.text}`);
-        } else if (repoArtifacts.specs && !repoArtifacts.tasks) {
-          // Fallback: tasks not parseable, send the spec verbatim.
-          sections.push(`\n## Technical Specification for ${repoName}\n${repoArtifacts.specs}`);
-        }
-
-        if (taskFiles.length > 0) {
-          const bundle = bundleFiles({ repoPath, files: taskFiles, maxBytes: 200_000 });
-          if (bundle.included.length > 0) {
-            sections.push(`\n## Files referenced by tasks (pre-bundled — do NOT re-read)\n${bundle.block}`);
-          }
-          if (bundle.skipped.length > 0) {
-            const lines = bundle.skipped
-              .map((s) => `- ${s.path} (${s.reason})`)
-              .join('\n');
-            sections.push(`\n## Task files NOT in bundle\nIf you need any of these, output \`NEED_FILE: path\` and stop. Do not guess contents.\n${lines}`);
-          }
-        }
-
-        // Last-resort fallback when there are no parseable tasks or specs.
-        if (!repoArtifacts.tasks && !repoArtifacts.specs && prevArtifact) {
-          sections.push(`\n## Prior stage output\n${prevArtifact.slice(0, 12000)}`);
-        }
-
-        sections.push(`\n## Instructions`);
-        sections.push(`Implement each task in order. Read/Grep/Glob/Agent are disabled — every file you may need is in the <files> block above.`);
-        sections.push(`- Use Edit/Write to modify files; use Bash only to run tests/build.`);
-        sections.push(`- Bash discipline: prefer focused test commands (single file or test name). Pipe verbose output through \`tail -50\`. Do NOT run a whole monorepo suite at once.`);
-        sections.push(`- If a file you need is missing from the bundle, output \`NEED_FILE: <path>\` on its own line and stop.`);
-        sections.push(`- Write production-quality code; no pseudocode or placeholders.`);
-        sections.push(`- Run the build/test step to verify your changes work.`);
-        sections.push(`- Do NOT make git commits — that happens in the ship stage.`);
-        sections.push(`- Do NOT ask for clarification. Decide from the context above and proceed.`);
-
-        if (resumeCtx) sections.push(resumeCtx);
-        return sections.join('\n');
-      }
-
-      case 'validate': {
-        const sections: string[] = [feature];
-
-        sections.push(`\n## Context`);
-        sections.push(`- You are validating the "${repoName}" repository at: ${repoPath}`);
-        sections.push(`- Feature branch: anvil/${this.state.featureSlug}`);
-
-        if (repoArtifacts.tasks) {
-          sections.push(`\n## Expected Changes (Tasks)\n${repoArtifacts.tasks}`);
-        }
-        if (repoArtifacts.specs) {
-          sections.push(`\n## Technical Specification\n${repoArtifacts.specs.slice(0, 4000)}`);
-        }
-        if (!repoArtifacts.tasks && !repoArtifacts.specs && prevArtifact) {
-          sections.push(`\n## Prior stage output\n${prevArtifact.slice(0, 8000)}`);
-        }
-
-        sections.push(`\n## Validation Steps`);
-        sections.push(`You MUST ensure the code is fully clean before this stage completes:`);
-        sections.push(`1. Run the build (compile/type-check). Fix ALL errors.`);
-        sections.push(`2. Run the linter. Fix ALL lint warnings and errors.`);
-        sections.push(`3. Run the test suite. Fix ALL failing tests.`);
-        sections.push(`4. Repeat steps 1-3 until everything passes with zero errors.`);
-        sections.push(`5. Do NOT move on until build, lint, AND tests all pass.`);
-        sections.push(`\nIf you cannot fix an issue after 5 attempts, document it clearly as UNRESOLVED.`);
-        sections.push(`\nAt the end, output a clear verdict:`);
-        sections.push(`- VERDICT: PASS — if build, lint, and tests all pass`);
-        sections.push(`- VERDICT: FAIL — if any issues remain unresolved`);
-        sections.push(`\nDo NOT make git commits.`);
-        sections.push(`Do NOT ask for missing information. Use the codebase and context above to validate.`);
-
-        if (resumeCtx) sections.push(resumeCtx);
-        return sections.join('\n');
-      }
-
-      default:
-        return `${feature}\n\nWork on "${repoName}".${prev}${resumeCtx}`;
-    }
+    return buildRepoStagePromptHelper(this.getPromptContext(), stage, repoName, prevArtifact);
   }
 
   private broadcastState(): void {

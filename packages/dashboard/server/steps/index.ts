@@ -95,6 +95,24 @@ export type {
   ShellRunner,
   RepoCommands,
 } from './workspace-ops.js';
+export {
+  buildProjectPrompt,
+  buildRepoProjectPrompt,
+  buildClarifyExplorePrompt,
+  buildStagePrompt,
+  buildRepoStagePrompt,
+  buildPerTaskPrompt,
+  buildManifestPrefix,
+  warnIfSystemPromptOversized,
+  loadPersonaPromptSync,
+  injectTemplateVars,
+} from './prompt-builders.js';
+export type {
+  PromptBuilderContext,
+  StageInfo,
+  KbTier,
+  RepoArtifacts,
+} from './prompt-builders.js';
 export { attachCostBudgetHook } from './cost-budget.hook.js';
 export type {
   CostBudgetHookOptions,
