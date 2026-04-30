@@ -4810,11 +4810,29 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         // without a pipeline-policy.yaml get no pauses.
         const policy = loadPolicy(info.project, ANVIL_HOME);
         if (!policy) return;
-        const stageAsPipelineStage = (
-          ['plan', 'implement', 'review', 'test', 'ship'].includes(info.stageName)
-            ? info.stageName
-            : 'implement'
-        ) as 'plan' | 'implement' | 'review' | 'test' | 'ship';
+        // Map the runner's fine-grained stage taxonomy onto the policy's
+        // 5-stage taxonomy. Without this, stages like `validate` fall back
+        // to `implement` and silently re-trigger any path-rule that lists
+        // `implement` in pauseAfter — pausing the pipeline forever.
+        const stageAsPipelineStage = ((): 'plan' | 'implement' | 'review' | 'test' | 'ship' => {
+          switch (info.stageName) {
+            case 'clarify':
+            case 'requirements':
+            case 'repo-requirements':
+            case 'specs':
+            case 'tasks':
+              return 'plan';
+            case 'build':
+              return 'implement';
+            case 'test':
+            case 'validate':
+              return 'test';
+            case 'ship':
+              return 'ship';
+            default:
+              return 'implement';
+          }
+        })();
         const decision = evaluatePolicy(policy, {
           stage: stageAsPipelineStage,
           touchedFiles: info.touchedFiles ?? [],
