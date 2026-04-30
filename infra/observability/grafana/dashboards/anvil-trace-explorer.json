@@ -1,0 +1,56 @@
+{
+  "title": "Anvil — Trace Explorer",
+  "uid": "anvil-trace-explorer",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["anvil", "traces"],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "",
+  "panels": [
+    {
+      "id": 1,
+      "type": "traces",
+      "title": "Recent agent sessions (slowest first)",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 12 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "queryType": "traceqlSearch",
+          "query": "{ name = \"anvil.agent.session\" } | select(anvil.persona, anvil.project, anvil.run.id, anvil.agent.outcome, anvil.agent.total_cost_usd)",
+          "limit": 25,
+          "tableType": "traces"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "traces",
+      "title": "Slow tool calls (>1s)",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 10 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "queryType": "traceqlSearch",
+          "query": "{ name =~ \"gen_ai.tool.\" && duration > 1s }",
+          "limit": 25,
+          "tableType": "traces"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "traces",
+      "title": "Failed runs",
+      "gridPos": { "x": 0, "y": 22, "w": 24, "h": 10 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "queryType": "traceqlSearch",
+          "query": "{ name = \"anvil.agent.session\" && status = error }",
+          "limit": 25,
+          "tableType": "traces"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "title": "Anvil — Cache Effectiveness",
+  "uid": "anvil-cache-effectiveness",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["anvil", "cache"],
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Cache hit ratio (per call)",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 9 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "avg by (anvil_stage) (gen_ai_cache_hit_ratio)",
+          "legendFormat": "{{anvil_stage}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 20 } } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Cache-read tokens (window)",
+      "gridPos": { "x": 0, "y": 9, "w": 6, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(increase(gen_ai_client_token_usage_total{io_type=\"cache_read\"}[$__range]))" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Cache-write tokens (window)",
+      "gridPos": { "x": 6, "y": 9, "w": 6, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(increase(gen_ai_client_token_usage_total{io_type=\"cache_write\"}[$__range]))" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Estimated $ saved by cache",
+      "gridPos": { "x": 12, "y": 9, "w": 6, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(gen_ai_client_token_usage_total{io_type=\"cache_read\"}[$__range])) * 0.000003 - sum(increase(gen_ai_client_cost_usd_USD_total{component=\"cache_read\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4, "color": { "mode": "thresholds" } } }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Cache writes vs cache reads",
+      "gridPos": { "x": 18, "y": 9, "w": 6, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(gen_ai_client_token_usage_total{io_type=\"cache_read\"}[5m])) / clamp_min(sum(rate(gen_ai_client_token_usage_total{io_type=\"cache_write\"}[5m])), 1)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1 } }
+    }
+  ]
+}

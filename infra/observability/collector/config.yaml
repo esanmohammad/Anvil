@@ -1,0 +1,107 @@
+# OpenTelemetry Collector — receives OTLP from Anvil and fans out to
+# Tempo (traces), Prometheus (metrics), and Loki (logs).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        # CORS so a browser-side OTel SDK can hit the collector if we ever
+        # add one. No-op for the Node/server-side path.
+        cors:
+          allowed_origins: ["http://localhost:*"]
+
+processors:
+  # Drop traffic from this collector's own self-metrics scrape so we don't
+  # spam Anvil's trace store with infrastructure noise.
+  filter/drop_self:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.target"] == "/metrics"'
+
+  # Tag every span/metric/log with extra resource attributes. Anvil already
+  # ships service.name + service.version; here we add deployment.environment
+  # so prod vs dev rolls up cleanly later.
+  resource/enrich:
+    attributes:
+      - key: deployment.environment
+        value: local
+        action: upsert
+
+  # Batch + memory_limiter are the standard pair for any production setup.
+  # memory_limiter must come BEFORE batch so it can reject before queuing.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 25
+
+  batch:
+    send_batch_size: 1024
+    timeout: 1s
+
+exporters:
+  # Tempo — OTLP gRPC over the docker network.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Prometheus — uses the native OTLP receiver (Prom 3.x). Histograms are
+  # remapped to Prometheus-classic-buckets via the receiver's flags.
+  otlphttp/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+    tls:
+      insecure: true
+
+  # Loki — accepts OTLP logs natively as of 3.x.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+
+  # Debug exporter — uncomment under a pipeline to dump signals to stdout.
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/drop_self, resource/enrich, batch]
+      exporters: [otlp/tempo]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/enrich, batch]
+      exporters: [otlphttp/prometheus]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/enrich, batch]
+      exporters: [otlphttp/loki]

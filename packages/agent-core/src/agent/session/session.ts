@@ -9,12 +9,20 @@
 
 import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
+import {
+  context as otelContext,
+  trace,
+  SpanStatusCode,
+  type Context,
+  type Span,
+} from '@opentelemetry/api';
 import type {
   AdapterRequest,
   AgentAdapter,
   AgentAdapterFactory,
 } from './adapter.js';
 import { buildAdapterRequest } from './adapter.js';
+import { getTracer } from '../../telemetry/tracer.js';
 import type {
   AgentActivity,
   AgentProcessEvents,
@@ -57,6 +65,13 @@ export class AgentProcess extends EventEmitter {
   protected readonly factory: AgentAdapterFactory;
   protected readonly now: () => number;
   protected readonly setTimeoutImpl: (fn: () => void, ms: number) => void;
+  /** Parent span covering the agent's whole lifetime — initial run +
+   *  every resume. Each adapter.run() span becomes a child via
+   *  AsyncLocalStorage propagation when start()/sendInput run inside
+   *  `sessionContext`. */
+  private sessionSpan: Span | null = null;
+  private sessionContext: Context | null = null;
+  private sessionEnded = false;
 
   constructor(spec: SpawnConfig, opts: AgentProcessOpts) {
     super();
@@ -89,17 +104,21 @@ export class AgentProcess extends EventEmitter {
 
   /** Start the process. Spawns the underlying adapter and begins streaming. */
   start(): void {
+    this.openSessionSpan();
     const req = buildAdapterRequest(this.spec, this.sessionId);
-    this.adapter = this.factory(req);
+    const adapter = this.factory(req);
     if (
       typeof this.spec.maxOutputTokens === 'number'
       && this.spec.maxOutputTokens > 0
-      && typeof this.adapter.setMaxOutputTokens === 'function'
+      && typeof adapter.setMaxOutputTokens === 'function'
     ) {
-      this.adapter.setMaxOutputTokens(this.spec.maxOutputTokens);
+      adapter.setMaxOutputTokens(this.spec.maxOutputTokens);
     }
-    this.wireAdapter(this.adapter);
-    this.adapter.start();
+    this.adapter = adapter;
+    this.wireAdapter(adapter);
+    // Run the adapter inside the session-span's context so every
+    // adapter.run() span becomes a child of the session.
+    this.runWithSessionContext(() => adapter.start());
     this.state.status = 'running';
     this.state.startedAt = this.now();
   }
@@ -133,7 +152,10 @@ export class AgentProcess extends EventEmitter {
     }
     this.adapter = resumeAdapter;
     this.wireAdapter(resumeAdapter);
-    resumeAdapter.start();
+    // Resume runs inside the same session span as the initial start —
+    // both adapter calls are children of one trace, so a multi-turn
+    // session shows up as a single waterfall.
+    this.runWithSessionContext(() => resumeAdapter.start());
   }
 
   /** Kill the underlying adapter and mark the process as `killed`. */
@@ -145,6 +167,7 @@ export class AgentProcess extends EventEmitter {
     }
     this.state.status = 'killed';
     this.state.finishedAt = this.now();
+    this.closeSessionSpan('killed');
   }
 
   // ── State queries ────────────────────────────────────────────────────
@@ -172,6 +195,53 @@ export class AgentProcess extends EventEmitter {
 
   // ── Internals ────────────────────────────────────────────────────────
 
+  /** Open a `anvil.agent.session` span scoped to this AgentProcess. Idempotent
+   *  — once opened, lives until kill() / done / error. */
+  private openSessionSpan(): void {
+    if (this.sessionSpan) return;
+    const tracer = getTracer();
+    this.sessionSpan = tracer.startSpan('anvil.agent.session', {
+      attributes: {
+        'anvil.agent.id': this.id,
+        'anvil.agent.name': this.spec.name,
+        'anvil.persona': this.spec.persona,
+        'anvil.project': this.spec.project,
+        'anvil.stage': this.spec.stage,
+        'anvil.session.session_id': this.sessionId,
+        'anvil.run.id': this.spec.runId ?? '',
+        'gen_ai.system': 'anvil',
+        'gen_ai.request.model': this.spec.model,
+      },
+    });
+    this.sessionContext = trace.setSpan(otelContext.active(), this.sessionSpan);
+  }
+
+  /** End the session span exactly once. Idempotent. */
+  private closeSessionSpan(outcome: 'done' | 'killed' | 'error'): void {
+    if (this.sessionEnded || !this.sessionSpan) return;
+    this.sessionEnded = true;
+    this.sessionSpan.setAttribute('anvil.agent.outcome', outcome);
+    if (outcome === 'error' || outcome === 'killed') {
+      this.sessionSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: outcome === 'killed' ? 'agent killed' : 'agent errored',
+      });
+    } else {
+      this.sessionSpan.setStatus({ code: SpanStatusCode.OK });
+    }
+    this.sessionSpan.end();
+    this.sessionSpan = null;
+    this.sessionContext = null;
+  }
+
+  /** Run a callback inside the session span's context. Adapter calls made
+   *  inside this run with active context propagated via AsyncLocalStorage,
+   *  so every gen_ai.invoke + tool span lands as a child of the session. */
+  private runWithSessionContext<T>(fn: () => T): T {
+    if (!this.sessionContext) return fn();
+    return otelContext.with(this.sessionContext, fn);
+  }
+
   protected wireAdapter(adapter: AgentAdapter): void {
     adapter.on('content', (chunk: string) => {
       appendOutput(this.state, chunk);
@@ -193,7 +263,16 @@ export class AgentProcess extends EventEmitter {
       if (data.result) {
         appendOutput(this.state, data.result);
       }
+      // Stamp the running aggregate cost on the session span so a single
+      // trace shows total token / USD spend without re-summing children.
+      if (this.sessionSpan) {
+        this.sessionSpan.setAttribute('anvil.agent.total_cost_usd', this.state.cost.totalUsd);
+        this.sessionSpan.setAttribute('anvil.agent.total_input_tokens', this.state.cost.inputTokens);
+        this.sessionSpan.setAttribute('anvil.agent.total_output_tokens', this.state.cost.outputTokens);
+        this.sessionSpan.setAttribute('anvil.agent.total_cache_read_tokens', this.state.cost.cacheReadTokens);
+      }
       this.emit('result', data);
+      this.closeSessionSpan('done');
     });
     adapter.on('error-output', (text: string) => {
       if (!this.state.error) this.state.error = '';
@@ -213,6 +292,7 @@ export class AgentProcess extends EventEmitter {
           this.state.error = `Process exited with code ${code}`;
         }
         this.emit('exit', code);
+        this.closeSessionSpan('error');
         return;
       }
       // Code 0 but no result — wait briefly for late events, else flag
@@ -230,10 +310,12 @@ export class AgentProcess extends EventEmitter {
           this.state.error = this.state.error
             || 'Agent exited immediately with no output. Check workspace directory and adapter configuration.';
           this.emit('exit', code);
+          this.closeSessionSpan('error');
         } else {
           this.state.status = 'done';
           this.state.finishedAt = this.now();
           this.emit('exit', code);
+          this.closeSessionSpan('done');
         }
       }, POST_EXIT_GRACE_MS);
     });

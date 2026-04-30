@@ -24,6 +24,7 @@
 
 import { EventEmitter } from 'node:events';
 import { Writable } from 'node:stream';
+import { SpanStatusCode, type Span } from '@opentelemetry/api';
 import type {
   ModelAdapter,
   ModelAdapterConfig,
@@ -36,6 +37,8 @@ import type {
   AdapterCapabilities,
   AdapterCostInfo,
 } from './legacy-adapter-types.js';
+import { instrumentModelAdapter } from '../../telemetry/instrument.js';
+import { getTracer } from '../../telemetry/tracer.js';
 
 // ── Capability mapping ───────────────────────────────────────────────────
 
@@ -95,6 +98,13 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
   private isStarted = false;
   private isKilled = false;
   private activityCounter = 0;
+  /** Map of tool_use_id → open child span. Tool spans are opened when we
+   *  see a `tool_use` block in the assistant stream and closed when the
+   *  matching `tool_result` arrives in a user-role message. Surviving
+   *  entries on adapter end are closed with status=UNSET so they're still
+   *  visible — adapters that hang up before tool_result arrives are not
+   *  uncommon. */
+  private readonly openToolSpans = new Map<string, Span>();
 
   constructor(
     request: AdapterRequest,
@@ -103,7 +113,10 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
   ) {
     super();
     this.request = request;
-    this.adapter = adapter;
+    // Wrap the adapter so every `run()` emits an OTel `gen_ai.invoke` span.
+    // No-op when telemetry is disabled (loadTelemetryConfig returns the
+    // noop exporter and OTel's no-op tracer skips work).
+    this.adapter = instrumentModelAdapter(adapter);
     this.providerName = providerName;
     this.capabilitiesCache = mapCapabilities(adapter.capabilities);
   }
@@ -191,6 +204,11 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
       result = await this.adapter.run(this.buildAdapterConfig(), sink);
     } catch (err) {
       runError = err instanceof Error ? err : new Error(String(err));
+    } finally {
+      // Close any tool spans whose tool_result never arrived (e.g. adapter
+      // crashed mid-call). Must happen BEFORE the adapter run span ends
+      // so OTel captures them as siblings, not orphans.
+      this.closeOpenToolSpans();
     }
 
     sink.end();
@@ -261,9 +279,22 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
     } catch {
       return;
     }
-    if (parsed?.type !== 'assistant' || !Array.isArray(parsed.message?.content)) return;
 
-    for (const block of parsed.message.content) {
+    // Tool-use blocks come in `assistant` messages. The corresponding
+    // `tool_result` blocks come back in `user` messages. We pair them up
+    // by `tool_use_id` to materialise child spans.
+    if (parsed?.type === 'assistant' && Array.isArray(parsed.message?.content)) {
+      this.handleAssistantBlocks(parsed.message.content);
+      return;
+    }
+    if (parsed?.type === 'user' && Array.isArray(parsed.message?.content)) {
+      this.handleUserBlocks(parsed.message.content);
+      return;
+    }
+  }
+
+  private handleAssistantBlocks(blocks: Array<Record<string, unknown>>): void {
+    for (const block of blocks) {
       if (block.type === 'text' && typeof block.text === 'string') {
         this.emit('content', block.text);
         this.emit('activity', {
@@ -275,6 +306,7 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
         });
       } else if (block.type === 'tool_use' && typeof block.name === 'string') {
         const input = (block.input as Record<string, unknown>) ?? {};
+        const toolUseId = typeof block.id === 'string' ? block.id : undefined;
         this.emit('activity', {
           id: this.nextActivityId(),
           kind: 'tool_use',
@@ -283,6 +315,7 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
           content: JSON.stringify(input, null, 2),
           timestamp: Date.now(),
         });
+        this.openToolSpan(block.name, input, toolUseId);
       } else if (block.type === 'thinking' && typeof block.text === 'string') {
         this.emit('activity', {
           id: this.nextActivityId(),
@@ -293,5 +326,59 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
         });
       }
     }
+  }
+
+  private handleUserBlocks(blocks: Array<Record<string, unknown>>): void {
+    for (const block of blocks) {
+      if (block.type !== 'tool_result') continue;
+      const toolUseId = typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined;
+      if (!toolUseId) continue;
+      const isError = block.is_error === true;
+      this.closeToolSpan(toolUseId, { isError });
+    }
+  }
+
+  /** Open a child span for a tool_use block. The span lives in the active
+   *  `gen_ai.invoke` span's context — that's set up by instrumentModelAdapter
+   *  before adapter.run() starts streaming. We rely on Node's
+   *  AsyncLocalStorage to propagate context through the Writable callback. */
+  private openToolSpan(
+    name: string,
+    input: Record<string, unknown>,
+    toolUseId: string | undefined,
+  ): void {
+    if (!toolUseId) return; // Without an id we can't pair the result; skip.
+    const tracer = getTracer();
+    const span = tracer.startSpan(`gen_ai.tool.${name}`, {
+      attributes: {
+        'gen_ai.tool.name': name,
+        'gen_ai.tool.call.id': toolUseId,
+        'gen_ai.tool.input.summary': summarizeToolUse(name, input).slice(0, 256),
+      },
+    });
+    this.openToolSpans.set(toolUseId, span);
+  }
+
+  /** Close a tool span when its matching tool_result arrives. */
+  private closeToolSpan(toolUseId: string, result: { isError: boolean }): void {
+    const span = this.openToolSpans.get(toolUseId);
+    if (!span) return;
+    this.openToolSpans.delete(toolUseId);
+    if (result.isError) {
+      span.setStatus({ code: SpanStatusCode.ERROR });
+    } else {
+      span.setStatus({ code: SpanStatusCode.OK });
+    }
+    span.end();
+  }
+
+  /** Close any tool spans that never received a tool_result. Called from
+   *  runAdapter's finally block so abandoned spans don't linger. */
+  private closeOpenToolSpans(): void {
+    for (const span of this.openToolSpans.values()) {
+      span.setAttribute('gen_ai.tool.abandoned', true);
+      span.end();
+    }
+    this.openToolSpans.clear();
   }
 }

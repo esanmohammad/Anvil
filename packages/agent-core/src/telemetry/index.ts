@@ -6,7 +6,9 @@
  * instrumentation is applied internally at the registry seam.
  */
 
-export { getTracer, resetTracer, getTelemetryConfig } from './tracer.js';
+export { getTracer, resetTracer, shutdownTracer, getTelemetryConfig } from './tracer.js';
+export { recordGenAiCall, shutdownMetrics } from './metrics.js';
+export type { GenAiCallMetrics } from './metrics.js';
 export { loadTelemetryConfig } from './config.js';
 export type { TelemetryConfig } from './config.js';
 export { GenAi } from './attributes.js';

@@ -1,9 +1,35 @@
 import { Command } from 'commander';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { parse as parseYaml } from 'yaml';
 import { info, error } from '../logger.js';
+
+/**
+ * Load `~/.anvil/observability.yaml` (if present) and apply its top-level
+ * scalar entries to process.env. Shell-exported values win — we never
+ * overwrite an env var that is already set. Lets users start the dashboard
+ * with `anvil-loc dashboard` and still get OTLP tracing into the local
+ * Jaeger stack at infra/observability/docker-compose.yml.
+ */
+function loadObservabilityConfig(): void {
+  const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil');
+  const cfgPath = join(anvilHome, 'observability.yaml');
+  if (!existsSync(cfgPath)) return;
+  try {
+    const parsed = parseYaml(readFileSync(cfgPath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (process.env[key] !== undefined) continue;
+      if (value === null || value === undefined) continue;
+      process.env[key] = String(value);
+    }
+  } catch (err) {
+    error(`Failed to parse ${cfgPath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 /**
  * Resolve the dashboard directory.
@@ -42,6 +68,8 @@ export const dashboardCommand = new Command('dashboard')
   .option('-p, --port <port>', 'Port to serve on', '5173')
   .option('--no-open', 'Do not open browser automatically')
   .action(async (opts: { port: string; open: boolean }) => {
+    loadObservabilityConfig();
+
     const resolved = resolveDashboardDir();
 
     if (!resolved) {

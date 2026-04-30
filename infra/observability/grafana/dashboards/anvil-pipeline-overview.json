@@ -1,0 +1,117 @@
+{
+  "title": "Anvil — Pipeline Overview",
+  "uid": "anvil-pipeline-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["anvil"],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(gen_ai_client_token_usage_total, job)",
+        "current": { "text": "anvil/anvil-agent-core", "value": "anvil/anvil-agent-core" },
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Tokens / sec by io_type",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (io_type) (rate(gen_ai_client_token_usage_total{job=~\"$service\"}[1m]))",
+          "legendFormat": "{{io_type}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } } }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "USD spend / min (total)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (anvil_stage) (rate(gen_ai_client_cost_usd_USD_total{job=~\"$service\",component=\"total\"}[1m]) * 60)",
+          "legendFormat": "{{anvil_stage}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "custom": { "drawStyle": "bars", "fillOpacity": 60 } } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Operation duration (p50 / p95 / p99)",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, anvil_stage) (rate(gen_ai_client_operation_duration_milliseconds_bucket{job=~\"$service\"}[5m])))",
+          "legendFormat": "p50 — {{anvil_stage}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, anvil_stage) (rate(gen_ai_client_operation_duration_milliseconds_bucket{job=~\"$service\"}[5m])))",
+          "legendFormat": "p95 — {{anvil_stage}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, anvil_stage) (rate(gen_ai_client_operation_duration_milliseconds_bucket{job=~\"$service\"}[5m])))",
+          "legendFormat": "p99 — {{anvil_stage}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "lineWidth": 2 } } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Total spend (window)",
+      "gridPos": { "x": 12, "y": 8, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(gen_ai_client_cost_usd_USD_total{job=~\"$service\",component=\"total\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Calls (window)",
+      "gridPos": { "x": 18, "y": 8, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(gen_ai_client_operation_duration_milliseconds_count{job=~\"$service\"}[$__range]))"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Spend by stage × persona × model",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (anvil_stage, anvil_persona, gen_ai_request_model) (increase(gen_ai_client_cost_usd_USD_total{job=~\"$service\",component=\"total\"}[$__range]))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "indexByName": { "anvil_stage": 0, "anvil_persona": 1, "gen_ai_request_model": 2, "Value": 3 } } }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+# Single-binary Loki — local filesystem storage. Loki 3.x accepts OTLP
+# logs natively at /otlp/v1/logs.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  ring:
+    kvstore:
+      store: inmemory
+    instance_addr: 127.0.0.1
+  replication_factor: 1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: 2025-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 48h
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  allow_structured_metadata: true
+  volume_enabled: true
+  otlp_config:
+    resource_attributes:
+      attributes_config:
+        - action: index_label
+          attributes:
+            - service.name
+            - service.namespace
+            - deployment.environment
+
+compactor:
+  working_directory: /loki/compactor
+  delete_request_store: filesystem
+  retention_enabled: true
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules

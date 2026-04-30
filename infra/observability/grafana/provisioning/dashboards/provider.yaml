@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: anvil
+    orgId: 1
+    folder: Anvil
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 15
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

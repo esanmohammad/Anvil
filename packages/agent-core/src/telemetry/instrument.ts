@@ -26,6 +26,7 @@ import type {
 import { getTracer } from './tracer.js';
 import { loadTelemetryConfig } from './config.js';
 import { GenAi } from './attributes.js';
+import { recordGenAiCall } from './metrics.js';
 import { calculateCostBreakdown } from '../cost.js';
 
 /**
@@ -193,6 +194,29 @@ class InstrumentedModelAdapter implements ModelAdapter {
               result.output.slice(0, PROMPT_TRUNCATE_BYTES),
             );
           }
+          // Mirror the span attrs into OTel metrics so Grafana can build
+          // counter/histogram dashboards. Failures here must not bubble —
+          // a metrics emit issue should never break the agent run.
+          try {
+            recordGenAiCall({
+              system: this.inner.provider,
+              requestModel: config.model,
+              responseModel: result.model,
+              stage: config.stage,
+              persona: config.persona,
+              inputTokens: result.inputTokens,
+              outputTokens: result.outputTokens,
+              cacheReadTokens: result.cacheReadTokens ?? 0,
+              cacheWriteTokens: result.cacheWriteTokens ?? 0,
+              reasoningTokens: result.reasoningTokens,
+              costInputUsd: bd.inputUsd,
+              costOutputUsd: bd.outputUsd,
+              costCacheReadUsd: bd.cacheReadUsd,
+              costCacheWriteUsd: bd.cacheWriteUsd,
+              costTotalUsd: totalUsd,
+              durationMs: result.durationMs ?? 0,
+            });
+          } catch { /* never let metrics break a run */ }
           span.setStatus({ code: SpanStatusCode.OK });
           return result;
         } catch (err) {

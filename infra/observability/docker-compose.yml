@@ -1,0 +1,113 @@
+name: anvil-observability
+
+networks:
+  obs:
+    driver: bridge
+
+volumes:
+  tempo-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+
+services:
+  # ── OpenTelemetry Collector ──────────────────────────────────────────────
+  # Single ingress for traces, metrics, and logs. Fans out to Tempo / Prom /
+  # Loki and adds resource enrichment + batching. Exposed on host so Anvil
+  # ships to localhost:4317/4318.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    container_name: anvil-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./collector/config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health_check
+      - "8888:8888"   # collector self-metrics
+    depends_on:
+      tempo:
+        condition: service_started
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks: [obs]
+
+  # ── Tempo (traces) ───────────────────────────────────────────────────────
+  tempo:
+    image: grafana/tempo:2.7.2
+    container_name: anvil-tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    user: "0"
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP API
+    networks: [obs]
+
+  # ── Prometheus (metrics) ─────────────────────────────────────────────────
+  # 3.x has a native OTLP write receiver enabled via flag below.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: anvil-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-otlp-receiver
+      - --web.enable-remote-write-receiver
+      - --web.enable-lifecycle
+      - --enable-feature=native-histograms
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [obs]
+
+  # ── Loki (logs) ──────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: anvil-loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    user: "0"
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    networks: [obs]
+
+  # ── Grafana (UI) ─────────────────────────────────────────────────────────
+  # Anonymous + admin role so you can hit http://localhost:3001 with no login.
+  grafana:
+    image: grafana/grafana:11.6.5
+    container_name: anvil-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor traceQLStreaming metricsSummary"
+      GF_LOG_LEVEL: "warn"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      tempo:
+        condition: service_started
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+    networks: [obs]
