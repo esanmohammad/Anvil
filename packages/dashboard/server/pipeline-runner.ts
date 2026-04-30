@@ -23,7 +23,7 @@ import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import { budgetPromptContext } from './context-budget.js';
 import { resolveModelByTier } from './model-tier-resolver.js';
-import { parseTasks, bundleFiles, groupTasksForExecution } from './engineer-task-bundler.js';
+import { parseTasks, bundleFiles } from './engineer-task-bundler.js';
 import type { ParsedTask } from './engineer-task-bundler.js';
 import { sliceSpecForRefs } from './engineer-spec-slicer.js';
 import { enforceBudget } from './prompt-budget.js';
@@ -43,6 +43,9 @@ import {
   runPerRepoStageForRepo,
   combinePerRepoArtifacts,
 } from './steps/per-repo-stage.step.js';
+import {
+  runBuildForOneRepo,
+} from './steps/per-repo-build.step.js';
 import {
   extractAcceptanceCriteria,
   extractAffectedRepos,
@@ -1829,115 +1832,46 @@ export class PipelineRunner extends EventEmitter {
     projectPrompt: string,
   ): Promise<{ artifact: string; cost: number }> {
     const repoArtifacts = this.loadRepoArtifacts(repoName);
-    const tasks = repoArtifacts.tasks ? parseTasks(repoArtifacts.tasks) : [];
 
-    if (tasks.length === 0) {
-      // Fallback: no parseable tasks → single repo-wide spawn (the existing P1 path).
-      const prompt = this.buildRepoStagePrompt(stage, repoName, '');
-      const agent = this.agentManager.spawn({
-        name: `${stage.persona}-${repoName}`,
-        persona: stage.persona,
-        project: this.config.project,
-        stage: `${stage.name}:${repoName}`,
-        prompt,
-        model: this.resolveModelForStage(stage.name),
-        cwd: repoPath,
-        projectPrompt,
-        permissionMode: 'bypassPermissions',
-        disallowedTools: ['Read', 'Grep', 'Glob', 'Agent'],
-        maxOutputTokens: maxOutputTokensForStage(stage.name),
-      });
-      const repoStateForFallback = this.state.stages[stageIndex].repos[repoIdx];
-      if (repoStateForFallback) repoStateForFallback.agentId = agent.id;
-      this.broadcastState();
-      const res = await this.waitForAgent(agent.id);
-      const repoStateAfter = this.state.stages[stageIndex].repos[repoIdx];
-      if (repoStateAfter) {
-        repoStateAfter.status = 'completed';
-        repoStateAfter.cost = res.cost;
-        repoStateAfter.artifact = res.artifact;
-      }
-      this.broadcastState();
-      this.checkpoint();
-      this.writeRepoArtifact(stage, repoName, res.artifact);
-      return res;
-    }
-
-    const groups = groupTasksForExecution(tasks);
-    this.emit('project-event', {
-      source: 'pipeline',
-      message: `[build] ${repoName}: ${tasks.length} task${tasks.length === 1 ? '' : 's'} in ${groups.length} group${groups.length === 1 ? '' : 's'} (per-task spawning)`,
-    });
-
-    const taskOutputs: { id: string; title: string; artifact: string }[] = [];
-    let totalCost = 0;
-
-    for (const group of groups) {
-      if (this.cancelled) throw new Error('Pipeline cancelled');
-
-      const groupPromises = group.tasks.map((task) => {
-        const prompt = this.buildPerTaskPrompt(stage, repoName, repoPath, task, repoArtifacts.specs);
-        const agent = this.agentManager.spawn({
-          name: `engineer-${repoName}-${task.id}`,
-          persona: stage.persona,
-          project: this.config.project,
-          stage: `${stage.name}:${repoName}:${task.id}`,
-          prompt,
-          model: this.resolveModelForStage(stage.name),
-          cwd: repoPath,
-          projectPrompt,
-          permissionMode: 'bypassPermissions',
-          disallowedTools: ['Read', 'Grep', 'Glob', 'Agent'],
-          maxOutputTokens: maxOutputTokensForStage(stage.name),
-        });
-
-        const repoStateForSpawn = this.state.stages[stageIndex].repos[repoIdx];
-        if (repoStateForSpawn) repoStateForSpawn.agentId = agent.id;
+    const result = await runBuildForOneRepo({
+      agentManager: this.agentManager,
+      project: this.config.project,
+      stageName: stage.name,
+      persona: stage.persona,
+      model: this.resolveModelForStage(stage.name),
+      maxOutputTokens: maxOutputTokensForStage(stage.name),
+      repoName,
+      repoPath,
+      projectPrompt,
+      tasksMarkdown: repoArtifacts.tasks,
+      buildPerTaskPrompt: (task) =>
+        this.buildPerTaskPrompt(stage, repoName, repoPath, task, repoArtifacts.specs),
+      buildFallbackPrompt: () => this.buildRepoStagePrompt(stage, repoName, ''),
+      isCancelled: () => this.cancelled,
+      onAgentSpawned: (agentId) => {
+        const repoState = this.state.stages[stageIndex].repos[repoIdx];
+        if (repoState) repoState.agentId = agentId;
         this.broadcastState();
-
-        return this.waitForAgent(agent.id)
-          .then((res) => {
-            totalCost += res.cost;
-            taskOutputs.push({ id: task.id, title: task.title, artifact: res.artifact });
-            this.emit('project-event', {
-              source: 'pipeline',
-              message: `[build] ${repoName} ${task.id} done (${(res.cost * 100).toFixed(2)}¢)`,
-            });
-          })
-          .catch((err) => {
-            const msg = err instanceof Error ? err.message : String(err);
-            taskOutputs.push({
-              id: task.id,
-              title: task.title,
-              artifact: `## Implementation: ${task.id} — ${task.title}\n\nUNRESOLVED: ${msg}\n`,
-            });
-            this.emit('project-event', {
-              source: 'pipeline',
-              message: `[build] ${repoName} ${task.id} failed: ${msg}`,
-              level: 'warn',
-            });
-          });
-      });
-
-      await Promise.all(groupPromises);
-    }
-
-    // Sort outputs by original task order so the artifact reads top-to-bottom.
-    const idOrder = new Map(tasks.map((t, i) => [t.id, i]));
-    taskOutputs.sort((a, b) => (idOrder.get(a.id) ?? 0) - (idOrder.get(b.id) ?? 0));
-    const combined = taskOutputs.map((t) => t.artifact.trim()).join('\n\n---\n\n');
+      },
+      onTruncation: (agentName, outputTokens) => {
+        this.handleOutputTruncation(agentName, outputTokens);
+      },
+      onProjectEvent: (level, message) => {
+        this.emit('project-event', { source: 'pipeline', message, level });
+      },
+    });
 
     const repoStateDone = this.state.stages[stageIndex].repos[repoIdx];
     if (repoStateDone) {
       repoStateDone.status = 'completed';
-      repoStateDone.cost = totalCost;
-      repoStateDone.artifact = combined;
+      repoStateDone.cost = result.cost;
+      repoStateDone.artifact = result.artifact;
     }
     this.broadcastState();
     this.checkpoint();
-    this.writeRepoArtifact(stage, repoName, combined);
+    this.writeRepoArtifact(stage, repoName, result.artifact);
 
-    return { artifact: combined, cost: totalCost };
+    return { artifact: result.artifact, cost: result.cost };
   }
 
   /**

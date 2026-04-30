@@ -69,3 +69,14 @@ export type {
   RunPerRepoStageResult,
   PerRepoStageStepOptions,
 } from './per-repo-stage.step.js';
+export {
+  runBuildForOneRepo,
+  combineTaskArtifacts,
+  createPerRepoBuildStep,
+  BUILD_DISALLOWED_TOOLS,
+} from './per-repo-build.step.js';
+export type {
+  RunBuildForRepoOptions,
+  RunBuildForRepoResult,
+  PerRepoBuildStepOptions,
+} from './per-repo-build.step.js';
