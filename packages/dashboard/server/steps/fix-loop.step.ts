@@ -21,7 +21,7 @@
 
 import { spawnAndWait, waitForAgent } from './agent-spawner.js';
 import { disallowedToolsForPersona } from './per-repo-stage.step.js';
-import type { AgentSessionRegistry as AgentManager } from '@anvil/agent-core';
+import type { AgentManager } from '@anvil/agent-core';
 import type { Step, StepContext } from '@anvil/core-pipeline';
 
 /**

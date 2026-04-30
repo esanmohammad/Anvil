@@ -26,11 +26,7 @@ import {
   runPerRepoStageForRepo,
   type RunPerRepoStageResult,
 } from '../steps/per-repo-stage.step.js';
-import type {
-  AgentSessionRegistry as AgentManager,
-  AgentSessionState as AgentState,
-  SessionSpec as SpawnConfig,
-} from '@anvil/agent-core';
+import type { AgentManager, AgentState, SpawnConfig } from '@anvil/agent-core';
 
 interface FakeOpts {
   /** Status sequence the next getAgent() calls return for each agent id. */

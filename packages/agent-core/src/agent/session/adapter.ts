@@ -15,7 +15,7 @@
  */
 
 import type { EventEmitter } from 'node:events';
-import type { AgentActivity, CostInfo, SessionSpec } from './types.js';
+import type { AgentActivity, CostInfo, SpawnConfig } from './types.js';
 
 /**
  * The 5 events an adapter emits during a run. Same shape as dashboard's
@@ -48,7 +48,7 @@ export interface AgentAdapter extends EventEmitter {
 /**
  * Options forwarded to the adapter factory when `AgentSession` builds its
  * underlying adapter. Mirrors dashboard's `AgentProcessConfig` — a flattened
- * subset of `SessionSpec` plus a `resume` flag.
+ * subset of `SpawnConfig` plus a `resume` flag.
  */
 export interface AdapterRequest {
   prompt: string;
@@ -77,11 +77,11 @@ export interface AdapterRequest {
 export type AgentAdapterFactory = (req: AdapterRequest) => AgentAdapter;
 
 /**
- * Convenience helper — constructs an `AdapterRequest` from a `SessionSpec`
+ * Convenience helper — constructs an `AdapterRequest` from a `SpawnConfig`
  * plus a generated session id.
  */
 export function buildAdapterRequest(
-  spec: SessionSpec,
+  spec: SpawnConfig,
   sessionId: string,
   opts?: { resume?: boolean; cwdOverride?: string },
 ): AdapterRequest {

@@ -28,10 +28,7 @@ import type {
   TestCategory,
   Confidence,
 } from './test-types.js';
-import type {
-  AgentSessionRegistry as AgentManager,
-  AgentSessionState as AgentState,
-} from '@anvil/agent-core';
+import type { AgentManager, AgentState } from '@anvil/agent-core';
 import type { TestRunStore } from './test-run-store.js';
 import type { TestLearningsStore } from './test-learnings.js';
 

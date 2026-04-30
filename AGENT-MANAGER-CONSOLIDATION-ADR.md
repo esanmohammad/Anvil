@@ -45,35 +45,35 @@
 **Why:** the user's stated goal is to make dashboard and cli equal consumers of agent-core. Two AgentManager classes with the same name and overlapping responsibilities is a maintenance liability — every change needs to be considered for both, and behavior drift is inevitable.
 **How to apply:** lift dashboard's superset surface; collapse agent-core's existing single-shot `AgentManager` into a thin wrapper. Phase 4 deletes dashboard's local copy; Phase 5 migrates cli (where it has callers).
 
-### D2 — Surface shape: `AgentSession` + `AgentSessionRegistry`
-**Choice:** Two new public types in agent-core:
-- `AgentSession` — one logical agent. EventEmitter. Owns the spawn → resume → resume → done lifecycle. Supports `sendInput(text)` for in-session resume. Inherits dashboard's 5-event surface (`content`, `activity`, `result`, `error-output`, `exit`) plus 3 lifecycle events (`agent-output`, `agent-activity`, `agent-done`, `agent-error`).
-- `AgentSessionRegistry` — `Map<id, AgentSession>` with `spawn(spec)` / `get(id)` / `kill(id)` / `killAll()` / `setCostHook(hook)` / `setCheckpointHook(hook)`. EventEmitter with the 4 dashboard `AgentManagerEvents`.
-**Why:** dashboard already has this exact shape working. Renaming clarifies the layering (one Session per agent; one Registry tracking many) and avoids the `AgentManager` name collision with agent-core's existing single-shot class.
-**How to apply:** the type aliases `AgentManager = AgentSessionRegistry` and `AgentProcess = AgentSession` are NOT exported — call sites flip to the new names in Phase 4. ADR appendix B locks the field-mapping table.
+### D2 — Surface shape: `AgentManager` + `AgentProcess` (agent-core canonical)
+**Choice:** Two public classes in agent-core, claiming the canonical names:
+- `AgentProcess` — one logical agent. EventEmitter. Owns the spawn → resume → resume → done lifecycle. Supports `sendInput(text)` for in-session resume. 5-event surface (`content`, `activity`, `result`, `error-output`, `exit`).
+- `AgentManager` — `Map<id, AgentProcess>` with `spawn(config)` / `getAgent(id)` / `kill(id)` / `killAll()` / `setCostHook(hook)` / `setCheckpointHook(hook)`. 4-event surface (`agent-output`, `agent-activity`, `agent-done`, `agent-error`).
+**Why:** dashboard pre-Phase-4 had this exact shape working. agent-core had a stub single-shot `AgentManager` class that was never wired up by any production caller — deleting it (Deferred #1 cleanup) frees the canonical name for the lifted stateful version. Result: `import { AgentManager } from '@anvil/agent-core'` is the expected ergonomic, no aliasing.
+**How to apply:** dashboard's local `agent-manager.ts` and `agent-process.ts` are deleted. Direct imports from `@anvil/agent-core` everywhere. The pre-existing single-shot `AgentManager` class + 7 supporting files (spawn, stream-parser, output-buffer, restart-policy, timeout-guard, stage-validator, types) are deleted as dead code (zero callers, zero tests, leftover from an earlier extract).
 
 ### D3 — Per-call checkpoint cache moves verbatim
 **Choice:** `runWithCheckpoint` + `CheckpointStore` + `BlobStore` + `checkpoint-key` + `CheckpointInputs/Record` move to `packages/agent-core/src/checkpoint/`. Public API unchanged. `~/.anvil/checkpoints/` storage layout unchanged. Dashboard re-exports from agent-core for one minor release for backwards compat.
 **Why:** the cache is storage-agnostic — only the writer is currently dashboard-local. Lifting it gives cli free retry-deduplication on the same prompt+model+stage combo, and unifies the on-disk schema across consumers. Verbatim move minimizes risk.
 **How to apply:** Phase 3 lands as a code move with import-path updates in dashboard; behavior + tests are unchanged. Re-exports drop in Phase 6.
 
-### D4 — `AgentProcess` collapses into `AgentSession`
-**Choice:** Dashboard's `AgentProcess` (the EventEmitter that pipes adapter events through to `AgentManager`) is merged into `AgentSession`'s constructor + private wiring. The standalone `AgentProcess` class is deleted in Phase 4.
-**Why:** the wrapper exists today only because dashboard's `AgentManager` predates `AgentSession`. With `AgentSession` owning the adapter wiring directly, the indirection adds nothing. cli never used it.
-**How to apply:** copy `AgentProcess.start()` body into `AgentSession.start()` private method; drop the file.
+### D4 — `AgentProcess` owns adapter event wiring directly
+**Choice:** The lifted `AgentProcess` class (in agent-core) owns the adapter-event-pipe pattern itself — no separate "process" wrapper. Dashboard's pre-Phase-4 `AgentProcess` (a thin EventEmitter that pipes adapter events through to its parent `AgentManager`) is merged into the new `AgentProcess`'s constructor + private `wireAdapter()` method.
+**Why:** the wrapper existed in dashboard only because `AgentManager` was added later as an outer layer. With one canonical class owning both the spawn lifecycle AND the adapter event-piping, the indirection adds nothing.
+**How to apply:** dashboard's local `agent-process.ts` is deleted. Code lives in `agent-core/src/agent/session/session.ts`.
 
 ### D5 — Session-resume contract
-**Choice:** `AgentSession.sendInput(text)` spawns a new adapter instance with `{ resume: true, sessionId, model }` and re-wires events through the same `AgentSession` emitter. Adapters whose `LanguageModel.capabilities.sessionResume === false` reject `sendInput` synchronously with a typed `SessionResumeNotSupportedError`. Same shape as today's dashboard behavior (`agent-manager.ts:257-287`).
+**Choice:** `AgentProcess.sendInput(text)` spawns a new adapter instance with `{ resume: true, sessionId, model }` and re-wires events through the same `AgentProcess` emitter. Adapters whose `LanguageModel.capabilities.sessionResume === false` reject `sendInput` synchronously with a typed `SessionResumeNotSupportedError`. Same shape as the pre-Phase-4 dashboard behavior.
 **Why:** session-resume-via-respawn is the only working pattern across all 7 adapters today (Claude CLI uses `--resume <session>`; Gemini CLI uses different flags but the spawn-fresh model is identical). A native multi-turn API in agent-core would be cleaner long-term but requires changes to every adapter — out of scope.
-**How to apply:** `AgentSession.sendInput()` body is the lifted `AgentManager.sendInput()` from `dashboard/server/agent-manager.ts:257-287`. Capability check moves to the top.
+**How to apply:** `AgentProcess.sendInput()` body lifts the dashboard's `AgentManager.sendInput()` semantics. Capability check moves to the top.
 
 ### D6 — agent-core's existing `AgentManager` becomes a thin wrapper
-**Choice:** `agent-core/src/agent/agent-manager.ts` shrinks from 125 LOC to ~30 LOC. The new body builds an `AgentSessionRegistry` (with restart/timeout/validate options on the `SessionSpec`), spawns one session, awaits the `'agent-done'` event, returns the existing `AgentResult` shape.
-**Why:** preserves cli's `runAgent(): Promise<AgentResult>` ergonomics while routing through the new lifecycle surface. The tests at `__tests__/runAgent.test.ts` continue to pass with no source-file change required (the contract shape is preserved).
-**How to apply:** Phase 5 rewrites the body. `RestartPolicy`, `TimeoutGuard`, `StageValidator` move *inside* `AgentSession`'s lifecycle so all consumers benefit (dashboard explicitly opts out by passing `restart: { maxAttempts: 0 }` and `timeoutMs: 0`).
+**Choice (revised in Deferred #1 cleanup):** `agent-core/src/agent/agent-manager.ts` (the legacy single-shot 125-LOC class) is **deleted**, freeing the canonical `AgentManager` name for the lifted stateful class. The legacy class had zero production callers and zero test coverage — leftover from an earlier extract phase that never got wired up. Its 7 supporting files (`spawn`, `stream-parser`, `output-buffer`, `restart-policy`, `timeout-guard`, `stage-validator`, `types`) are deleted alongside (~640 LOC of dead code). The `runAgent.test.ts` suite covers a different `runAgent` (the headless tool-loop runner at `headless/runner.ts`), which is untouched.
+**Why:** the original plan called for shrinking the legacy class to a wrapper. Honest audit revealed it had no callers — wrapping nothing buys nothing. Deletion is cleaner and frees the canonical name for the new stateful surface.
+**How to apply:** delete the 8 files; trim the `agent/index.ts` barrel to just re-export `./session/`. Existing test suite continues to pass (the headless `runAgent` in `__tests__/runAgent.test.ts` is unrelated).
 
 ### D7 — cli orchestrator migrates once
-**Choice:** cli's existing per-stage agent calls (currently direct adapter calls via the LLM router) migrate to `AgentSessionRegistry.spawn(spec)`. cli runs gain free per-call checkpoint caching as a behavior change. The cli's `commands/diff.ts:300 runAgent()` local helper migrates to use `runAgent()` from agent-core's wrapper (D6).
+**Choice:** cli's existing per-stage agent calls (currently direct adapter calls via the LLM router) migrate to `AgentManager.spawn(config)`. cli runs gain free per-call checkpoint caching as a behavior change. The cli's `commands/diff.ts:300 runAgent()` local helper now wraps with `runWithCheckpoint` from agent-core (Phase 5).
 **Why:** without this, cli stays a non-consumer of the new surface and the consolidation is dashboard-only. The user explicitly asked for both consumers to use agent-core; cli migration is the cost.
 **How to apply:** Phase 5 inventories every cli site, migrates atomically. Cache-hit smoke test added to CI to prove cli benefits.
 
@@ -169,11 +169,11 @@ This is a **different abstraction** (newer, post-extract; LanguageModel-native; 
 
 ---
 
-## 4. Schema-shape mapping (`SessionSpec` unification)
+## 4. Schema-shape mapping (`SpawnConfig` unification)
 
-Phase 1 introduces `SessionSpec` as the canonical agent-launch shape. Field mapping:
+`SpawnConfig` is the canonical agent-launch shape — the name comes from the dashboard's pre-Phase-4 type, retained because it's what the consumer code already used. Field mapping:
 
-| `SessionSpec` field | Dashboard `SpawnConfig` (today) | agent-core `AgentProcessConfig` (today) | Notes |
+| `SpawnConfig` field | Dashboard `SpawnConfig` (pre-Phase-4) | agent-core legacy `AgentProcessConfig` (deleted) | Notes |
 |---|---|---|---|
 | `name: string` | `name` | derived from `args[0]` | dashboard convention; cli synthesizes |
 | `persona: string` | `persona` | derived from `stage` | dashboard convention; cli synthesizes from stage name |
@@ -194,7 +194,7 @@ Phase 1 introduces `SessionSpec` as the canonical agent-launch shape. Field mapp
 | `binaryPath?: string` | (none, env-derived) | `binaryPath` | optional; defaults to `ANVIL_AGENT_CMD` env |
 | `args?: string[]` | (none, derived) | `args` | optional escape hatch; dashboard never sets |
 
-After D2, `SpawnConfig` and `AgentProcessConfig` both become deprecated type aliases that map to `SessionSpec`. Phase 1 lands the type with backwards-compat aliases; Phase 4 removes the dashboard alias; Phase 6 removes the agent-core alias.
+After Deferred #1 cleanup, `SpawnConfig` is the single canonical name. The legacy agent-core `AgentProcessConfig` is deleted (it was a stub that never got wired up). Dashboard's pre-Phase-4 `SpawnConfig` is the same shape (now imported from agent-core).
 
 ---
 
@@ -203,16 +203,16 @@ After D2, `SpawnConfig` and `AgentProcessConfig` both become deprecated type ali
 | Surface | Today | After (Phase 6) | Phase |
 |---|---|---|---|
 | `dashboard/server/agent-manager.ts` (444 LOC, stateful) | local | **deleted** — re-export from `@anvil/agent-core` removed in Phase 6 cleanup | 4 |
-| `dashboard/server/agent-process.ts` (120 LOC) | local | **deleted** — folded into `AgentSession` | 4 |
+| `dashboard/server/agent-process.ts` (120 LOC) | local | **deleted** — folded into `AgentProcess` | 4 |
 | `dashboard/server/agent-runner-wrapper.ts` (`runWithCheckpoint`) | local | **moved** to `@anvil/agent-core/checkpoint/runner.ts` | 3 |
 | `dashboard/server/checkpoint-store.ts` (387 LOC) | local | **moved** to `@anvil/agent-core/checkpoint/store.ts` | 3 |
 | `dashboard/server/checkpoint-blob-store.ts` (144 LOC) | local | **moved** to `@anvil/agent-core/checkpoint/blob-store.ts` | 3 |
 | `dashboard/server/checkpoint-key.ts` + `checkpoint-types.ts` | local | **moved** to `@anvil/agent-core/checkpoint/{key,types}.ts` | 3 |
-| `agent-core/src/agent/agent-manager.ts` (125 LOC, single-shot) | local | **shrunk to ~30 LOC** — wrapper over `AgentSessionRegistry` | 5 |
-| `agent-core/src/agent/{spawn,stream-parser,output-buffer,timeout-guard,restart-policy,stage-validator}.ts` | unchanged | unchanged — used internally by `AgentSession` | — |
+| `agent-core/src/agent/agent-manager.ts` (125 LOC, single-shot stub) | local | **deleted** — name reclaimed by lifted stateful `AgentManager` | Deferred #1 |
+| `agent-core/src/agent/{spawn,stream-parser,output-buffer,timeout-guard,restart-policy,stage-validator,types}.ts` | unchanged | **deleted** — dead code with zero callers/tests | Deferred #1 |
 | `cli/src/commands/diff.ts:300 runAgent()` | local helper | replaced with `runAgent` import from `@anvil/agent-core` | 5 |
-| `dashboard/server/pipeline-runner.ts` `agentManager` field | dashboard-local class | re-exported `AgentSessionRegistry` from agent-core | 4 |
-| `dashboard/server/steps/agent-spawner.ts` | takes `AgentManager` | takes `AgentSessionRegistry` (same surface) | 4 |
+| `dashboard/server/pipeline-runner.ts` `agentManager` field | dashboard-local class | imported `AgentManager` from agent-core | 4 |
+| `dashboard/server/steps/agent-spawner.ts` | takes `AgentManager` | takes `AgentManager` from agent-core (same name, same surface) | 4 |
 | `dashboard/server/dashboard-server.ts:806,828,829` (3 construction sites) | dashboard-local | imports from `@anvil/agent-core` | 3 (checkpoint), 4 (registry) |
 | `~/.anvil/checkpoints/<project>/<runFamily>/` | dashboard-owned writer | agent-core-owned writer; on-disk format unchanged (D11) | 3 |
 
@@ -224,7 +224,7 @@ After D2, `SpawnConfig` and `AgentProcessConfig` both become deprecated type ali
 |---|---|---|---|
 | 0 | Audit + ADR + plan | `b712300` | landed 2026-04-30 |
 | 1 | agent-core surface design + types | `881407b` | landed 2026-04-30 |
-| 2 | Lift `AgentSession` + Registry into agent-core | `a8c0b3f` | landed 2026-04-30 |
+| 2 | Lift `AgentProcess` + `AgentManager` runtime into agent-core | `a8c0b3f` | landed 2026-04-30 |
 | 3 | Move checkpoint cache into agent-core | `3be39ee` | landed 2026-04-30 |
 | 4 | Dashboard cuts over | `fcae760` | landed 2026-04-30 |
 | 5 | cli `diff` consumes checkpoint cache | `c21d7dd` | landed 2026-04-30 |
@@ -244,7 +244,7 @@ After D2, `SpawnConfig` and `AgentProcessConfig` both become deprecated type ali
 | `agent-core/src/agent/session/` | (did not exist) | 4 source files (~580 LOC) + 2 test files (~510 LOC) |
 | `agent-core/src/checkpoint/` | (did not exist) | 5 source files (~960 LOC, lifted) + 4 test files (~1080 LOC, lifted) |
 
-**Net repo delta:** dashboard shrinks by ~1,400 LOC (classes deleted; shims add ~115 LOC); agent-core grows by ~580 LOC (new session module) + ~960 LOC (lifted checkpoint code that previously lived in dashboard). The 960 LOC didn't disappear — it relocated to its proper home so cli now consumes it too. Net repo LOC delta: **−~190 LOC** with one canonical `AgentSessionRegistry` instead of two same-named classes.
+**Net repo delta:** dashboard shrinks by ~1,520 LOC (classes deleted; re-export shims also deleted in Deferred #3); agent-core grows by ~580 LOC (new session module) + ~960 LOC (lifted checkpoint code) − ~770 LOC (legacy agent-manager.ts + 7 supporting files deleted in Deferred #1). The lifted 960 LOC didn't disappear — it relocated to its proper home so cli now consumes it too. Net repo LOC delta: **−~750 LOC** with one canonical `AgentManager` (in agent-core, no aliasing).
 
 **Test coverage:**
 
@@ -254,14 +254,14 @@ After D2, `SpawnConfig` and `AgentProcessConfig` both become deprecated type ali
 | `@anvil-dev/dashboard` server | 642 / 180 | 642 / 180 | 0 (lifted tests live in agent-core now) |
 | Combined | 798 / 224 | 883 / 246 | +85 / +22 |
 
-agent-core's 85 new tests break down as: 21 type-shape locks (Phase 1) + 28 `AgentSession`/`AgentSessionRegistry` runtime parity tests (Phase 2) + 36 lifted from dashboard's checkpoint suite (Phase 3 — same behavior, new home).
+agent-core's 85 new tests break down as: 21 type-shape locks (Phase 1) + 28 `AgentProcess`/`AgentManager` runtime parity tests (Phase 2) + 36 lifted from dashboard's checkpoint suite (Phase 3 — same behavior, new home).
 
 **D10 invariant verified:** dashboard's WebSocket message protocol unchanged. The 4 registry events (`agent-output`, `agent-activity`, `agent-done`, `agent-error`) and 5 session events (`content`, `activity`, `result`, `error-output`, `exit`) carry byte-identical payload shapes. Dashboard's existing `BaseAdapter` family structurally satisfies agent-core's new `AgentAdapter` interface — no adapter rewriting required.
 
-**Honestly deferred:**
-- **Full collapse of agent-core's existing single-shot `AgentManager.runAgent()`** (per ADR D6) into a thin wrapper over `AgentSessionRegistry`. Today the cli-style `AgentManager` survives unchanged in `agent-core/src/agent/agent-manager.ts` (125 LOC); it has no production consumers but is exported. Collapsing it would require an `AgentAdapter` impl that wraps `agent/spawn.ts:spawnAgent()` and translates the `AgentEvent` discriminated union into the 5-event surface. ~80 LOC of careful event-shape translation. Tractable but separate work.
-- **cli orchestrator full migration** to `AgentSessionRegistry` (per ADR D7). cli's main pipeline orchestrator (`cli/src/pipeline/orchestrator.ts`) does not use either `AgentManager` class today — it shells out via `execSync`. Phase 5 wired up the meaningful consumer (`commands/diff.ts` for the per-call cache); broader cli orchestrator integration is gated on cli growing multi-agent state-tracking needs.
-- **Re-export shim deletion** (final §4.2 step). The 7 dashboard re-export shims (~95 LOC total) stay in place to preserve existing dashboard call sites. Phase 6 leaves them; a follow-up PR can update direct imports across `pipeline-runner.ts`, `dashboard-server.ts`, the 5 step modules, and 5 test files in one mechanical rename pass.
+**Deferred items — status after cleanup pass:**
+- **Deferred #1 — Legacy `AgentManager` collapse — ✅ landed.** Honest audit showed the legacy single-shot `AgentManager` had zero production callers and zero test coverage (the `runAgent.test.ts` suite covers a different `runAgent` in `headless/runner.ts`). The original plan's "shrink to wrapper" became "delete dead code" — 8 files (~770 LOC) removed, the canonical `AgentManager` name reclaimed for the lifted stateful class.
+- **Deferred #3 — Re-export shim deletion — ✅ landed.** All 12 dashboard call sites + 5 test files now import directly from `@anvil/agent-core`. The 7 re-export shim files (~95 LOC) deleted. Dashboard imports read `import { AgentManager, type AgentState, type SpawnConfig } from '@anvil/agent-core'` — no aliasing, no indirection.
+- **Deferred #2 — cli orchestrator broader migration — still deferred.** cli's main pipeline orchestrator (`cli/src/pipeline/orchestrator.ts`, 1682 LOC) shells out via `execSync` and does not consume either `AgentManager` class. cli's only AI agent invocations are in `commands/diff.ts:300` (already wrapped with `runWithCheckpoint` in Phase 5) and `commands/learn.ts:155` (could similarly benefit from the cache; ~30 LOC change). Broader integration is gated on cli growing multi-agent state-tracking needs.
 
 ---
 

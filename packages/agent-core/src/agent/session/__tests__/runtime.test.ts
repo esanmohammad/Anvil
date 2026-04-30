@@ -1,10 +1,7 @@
 /**
- * Phase 2 of the agent-manager consolidation — parity tests for the
- * `AgentSession` + `AgentSessionRegistry` runtime against dashboard's
- * `AgentManager` + `AgentProcess` behavior.
- *
- * Drives the registry with a fake `AgentAdapter` (EventEmitter) so the
- * tests don't require a real subprocess.
+ * Runtime parity tests for `AgentProcess` + `AgentManager`. Drives the
+ * manager with a fake `AgentAdapter` (EventEmitter) so the tests don't
+ * require a real subprocess.
  */
 
 import { describe, it } from 'node:test';
@@ -12,15 +9,15 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
 import {
-  AgentSession,
-  AgentSessionNotFoundError,
-  AgentSessionRegistry,
+  AgentManager,
+  AgentNotFoundError,
+  AgentProcess,
   emptyCost,
   type AgentActivity,
   type AgentAdapter,
-  type AgentSessionState,
+  type AgentState,
   type CostInfo,
-  type SessionSpec,
+  type SpawnConfig,
 } from '../index.js';
 
 // ── Test adapter ────────────────────────────────────────────────────────
@@ -52,7 +49,7 @@ class FakeAdapter extends EventEmitter implements AgentAdapter {
   exit(code: number | null): void { this.emit('exit', code); }
 }
 
-function spec(overrides: Partial<SessionSpec> = {}): SessionSpec {
+function spec(overrides: Partial<SpawnConfig> = {}): SpawnConfig {
   return {
     name: 'test',
     persona: 'engineer',
@@ -78,16 +75,16 @@ function harness() {
 
 // ── Spawn happy path ────────────────────────────────────────────────────
 
-describe('AgentSessionRegistry — spawn happy path', () => {
+describe('AgentManager — spawn happy path', () => {
   it('spawns adapter, pipes content, completes on result', async () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     const outputs: { agentId: string; chunk: string }[] = [];
-    const dones: AgentSessionState[] = [];
-    reg.on('agent-output', (data) => outputs.push(data));
-    reg.on('agent-done', (data) => dones.push(data.agent));
+    const dones: AgentState[] = [];
+    mgr.on('agent-output', (data) => outputs.push(data));
+    mgr.on('agent-done', (data) => dones.push(data.agent));
 
-    const state = reg.spawn(spec());
+    const state = mgr.spawn(spec());
     assert.equal(state.status, 'running');
     assert.equal(adapters.length, 1);
     assert.equal(adapters[0].started, true);
@@ -110,17 +107,17 @@ describe('AgentSessionRegistry — spawn happy path', () => {
 
   it('honors maxOutputTokens — passes it to the adapter', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    reg.spawn(spec({ maxOutputTokens: 4000 }));
+    const mgr = new AgentManager({ adapterFactory: factory });
+    mgr.spawn(spec({ maxOutputTokens: 4000 }));
     assert.equal(adapters[0].maxOutputTokens, 4000);
   });
 
-  it('emits activity events through the registry', () => {
+  it('emits activity events through the manager', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     const activities: { agentId: string; activity: AgentActivity }[] = [];
-    reg.on('agent-activity', (data) => activities.push(data));
-    reg.spawn(spec());
+    mgr.on('agent-activity', (data) => activities.push(data));
+    mgr.spawn(spec());
     adapters[0].sendActivity({ id: '1', kind: 'tool_use', tool: 'Read', summary: 'r', timestamp: 0 });
     assert.equal(activities.length, 1);
     assert.equal(activities[0].activity.tool, 'Read');
@@ -129,21 +126,21 @@ describe('AgentSessionRegistry — spawn happy path', () => {
 
 // ── Checkpoint cache ────────────────────────────────────────────────────
 
-describe('AgentSessionRegistry — checkpoint cache', () => {
+describe('AgentManager — checkpoint cache', () => {
   it('hit: synthesizes done without spawning an adapter', async () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    reg.setCheckpointHook({
+    const mgr = new AgentManager({ adapterFactory: factory });
+    mgr.setCheckpointHook({
       lookup: () => ({
         hit: true,
         output: 'cached output',
         cost: { ...emptyCost(), totalUsd: 0.01, inputTokens: 50, outputTokens: 25 },
       }),
     });
-    const dones: AgentSessionState[] = [];
-    reg.on('agent-done', (data) => dones.push(data.agent));
+    const dones: AgentState[] = [];
+    mgr.on('agent-done', (data) => dones.push(data.agent));
 
-    const state = reg.spawn(spec());
+    const state = mgr.spawn(spec());
     assert.equal(state.status, 'done');
     assert.match(state.output, /cached output/);
     assert.equal(state.cost.totalUsd, 0.01);
@@ -155,30 +152,30 @@ describe('AgentSessionRegistry — checkpoint cache', () => {
 
   it('miss: spawns the adapter normally', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    reg.setCheckpointHook({ lookup: () => ({ hit: false }) });
-    reg.spawn(spec());
+    const mgr = new AgentManager({ adapterFactory: factory });
+    mgr.setCheckpointHook({ lookup: () => ({ hit: false }) });
+    mgr.spawn(spec());
     assert.equal(adapters.length, 1);
     assert.equal(adapters[0].started, true);
   });
 
   it('cache lookup throw is non-fatal — falls through to spawn', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    reg.setCheckpointHook({ lookup: () => { throw new Error('boom'); } });
-    reg.spawn(spec());
+    const mgr = new AgentManager({ adapterFactory: factory });
+    mgr.setCheckpointHook({ lookup: () => { throw new Error('boom'); } });
+    mgr.spawn(spec());
     assert.equal(adapters.length, 1, 'spawned despite lookup throw');
   });
 
   it('record is fired on completion', async () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     const records: unknown[] = [];
-    reg.setCheckpointHook({
+    mgr.setCheckpointHook({
       lookup: () => ({ hit: false }),
       record: (r) => records.push(r),
     });
-    reg.spawn(spec());
+    mgr.spawn(spec());
     adapters[0].finish('result text', { totalUsd: 0.05 });
     await new Promise((r) => setImmediate(r));
     assert.equal(records.length, 1);
@@ -191,50 +188,50 @@ describe('AgentSessionRegistry — checkpoint cache', () => {
 
 // ── sendInput / resume ──────────────────────────────────────────────────
 
-describe('AgentSessionRegistry — sendInput / resume', () => {
+describe('AgentManager — sendInput / resume', () => {
   it('throws when agent unknown', () => {
     const { factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     assert.throws(
-      () => reg.sendInput('missing', 'hi'),
-      AgentSessionNotFoundError,
+      () => mgr.sendInput('missing', 'hi'),
+      AgentNotFoundError,
     );
   });
 
   it('spawns a NEW adapter with the same sessionId on sendInput', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    const state = reg.spawn(spec());
+    const mgr = new AgentManager({ adapterFactory: factory });
+    const state = mgr.spawn(spec());
     const id = state.id;
 
-    reg.sendInput(id, 'follow-up');
+    mgr.sendInput(id, 'follow-up');
     assert.equal(adapters.length, 2, 'second adapter spawned');
     assert.equal(adapters[1].started, true);
   });
 
-  it('appends user-marker chunk to the output stream + registry emit', () => {
+  it('appends user-marker chunk to the output stream + manager emit', () => {
     const { factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     const outputs: string[] = [];
-    reg.on('agent-output', (data) => outputs.push(data.chunk));
-    const state = reg.spawn(spec());
-    reg.sendInput(state.id, 'follow-up');
+    mgr.on('agent-output', (data) => outputs.push(data.chunk));
+    const state = mgr.spawn(spec());
+    mgr.sendInput(state.id, 'follow-up');
     const userMarker = outputs.find((c) => c.includes('> User: follow-up'));
     assert.ok(userMarker, `expected user marker chunk, got: ${JSON.stringify(outputs)}`);
   });
 
   it('cost accumulates across resume calls', async () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    const state = reg.spawn(spec());
+    const mgr = new AgentManager({ adapterFactory: factory });
+    const state = mgr.spawn(spec());
     adapters[0].finish('first', { totalUsd: 0.10, inputTokens: 100, outputTokens: 50 });
     await new Promise((r) => setImmediate(r));
 
-    reg.sendInput(state.id, 'more');
+    mgr.sendInput(state.id, 'more');
     adapters[1].finish('second', { totalUsd: 0.05, inputTokens: 30, outputTokens: 20 });
     await new Promise((r) => setImmediate(r));
 
-    const final = reg.getAgent(state.id)!;
+    const final = mgr.getAgent(state.id)!;
     // Float precision — 0.10 + 0.05 = 0.15000000000000002.
     assert.ok(Math.abs(final.cost.totalUsd - 0.15) < 1e-9);
     assert.equal(final.cost.inputTokens, 130);
@@ -244,55 +241,55 @@ describe('AgentSessionRegistry — sendInput / resume', () => {
 
 // ── Kill / killAll ──────────────────────────────────────────────────────
 
-describe('AgentSessionRegistry — kill / killAll', () => {
+describe('AgentManager — kill / killAll', () => {
   it('kill returns true and marks state killed', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    const state = reg.spawn(spec());
-    const ok = reg.kill(state.id);
+    const mgr = new AgentManager({ adapterFactory: factory });
+    const state = mgr.spawn(spec());
+    const ok = mgr.kill(state.id);
     assert.equal(ok, true);
     assert.equal(adapters[0].killed, true);
-    assert.equal(reg.getAgent(state.id)!.status, 'killed');
+    assert.equal(mgr.getAgent(state.id)!.status, 'killed');
   });
 
   it('kill on unknown agent returns false', () => {
     const { factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    assert.equal(reg.kill('missing'), false);
+    const mgr = new AgentManager({ adapterFactory: factory });
+    assert.equal(mgr.kill('missing'), false);
   });
 
-  it('killAll kills every running session and reports the count', () => {
+  it('killAll kills every running agent and reports the count', () => {
     const { factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    reg.spawn(spec({ name: 'a' }));
-    reg.spawn(spec({ name: 'b' }));
-    reg.spawn(spec({ name: 'c' }));
-    const killed = reg.killAll();
+    const mgr = new AgentManager({ adapterFactory: factory });
+    mgr.spawn(spec({ name: 'a' }));
+    mgr.spawn(spec({ name: 'b' }));
+    mgr.spawn(spec({ name: 'c' }));
+    const killed = mgr.killAll();
     assert.equal(killed, 3);
   });
 
-  it('killAll skips already-done sessions', async () => {
+  it('killAll skips already-done agents', async () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    reg.spawn(spec({ name: 'a' }));
+    const mgr = new AgentManager({ adapterFactory: factory });
+    mgr.spawn(spec({ name: 'a' }));
     adapters[0].finish('done', { totalUsd: 0.01 });
     await new Promise((r) => setImmediate(r));
 
-    reg.spawn(spec({ name: 'b' }));
-    const killed = reg.killAll();
-    assert.equal(killed, 1, 'only the running session counted');
+    mgr.spawn(spec({ name: 'b' }));
+    const killed = mgr.killAll();
+    assert.equal(killed, 1, 'only the running agent counted');
   });
 });
 
 // ── Cost hook ───────────────────────────────────────────────────────────
 
-describe('AgentSessionRegistry — cost hook', () => {
+describe('AgentManager — cost hook', () => {
   it('fires once per result with full payload', async () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     const calls: unknown[] = [];
-    reg.setCostHook((info) => { calls.push(info); });
-    reg.spawn(spec({ runId: 'r1' }));
+    mgr.setCostHook((info) => { calls.push(info); });
+    mgr.spawn(spec({ runId: 'r1' }));
     adapters[0].finish('done', {
       totalUsd: 0.07,
       inputTokens: 100,
@@ -310,9 +307,9 @@ describe('AgentSessionRegistry — cost hook', () => {
 
   it('cost hook throws are non-fatal', async () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    reg.setCostHook(() => { throw new Error('boom'); });
-    reg.spawn(spec());
+    const mgr = new AgentManager({ adapterFactory: factory });
+    mgr.setCostHook(() => { throw new Error('boom'); });
+    mgr.spawn(spec());
     assert.doesNotThrow(() => {
       adapters[0].finish('done', { totalUsd: 0.01 });
     });
@@ -322,15 +319,15 @@ describe('AgentSessionRegistry — cost hook', () => {
 
 // ── Error / exit paths ──────────────────────────────────────────────────
 
-describe('AgentSession — error + exit semantics', () => {
+describe('AgentProcess — error + exit semantics', () => {
   it('non-zero exit transitions state to error', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     const errors: unknown[] = [];
-    reg.on('agent-error', (data) => errors.push(data));
-    const state = reg.spawn(spec());
+    mgr.on('agent-error', (data) => errors.push(data));
+    const state = mgr.spawn(spec());
     adapters[0].exit(1);
-    const after = reg.getAgent(state.id)!;
+    const after = mgr.getAgent(state.id)!;
     assert.equal(after.status, 'error');
     assert.match(after.error ?? '', /exited with code 1/);
     assert.equal(errors.length, 1);
@@ -338,17 +335,17 @@ describe('AgentSession — error + exit semantics', () => {
 
   it('error-output stream appends to state.error', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
+    const mgr = new AgentManager({ adapterFactory: factory });
     const errors: { agentId: string; error: string }[] = [];
-    reg.on('agent-error', (data) => errors.push(data));
-    const state = reg.spawn(spec());
+    mgr.on('agent-error', (data) => errors.push(data));
+    const state = mgr.spawn(spec());
     adapters[0].emit('error-output', 'something broke');
-    const after = reg.getAgent(state.id)!;
+    const after = mgr.getAgent(state.id)!;
     assert.match(after.error ?? '', /something broke/);
     assert.equal(errors.length, 1);
   });
 
-  it('clean exit with empty output marks session as error', async () => {
+  it('clean exit with empty output marks agent as error', async () => {
     const calls: { fn: () => void; ms: number }[] = [];
     const fakeSetTimeout = (fn: () => void, ms: number) => { calls.push({ fn, ms }); };
     const fakeNow = (() => {
@@ -356,17 +353,17 @@ describe('AgentSession — error + exit semantics', () => {
       return () => { t += 1; return t; };
     })();
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({
+    const mgr = new AgentManager({
       adapterFactory: factory,
       setTimeoutImpl: fakeSetTimeout,
       now: fakeNow,
     });
-    const state = reg.spawn(spec());
+    const state = mgr.spawn(spec());
     adapters[0].exit(0);
     // Trigger the deferred callback synchronously.
     assert.equal(calls.length, 1);
     calls[0].fn();
-    const after = reg.getAgent(state.id)!;
+    const after = mgr.getAgent(state.id)!;
     assert.equal(after.status, 'error');
     assert.match(after.error ?? '', /no output/);
   });
@@ -374,22 +371,22 @@ describe('AgentSession — error + exit semantics', () => {
 
 // ── Output truncation ───────────────────────────────────────────────────
 
-describe('AgentSession — output buffering', () => {
+describe('AgentProcess — output buffering', () => {
   it('caps in-memory output at 500KB tail', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    const state = reg.spawn(spec());
+    const mgr = new AgentManager({ adapterFactory: factory });
+    const state = mgr.spawn(spec());
     const big = 'x'.repeat(600 * 1024);
     adapters[0].sendContent(big);
-    const after = reg.getAgent(state.id)!;
+    const after = mgr.getAgent(state.id)!;
     // 500 * 1024 = 512000
     assert.equal(after.output.length, 500 * 1024);
   });
 
   it('caps in-memory activities at 500 entries', () => {
     const { adapters, factory } = harness();
-    const reg = new AgentSessionRegistry({ adapterFactory: factory });
-    const state = reg.spawn(spec());
+    const mgr = new AgentManager({ adapterFactory: factory });
+    const state = mgr.spawn(spec());
     for (let i = 0; i < 600; i++) {
       adapters[0].sendActivity({
         id: `a${i}`,
@@ -399,7 +396,7 @@ describe('AgentSession — output buffering', () => {
         timestamp: i,
       });
     }
-    const after = reg.getAgent(state.id)!;
+    const after = mgr.getAgent(state.id)!;
     assert.equal(after.activities.length, 500);
     // Tail should be the LAST 500 activities (a100..a599).
     assert.equal(after.activities[0].id, 'a100');
@@ -407,19 +404,19 @@ describe('AgentSession — output buffering', () => {
   });
 });
 
-// ── Direct AgentSession access ──────────────────────────────────────────
+// ── Direct AgentProcess access ──────────────────────────────────────────
 
-describe('AgentSession — direct usage (without registry)', () => {
+describe('AgentProcess — direct usage (without AgentManager)', () => {
   it('can be driven directly with an injected adapter', async () => {
     const { adapters, factory } = harness();
-    const session = new AgentSession(spec(), { adapterFactory: factory });
+    const proc = new AgentProcess(spec(), { adapterFactory: factory });
     const results: unknown[] = [];
-    session.on('result', (r) => results.push(r));
-    session.start();
+    proc.on('result', (r) => results.push(r));
+    proc.start();
     adapters[0].finish('hi', { totalUsd: 0.02 });
     await new Promise((r) => setImmediate(r));
     assert.equal(results.length, 1);
-    assert.equal(session.status, 'done');
-    assert.equal(session.cost.totalUsd, 0.02);
+    assert.equal(proc.status, 'done');
+    assert.equal(proc.cost.totalUsd, 0.02);
   });
 });

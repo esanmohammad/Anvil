@@ -11,7 +11,7 @@ The dashboard is a **consumer** of four extracted Anvil packages
 
 | Package | Used for |
 |---|---|
-| `@anvil/agent-core` | Provider adapters + agent lifecycle (`AgentSession` / `AgentSessionRegistry`) + per-call checkpoint cache (`runWithCheckpoint`, `CheckpointStore`, `BlobStore`). Dashboard's `agent-manager.ts` is now a re-export shim aliasing `AgentSessionRegistry` as `AgentManager` for backwards-compat. |
+| `@anvil/agent-core` | Provider adapters + agent lifecycle (`AgentManager` / `AgentProcess`) + per-call checkpoint cache (`runWithCheckpoint`, `CheckpointStore`, `BlobStore`). Dashboard imports `AgentManager` directly from agent-core — no local re-exports. |
 | `@anvil/core-pipeline` | `EventBus` + `Step<I,O>` + `StepRegistry` + `Pipeline` — dashboard's `pipeline-runner.ts` orchestrates Steps from `server/steps/` |
 | `@anvil/knowledge-core` | Codebase fingerprinting, structural-hash diffing, KB-tier prompt injection |
 | `@anvil/memory-core` | `HybridMemoryStore` (JSONL canonical + SQLite hot index) — dashboard's `memory-store.ts` is now a thin façade over this |

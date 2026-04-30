@@ -1,27 +1,14 @@
 /**
- * Agent Process Manager — barrel exports.
+ * `@anvil/agent-core/agent` — barrel exports for the agent-lifecycle layer.
+ *
+ * The pre-existing single-shot `AgentManager` class and its supporting
+ * subprocess machinery (spawn, stream-parser, output-buffer, restart-policy,
+ * timeout-guard, stage-validator) lived alongside the new `AgentSession` /
+ * `AgentSessionRegistry` surface for one release. Both had zero production
+ * consumers — the cli-style runner was a dead extract leftover. The post-
+ * Phase 4/5 cleanup (Deferred #1) deletes them.
+ *
+ * The canonical agent-lifecycle surface lives under `./session/`.
  */
 
-export {
-  type AgentProcessConfig,
-  type AgentProcessState,
-  type AgentEvent,
-  type AgentResult,
-  type ValidationResult,
-  STAGE_TIMEOUT_DEFAULTS,
-  getDefaultTimeout,
-  createDefaultConfig,
-} from './types.js';
-
-export { spawnAgent, type AgentProcess } from './spawn.js';
-export { StreamParser } from './stream-parser.js';
-export { OutputBuffer } from './output-buffer.js';
-export { RestartPolicy } from './restart-policy.js';
-export { TimeoutGuard } from './timeout-guard.js';
-export { StageValidator } from './stage-validator.js';
-export { AgentManager, type SpawnFn } from './agent-manager.js';
-
-// Phase 1 of the agent-manager consolidation: type skeletons for the unified
-// agent-lifecycle layer. Runtime behavior lands in Phase 2; these exports
-// exist now so consumers can rename imports incrementally.
 export * from './session/index.js';

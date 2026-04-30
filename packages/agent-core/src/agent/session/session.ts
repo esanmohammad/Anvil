@@ -1,14 +1,10 @@
 /**
- * `AgentSession` — one logical agent.
+ * `AgentProcess` — one logical agent.
  *
  * Owns the spawn → resume → resume → done lifecycle for a single agent. Pipes
  * adapter events through to its own EventEmitter surface so consumers (the
  * dashboard's WebSocket layer; cli's await-result loop) wire once and
  * survive multiple resume calls.
- *
- * Lifted from dashboard's `AgentProcess` + the per-agent slice of dashboard's
- * `AgentManager` (event wiring at `agent-manager.ts:331-443`). Behavior is
- * preserved verbatim modulo the adapter-factory injection point.
  */
 
 import { EventEmitter } from 'node:events';
@@ -21,11 +17,11 @@ import type {
 import { buildAdapterRequest } from './adapter.js';
 import type {
   AgentActivity,
-  AgentSessionEvents,
-  AgentSessionState,
-  AgentSessionStatus,
+  AgentProcessEvents,
+  AgentState,
+  AgentStatus,
   CostInfo,
-  SessionSpec,
+  SpawnConfig,
 } from './types.js';
 
 // ── Tunables ────────────────────────────────────────────────────────────
@@ -41,7 +37,7 @@ const EMPTY_EXIT_THRESHOLD_MS = 5000;
 
 // ── Public ──────────────────────────────────────────────────────────────
 
-export interface AgentSessionConstructorOpts {
+export interface AgentProcessOpts {
   /** Override the generated id. Defaults to a UUID v4. */
   id?: string;
   /** Adapter factory — required. */
@@ -52,17 +48,17 @@ export interface AgentSessionConstructorOpts {
   setTimeoutImpl?: (fn: () => void, ms: number) => void;
 }
 
-export class AgentSession extends EventEmitter {
+export class AgentProcess extends EventEmitter {
   readonly id: string;
-  readonly spec: SessionSpec;
+  readonly spec: SpawnConfig;
   readonly sessionId: string;
   protected adapter: AgentAdapter | null = null;
-  protected state: AgentSessionState;
+  protected state: AgentState;
   protected readonly factory: AgentAdapterFactory;
   protected readonly now: () => number;
   protected readonly setTimeoutImpl: (fn: () => void, ms: number) => void;
 
-  constructor(spec: SessionSpec, opts: AgentSessionConstructorOpts) {
+  constructor(spec: SpawnConfig, opts: AgentProcessOpts) {
     super();
     this.spec = spec;
     this.factory = opts.adapterFactory;
@@ -75,23 +71,23 @@ export class AgentSession extends EventEmitter {
 
   // ── Typed event helpers ──────────────────────────────────────────────
 
-  override on<K extends keyof AgentSessionEvents>(
+  override on<K extends keyof AgentProcessEvents>(
     event: K,
-    listener: AgentSessionEvents[K],
+    listener: AgentProcessEvents[K],
   ): this {
     return super.on(event, listener);
   }
 
-  override emit<K extends keyof AgentSessionEvents>(
+  override emit<K extends keyof AgentProcessEvents>(
     event: K,
-    ...args: Parameters<AgentSessionEvents[K]>
+    ...args: Parameters<AgentProcessEvents[K]>
   ): boolean {
     return super.emit(event, ...args);
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────
 
-  /** Start the session. Spawns the underlying adapter and begins streaming. */
+  /** Start the process. Spawns the underlying adapter and begins streaming. */
   start(): void {
     const req = buildAdapterRequest(this.spec, this.sessionId);
     this.adapter = this.factory(req);
@@ -109,10 +105,8 @@ export class AgentSession extends EventEmitter {
   }
 
   /**
-   * Send input to a running session — spawns a NEW adapter with `resume:
-   * true` and the same `sessionId`, re-wires events through this session.
-   *
-   * Lifted from `dashboard/server/agent-manager.ts:sendInput()`.
+   * Send input to a running process — spawns a NEW adapter with `resume:
+   * true` and the same `sessionId`, re-wires events through this process.
    */
   sendInput(text: string): void {
     // Show user message in output stream
@@ -142,7 +136,7 @@ export class AgentSession extends EventEmitter {
     resumeAdapter.start();
   }
 
-  /** Kill the underlying adapter and mark the session as `killed`. */
+  /** Kill the underlying adapter and mark the process as `killed`. */
   kill(signal?: NodeJS.Signals): void {
     if (this.adapter) {
       try {
@@ -155,12 +149,12 @@ export class AgentSession extends EventEmitter {
 
   // ── State queries ────────────────────────────────────────────────────
 
-  /** Read-only snapshot of the session's runtime state. */
-  getState(): AgentSessionState {
+  /** Read-only snapshot of the process's runtime state. */
+  getState(): AgentState {
     return this.state;
   }
 
-  get status(): AgentSessionStatus {
+  get status(): AgentStatus {
     return this.state.status;
   }
 
@@ -249,9 +243,9 @@ export class AgentSession extends EventEmitter {
 // ── Factories + helpers (exported for cross-file reuse) ─────────────────
 
 export function createPendingState(
-  spec: SessionSpec,
+  spec: SpawnConfig,
   id: string,
-): AgentSessionState {
+): AgentState {
   return {
     id,
     name: spec.name,
@@ -279,7 +273,7 @@ export function emptyCost(): CostInfo {
   };
 }
 
-export function appendOutput(state: AgentSessionState, chunk: string): void {
+export function appendOutput(state: AgentState, chunk: string): void {
   state.output += chunk;
   if (state.output.length > MAX_OUTPUT_BYTES) {
     state.output = state.output.slice(-MAX_OUTPUT_BYTES);
@@ -287,7 +281,7 @@ export function appendOutput(state: AgentSessionState, chunk: string): void {
 }
 
 export function pushActivity(
-  state: AgentSessionState,
+  state: AgentState,
   activity: AgentActivity,
 ): void {
   state.activities.push(activity);
@@ -310,7 +304,6 @@ export function accumulateCost(prev: CostInfo, next: CostInfo): CostInfo {
 
 /**
  * Generate a UUID v4. Claude CLI requires a valid v4 for `--session-id`.
- * Lifted from `dashboard/server/agent-manager.ts:generateSessionId()`.
  */
 export function generateSessionId(): string {
   const bytes = randomBytes(16);

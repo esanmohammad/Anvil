@@ -35,10 +35,7 @@ import { fileURLToPath } from 'node:url';
 // @ts-ignore — ws is a runtime dependency
 import { WebSocketServer, WebSocket } from 'ws';
 
-import {
-  AgentSessionRegistry as AgentManager,
-  type AgentSessionState as AgentState,
-} from '@anvil/agent-core';
+import { AgentManager, type AgentState } from '@anvil/agent-core';
 import { createAdapter } from './adapters/adapter-factory.js';
 import { PipelineRunner } from './pipeline-runner.js';
 import type { PipelineRunState } from './pipeline-runner.js';
@@ -807,11 +804,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   // ── Shared services ─────────────────────────────────────────────────
   const projectLoader = new ProjectLoader();
   const featureStore = new FeatureStore();
-  // AgentManager is now a re-export of agent-core's AgentSessionRegistry
-  // (Phase 4 of the agent-manager consolidation). The adapter factory is
-  // injected so agent-core stays decoupled from dashboard's BaseAdapter
-  // family — `createAdapter` returns a BaseAdapter which structurally
-  // satisfies agent-core's `AgentAdapter` (5-event EventEmitter).
+  // AgentManager lives in @anvil/agent-core (the source of truth). The
+  // adapter factory is injected so agent-core stays decoupled from
+  // dashboard's BaseAdapter family — `createAdapter` returns a BaseAdapter
+  // which structurally satisfies agent-core's `AgentAdapter` (5-event
+  // EventEmitter).
   const agentManager = new AgentManager({ adapterFactory: createAdapter });
   const memoryStore = new MemoryStore();
   const kbManager = new KnowledgeBaseManager(projectLoader);

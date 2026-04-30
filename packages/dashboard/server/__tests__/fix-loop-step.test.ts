@@ -15,11 +15,7 @@ import {
   hasValidationFailures,
   runFixLoop,
 } from '../steps/fix-loop.step.js';
-import type {
-  AgentSessionRegistry as AgentManager,
-  AgentSessionState as AgentState,
-  SessionSpec as SpawnConfig,
-} from '@anvil/agent-core';
+import type { AgentManager, AgentState, SpawnConfig } from '@anvil/agent-core';
 
 interface FakeOpts {
   /** Per-id-status sequence (default: each agent reports `done` on first poll). */

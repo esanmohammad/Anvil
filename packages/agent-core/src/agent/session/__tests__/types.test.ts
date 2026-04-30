@@ -1,38 +1,31 @@
 /**
- * Phase 1 type-shape lock for the unified agent-lifecycle surface.
+ * Type-shape lock for agent-core's canonical agent-lifecycle surface.
  *
- * These tests prove (at compile time + a thin runtime shim) that:
- *
- *   1. `SessionSpec` is structurally compatible with dashboard's existing
- *      `SpawnConfig` shape (every legacy field has a destination).
- *   2. `SessionSpec` is structurally compatible with agent-core's existing
- *      `AgentProcessConfig` shape (cli single-shot caller).
- *   3. `AgentSessionState` exposes the same fields dashboard's `AgentState`
- *      does, with the same status union.
- *   4. The skeleton classes throw a clear "Phase 2" error when their
- *      runtime methods are called — Phase 2 will replace these.
+ * Asserts (compile time + a thin runtime shim) that the public types match
+ * the dashboard's pre-Phase-4 shapes — every legacy field has a destination
+ * — so dashboard's call sites compile after dropping their re-export shims.
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-
 import { EventEmitter } from 'node:events';
+
 import {
-  AgentSession,
-  AgentSessionNotFoundError,
-  AgentSessionRegistry,
+  AgentManager,
+  AgentNotFoundError,
+  AgentProcess,
   SessionResumeNotSupportedError,
   emptyCost,
   type AgentActivity,
   type AgentAdapter,
   type AgentCheckpointHook,
   type AgentCostHook,
-  type AgentSessionEvents,
-  type AgentSessionRegistryEvents,
-  type AgentSessionState,
-  type AgentSessionStatus,
+  type AgentManagerEvents,
+  type AgentProcessEvents,
+  type AgentState,
+  type AgentStatus,
   type CostInfo,
-  type SessionSpec,
+  type SpawnConfig,
 } from '../index.js';
 
 // Minimal fake adapter for the type-shape locks. Not exercised; only
@@ -43,11 +36,11 @@ class NoopAdapter extends EventEmitter implements AgentAdapter {
 }
 const noopFactory = () => new NoopAdapter();
 
-// ── 1. SessionSpec accepts dashboard's SpawnConfig shape ────────────────
+// ── 1. SpawnConfig parity ───────────────────────────────────────────────
 
-describe('SessionSpec — dashboard SpawnConfig parity', () => {
+describe('SpawnConfig — dashboard parity', () => {
   it('accepts every field dashboard sets today', () => {
-    const spec: SessionSpec = {
+    const spec: SpawnConfig = {
       name: 'engineer-build-backend',
       persona: 'engineer',
       project: 'demo',
@@ -68,8 +61,8 @@ describe('SessionSpec — dashboard SpawnConfig parity', () => {
     assert.equal(spec.maxOutputTokens, 16000);
   });
 
-  it('accepts agent-core AgentProcessConfig fields (cli flow)', () => {
-    const spec: SessionSpec = {
+  it('accepts cli-shape options (restart + timeout + binaryPath)', () => {
+    const spec: SpawnConfig = {
       name: 'cli-stage',
       persona: 'cli',
       project: '',
@@ -87,11 +80,11 @@ describe('SessionSpec — dashboard SpawnConfig parity', () => {
   });
 });
 
-// ── 2. AgentSessionState parity with dashboard's AgentState ─────────────
+// ── 2. AgentState parity ────────────────────────────────────────────────
 
-describe('AgentSessionState — dashboard AgentState parity', () => {
+describe('AgentState — dashboard parity', () => {
   it('exposes the same 5-state status union', () => {
-    const states: AgentSessionStatus[] = [
+    const states: AgentStatus[] = [
       'pending',
       'running',
       'done',
@@ -102,7 +95,7 @@ describe('AgentSessionState — dashboard AgentState parity', () => {
   });
 
   it('shape matches dashboard AgentState field-for-field', () => {
-    const state: AgentSessionState = {
+    const state: AgentState = {
       id: 'a',
       name: 'b',
       persona: 'c',
@@ -188,8 +181,8 @@ describe('AgentActivity + CostInfo', () => {
 // ── 5. Event shapes ─────────────────────────────────────────────────────
 
 describe('Event shapes', () => {
-  it('AgentSessionEvents has the 5 dashboard AgentProcessEvents', () => {
-    const events: (keyof AgentSessionEvents)[] = [
+  it('AgentProcessEvents has the 5 dashboard AgentProcessEvents', () => {
+    const events: (keyof AgentProcessEvents)[] = [
       'content',
       'activity',
       'result',
@@ -199,8 +192,8 @@ describe('Event shapes', () => {
     assert.equal(events.length, 5);
   });
 
-  it('AgentSessionRegistryEvents has the 4 dashboard AgentManagerEvents', () => {
-    const events: (keyof AgentSessionRegistryEvents)[] = [
+  it('AgentManagerEvents has the 4 dashboard AgentManagerEvents', () => {
+    const events: (keyof AgentManagerEvents)[] = [
       'agent-output',
       'agent-activity',
       'agent-done',
@@ -210,10 +203,10 @@ describe('Event shapes', () => {
   });
 });
 
-// ── 6. Skeleton classes throw a clear "Phase 2" error ───────────────────
+// ── 6. Class construction ───────────────────────────────────────────────
 
-describe('AgentSession skeleton', () => {
-  const spec: SessionSpec = {
+describe('AgentProcess construction', () => {
+  const spec: SpawnConfig = {
     name: 't',
     persona: 'p',
     project: 'pr',
@@ -224,29 +217,29 @@ describe('AgentSession skeleton', () => {
   };
 
   it('constructs with a pending state', () => {
-    const session = new AgentSession(spec, { adapterFactory: noopFactory });
-    assert.equal(session.status, 'pending');
-    assert.equal(session.output, '');
+    const proc = new AgentProcess(spec, { adapterFactory: noopFactory });
+    assert.equal(proc.status, 'pending');
+    assert.equal(proc.output, '');
   });
 
   it('honors id override', () => {
-    const session = new AgentSession(spec, { adapterFactory: noopFactory, id: 'custom-id' });
-    assert.equal(session.id, 'custom-id');
-    assert.equal(session.sessionId, 'custom-id');
+    const proc = new AgentProcess(spec, { adapterFactory: noopFactory, id: 'custom-id' });
+    assert.equal(proc.id, 'custom-id');
+    assert.equal(proc.sessionId, 'custom-id');
   });
 
   it('id defaults to a UUID v4', () => {
-    const session = new AgentSession(spec, { adapterFactory: noopFactory });
-    assert.match(session.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    const proc = new AgentProcess(spec, { adapterFactory: noopFactory });
+    assert.match(proc.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
 });
 
-describe('AgentSessionRegistry skeleton', () => {
+describe('AgentManager construction', () => {
   it('constructs and accepts hook setters', () => {
-    const reg = new AgentSessionRegistry({ adapterFactory: noopFactory });
-    reg.setCostHook(() => {});
-    reg.setCheckpointHook({ lookup: () => ({ hit: false }) });
-    assert.equal(reg.getAgent('missing'), undefined);
+    const mgr = new AgentManager({ adapterFactory: noopFactory });
+    mgr.setCostHook(() => {});
+    mgr.setCheckpointHook({ lookup: () => ({ hit: false }) });
+    assert.equal(mgr.getAgent('missing'), undefined);
   });
 });
 
@@ -261,8 +254,8 @@ describe('Errors', () => {
     assert.match(err.message, /gpt-4/);
   });
 
-  it('AgentSessionNotFoundError carries the agentId', () => {
-    const err = new AgentSessionNotFoundError('agent-xyz');
+  it('AgentNotFoundError carries the agentId', () => {
+    const err = new AgentNotFoundError('agent-xyz');
     assert.equal(err.agentId, 'agent-xyz');
     assert.match(err.message, /agent-xyz/);
   });

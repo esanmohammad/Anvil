@@ -24,7 +24,7 @@ import type {
   TestCase,
   TestSpec,
 } from './test-types.js';
-import type { AgentSessionRegistry as AgentManager } from '@anvil/agent-core';
+import type { AgentManager } from '@anvil/agent-core';
 import type { TestCaseStore } from './test-case-store.js';
 import type { TestLearningsStore } from './test-learnings.js';
 

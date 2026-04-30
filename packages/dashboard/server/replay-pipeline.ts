@@ -38,7 +38,7 @@ import { dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-import type { AgentSessionRegistry as AgentManager } from '@anvil/agent-core';
+import type { AgentManager } from '@anvil/agent-core';
 import type { IncidentStore } from './incident-store.js';
 import type { ReplayStore } from './replay-store.js';
 import type { TestCaseStore } from './test-case-store.js';

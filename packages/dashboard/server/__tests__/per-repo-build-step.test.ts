@@ -28,11 +28,7 @@ import {
   type RunBuildForRepoResult,
 } from '../steps/per-repo-build.step.js';
 import type { ParsedTask } from '../engineer-task-bundler.js';
-import type {
-  AgentSessionRegistry as AgentManager,
-  AgentSessionState as AgentState,
-  SessionSpec as SpawnConfig,
-} from '@anvil/agent-core';
+import type { AgentManager, AgentState, SpawnConfig } from '@anvil/agent-core';
 
 interface FakeOpts {
   /** Status sequence the next getAgent() calls return. */

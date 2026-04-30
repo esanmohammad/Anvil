@@ -24,7 +24,7 @@
 import { spawnAndWait } from './agent-spawner.js';
 import { parseTasks, groupTasksForExecution } from '../engineer-task-bundler.js';
 import type { ParsedTask } from '../engineer-task-bundler.js';
-import type { AgentSessionRegistry as AgentManager } from '@anvil/agent-core';
+import type { AgentManager } from '@anvil/agent-core';
 import type { Step, StepContext } from '@anvil/core-pipeline';
 
 /**

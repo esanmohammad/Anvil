@@ -1,43 +1,41 @@
 /**
- * `AgentSessionRegistry` — tracks many concurrent `AgentSession`s.
+ * `AgentManager` — tracks many concurrent `AgentProcess`es.
  *
- * Lifted from dashboard's `AgentManager` class
- * (`dashboard/server/agent-manager.ts`). Behavior parity:
- *
- *   - `spawn(spec)` consults the checkpoint hook; on hit, synthesizes a
+ * Behavior:
+ *   - `spawn(config)` consults the checkpoint hook; on hit, synthesizes a
  *     done-event without launching an adapter.
- *   - On miss, constructs an `AgentSession` (which spawns the adapter via
- *     the registry's `adapterFactory`) and re-emits the session's events
- *     onto the registry's own EventEmitter surface.
- *   - `sendInput(id, text)` delegates to the session.
- *   - `kill(id)` / `killAll()` propagate to sessions and update state.
+ *   - On miss, constructs an `AgentProcess` (which spawns the adapter via
+ *     the manager's `adapterFactory`) and re-emits the process's events
+ *     onto the manager's own EventEmitter surface.
+ *   - `sendInput(id, text)` delegates to the process.
+ *   - `kill(id)` / `killAll()` propagate to processes and update state.
  *   - The cost hook is invoked once per `result` event, and the checkpoint
  *     `record` (when present) is called with the same data.
  */
 
 import { EventEmitter } from 'node:events';
 import {
-  AgentSession,
+  AgentProcess,
   appendOutput,
-  type AgentSessionConstructorOpts,
+  type AgentProcessOpts,
 } from './session.js';
 import type { AgentAdapterFactory } from './adapter.js';
 import type {
   AgentCheckpointHook,
   AgentCostHook,
-  AgentSessionRegistryEvents,
-  AgentSessionState,
+  AgentManagerEvents,
+  AgentState,
   CostInfo,
-  SessionSpec,
+  SpawnConfig,
 } from './types.js';
-import { AgentSessionNotFoundError } from './types.js';
+import { AgentNotFoundError } from './types.js';
 
-export interface AgentSessionRegistryOpts {
+export interface AgentManagerOpts {
   /** Adapter factory — required. Same factory is reused for every spawn. */
   adapterFactory: AgentAdapterFactory;
   /** Test seam — clock. Defaults to `Date.now`. */
   now?: () => number;
-  /** Test seam — `setTimeout` substitute used by sessions. */
+  /** Test seam — `setTimeout` substitute used by processes. */
   setTimeoutImpl?: (fn: () => void, ms: number) => void;
   /**
    * Test seam — defer the cache-hit `agent-done` emission. Production uses
@@ -47,8 +45,8 @@ export interface AgentSessionRegistryOpts {
   nextTickImpl?: (fn: () => void) => void;
 }
 
-export class AgentSessionRegistry extends EventEmitter {
-  protected readonly sessions = new Map<string, { session: AgentSession; spec: SessionSpec }>();
+export class AgentManager extends EventEmitter {
+  protected readonly processes = new Map<string, { process: AgentProcess; spec: SpawnConfig }>();
   protected costHook: AgentCostHook | null = null;
   protected checkpointHook: AgentCheckpointHook | null = null;
   protected readonly adapterFactory: AgentAdapterFactory;
@@ -56,7 +54,7 @@ export class AgentSessionRegistry extends EventEmitter {
   protected readonly setTimeoutImpl: (fn: () => void, ms: number) => void;
   protected readonly nextTickImpl: (fn: () => void) => void;
 
-  constructor(opts: AgentSessionRegistryOpts) {
+  constructor(opts: AgentManagerOpts) {
     super();
     this.adapterFactory = opts.adapterFactory;
     this.now = opts.now ?? Date.now;
@@ -66,16 +64,16 @@ export class AgentSessionRegistry extends EventEmitter {
 
   // ── Typed event helpers ──────────────────────────────────────────────
 
-  override on<K extends keyof AgentSessionRegistryEvents>(
+  override on<K extends keyof AgentManagerEvents>(
     event: K,
-    listener: AgentSessionRegistryEvents[K],
+    listener: AgentManagerEvents[K],
   ): this {
     return super.on(event, listener);
   }
 
-  override emit<K extends keyof AgentSessionRegistryEvents>(
+  override emit<K extends keyof AgentManagerEvents>(
     event: K,
-    ...args: Parameters<AgentSessionRegistryEvents[K]>
+    ...args: Parameters<AgentManagerEvents[K]>
   ): boolean {
     return super.emit(event, ...args);
   }
@@ -88,19 +86,19 @@ export class AgentSessionRegistry extends EventEmitter {
   // ── Spawn ────────────────────────────────────────────────────────────
 
   /**
-   * Spawn a new session. Returns a synchronous snapshot of its state.
-   * On a checkpoint cache hit the snapshot has `status === 'done'` and the
+   * Spawn a new agent. Returns a synchronous snapshot of its state. On a
+   * checkpoint cache hit the snapshot has `status === 'done'` and the
    * `agent-done` event fires asynchronously (next tick) so listeners
    * attached after `spawn()` returns still observe it.
    */
-  spawn(spec: SessionSpec): AgentSessionState {
-    const sessionOpts: AgentSessionConstructorOpts = {
+  spawn(spec: SpawnConfig): AgentState {
+    const processOpts: AgentProcessOpts = {
       adapterFactory: this.adapterFactory,
       now: this.now,
       setTimeoutImpl: this.setTimeoutImpl,
     };
-    const session = new AgentSession(spec, sessionOpts);
-    const agentId = session.id;
+    const proc = new AgentProcess(spec, processOpts);
+    const agentId = proc.id;
 
     // ── Checkpoint cache lookup ───────────────────────────────────────
     if (this.checkpointHook) {
@@ -115,13 +113,13 @@ export class AgentSessionRegistry extends EventEmitter {
         });
         if (hit.hit) {
           // Manually populate state — no adapter ever spawns.
-          const state = session.getState();
+          const state = proc.getState();
           state.status = 'done';
           state.startedAt = this.now();
           state.finishedAt = this.now();
           appendOutput(state, hit.output);
           if (hit.cost) state.cost = hit.cost;
-          this.sessions.set(agentId, { session, spec });
+          this.processes.set(agentId, { process: proc, spec });
           this.nextTickImpl(() => {
             this.emit('agent-done', { agent: state });
           });
@@ -129,48 +127,48 @@ export class AgentSessionRegistry extends EventEmitter {
         }
       } catch (err) {
         process.stderr.write(
-          `[agent-session-registry] checkpoint lookup failed: ${err instanceof Error ? err.message : String(err)}\n`,
+          `[agent-manager] checkpoint lookup failed: ${err instanceof Error ? err.message : String(err)}\n`,
         );
       }
     }
 
-    // ── Wire session events through to the registry surface ──────────
-    this.wireSession(agentId, session, spec);
+    // ── Wire process events through to the manager surface ──────────
+    this.wireProcess(agentId, proc, spec);
 
-    session.start();
-    this.sessions.set(agentId, { session, spec });
-    return session.getState();
+    proc.start();
+    this.processes.set(agentId, { process: proc, spec });
+    return proc.getState();
   }
 
   // ── Send input ───────────────────────────────────────────────────────
 
   /** Send input to a running agent. Throws if the agent is not registered. */
   sendInput(agentId: string, text: string): void {
-    const entry = this.sessions.get(agentId);
-    if (!entry) throw new AgentSessionNotFoundError(agentId);
-    // Show user message in registry output stream BEFORE the session emits
-    // its own copy — preserves dashboard's emit order
-    // (`agent-output` first, then session's own `content`).
+    const entry = this.processes.get(agentId);
+    if (!entry) throw new AgentNotFoundError(agentId);
+    // Show user message in manager output stream BEFORE the process emits
+    // its own copy — preserves the dashboard emit order
+    // (`agent-output` first, then process's own `content`).
     this.emit('agent-output', { agentId, chunk: `\n\n> User: ${text}\n\n` });
-    entry.session.sendInput(text);
+    entry.process.sendInput(text);
   }
 
   // ── Kill ─────────────────────────────────────────────────────────────
 
   kill(agentId: string): boolean {
-    const entry = this.sessions.get(agentId);
+    const entry = this.processes.get(agentId);
     if (!entry) return false;
-    entry.session.kill();
+    entry.process.kill();
     return true;
   }
 
   killAll(): number {
     let killed = 0;
-    for (const { session } of this.sessions.values()) {
-      const status = session.getState().status;
+    for (const { process: proc } of this.processes.values()) {
+      const status = proc.getState().status;
       if (status === 'running' || status === 'pending') {
         try {
-          session.kill('SIGTERM');
+          proc.kill('SIGTERM');
           killed++;
         } catch { /* already dead */ }
       }
@@ -180,34 +178,34 @@ export class AgentSessionRegistry extends EventEmitter {
 
   // ── Queries ──────────────────────────────────────────────────────────
 
-  getAgent(agentId: string): AgentSessionState | undefined {
-    return this.sessions.get(agentId)?.session.getState();
+  getAgent(agentId: string): AgentState | undefined {
+    return this.processes.get(agentId)?.process.getState();
   }
 
-  getAllAgents(): AgentSessionState[] {
-    return Array.from(this.sessions.values()).map((e) => e.session.getState());
+  getAllAgents(): AgentState[] {
+    return Array.from(this.processes.values()).map((e) => e.process.getState());
   }
 
   // ── Internals ────────────────────────────────────────────────────────
 
-  protected wireSession(agentId: string, session: AgentSession, spec: SessionSpec): void {
-    session.on('content', (chunk: string) => {
+  protected wireProcess(agentId: string, proc: AgentProcess, spec: SpawnConfig): void {
+    proc.on('content', (chunk: string) => {
       this.emit('agent-output', { agentId, chunk });
     });
-    session.on('activity', (activity) => {
+    proc.on('activity', (activity) => {
       this.emit('agent-activity', { agentId, activity });
     });
-    session.on('result', (data: { result: string; cost: CostInfo; sessionId: string }) => {
-      const state = session.getState();
+    proc.on('result', (data: { result: string; cost: CostInfo; sessionId: string }) => {
+      const state = proc.getState();
       this.fireCostHook(agentId, spec, data.cost);
       this.fireCheckpointRecord(spec, data.result || state.output, state.cost);
       this.emit('agent-done', { agent: state });
     });
-    session.on('error-output', (text: string) => {
+    proc.on('error-output', (text: string) => {
       this.emit('agent-error', { agentId, error: text });
     });
-    session.on('exit', () => {
-      const state = session.getState();
+    proc.on('exit', () => {
+      const state = proc.getState();
       if (state.status === 'error' && state.error) {
         this.emit('agent-error', { agentId, error: state.error });
       } else if (state.status === 'done' && state.finishedAt !== state.startedAt) {
@@ -219,7 +217,7 @@ export class AgentSessionRegistry extends EventEmitter {
     });
   }
 
-  protected fireCostHook(agentId: string, spec: SessionSpec, cost: CostInfo): void {
+  protected fireCostHook(agentId: string, spec: SpawnConfig, cost: CostInfo): void {
     if (!this.costHook) return;
     try {
       void this.costHook({
@@ -237,12 +235,12 @@ export class AgentSessionRegistry extends EventEmitter {
       });
     } catch (err) {
       process.stderr.write(
-        `[agent-session-registry] cost hook threw: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[agent-manager] cost hook threw: ${err instanceof Error ? err.message : String(err)}\n`,
       );
     }
   }
 
-  protected fireCheckpointRecord(spec: SessionSpec, output: string, cost: CostInfo): void {
+  protected fireCheckpointRecord(spec: SpawnConfig, output: string, cost: CostInfo): void {
     if (!this.checkpointHook?.record) return;
     try {
       this.checkpointHook.record({
@@ -257,7 +255,7 @@ export class AgentSessionRegistry extends EventEmitter {
       });
     } catch (err) {
       process.stderr.write(
-        `[agent-session-registry] checkpoint record threw: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[agent-manager] checkpoint record threw: ${err instanceof Error ? err.message : String(err)}\n`,
       );
     }
   }

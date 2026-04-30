@@ -1,20 +1,22 @@
 /**
- * `@anvil/agent-core/agent/session` — barrel exports for the unified
- * agent-lifecycle layer (Phase 1 of the agent-manager consolidation).
+ * `@anvil/agent-core/agent/session` — barrel exports for the agent-lifecycle
+ * layer. agent-core is the canonical source of truth for `AgentManager`
+ * (registry of many) and `AgentProcess` (one logical agent).
  */
 
 export {
-  AgentSession,
+  AgentProcess,
   emptyCost,
   generateSessionId,
   appendOutput,
   pushActivity,
   accumulateCost,
+  type AgentProcessOpts,
 } from './session.js';
 
 export {
-  AgentSessionRegistry,
-  type AgentSessionRegistryOpts,
+  AgentManager,
+  type AgentManagerOpts,
 } from './session-registry.js';
 
 export type {
@@ -29,15 +31,15 @@ export type {
   AgentActivity,
   AgentCheckpointHook,
   AgentCostHook,
-  AgentSessionEvents,
-  AgentSessionRegistryEvents,
-  AgentSessionState,
-  AgentSessionStatus,
+  AgentManagerEvents,
+  AgentProcessEvents,
+  AgentState,
+  AgentStatus,
   CostInfo,
-  SessionSpec,
+  SpawnConfig,
 } from './types.js';
 
 export {
-  AgentSessionNotFoundError,
+  AgentNotFoundError,
   SessionResumeNotSupportedError,
 } from './types.js';
