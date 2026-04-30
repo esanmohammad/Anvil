@@ -56,6 +56,12 @@ import {
   runTestGenForProject,
 } from './steps/test-gen-stage.step.js';
 import {
+  pullBaseBranchForRepos,
+  runPostBuildGuards,
+  deployProject,
+  createFeatureBranches as createFeatureBranchesHelper,
+} from './steps/workspace-ops.js';
+import {
   extractAcceptanceCriteria,
   extractAffectedRepos,
   extractApiEndpoints,
@@ -1508,48 +1514,16 @@ export class PipelineRunner extends EventEmitter {
    * Uses config.baseBranch, then tries main, then master as fallback.
    */
   private async pullLatestMain(): Promise<void> {
-    const base = this.getBaseBranch();
-    const repos = this.state.repoNames;
-
-    const pullBranch = (cwd: string, label: string): boolean => {
-      // If explicit baseBranch is set, only try that one
-      if (this.config.baseBranch) {
-        try {
-          execSync(`git fetch origin && git checkout "${base}" && git pull origin "${base}"`, { cwd, timeout: 30000, stdio: 'pipe' });
-          console.log(`[pipeline] ${label}: up to date with ${base}`);
-          return true;
-        } catch {
-          console.warn(`[pipeline] ${label}: could not pull ${base} — continuing with current state`);
-          return false;
-        }
-      }
-      // Auto-detect: try main, then master
-      try {
-        execSync('git fetch origin && git checkout main && git pull origin main', { cwd, timeout: 30000, stdio: 'pipe' });
-        console.log(`[pipeline] ${label}: up to date with main`);
-        return true;
-      } catch {
-        try {
-          execSync('git fetch origin && git checkout master && git pull origin master', { cwd, timeout: 30000, stdio: 'pipe' });
-          console.log(`[pipeline] ${label}: up to date with master`);
-          return true;
-        } catch {
-          console.warn(`[pipeline] ${label}: could not pull latest — continuing with current state`);
-          return false;
-        }
-      }
-    };
-
-    if (repos.length === 0) {
-      pullBranch(this.workspaceDir, 'workspace root');
-      return;
-    }
-
-    for (const repoName of repos) {
-      const repoPath = this.repoPaths[repoName];
-      if (!repoPath || !existsSync(repoPath)) continue;
-      pullBranch(repoPath, repoName);
-    }
+    await pullBaseBranchForRepos({
+      baseBranch: this.config.baseBranch,
+      repoPaths: this.repoPaths,
+      repoNames: this.state.repoNames,
+      workspaceDir: this.workspaceDir,
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
   }
 
   // ── Interactive Clarify (one question at a time) ─────────────────
@@ -2218,67 +2192,18 @@ export class PipelineRunner extends EventEmitter {
    */
   private runPostBuildGuards(): void {
     console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
-
     const repos = this.state.repoNames.length > 0
       ? this.state.repoNames.map((r) => ({ name: r, path: this.repoPaths[r] || join(this.workspaceDir, r) }))
       : [{ name: this.config.project, path: this.workspaceDir }];
-
-    for (const repo of repos) {
-      try {
-        // Load commands from project config (factory.yaml)
-        const repoCommands = this.projectLoader.getRepoCommands(this.config.project, repo.name);
-        if (repoCommands?.format) {
-          this.runSilent(repoCommands.format, repo.path, repo.name);
-        }
-        if (repoCommands?.lint) {
-          this.runSilent(repoCommands.lint, repo.path, repo.name);
-        }
-
-        // Fallback to language-based detection if no config
-        if (!repoCommands?.format && !repoCommands?.lint) {
-          const hasGo = this.fileExists(repo.path, 'go.mod');
-          const hasTs = this.fileExists(repo.path, 'tsconfig.json');
-          const hasPackageJson = this.fileExists(repo.path, 'package.json');
-          const hasPython = this.fileExists(repo.path, 'pyproject.toml') || this.fileExists(repo.path, 'setup.py');
-
-          if (hasGo) {
-            this.runSilent('gofmt -w .', repo.path, repo.name);
-            this.runSilent('golangci-lint run --fix ./... 2>/dev/null', repo.path, repo.name);
-          }
-
-          if (hasTs || hasPackageJson) {
-            this.runSilent('npx prettier --write "**/*.{ts,tsx,js,jsx}" --ignore-unknown 2>/dev/null', repo.path, repo.name);
-            this.runSilent('npx eslint --fix "**/*.{ts,tsx,js,jsx}" 2>/dev/null', repo.path, repo.name);
-          }
-
-          if (hasPython) {
-            this.runSilent('black . 2>/dev/null', repo.path, repo.name);
-            this.runSilent('ruff check --fix . 2>/dev/null', repo.path, repo.name);
-          }
-        }
-      } catch (err) {
-        // Guards are best-effort — don't fail the pipeline
-        console.warn(`[pipeline] Post-build guard error in ${repo.name}:`, err);
-      }
-    }
-
+    runPostBuildGuards({
+      repos,
+      getRepoCommands: (repoName) => this.projectLoader.getRepoCommands(this.config.project, repoName),
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
     console.log('[pipeline] Post-build guards complete.');
-  }
-
-  private runSilent(cmd: string, cwd: string, _repoName: string): void {
-    try {
-      execSync(cmd, { cwd, stdio: 'pipe', timeout: 60_000 });
-    } catch {
-      // Silently ignore — formatters/linters may not be installed
-    }
-  }
-
-  private fileExists(dir: string, filename: string): boolean {
-    try {
-      return existsSync(join(dir, filename));
-    } catch {
-      return false;
-    }
   }
 
   // ── Remote sandbox deployment ──────────────────────────────────────
@@ -2292,55 +2217,18 @@ export class PipelineRunner extends EventEmitter {
    * Runs after ship stage. Non-blocking — pipeline completes even if deploy fails.
    */
   private deployToRemote(): void {
-    const project = this.config.project;
-    const mode = this.config.deploy;
-    if (!mode) return;
-
-    const isRemote = mode === 'remote';
-    const label = isRemote ? 'remote sandbox' : 'local environment';
-
-    // Resolve deploy command: factory.yaml > ANVIL_DEPLOY_CMD env > skip
-    const factoryConfig = this.projectLoader.getConfig(project);
-    const configDeployCmd = factoryConfig?.pipeline?.ship?.deploy;
-    const envDeployCmd = process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD;
-
-    let cmd: string;
-    if (configDeployCmd) {
-      cmd = configDeployCmd;
-      console.log(`[pipeline] Using deploy command from factory.yaml: ${cmd}`);
-    } else if (envDeployCmd) {
-      cmd = isRemote ? `${envDeployCmd} up ${project} --remote` : `${envDeployCmd} up ${project}`;
-      console.log(`[pipeline] Using deploy command from ANVIL_DEPLOY_CMD: ${cmd}`);
-    } else {
-      console.log(`[pipeline] No deploy command configured — skipping sandbox deployment`);
-      return;
-    }
-    console.log(`[pipeline] Deploying ${project} to ${label}...`);
-
-    try {
-      const result = execSync(cmd, {
-        cwd: this.workspaceDir,
-        timeout: 10 * 60 * 1000,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }).toString();
-
-      // Try to extract URL from output
-      const urlMatch = result.match(/https?:\/\/\S+/);
-      if (urlMatch) {
-        console.log(`[pipeline] Deployed: ${urlMatch[0]}`);
-        this.emit('artifact-written', {
-          stage: 'ship',
-          file: isRemote ? 'SANDBOX_URL' : 'LOCAL_URL',
-          summary: `${label} deployed: ${urlMatch[0]}`,
-          content: urlMatch[0],
-        });
-      } else {
-        console.log(`[pipeline] ${label} deployed for ${project}`);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[pipeline] Deploy to ${label} failed (non-fatal): ${msg}`);
-    }
+    deployProject({
+      project: this.config.project,
+      mode: this.config.deploy,
+      workspaceDir: this.workspaceDir,
+      configDeployCmd: this.projectLoader.getConfig(this.config.project)?.pipeline?.ship?.deploy,
+      envDeployCmd: process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD,
+      onArtifact: (artifact) => this.emit('artifact-written', artifact),
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
   }
 
   // ── Feature branch creation ────────────────────────────────────────
@@ -2352,40 +2240,16 @@ export class PipelineRunner extends EventEmitter {
   private createFeatureBranches(): void {
     const branchName = `anvil/${this.state.featureSlug}`;
     console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
-
-    for (const repoName of this.state.repoNames) {
-      const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
-      try {
-        // Check if branch already exists
-        try {
-          execSync(`git rev-parse --verify "${branchName}"`, { cwd: repoPath, stdio: 'pipe' });
-          // Branch exists — check it out
-          execSync(`git checkout "${branchName}"`, { cwd: repoPath, stdio: 'pipe' });
-          console.log(`[pipeline] Checked out existing branch "${branchName}" in ${repoName}`);
-        } catch {
-          // Branch doesn't exist — create it from current HEAD
-          execSync(`git checkout -b "${branchName}"`, { cwd: repoPath, stdio: 'pipe' });
-          console.log(`[pipeline] Created branch "${branchName}" in ${repoName}`);
-        }
-      } catch (err) {
-        console.warn(`[pipeline] Failed to create branch in ${repoName}:`, err);
-      }
-    }
-
-    // Also create branch in workspace root if no repos
-    if (this.state.repoNames.length === 0) {
-      try {
-        try {
-          execSync(`git rev-parse --verify "${branchName}"`, { cwd: this.workspaceDir, stdio: 'pipe' });
-          execSync(`git checkout "${branchName}"`, { cwd: this.workspaceDir, stdio: 'pipe' });
-        } catch {
-          execSync(`git checkout -b "${branchName}"`, { cwd: this.workspaceDir, stdio: 'pipe' });
-        }
-        console.log(`[pipeline] Created branch "${branchName}" in workspace root`);
-      } catch (err) {
-        console.warn(`[pipeline] Failed to create branch in workspace root:`, err);
-      }
-    }
+    createFeatureBranchesHelper({
+      featureSlug: this.state.featureSlug,
+      repoPaths: this.repoPaths,
+      repoNames: this.state.repoNames,
+      workspaceDir: this.workspaceDir,
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
   }
 
   // ── Artifact writing ───────────────────────────────────────────────

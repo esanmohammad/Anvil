@@ -78,6 +78,23 @@ export type {
   TestGenStageStepOptions,
   TestGenArtifactEvent,
 } from './test-gen-stage.step.js';
+export {
+  pullBaseBranchForRepos,
+  runPostBuildGuards,
+  deployProject,
+  createFeatureBranches,
+  runSilent,
+  fileExists,
+} from './workspace-ops.js';
+export type {
+  PullBaseBranchOptions,
+  RunPostBuildGuardsOptions,
+  DeployProjectOptions,
+  DeployArtifact,
+  CreateFeatureBranchesOptions,
+  ShellRunner,
+  RepoCommands,
+} from './workspace-ops.js';
 export { attachCostBudgetHook } from './cost-budget.hook.js';
 export type {
   CostBudgetHookOptions,
