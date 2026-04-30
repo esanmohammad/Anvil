@@ -58,3 +58,14 @@ export type {
   SpawnAndWaitResult,
   WaitForAgentOptions,
 } from './agent-spawner.js';
+export {
+  runPerRepoStageForRepo,
+  combinePerRepoArtifacts,
+  createPerRepoStageStep,
+  disallowedToolsForPersona,
+} from './per-repo-stage.step.js';
+export type {
+  RunPerRepoStageOptions,
+  RunPerRepoStageResult,
+  PerRepoStageStepOptions,
+} from './per-repo-stage.step.js';

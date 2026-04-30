@@ -40,6 +40,10 @@ import {
   waitForAgent as waitForAgentHelper,
 } from './steps/agent-spawner.js';
 import {
+  runPerRepoStageForRepo,
+  combinePerRepoArtifacts,
+} from './steps/per-repo-stage.step.js';
+import {
   extractAcceptanceCriteria,
   extractAffectedRepos,
   extractApiEndpoints,
@@ -1704,6 +1708,7 @@ export class PipelineRunner extends EventEmitter {
     for (let r = 0; r < repos.length; r++) {
       const repoName = repos[r];
       const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
+      const repoIdx = r;
 
       // Mark repo as running
       if (this.state.stages[index].repos[r]) {
@@ -1718,7 +1723,6 @@ export class PipelineRunner extends EventEmitter {
       // Each per-task spawn shares the same stable system prompt, which lets the
       // Claude CLI prompt cache hit across spawns.
       if (stage.name === 'build' && stage.persona === 'engineer') {
-        const repoIdx = r;
         promises.push(
           this.runBuildForRepo(index, repoIdx, stage, repoName, repoPath, projectPrompt)
             .then((res) => ({ repoName, artifact: res.artifact, cost: res.cost }))
@@ -1738,40 +1742,32 @@ export class PipelineRunner extends EventEmitter {
 
       const prompt = this.buildRepoStagePrompt(stage, repoName, prevArtifact);
 
-      // Non-engineer/tester personas cannot write files — only engineers and testers modify code.
-      // All non-clarifier personas have Agent disabled (P8) — sub-agents inherit context and
-      // double the token cost; nothing in the pipeline benefits from them.
-      let disallowedTools: string[] | undefined;
-      if (stage.persona !== 'engineer' && stage.persona !== 'tester') {
-        disallowedTools = ['Write', 'Edit', 'NotebookEdit', 'Bash', 'Agent'];
-      } else {
-        disallowedTools = ['Agent'];
-      }
-
-      const agent = this.agentManager.spawn({
-        name: `${stage.persona}-${repoName}`,
-        persona: stage.persona,
-        project: this.config.project,
-        stage: `${stage.name}:${repoName}`,
-        prompt,
-        model: this.resolveModelForStage(stage.name),
-        cwd: repoPath,
-        projectPrompt,
-        permissionMode: 'bypassPermissions',
-        disallowedTools,
-        maxOutputTokens: maxOutputTokensForStage(stage.name),
-      });
-
-      if (this.state.stages[index].repos[r]) {
-        this.state.stages[index].repos[r].agentId = agent.id;
-      }
-      this.broadcastState();
-
       promises.push(
-        this.waitForAgent(agent.id)
+        runPerRepoStageForRepo({
+          agentManager: this.agentManager,
+          project: this.config.project,
+          stageName: stage.name,
+          persona: stage.persona,
+          model: this.resolveModelForStage(stage.name),
+          maxOutputTokens: maxOutputTokensForStage(stage.name),
+          repoName,
+          repoPath,
+          projectPrompt,
+          prompt,
+          isCancelled: () => this.cancelled,
+          onSpawn: (agentId) => {
+            if (this.state.stages[index].repos[repoIdx]) {
+              this.state.stages[index].repos[repoIdx].agentId = agentId;
+            }
+            this.broadcastState();
+          },
+          onTruncation: (agentName, outputTokens) => {
+            this.handleOutputTruncation(agentName, outputTokens);
+          },
+        })
           .then((result) => {
             // Mark repo as completed
-            const repoState = this.state.stages[index].repos[r];
+            const repoState = this.state.stages[index].repos[repoIdx];
             if (repoState) {
               repoState.status = 'completed';
               repoState.cost = result.cost;
@@ -1787,7 +1783,7 @@ export class PipelineRunner extends EventEmitter {
           })
           .catch((err) => {
             const errorMsg = err instanceof Error ? err.message : String(err);
-            const repoState = this.state.stages[index].repos[r];
+            const repoState = this.state.stages[index].repos[repoIdx];
             if (repoState) {
               repoState.status = 'failed';
               repoState.error = errorMsg;
@@ -1803,10 +1799,8 @@ export class PipelineRunner extends EventEmitter {
     const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
     const successResults = results.filter((r) => r.artifact);
 
-    // Combine artifacts
-    const combined = successResults
-      .map((r) => `## ${r.repoName}\n\n${r.artifact}`)
-      .join('\n\n---\n\n');
+    // Combine artifacts (legacy "## <repo>\n\n<artifact>" separator format).
+    const combined = combinePerRepoArtifacts(successResults);
 
     // If all repos failed, throw
     if (successResults.length === 0 && repos.length > 0) {
