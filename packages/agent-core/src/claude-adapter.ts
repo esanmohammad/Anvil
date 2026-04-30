@@ -110,7 +110,11 @@ export class ClaudeAdapter implements ModelAdapter {
     ];
 
     if (config.projectPrompt) {
-      args.push('--project-prompt', config.projectPrompt);
+      // Claude CLI's flag is --system-prompt (replaces default) or
+      // --append-system-prompt (extends default). The legacy
+      // single-shot.ts uses --system-prompt. We follow that convention
+      // since the dashboard's projectPrompt is a full persona prompt.
+      args.push('--system-prompt', config.projectPrompt);
     }
     if (config.model) {
       args.push('--model', config.model);
