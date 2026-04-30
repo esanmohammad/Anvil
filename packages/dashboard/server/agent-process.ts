@@ -1,18 +1,22 @@
 /**
- * AgentProcess — multi-provider agent execution via adapter pattern.
+ * Backwards-compat re-export shim. The real types now live in
+ * `@anvil/agent-core/agent/session`. Phase 6 of the agent-manager
+ * consolidation deletes this file once direct imports flip everywhere.
  *
- * Delegates to the correct adapter (Claude CLI, Gemini CLI, or API)
- * based on the model ID. All adapters emit the same events, so
- * AgentManager and the dashboard don't need to know which provider is running.
+ * Note: the standalone `AgentProcess` class is gone — its lifecycle role
+ * folded into `AgentSession`'s constructor + private wiring (ADR D4). No
+ * dashboard call site constructs `AgentProcess` directly today.
  */
 
-import { EventEmitter } from 'node:events';
-import { createAdapter } from './adapters/adapter-factory.js';
-import type { BaseAdapter } from './adapters/base-adapter.js';
+export type {
+  AgentActivity,
+  CostInfo,
+} from '@anvil/agent-core';
 
-// ── Types (public contract — unchanged) ───────────────────────────────
-
-export interface AgentProcessConfig {
+// Local-only legacy type — agent-core's `SessionSpec` is the canonical
+// shape, and dashboard call sites that historically used
+// `AgentProcessConfig` are now via `SessionSpec`.
+export type AgentProcessConfig = {
   prompt: string;
   model: string;
   sessionId: string;
@@ -22,99 +26,5 @@ export interface AgentProcessConfig {
   permissionMode?: string;
   disallowedTools?: string[];
   allowedTools?: string[];
-  /**
-   * Phase 3 — output-token ceiling for this run. Forwarded to the adapter
-   * via setMaxOutputTokens() before start(). No-op when the adapter's
-   * capabilities.maxOutputTokens is false.
-   */
   maxOutputTokens?: number;
-}
-
-export interface CostInfo {
-  totalUsd: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  durationMs: number;
-  /** Phase 3 — provider stop reason ('max_tokens' indicates truncation). */
-  stopReason?: string;
-}
-
-export interface AgentActivity {
-  id: string;
-  kind: 'tool_use' | 'thinking' | 'text';
-  tool?: string;
-  summary: string;
-  content?: string;
-  timestamp: number;
-}
-
-export interface AgentProcessEvents {
-  content: (text: string) => void;
-  activity: (activity: AgentActivity) => void;
-  result: (data: { result: string; cost: CostInfo; sessionId: string }) => void;
-  'error-output': (text: string) => void;
-  exit: (code: number | null) => void;
-}
-
-// ── AgentProcess ──────────────────────────────────────────────────────
-
-export class AgentProcess extends EventEmitter {
-  private adapter: BaseAdapter | null = null;
-  private config: AgentProcessConfig;
-
-  constructor(config: AgentProcessConfig) {
-    super();
-    this.config = config;
-  }
-
-  // ── Typed event helpers ──────────────────────────────────────────────
-
-  override on<K extends keyof AgentProcessEvents>(
-    event: K,
-    listener: AgentProcessEvents[K],
-  ): this {
-    return super.on(event, listener);
-  }
-
-  override emit<K extends keyof AgentProcessEvents>(
-    event: K,
-    ...args: Parameters<AgentProcessEvents[K]>
-  ): boolean {
-    return super.emit(event, ...args);
-  }
-
-  // ── Lifecycle ────────────────────────────────────────────────────────
-
-  start(): void {
-    this.adapter = createAdapter(this.config);
-
-    // Phase 3: forward the output-token ceiling to the adapter before start().
-    // Adapters that don't support it (Claude CLI, Gemini CLI today) ignore it.
-    if (typeof this.config.maxOutputTokens === 'number' && this.config.maxOutputTokens > 0) {
-      this.adapter.setMaxOutputTokens(this.config.maxOutputTokens);
-    }
-
-    // Pipe all adapter events through to AgentProcess
-    this.adapter.on('content', (text) => this.emit('content', text));
-    this.adapter.on('activity', (activity) => this.emit('activity', activity));
-    this.adapter.on('result', (data) => this.emit('result', data));
-    this.adapter.on('error-output', (text) => this.emit('error-output', text));
-    this.adapter.on('exit', (code) => this.emit('exit', code));
-
-    this.adapter.start();
-  }
-
-  kill(signal?: string): void {
-    this.adapter?.kill();
-  }
-
-  get pid(): number | undefined {
-    return this.adapter?.pid;
-  }
-
-  get killed(): boolean {
-    return this.adapter?.killed ?? false;
-  }
-}
+};
