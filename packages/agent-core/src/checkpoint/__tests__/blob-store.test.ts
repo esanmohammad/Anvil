@@ -8,8 +8,8 @@ import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BlobStore } from '../checkpoint-blob-store.js';
-import { blobPath } from '../checkpoint-key.js';
+import { BlobStore } from '../blob-store.js';
+import { blobPath } from '../key.js';
 
 describe('BlobStore', () => {
   let home: string;

@@ -15,11 +15,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BlobStore } from '../checkpoint-blob-store.js';
-import { CheckpointStore } from '../checkpoint-store.js';
-import { runWithCheckpoint } from '../agent-runner-wrapper.js';
-import { computeKey } from '../checkpoint-key.js';
-import type { CheckpointInputs } from '../checkpoint-types.js';
+import { BlobStore } from '../blob-store.js';
+import { CheckpointStore } from '../store.js';
+import { runWithCheckpoint } from '../runner.js';
+import { computeKey } from '../key.js';
+import type { CheckpointInputs } from '../types.js';
 
 interface Payload { greeting: string }
 

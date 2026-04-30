@@ -9,10 +9,10 @@ import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BlobStore } from '../checkpoint-blob-store.js';
-import { CheckpointStore } from '../checkpoint-store.js';
-import { checkpointPath, computeKey } from '../checkpoint-key.js';
-import type { CheckpointInputs } from '../checkpoint-types.js';
+import { BlobStore } from '../blob-store.js';
+import { CheckpointStore } from '../store.js';
+import { checkpointPath, computeKey } from '../key.js';
+import type { CheckpointInputs } from '../types.js';
 
 function baseInputs(over: Partial<CheckpointInputs> = {}): CheckpointInputs {
   return {

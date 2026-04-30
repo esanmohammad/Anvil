@@ -12,8 +12,8 @@ import {
   checkpointPath,
   computeFingerprint,
   computeKey,
-} from '../checkpoint-key.js';
-import type { CheckpointInputs } from '../checkpoint-types.js';
+} from '../key.js';
+import type { CheckpointInputs } from '../types.js';
 
 describe('computeFingerprint', () => {
   it('produces the same hash for identical inputs', () => {
