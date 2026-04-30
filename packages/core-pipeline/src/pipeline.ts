@@ -73,12 +73,40 @@ export interface PipelineDeps {
   now?: () => number;
   /** Optional sleep — defaults to `setTimeout`. Test-injectable. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Initial value for `ctx.shared` — the mutable shared-state record
+   * threaded through every step. Defaults to `{}`. Phase 3 of the
+   * core-pipeline consolidation.
+   */
+  initialShared?: Record<string, unknown>;
+  /**
+   * Resume from a specific step ID. Steps registered before this one in
+   * the registry are emitted as `step:skipped` and not invoked. Phase 2
+   * of the core-pipeline consolidation.
+   *
+   * If `resumeFromStep` is set but the ID is not found in the registry,
+   * `Pipeline.run()` rejects synchronously with an error.
+   */
+  resumeFromStep?: string;
+  /**
+   * Step IDs that are considered already completed in a prior run.
+   * Walker emits `step:skipped` for these and does not invoke `run()`.
+   * Combined with `resumeFromStep`: union of the two skip sets.
+   *
+   * The cli `feature-store` helper populates this from the on-disk
+   * artifact directory; downstream steps that need the prior outputs
+   * read them from `ctx.shared` (Phase 3).
+   */
+  completedSteps?: string[];
 }
 
 export class Pipeline {
   private readonly artifacts = new InMemoryArtifactStore();
+  private readonly shared: Record<string, unknown>;
 
-  constructor(private readonly deps: PipelineDeps) {}
+  constructor(private readonly deps: PipelineDeps) {
+    this.shared = deps.initialShared ?? {};
+  }
 
   /**
    * Read-only view of artifacts the run has emitted so far. Useful for
@@ -89,7 +117,7 @@ export class Pipeline {
   }
 
   async run(): Promise<PipelineRunResult> {
-    const { registry, bus, runId, signal } = this.deps;
+    const { registry, bus, runId, signal, resumeFromStep, completedSteps: priorCompleted } = this.deps;
     const now = this.deps.now ?? Date.now;
     const startedAt = now();
     const completedSteps: string[] = [];
@@ -99,17 +127,46 @@ export class Pipeline {
     let lastError: unknown;
     let prevOutput: unknown = this.deps.initialInput;
 
+    // Resolve the skip set from resumeFromStep + completedSteps.
+    const orderedSteps = registry.steps();
+    const skipSet = new Set<string>(priorCompleted ?? []);
+    if (resumeFromStep) {
+      const resumeIdx = orderedSteps.findIndex((s) => s.id === resumeFromStep);
+      if (resumeIdx < 0) {
+        throw new Error(
+          `Pipeline.run: resumeFromStep "${resumeFromStep}" is not in the registry. ` +
+            `Known steps: ${orderedSteps.map((s) => s.id).join(', ')}`,
+        );
+      }
+      for (let i = 0; i < resumeIdx; i++) {
+        skipSet.add(orderedSteps[i].id);
+      }
+    }
+
     await this.emit(bus, {
       hook: 'pipeline:started',
       runId,
       ts: this.iso(now),
-      payload: { stepCount: registry.steps().length },
+      payload: { stepCount: orderedSteps.length },
     });
 
-    for (const step of registry.steps()) {
+    for (const step of orderedSteps) {
       if (signal?.aborted) {
         status = 'aborted';
         break;
+      }
+
+      if (skipSet.has(step.id)) {
+        await this.emit(bus, {
+          hook: 'step:skipped',
+          runId,
+          stepId: step.id,
+          ts: this.iso(now),
+          payload: { reason: resumeFromStep ? 'resume' : 'completed' },
+        });
+        // Track in completedSteps so the result reflects what the run "saw".
+        completedSteps.push(step.id);
+        continue;
       }
 
       await this.emit(bus, {
@@ -331,6 +388,7 @@ export class Pipeline {
       repoPaths,
       repoName: fanoutOpts?.repoName,
       input: input as I,
+      shared: this.shared,
       artifacts: artifactsView,
       emit,
       bus,

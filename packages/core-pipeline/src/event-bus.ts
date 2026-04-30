@@ -18,12 +18,15 @@
  */
 
 import type {
+  BusRequestListener,
+  BusRequestOptions,
   EventBus,
   EventListener,
   EventListenerOptions,
   PipelineEvent,
   StepHookPoint,
 } from './types.js';
+import { BusRequestRegistry } from './bus-request.js';
 
 interface Entry {
   listener: EventListener;
@@ -35,6 +38,7 @@ interface Entry {
 export class InMemoryEventBus implements EventBus {
   private readonly entries = new Map<StepHookPoint, Entry[]>();
   private seqCounter = 0;
+  private readonly requests = new BusRequestRegistry();
 
   on(hook: StepHookPoint, listener: EventListener, opts: EventListenerOptions = {}): () => void {
     const arr = this.entries.get(hook) ?? [];
@@ -92,6 +96,23 @@ export class InMemoryEventBus implements EventBus {
         /* swallow — fire-and-forget */
       }
     }
+  }
+
+  request<P, R>(channel: string, payload: P, opts?: BusRequestOptions): Promise<R> {
+    return this.requests.request<P, R>(channel, payload, opts);
+  }
+
+  respond<R>(channel: string, requestId: string, response: R): void {
+    this.requests.respond<R>(channel, requestId, response);
+  }
+
+  onRequest<P>(channel: string, listener: BusRequestListener<P>): () => void {
+    return this.requests.onRequest<P>(channel, listener);
+  }
+
+  /** Test-only: number of pending requests waiting for a respond(). */
+  pendingRequestCount(): number {
+    return this.requests.pendingCount();
   }
 }
 

@@ -52,6 +52,19 @@ export interface StepContext<I> {
   repoName?: string;
   /** Strongly-typed input — output of the previous step. */
   input: I;
+  /**
+   * Mutable shared-state record threaded through every step in a run.
+   * Used for cross-stage context that doesn't fit the strict I→O step
+   * chain (project name, agent runner, run dir, etc.). cli defines a
+   * typed `CliPipelineState` interface and casts at the boundary;
+   * dashboard steps that have natural I→O chains can ignore this field.
+   *
+   * Phase 3 of the core-pipeline consolidation. The walker passes the
+   * same reference to every step, so writes from step A are visible to
+   * step B. Per-repo fanouts share the reference too — steps that fan
+   * out are responsible for their own concurrent-write safety.
+   */
+  shared: Record<string, unknown>;
   /** Pipeline-wide read-only artifacts ledger; downstream steps can read prior outputs by id. */
   artifacts: ReadonlyArtifactStore;
   /** Step can write artifacts; persisted to runDir. */
@@ -125,9 +138,47 @@ export interface EventBus {
   emit(event: PipelineEvent): Promise<void>;
   /** Emit without awaiting — for non-critical paths (telemetry, dashboard). */
   emitFireAndForget(event: PipelineEvent): void;
+
+  /**
+   * Issue a typed request on `channel` and await a response. Used for
+   * human-in-the-loop steps (clarify Q&A, approval gates) so the *step*
+   * declares its need for an answer and the consumer (cli/dashboard)
+   * decides how to source it.
+   *
+   * Default timeout: 30 minutes. Pass `opts.timeoutMs` to override.
+   * Pass `opts.signal` to cancel the request from the caller side.
+   *
+   * Throws `BusRequestTimeoutError` on timeout, `BusRequestAbortedError`
+   * when `opts.signal` aborts. If no responder is attached and the
+   * request times out, the promise rejects with the timeout error.
+   */
+  request<P, R>(channel: string, payload: P, opts?: BusRequestOptions): Promise<R>;
+  /** Resolve a pending request. Called by responders attached via `onRequest`. */
+  respond<R>(channel: string, requestId: string, response: R): void;
+  /**
+   * Subscribe to incoming requests on `channel`. Listener receives
+   * `{ requestId, payload }` and should call `bus.respond(channel,
+   * requestId, response)` to resolve the awaiting promise. Returns an
+   * unsubscribe handle.
+   */
+  onRequest<P>(channel: string, listener: BusRequestListener<P>): () => void;
 }
 
 export type EventListener = (event: PipelineEvent) => void | Promise<void>;
+
+export interface BusRequestOptions {
+  /** Defaults to 30 minutes (1_800_000ms). */
+  timeoutMs?: number;
+  /** Aborts the request when the signal fires. */
+  signal?: AbortSignal;
+}
+
+export interface BusRequest<P> {
+  requestId: string;
+  payload: P;
+}
+
+export type BusRequestListener<P> = (req: BusRequest<P>) => void | Promise<void>;
 
 // ---------------------------------------------------------------------------
 // StepRegistry

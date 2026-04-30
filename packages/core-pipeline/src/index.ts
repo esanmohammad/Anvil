@@ -19,8 +19,16 @@ export type {
   PipelineRunResult,
   MemoryHandles,
   LlmHandles,
+  BusRequest,
+  BusRequestListener,
+  BusRequestOptions,
 } from './types.js';
 export { InMemoryEventBus } from './event-bus.js';
+export {
+  BusRequestRegistry,
+  BusRequestTimeoutError,
+  BusRequestAbortedError,
+} from './bus-request.js';
 export { InMemoryStepRegistry } from './step-registry.js';
 export { InMemoryArtifactStore } from './artifacts.js';
 export { Pipeline, makePipelineEvent } from './pipeline.js';
@@ -31,6 +39,10 @@ export {
   attachDashboardStateHook,
   attachCostTrackerHook,
   attachLearnersHook,
+  attachRunStoreHook,
+  attachFeatureStoreHook,
+  attachApprovalGateHook,
+  APPROVAL_GATE_CHANNEL,
 } from './hooks/index.js';
 export type {
   AuditLogHookOptions,
@@ -42,5 +54,14 @@ export type {
   CostTrackerHookHandle,
   LearnersHookOptions,
   LearnersHookHandle,
+  RunStoreLike,
+  RunStoreHookOptions,
+  RunStoreHookHandle,
+  FeatureStoreHookOptions,
+  FeatureStoreHookHandle,
+  ApprovalRequest,
+  ApprovalDecision,
+  ApprovalGateHookOptions,
+  ApprovalGateHookHandle,
 } from './hooks/index.js';
 export { VERSION } from './version.js';

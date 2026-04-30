@@ -19,3 +19,28 @@ export {
   attachLearnersHook,
 } from './learners.hook.js';
 export type { LearnersHookOptions, LearnersHookHandle } from './learners.hook.js';
+export {
+  attachRunStoreHook,
+} from './run-store.hook.js';
+export type {
+  RunStoreLike,
+  RunStoreHookOptions,
+  RunStoreHookHandle,
+} from './run-store.hook.js';
+export {
+  attachFeatureStoreHook,
+} from './feature-store.hook.js';
+export type {
+  FeatureStoreHookOptions,
+  FeatureStoreHookHandle,
+} from './feature-store.hook.js';
+export {
+  attachApprovalGateHook,
+  APPROVAL_GATE_CHANNEL,
+} from './approval-gate.hook.js';
+export type {
+  ApprovalRequest,
+  ApprovalDecision,
+  ApprovalGateHookOptions,
+  ApprovalGateHookHandle,
+} from './approval-gate.hook.js';
