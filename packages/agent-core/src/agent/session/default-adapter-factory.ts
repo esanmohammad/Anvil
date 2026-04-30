@@ -29,6 +29,10 @@ import { LanguageModelBridge } from './language-model-bridge.js';
 export function resolveProvider(modelId: string): ProviderName {
   const id = modelId.toLowerCase();
 
+  // Ollama: explicit `ollama:` prefix or `:tag` suffix common to local models
+  // (e.g. `qwen2.5-coder:7b`, `llama3.1:8b`).
+  if (id.startsWith('ollama:')) return 'ollama';
+
   // Gemini: prefer CLI when available, fall back to HTTP API.
   if (id.startsWith('gemini-')) {
     if (geminiCliAvailable()) return 'gemini-cli';
@@ -49,6 +53,13 @@ export function resolveProvider(modelId: string): ProviderName {
   // OpenRouter uses `org/model` format
   if (id.includes('/')) {
     return 'openrouter';
+  }
+
+  // Local Ollama models often look like `<family>:<size>` (no slash, with tag).
+  // Route through Ollama only when the daemon is reachable; otherwise fall
+  // back to Claude so misconfigured runs don't break.
+  if (/^[a-z0-9_.-]+:[a-z0-9_.-]+$/.test(id) && id !== 'claude' && !id.startsWith('claude-')) {
+    return 'ollama';
   }
 
   // Claude (default)

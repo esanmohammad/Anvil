@@ -73,7 +73,10 @@ export class OllamaAdapter implements ModelAdapter {
 
     const messages: Array<{ role: string; content: string }> = [];
     if (projectPrompt) {
-      messages.push({ role: 'project', content: projectPrompt });
+      // Ollama follows the OpenAI message-role convention; the canonical
+      // value for the always-prefixed instructions is `system`. (The
+      // earlier `project` value was a no-op and silently dropped.)
+      messages.push({ role: 'system', content: projectPrompt });
     }
     messages.push({ role: 'user', content: userPrompt });
 

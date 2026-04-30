@@ -284,6 +284,18 @@ export interface PipelineRunnerEvents {
   'waiting-for-input': (stageIndex: number, agentId: string) => void;
 }
 
+// ── Local-tier stage list (Phase 5 — Ollama) ──────────────────────────
+
+/**
+ * Stages eligible to be routed to a local Ollama model when
+ * `process.env.ANVIL_LOCAL_MODEL` is set. The list is conservative —
+ * stages whose output feeds engineer/architect/tester are excluded so a
+ * weaker local model can't poison the rest of the pipeline. Manifest
+ * extraction is heuristic (no LLM call today) so it's not in the list;
+ * if/when Phase 4b grows an LLM extractor, append it here.
+ */
+const LOCAL_TIER_STAGES = new Set<string>(['clarify', 'ship']);
+
 // ── Token-stats helpers ───────────────────────────────────────────────
 
 function zeroTokenStats(): StageTokenStats {
@@ -862,11 +874,21 @@ export class PipelineRunner extends EventEmitter {
     const yamlModels = this.projectLoader.getConfig(this.config.project)?.pipeline?.models;
     if (yamlModels?.[stageName]) return yamlModels[stageName];
 
-    // 2. If no tier selected, use the single model from the UI dropdown
+    // 2. Phase 5 of TOKEN-OPTIMIZATION-PLAN — opt-in local-model overlay.
+    //    `ANVIL_LOCAL_MODEL=qwen2.5-coder:7b` (or similar) routes the
+    //    cheap-tier stages (clarify + ship + manifest extraction) to a
+    //    local Ollama model when the daemon is up. Stays off by default
+    //    so production runs keep deterministic Claude behaviour.
+    const localModel = process.env.ANVIL_LOCAL_MODEL?.trim();
+    if (localModel && LOCAL_TIER_STAGES.has(stageName)) {
+      return localModel;
+    }
+
+    // 3. If no tier selected, use the single model from the UI dropdown
     const tier = this.config.modelTier;
     if (!tier) return this.config.model;
 
-    // 3. Tier-based routing — resolve from provider registry
+    // 4. Tier-based routing — resolve from provider registry
     return resolveModelByTier(tier, stageName, this.config.model);
   }
 
