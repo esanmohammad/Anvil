@@ -10,6 +10,7 @@ import { runPostBuildGuards, hasValidationFailures } from '../post-build-guards.
 import { sendPipelineNotification } from '../notifications.js';
 import { updatePipelineStage, updateStageCost, updatePipelineCost } from '../state-file.js';
 import { info, warn } from '../../logger.js';
+import { estimateAgentCallCost } from '../cost-estimator.js';
 import type { CliPipelineState } from '../cli-state.js';
 
 export const VALIDATE_STEP_ID = 'validate' as const;
@@ -95,14 +96,14 @@ export function createValidateStep(): Step<unknown, unknown> {
 
       state.validationArtifact = validateArtifact;
 
-      const costUsd = totalTokens * 0.000003;
+      const { inputTokens, outputTokens, costUsd } = estimateAgentCallCost(totalTokens, state.model);
       ctx.emit(VALIDATION_ARTIFACT_ID, {
         artifact: validateArtifact,
         artifactName: VALIDATION_ARTIFACT_ID,
         tokenEstimate: totalTokens,
         costUsd,
       });
-      state.stageCosts.set(6, { inputTokens: totalTokens, outputTokens: Math.floor(totalTokens * 0.3), estimatedCost: costUsd });
+      state.stageCosts.set(6, { inputTokens, outputTokens, estimatedCost: costUsd });
       updateStageCost(6, costUsd);
       updatePipelineCost(aggregateCost(state));
       updatePipelineStage(6, 'completed');

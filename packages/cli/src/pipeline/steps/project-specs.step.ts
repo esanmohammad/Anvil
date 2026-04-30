@@ -8,6 +8,7 @@ import { APPROVAL_GATE_CHANNEL } from '@anvil/core-pipeline';
 import { runProjectSpecsStage } from '../stages/index.js';
 import type { StageContext } from '../stages/types.js';
 import { updatePipelineStage, updateStageCost, updatePipelineCost } from '../state-file.js';
+import { estimateAgentCallCost } from '../cost-estimator.js';
 import type { CliPipelineState } from '../cli-state.js';
 
 export const PROJECT_SPECS_STEP_ID = 'specs' as const;
@@ -52,8 +53,8 @@ export function createProjectSpecsStep(): Step<unknown, unknown> {
       }
       if (!anySuccess) throw new Error('All project specs stages failed');
 
-      const costUsd = totalTokens * 0.000003;
-      state.stageCosts.set(3, { inputTokens: totalTokens, outputTokens: Math.floor(totalTokens * 0.3), estimatedCost: costUsd });
+      const { inputTokens, outputTokens, costUsd } = estimateAgentCallCost(totalTokens, state.model);
+      state.stageCosts.set(3, { inputTokens, outputTokens, estimatedCost: costUsd });
       updateStageCost(3, costUsd);
       updatePipelineCost(aggregateCost(state));
       updatePipelineStage(3, 'completed');

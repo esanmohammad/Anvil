@@ -9,6 +9,7 @@ import { runProjectRequirementsStage } from '../stages/index.js';
 import type { StageContext } from '../stages/types.js';
 import { detectAffectedProjects } from '../affected-projects.js';
 import { updatePipelineStage, updateStageCost, updatePipelineCost } from '../state-file.js';
+import { estimateAgentCallCost } from '../cost-estimator.js';
 import type { CliPipelineState } from '../cli-state.js';
 
 export const PROJECT_REQUIREMENTS_STEP_ID = 'project-requirements' as const;
@@ -66,8 +67,8 @@ export function createProjectRequirementsStep(): Step<unknown, unknown> {
       }
       if (!anySuccess) throw new Error('All project requirements stages failed');
 
-      const costUsd = totalTokens * 0.000003;
-      state.stageCosts.set(2, { inputTokens: totalTokens, outputTokens: Math.floor(totalTokens * 0.3), estimatedCost: costUsd });
+      const { inputTokens, outputTokens, costUsd } = estimateAgentCallCost(totalTokens, state.model);
+      state.stageCosts.set(2, { inputTokens, outputTokens, estimatedCost: costUsd });
       updateStageCost(2, costUsd);
       updatePipelineCost(aggregateCost(state));
       updatePipelineStage(2, 'completed');

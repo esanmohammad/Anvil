@@ -48,7 +48,12 @@ const MODEL_PRICING: Record<string, [number, number]> = {
   'meta-llama/llama-3-70b-instruct': [0.59, 0.79],
 };
 
-function getModelPricing(model: string): [number, number] {
+/**
+ * Resolve model pricing as `[inputUSDPer1M, outputUSDPer1M]`.
+ * Exported so step adapters can convert `tokenEstimate` → USD using the
+ * same table the pre-run estimator uses.
+ */
+export function getModelPricing(model: string): [number, number] {
   // Direct match
   if (MODEL_PRICING[model]) return MODEL_PRICING[model];
 
@@ -156,4 +161,24 @@ export function formatCostEstimate(estimate: CostEstimate): string {
   const low = estimate.totalEstimatedCost.toFixed(2);
   const high = estimate.totalEstimatedCostHigh.toFixed(2);
   return `~$${low}-$${high} (${estimate.model}, confidence: ${estimate.confidence})`;
+}
+
+/**
+ * Convert an agent's `tokenEstimate` (total tokens used) into USD using
+ * the model pricing table. Mirrors the legacy `CostTracker.addStageCost`
+ * convention: treat the agent-reported `tokenEstimate` as input tokens
+ * and approximate output as 30% of input.
+ *
+ * Returns `{ inputTokens, outputTokens, costUsd }`. Step adapters call
+ * this once per agent invocation.
+ */
+export function estimateAgentCallCost(
+  tokenEstimate: number,
+  model: string | undefined,
+): { inputTokens: number; outputTokens: number; costUsd: number } {
+  const inputTokens = Math.max(0, Math.round(tokenEstimate));
+  const outputTokens = Math.max(0, Math.floor(tokenEstimate * 0.3));
+  const [inputRate, outputRate] = getModelPricing(model ?? 'sonnet');
+  const costUsd = (inputTokens * inputRate + outputTokens * outputRate) / 1_000_000;
+  return { inputTokens, outputTokens, costUsd };
 }

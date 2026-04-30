@@ -18,6 +18,7 @@ import { APPROVAL_GATE_CHANNEL } from '@anvil/core-pipeline';
 import { buildPersonaProjectPrompt, parseQuestions } from '../persona-prompt.js';
 import { info } from '../../logger.js';
 import { updatePipelineStage, updateStageCost, updatePipelineCost } from '../state-file.js';
+import { estimateAgentCallCost } from '../cost-estimator.js';
 import type { CliPipelineState } from '../cli-state.js';
 
 export const CLARIFY_STEP_ID = 'clarify' as const;
@@ -89,14 +90,14 @@ export function createClarifyStep(): Step<unknown, unknown> {
       state.clarificationArtifact = artifact;
 
       // Cost tracking — emit costUsd via artifact event so attachCostTrackerHook accumulates
-      const costUsd = totalTokens * 0.000003; // rough placeholder — agent-core records actual via bus
+      const { inputTokens, outputTokens, costUsd } = estimateAgentCallCost(totalTokens, state.model);
       ctx.emit(CLARIFICATION_ARTIFACT_ID, {
         artifact,
         artifactName: CLARIFICATION_ARTIFACT_ID,
         tokenEstimate: totalTokens,
         costUsd,
       });
-      state.stageCosts.set(0, { inputTokens: totalTokens, outputTokens: Math.floor(totalTokens * 0.3), estimatedCost: costUsd });
+      state.stageCosts.set(0, { inputTokens, outputTokens, estimatedCost: costUsd });
       updateStageCost(0, costUsd);
       updatePipelineCost(aggregateCost(state));
       updatePipelineStage(0, 'completed');

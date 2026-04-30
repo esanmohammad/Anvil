@@ -7,6 +7,7 @@ import type { Step, StepContext } from '@anvil/core-pipeline';
 import { APPROVAL_GATE_CHANNEL } from '@anvil/core-pipeline';
 import { buildPersonaProjectPrompt } from '../persona-prompt.js';
 import { updatePipelineStage, updateStageCost, updatePipelineCost } from '../state-file.js';
+import { estimateAgentCallCost } from '../cost-estimator.js';
 import type { CliPipelineState } from '../cli-state.js';
 
 export const HIGH_LEVEL_REQUIREMENTS_STEP_ID = 'requirements' as const;
@@ -40,14 +41,14 @@ export function createHighLevelRequirementsStep(): Step<unknown, unknown> {
 
       state.highLevelReqsArtifact = out.output;
 
-      const costUsd = out.tokenEstimate * 0.000003;
+      const { inputTokens, outputTokens, costUsd } = estimateAgentCallCost(out.tokenEstimate, state.model);
       ctx.emit(HIGH_LEVEL_REQUIREMENTS_ARTIFACT_ID, {
         artifact: out.output,
         artifactName: HIGH_LEVEL_REQUIREMENTS_ARTIFACT_ID,
         tokenEstimate: out.tokenEstimate,
         costUsd,
       });
-      state.stageCosts.set(1, { inputTokens: out.tokenEstimate, outputTokens: Math.floor(out.tokenEstimate * 0.3), estimatedCost: costUsd });
+      state.stageCosts.set(1, { inputTokens, outputTokens, estimatedCost: costUsd });
       updateStageCost(1, costUsd);
       updatePipelineCost(aggregateCost(state));
       updatePipelineStage(1, 'completed');

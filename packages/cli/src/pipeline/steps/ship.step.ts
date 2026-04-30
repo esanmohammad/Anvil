@@ -8,6 +8,7 @@ import type { Step, StepContext } from '@anvil/core-pipeline';
 import { buildPersonaProjectPrompt } from '../persona-prompt.js';
 import { updatePipelineStage, updateStageCost, updatePipelineCost } from '../state-file.js';
 import { warn } from '../../logger.js';
+import { estimateAgentCallCost } from '../cost-estimator.js';
 import type { CliPipelineState } from '../cli-state.js';
 
 export const SHIP_STEP_ID = 'ship' as const;
@@ -64,8 +65,8 @@ export function createShipStep(): Step<unknown, unknown> {
       }
 
       const totalTokens = shipResult.tokenEstimate;
-      const costUsd = totalTokens * 0.000003;
-      state.stageCosts.set(7, { inputTokens: totalTokens, outputTokens: Math.floor(totalTokens * 0.3), estimatedCost: costUsd });
+      const { inputTokens, outputTokens, costUsd } = estimateAgentCallCost(totalTokens, state.model);
+      state.stageCosts.set(7, { inputTokens, outputTokens, estimatedCost: costUsd });
       updateStageCost(7, costUsd);
       updatePipelineCost(aggregateCost(state));
       updatePipelineStage(7, 'completed');
