@@ -4868,6 +4868,15 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         if (typeof note === 'string' && note.trim().length > 0) {
           runner.setReviewNote(note);
         }
+        // Phase B — `modify-artifact`: replace the just-completed stage's
+        // artifact with the reviewer's edited markdown. The runner's
+        // applyArtifactEdit re-writes disk state and arms the override
+        // so the next stage's `prevArtifact` is the edited body.
+        if (final?.resumeDecision?.action === 'modify-artifact'
+            && typeof final.resumeDecision.editedArtifact === 'string'
+            && final.resumeDecision.editedArtifact.length > 0) {
+          runner.applyArtifactEdit(info.stageIndex, final.resumeDecision.editedArtifact);
+        }
       });
     }
 

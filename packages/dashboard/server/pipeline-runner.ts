@@ -516,6 +516,45 @@ export class PipelineRunner extends EventEmitter {
     return this.currentStageReviewNote;
   }
 
+  // ── Artifact override (Phase B — modify-artifact) ────────────────────
+
+  /**
+   * Set when the dashboard's after-stage hook resolves a pause with
+   * `modify-artifact`. The pipeline loop reads this AFTER the hook
+   * returns and uses it as the `prevArtifact` for the next stage,
+   * superseding the agent's output. Cleared once consumed.
+   */
+  private prevArtifactOverride: string | null = null;
+
+  /**
+   * Replace the just-completed stage's artifact with reviewer-edited
+   * markdown. Updates in-memory state, the on-disk artifact, broadcasts
+   * the change, and arms the override so the next stage's `prevArtifact`
+   * is the edited body.
+   */
+  applyArtifactEdit(stageIndex: number, editedArtifact: string): void {
+    const stage = STAGES[stageIndex];
+    if (!stage) return;
+    if (this.state.stages[stageIndex]) {
+      this.state.stages[stageIndex].artifact = editedArtifact;
+    }
+    try {
+      this.writeStageArtifact(stageIndex, stage, editedArtifact);
+    } catch (err) {
+      console.warn(`[pipeline] applyArtifactEdit: writeStageArtifact failed: ${err instanceof Error ? err.message : err}`);
+    }
+    this.prevArtifactOverride = editedArtifact;
+    this.broadcastState();
+    this.checkpoint();
+  }
+
+  /** Read-and-clear the artifact override. Returns null when unset. */
+  private consumeArtifactOverride(): string | null {
+    const v = this.prevArtifactOverride;
+    this.prevArtifactOverride = null;
+    return v;
+  }
+
   /**
    * Best-effort list of files modified by this run so far, prefixed with the
    * repo name so policy globs like `backend/internal/db/**` can match across
@@ -1385,8 +1424,18 @@ export class PipelineRunner extends EventEmitter {
             }
           }
 
-          // Write artifact to feature folder
-          this.writeStageArtifact(i, stage, result.artifact);
+          // Phase B — modify-artifact: if the reviewer edited the artifact
+          // during the after-stage pause, applyArtifactEdit has already
+          // re-written disk state + broadcast. Pick up the edited body so
+          // the next stage receives it as `prevArtifact`.
+          const edited = this.consumeArtifactOverride();
+          if (edited !== null) {
+            prevArtifact = edited;
+          } else {
+            // No edit — write the agent's artifact (skipped on edit since
+            // applyArtifactEdit already wrote the edited copy).
+            this.writeStageArtifact(i, stage, result.artifact);
+          }
 
           // Phase 2: extract structured fields from this stage's artifact and
           // patch the manifest. Best-effort — extractor failures degrade to
