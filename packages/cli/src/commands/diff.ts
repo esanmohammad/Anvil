@@ -9,6 +9,12 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import pc from 'picocolors';
 import { info, success, error, warn } from '../logger.js';
+import {
+  BlobStore,
+  CheckpointStore,
+  runWithCheckpoint,
+  type CheckpointInputs,
+} from '@anvil/agent-core';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -543,7 +549,32 @@ export const diffCommand = new Command('diff')
     info('Running review agent...');
     let agentOutput: string;
     try {
-      agentOutput = await runAgent(projectPrompt, userPrompt);
+      // Phase 5 of the agent-manager consolidation: cli now consumes
+      // agent-core's per-call checkpoint cache. Identical re-runs of
+      // `anvil diff` against the same git state hit the cache and skip
+      // the agent invocation. Cache key derives from the full prompt;
+      // any diff change invalidates.
+      const blobStore = new BlobStore(ANVIL_HOME);
+      const checkpointStore = new CheckpointStore({
+        anvilHome: ANVIL_HOME,
+        blobStore,
+      });
+      const checkpointInputs: CheckpointInputs & { inputs: unknown } = {
+        stage: 'review',
+        taskId: `diff:${project ?? 'unknown'}`,
+        promptVersion: 'diff-v1',
+        model: 'agent-default',
+        inputs: { projectPrompt, userPrompt },
+      };
+      agentOutput = await runWithCheckpoint(checkpointStore, blobStore, {
+        project: project ?? 'unknown',
+        runFamily: `diff-${Date.now().toString(36)}`,
+        inputs: checkpointInputs,
+        run: () => runAgent(projectPrompt, userPrompt),
+        serialize: (s) => s,
+        deserialize: (b) => b.toString('utf-8'),
+        onHit: () => info('Cache hit — skipped agent invocation.'),
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       error(`Agent failed: ${msg}`);
