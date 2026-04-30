@@ -57,6 +57,8 @@ export function loadPersonaPromptSync(personaName) {
         return content;
     }
     const bundledPaths = [
+        // anvil-loc bundle: server/steps/<file> → cli/dist/personas/prompts/<name>.md
+        join(__dirname, '..', '..', '..', 'personas', 'prompts', `${personaName}.md`),
         join(__dirname, '..', '..', 'personas', 'prompts', `${personaName}.md`),
         join(__dirname, '..', '..', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
         join(__dirname, '..', '..', '..', 'packages', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),

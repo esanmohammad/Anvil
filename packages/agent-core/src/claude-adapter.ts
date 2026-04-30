@@ -119,10 +119,14 @@ export class ClaudeAdapter implements ModelAdapter {
     if (config.model) {
       args.push('--model', config.model);
     }
-    if (config.sessionId) {
+    // Claude CLI: --session-id starts a NEW session with that UUID;
+    // --resume <id> continues an existing one. The two flags are mutually
+    // exclusive — passing both makes the CLI exit non-zero immediately.
+    if (config.resume && config.sessionId) {
+      args.push('--resume', config.sessionId);
+    } else if (config.sessionId) {
       args.push('--session-id', config.sessionId);
-    }
-    if (config.resume) {
+    } else if (config.resume) {
       args.push('--resume');
     }
     if (config.permissionMode) {
