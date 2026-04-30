@@ -81,6 +81,14 @@ export interface RunBuildForRepoResult {
     taskCount: number;
     /** True when TASKS.md wasn't parseable and the single-repo path ran. */
     fallback: boolean;
+    /** Aggregate input tokens across all per-task spawns. */
+    inputTokens: number;
+    /** Aggregate output tokens across all per-task spawns. */
+    outputTokens: number;
+    /** Aggregate prompt-cache READ tokens across all per-task spawns. */
+    cacheReadTokens: number;
+    /** Aggregate prompt-cache WRITE tokens across all per-task spawns. */
+    cacheWriteTokens: number;
 }
 interface TaskOutput {
     id: string;

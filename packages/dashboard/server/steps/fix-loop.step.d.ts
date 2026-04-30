@@ -82,6 +82,14 @@ export interface RunFixLoopResult {
      * resume via sendInput. Unchanged on per-repo path.
      */
     newSingleId: string | null;
+    /** Aggregate input tokens across all spawns / resumes in this attempt. */
+    inputTokens: number;
+    /** Aggregate output tokens across all spawns / resumes in this attempt. */
+    outputTokens: number;
+    /** Aggregate cache READ tokens. */
+    cacheReadTokens: number;
+    /** Aggregate cache WRITE tokens. */
+    cacheWriteTokens: number;
 }
 /**
  * Run one fix-loop attempt. Mutates `priorByRepo` in place; returns the

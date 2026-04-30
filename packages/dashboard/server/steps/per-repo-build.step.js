@@ -64,6 +64,10 @@ export async function runBuildForOneRepo(opts) {
     opts.onProjectEvent?.('info', `[build] ${opts.repoName}: ${tasks.length} task${tasks.length === 1 ? '' : 's'} in ${groups.length} group${groups.length === 1 ? '' : 's'} (per-task spawning)`);
     const taskOutputs = [];
     let totalCost = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalCacheReadTokens = 0;
+    let totalCacheWriteTokens = 0;
     for (const group of groups) {
         if (opts.isCancelled()) {
             throw new Error('Pipeline cancelled');
@@ -93,6 +97,10 @@ export async function runBuildForOneRepo(opts) {
                     sleep: opts.sleep,
                 });
                 totalCost += result.cost;
+                totalInputTokens += result.inputTokens;
+                totalOutputTokens += result.outputTokens;
+                totalCacheReadTokens += result.cacheReadTokens;
+                totalCacheWriteTokens += result.cacheWriteTokens;
                 taskOutputs.push({ id: task.id, title: task.title, artifact: result.artifact });
                 opts.onProjectEvent?.('info', `[build] ${opts.repoName} ${task.id} done (${(result.cost * 100).toFixed(2)}¢)`);
             }
@@ -109,7 +117,16 @@ export async function runBuildForOneRepo(opts) {
         await Promise.all(groupPromises);
     }
     const combined = combineTaskArtifacts(tasks, taskOutputs);
-    return { artifact: combined, cost: totalCost, taskCount: tasks.length, fallback: false };
+    return {
+        artifact: combined,
+        cost: totalCost,
+        taskCount: tasks.length,
+        fallback: false,
+        inputTokens: totalInputTokens,
+        outputTokens: totalOutputTokens,
+        cacheReadTokens: totalCacheReadTokens,
+        cacheWriteTokens: totalCacheWriteTokens,
+    };
 }
 async function runBuildFallback(opts) {
     const result = await spawnAndWait({
@@ -138,6 +155,10 @@ async function runBuildFallback(opts) {
         cost: result.cost,
         taskCount: 0,
         fallback: true,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheWriteTokens: result.cacheWriteTokens,
     };
 }
 /**

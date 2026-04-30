@@ -106,6 +106,10 @@ export async function runClarifyForProject(opts) {
             qaPairs,
             synthesizeRan: false,
             cancelled,
+            inputTokens: explore.inputTokens,
+            outputTokens: explore.outputTokens,
+            cacheReadTokens: explore.cacheReadTokens,
+            cacheWriteTokens: explore.cacheWriteTokens,
         };
     }
     opts.onSynthesizeStart?.();
@@ -128,6 +132,10 @@ export async function runClarifyForProject(opts) {
         qaPairs,
         synthesizeRan: true,
         cancelled: false,
+        inputTokens: explore.inputTokens + synthesize.inputTokens,
+        outputTokens: explore.outputTokens + synthesize.outputTokens,
+        cacheReadTokens: explore.cacheReadTokens + synthesize.cacheReadTokens,
+        cacheWriteTokens: explore.cacheWriteTokens + synthesize.cacheWriteTokens,
     };
 }
 /**

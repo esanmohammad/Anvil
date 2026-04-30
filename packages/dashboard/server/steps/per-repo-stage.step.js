@@ -24,18 +24,28 @@
  */
 import { spawnAndWait } from './agent-spawner.js';
 /**
- * Personas that are allowed to mutate the working tree. Engineers do
- * codegen; testers write tests. Everyone else gets file-mutation tools
- * disabled so reviewers/planners can't accidentally commit code.
+ * Per-persona tool gates. The `Agent` tool is always disabled (P8 —
+ * sub-agents inherit context and double the token cost).
  *
- * Mirrors the rule at `pipeline-runner.ts:1744-1749` verbatim. The
- * `Agent` tool is always disabled (P8 — sub-agents inherit context and
- * double the token cost).
+ * Token-optimization rule (Phase 1 of TOKEN-OPTIMIZATION-PLAN, follow-up):
+ *   The Knowledge Base is injected into every system prompt for the
+ *   spec-writing personas (analyst, architect, lead). Without explicit
+ *   tool restrictions the model still re-explores the codebase via
+ *   Grep/Glob, defeating the optimization. Disable exploration tools for
+ *   those personas — they keep `Read` so they can spot-check a specific
+ *   file when the KB doesn't fully cover an implementation detail.
+ *
+ *   Clarifier KEEPS Grep/Glob: its job IS to explore the code to produce
+ *   thoughtful questions for the user.
  */
 const FILE_MUTATING_PERSONAS = new Set(['engineer', 'tester']);
+const KB_ONLY_PERSONAS = new Set(['analyst', 'architect', 'lead']);
 export function disallowedToolsForPersona(persona) {
     if (FILE_MUTATING_PERSONAS.has(persona)) {
         return ['Agent'];
+    }
+    if (KB_ONLY_PERSONAS.has(persona)) {
+        return ['Write', 'Edit', 'NotebookEdit', 'Bash', 'Grep', 'Glob', 'Agent'];
     }
     return ['Write', 'Edit', 'NotebookEdit', 'Bash', 'Agent'];
 }

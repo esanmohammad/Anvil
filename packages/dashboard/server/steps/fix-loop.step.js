@@ -80,7 +80,14 @@ export async function runFixLoop(opts) {
         const repoPath = opts.repoPaths[repoName] ?? '';
         const repoSection = extractRepoSection(opts.validateArtifact, repoName);
         if (!repoSection || !hasValidationFailures(repoSection)) {
-            return { artifact: '', cost: 0 };
+            return {
+                artifact: '',
+                cost: 0,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+            };
         }
         const issuesBlock = repoSection.slice(0, 4000);
         const priorId = opts.priorByRepo.get(repoName);
@@ -118,12 +125,27 @@ export async function runFixLoop(opts) {
             pollIntervalMs: opts.pollIntervalMs,
             sleep: opts.sleep,
         });
-        return { artifact: result.artifact, cost: result.cost };
+        return {
+            artifact: result.artifact,
+            cost: result.cost,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            cacheReadTokens: result.cacheReadTokens,
+            cacheWriteTokens: result.cacheWriteTokens,
+        };
     });
     const results = await Promise.all(promises);
     const combinedArtifact = results.map((r) => r.artifact).filter(Boolean).join('\n\n');
     const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
-    return { artifact: combinedArtifact, cost: totalCost, newSingleId: opts.priorSingleId };
+    return {
+        artifact: combinedArtifact,
+        cost: totalCost,
+        newSingleId: opts.priorSingleId,
+        inputTokens: results.reduce((s, r) => s + r.inputTokens, 0),
+        outputTokens: results.reduce((s, r) => s + r.outputTokens, 0),
+        cacheReadTokens: results.reduce((s, r) => s + r.cacheReadTokens, 0),
+        cacheWriteTokens: results.reduce((s, r) => s + r.cacheWriteTokens, 0),
+    };
 }
 async function runFixLoopSingle(opts) {
     const issuesBlock = opts.validateArtifact.slice(0, 6000);
@@ -144,6 +166,10 @@ async function runFixLoopSingle(opts) {
             artifact: result.artifact,
             cost: result.cost,
             newSingleId: opts.priorSingleId,
+            inputTokens: result.inputTokens,
+            outputTokens: result.outputTokens,
+            cacheReadTokens: result.cacheReadTokens,
+            cacheWriteTokens: result.cacheWriteTokens,
         };
     }
     const prompt = `The validation stage found issues that need to be fixed (attempt ${opts.attempt}):\n\n${issuesBlock}\n\nFix ALL build errors, lint errors, and test failures. Run the build and tests again to verify. Do NOT make git commits.`;
@@ -169,7 +195,15 @@ async function runFixLoopSingle(opts) {
         pollIntervalMs: opts.pollIntervalMs,
         sleep: opts.sleep,
     });
-    return { artifact: result.artifact, cost: result.cost, newSingleId };
+    return {
+        artifact: result.artifact,
+        cost: result.cost,
+        newSingleId,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheWriteTokens: result.cacheWriteTokens,
+    };
 }
 /**
  * Step factory for one fix-loop attempt. Phase 4f.7 wires registration

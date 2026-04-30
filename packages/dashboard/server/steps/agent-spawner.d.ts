@@ -39,6 +39,10 @@ export interface SpawnAndWaitResult {
     agentId: string;
     artifact: string;
     cost: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
 }
 /**
  * Spawn an agent and resolve when it completes. Returns the agent's id,
@@ -63,8 +67,13 @@ export interface WaitForAgentOptions {
  * `pipeline-runner.ts` legacy paths that spawn their agents directly
  * (per-repo fanout, per-task build) and just need the wait machinery.
  */
-export declare function waitForAgent(opts: WaitForAgentOptions): Promise<{
+export interface WaitForAgentResult {
     artifact: string;
     cost: number;
-}>;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+}
+export declare function waitForAgent(opts: WaitForAgentOptions): Promise<WaitForAgentResult>;
 //# sourceMappingURL=agent-spawner.d.ts.map

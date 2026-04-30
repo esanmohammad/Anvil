@@ -61,6 +61,10 @@ export interface RunPerRepoStageResult {
     agentId: string;
     artifact: string;
     cost: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
 }
 /**
  * Spawn one agent for one repo and resolve when it completes. Throws on

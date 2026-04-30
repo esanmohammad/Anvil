@@ -39,13 +39,16 @@ export async function spawnAndWait(opts) {
         pollIntervalMs: opts.pollIntervalMs,
         sleep: opts.sleep,
     });
-    return { agentId: agent.id, artifact: completed.artifact, cost: completed.cost };
+    return {
+        agentId: agent.id,
+        artifact: completed.artifact,
+        cost: completed.cost,
+        inputTokens: completed.inputTokens,
+        outputTokens: completed.outputTokens,
+        cacheReadTokens: completed.cacheReadTokens,
+        cacheWriteTokens: completed.cacheWriteTokens,
+    };
 }
-/**
- * Poll an already-spawned agent until it completes. Used by
- * `pipeline-runner.ts` legacy paths that spawn their agents directly
- * (per-repo fanout, per-task build) and just need the wait machinery.
- */
 export async function waitForAgent(opts) {
     const sleep = opts.sleep ?? defaultSleep;
     const pollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
@@ -61,7 +64,14 @@ export async function waitForAgent(opts) {
             if (current.cost.stopReason === 'max_tokens') {
                 opts.onTruncation?.(current.name, current.cost.outputTokens);
             }
-            return { artifact: current.output, cost: current.cost.totalUsd };
+            return {
+                artifact: current.output,
+                cost: current.cost.totalUsd,
+                inputTokens: current.cost.inputTokens,
+                outputTokens: current.cost.outputTokens,
+                cacheReadTokens: current.cost.cacheReadTokens,
+                cacheWriteTokens: current.cost.cacheWriteTokens,
+            };
         }
         if (current.status === 'error' || current.status === 'killed') {
             throw new Error(current.error ?? 'Agent failed');

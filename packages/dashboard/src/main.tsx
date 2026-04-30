@@ -35,6 +35,9 @@ import type { CostBreachModalBreach } from './components/pipeline/CostBreachModa
 import { CostBreachToast } from './components/pipeline/CostBreachToast.js';
 import { CostMeter } from './components/pipeline/CostMeter.js';
 import { StageSpendPanel } from './components/pipeline/StageSpendPanel.js';
+import { PausedBanner } from './components/pipeline/PausedBanner.js';
+import { PlanReviewModal } from './components/pipeline/PlanReviewModal.js';
+import { usePausedRuns } from './components/pipeline/usePausedRuns.js';
 import { CostBreachHistoryPage } from './components/cost-breaches/CostBreachHistoryPage.js';
 
 // ---------------------------------------------------------------------------
@@ -284,6 +287,10 @@ function App() {
   const [breachModalOpen, setBreachModalOpen] = useState<boolean>(false);
   const [breachDismissed, setBreachDismissed] = useState<boolean>(false);
   const [runCost, setRunCost] = useState<{ runId: string; usd: number; limitUsd?: number; perStageUsd: Record<string, number> } | null>(null);
+  // Local UI state for the paused-run review modal. The pause data itself
+  // comes from the usePausedRuns hook below — this only tracks whether the
+  // user clicked "Review" on the banner.
+  const [reviewModalOpen, setReviewModalOpen] = useState<boolean>(false);
   const [viewingRunActivities, setViewingRunActivities] = useState<ActivityEntry[]>([]);
   const [overviewData, setOverviewData] = useState<{
     memories: Array<{ id: string; key: string; value: string; category: string; timestamp: number }>;
@@ -314,6 +321,16 @@ function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttempts = useRef(0);
   const MAX_RECONNECTS = 10;
+
+  // Paused-pipeline state. The hook subscribes to pipeline-paused /
+  // pipeline-resumed WS events; we only render the banner + modal for the
+  // run currently being viewed. Banner stays visible the whole time the
+  // pause is open; the modal opens on demand via the banner's Review button.
+  const pausedRunsWs = wsConnected ? wsRef.current : null;
+  const pausedRunsState = usePausedRuns(pausedRunsWs, currentProject?.name ?? null);
+  const activePause = pausedRunsState.pauses.find(
+    (p) => p.pause.runId === urlRunId && p.pause.status === 'paused-awaiting-user',
+  );
 
   // Derived
   const activePipeline = toPipelineData(dashboardState?.activePipeline ?? null);
@@ -1130,6 +1147,13 @@ function App() {
         const showStageSpend = runCost && runCost.runId === urlRunId && Object.values(runCost.perStageUsd).some((v) => v > 0);
         return (
           <div style={{ height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {activePause && (
+              <PausedBanner
+                data={activePause}
+                onReview={() => setReviewModalOpen(() => true)}
+                onCancel={() => pausedRunsState.resume(activePause.pause.runId, 'reject-cancel')}
+              />
+            )}
             {showStageSpend && runCost && (
               <div style={{
                 padding: '8px 16px', borderBottom: '1px solid var(--separator)',
@@ -1420,6 +1444,16 @@ function App() {
         </div>
       </DashboardLayout>
       <CommandPalette commands={commands} isOpen={cmdPaletteOpen} onClose={() => setCmdPaletteOpen(false)} />
+      {reviewModalOpen && activePause && (
+        <PlanReviewModal
+          data={activePause}
+          onResolve={(action, note, planPatch) => {
+            pausedRunsState.resume(activePause.pause.runId, action, note, planPatch);
+            setReviewModalOpen(() => false);
+          }}
+          onClose={() => setReviewModalOpen(() => false)}
+        />
+      )}
       {pendingBreach && breachModalOpen && (
         <CostBreachModal
           breach={pendingBreach}
