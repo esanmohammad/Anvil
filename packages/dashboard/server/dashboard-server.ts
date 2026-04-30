@@ -37,6 +37,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 import { AgentManager, type AgentState } from '@anvil/agent-core';
 import { PipelineRunner } from './pipeline-runner.js';
+import { disallowedToolsForPersona } from './steps/per-repo-stage.step.js';
 import type { PipelineRunState } from './pipeline-runner.js';
 import { ProjectLoader } from './project-loader.js';
 import type { ProjectRepo } from './project-loader.js';
@@ -5412,9 +5413,10 @@ Your project prompt contains a comprehensive Knowledge Base (${kbReport.length} 
 You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these directories only.\n\n` : ''}This is read-only research — do NOT modify any files.`,
     };
 
+    const spikePersona = actionType === 'run-spike' ? 'analyst' : 'engineer';
     const agent = agentManager.spawn({
       name: `${actionType.replace('run-', '')}-${project}`,
-      persona: actionType === 'run-spike' ? 'analyst' : 'engineer',
+      persona: spikePersona,
       project,
       stage: actionType.replace('run-', ''),
       prompt: promptMap[actionType] ?? description,
@@ -5422,6 +5424,7 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
       model: model ?? 'sonnet',
       cwd,
       permissionMode: 'bypassPermissions',
+      disallowedTools: disallowedToolsForPersona(spikePersona),
     });
 
     // Register active run
@@ -5620,6 +5623,9 @@ No prose outside the JSON block.`;
       model,
       cwd,
       permissionMode: 'bypassPermissions',
+      // KB is injected via projectPrompt — block exploration tools so the
+      // architect uses the Knowledge Base instead of re-exploring the repo.
+      disallowedTools: disallowedToolsForPersona('architect'),
     });
 
     planAgentContext.set(agent.id, { project, feature, model });
@@ -5714,6 +5720,7 @@ No prose outside the JSON block.`;
         model,
         cwd,
         permissionMode: 'bypassPermissions',
+        disallowedTools: disallowedToolsForPersona('architect'),
       });
 
       planAgentContext.set(agent.id, {
@@ -5777,6 +5784,7 @@ No prose outside the JSON block.`;
       model,
       cwd,
       permissionMode: 'bypassPermissions',
+      disallowedTools: disallowedToolsForPersona('architect'),
     });
 
     planAgentContext.set(agent.id, {
