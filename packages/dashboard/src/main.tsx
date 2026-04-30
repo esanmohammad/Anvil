@@ -332,6 +332,12 @@ function App() {
     (p) => p.pause.runId === urlRunId && p.pause.status === 'paused-awaiting-user',
   );
 
+  // Auto-close the review modal when the server-side pause goes away
+  // (timeout or external cancel) so the modal doesn't sit on a stale view.
+  useEffect(() => {
+    if (!activePause && reviewModalOpen) setReviewModalOpen(() => false);
+  }, [activePause, reviewModalOpen]);
+
   // Derived
   const activePipeline = toPipelineData(dashboardState?.activePipeline ?? null);
   const rawPipeline = dashboardState?.activePipeline ?? null;
@@ -1447,6 +1453,16 @@ function App() {
       {reviewModalOpen && activePause && (
         <PlanReviewModal
           data={activePause}
+          currentArtifact={
+            activePipeline?.stages?.[activePipeline.currentStage ?? 0]?.artifact ?? ''
+          }
+          pipelineStages={
+            activePipeline?.stages?.map((s: { name: string; label: string }) => ({
+              name: s.name,
+              label: s.label,
+            })) ?? []
+          }
+          currentStageIndex={activePipeline?.currentStage}
           onResolve={(decision) => {
             pausedRunsState.resume(activePause.pause.runId, decision);
             setReviewModalOpen(() => false);

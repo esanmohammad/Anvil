@@ -21,11 +21,26 @@ import type { PausedRunData, ResumeDecision } from './pipeline-ui-types.js';
 
 export interface PlanReviewModalProps {
   data: PausedRunData;
+  /**
+   * Markdown artifact emitted by the just-paused stage. Pre-fills the
+   * "Edit artifact" textarea so the reviewer can tweak the output and
+   * resume with the edited copy. Optional — when missing, the edit panel
+   * stays empty (still functional, just less helpful).
+   */
+  currentArtifact?: string;
+  /**
+   * All pipeline stages in order. Used to populate the rerun-from
+   * dropdown — the reviewer picks one prior stage to roll back to.
+   * Stages with index > currentStageIndex are filtered out client-side.
+   */
+  pipelineStages?: ReadonlyArray<{ name: string; label: string }>;
+  /** Index of the just-paused stage. Caps the rerun-from dropdown. */
+  currentStageIndex?: number;
   onResolve: (decision: ResumeDecision) => void;
   onClose: () => void;
 }
 
-type InlinePanel = 'modify' | 'replan' | 'confirmCancel' | null;
+type InlinePanel = 'approveNote' | 'modify' | 'replan' | 'confirmCancel' | null;
 
 function relativeTime(iso: string): string {
   const then = new Date(iso).getTime();
@@ -57,7 +72,14 @@ function initial(name: string): string {
   return (name.trim()[0] ?? '?').toUpperCase();
 }
 
-export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalProps) {
+export function PlanReviewModal({
+  data,
+  currentArtifact,
+  pipelineStages,
+  currentStageIndex,
+  onResolve,
+  onClose,
+}: PlanReviewModalProps) {
   const { pause, riskScore, planSummary, touchedFiles, predictedDiff, tokenCostEstimate } = data;
 
   const [summaryOpen, setSummaryOpen] = useState(true);
@@ -65,9 +87,15 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
   const [diffOpen, setDiffOpen] = useState(false);
   const [inline, setInline] = useState<InlinePanel>(null);
 
-  const [modifyText, setModifyText] = useState('{\n  \n}');
+  const [modifyText, setModifyText] = useState(currentArtifact ?? '');
   const [modifyError, setModifyError] = useState<string | null>(null);
   const [note, setNote] = useState('');
+  const [approveNote, setApproveNote] = useState('');
+  // Rerun target — defaults to the just-paused stage so "Rerun + note"
+  // means "redo this stage with my feedback" without forcing a click.
+  const [rerunTarget, setRerunTarget] = useState<number>(
+    typeof currentStageIndex === 'number' ? currentStageIndex : 0,
+  );
 
   const approveRef = useRef<HTMLButtonElement>(null);
 
@@ -110,8 +138,13 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
   }, [modifyText]);
 
   const handleSaveModify = useCallback(() => {
-    // Phase E will replace the JSON-patch panel with markdown artifact
-    // editing — for now treat the textarea contents as the new artifact.
+    // The textarea was pre-filled with the just-paused stage's artifact
+    // (markdown). Sending it back replaces the on-disk + in-memory copy
+    // before the next stage runs.
+    if (!modifyText.trim()) {
+      setModifyError('Edited artifact cannot be empty.');
+      return;
+    }
     setModifyError(null);
     onResolve({ action: 'modify-artifact', editedArtifact: modifyText });
   }, [modifyText, onResolve]);
@@ -119,10 +152,17 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
   const handleSubmitReplan = useCallback(() => {
     const trimmed = note.trim();
     if (!trimmed) return;
-    // Default rerun target is the previous stage. Phase E will surface a
-    // dropdown so the user can pick which stage to roll back to.
-    onResolve({ action: 'rerun-from', note: trimmed });
-  }, [note, onResolve]);
+    onResolve({ action: 'rerun-from', note: trimmed, rerunFromStage: rerunTarget });
+  }, [note, rerunTarget, onResolve]);
+
+  const handleApproveWithNote = useCallback(() => {
+    const trimmed = approveNote.trim();
+    if (!trimmed) {
+      onResolve({ action: 'approve' });
+    } else {
+      onResolve({ action: 'approve-with-note', note: trimmed });
+    }
+  }, [approveNote, onResolve]);
 
   const handleConfirmCancel = useCallback(() => {
     onResolve({ action: 'cancel' });
@@ -467,6 +507,63 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
               </button>
 
               <button
+                onClick={() => setInline((v) => v === 'approveNote' ? null : 'approveNote')}
+                aria-expanded={inline === 'approveNote'}
+                style={actionBtnStyle('secondary')}
+              >
+                <Send size={13} strokeWidth={1.75} aria-hidden="true" />
+                Approve with note
+              </button>
+
+              {inline === 'approveNote' && (
+                <div style={inlinePanelStyle()}>
+                  <div style={{
+                    fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 6,
+                  }}>
+                    The note is injected at the top of the next stage's user prompt as guidance.
+                  </div>
+                  <textarea
+                    value={approveNote}
+                    onChange={(e) => setApproveNote(e.target.value)}
+                    rows={4}
+                    placeholder="e.g. Watch out for the existing CheckoutPage flow when wiring the adoption form."
+                    aria-label="Note for next stage"
+                    style={{
+                      width: '100%',
+                      background: 'var(--bg-base)',
+                      border: '1px solid var(--separator)',
+                      borderRadius: 'var(--radius-sm)',
+                      padding: 8,
+                      color: 'var(--text-primary)',
+                      fontFamily: 'var(--font-sans)',
+                      fontSize: 13,
+                      outline: 'none',
+                      resize: 'vertical',
+                    }}
+                  />
+                  <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                    <button
+                      onClick={handleApproveWithNote}
+                      disabled={!approveNote.trim()}
+                      style={{
+                        ...actionBtnStyle('primary', 32),
+                        opacity: approveNote.trim() ? 1 : 0.55,
+                        cursor: approveNote.trim() ? 'pointer' : 'not-allowed',
+                      }}
+                    >
+                      Approve & resume
+                    </button>
+                    <button
+                      onClick={() => setInline(null)}
+                      style={actionBtnStyle('ghost', 32)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <button
                 onClick={() => setInline((v) => v === 'modify' ? null : 'modify')}
                 aria-expanded={inline === 'modify'}
                 style={actionBtnStyle('secondary')}
@@ -480,7 +577,7 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
                   <div style={{
                     fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 6,
                   }}>
-                    Paste a JSON patch to override fields in the plan.
+                    Edit the artifact this stage produced. Your edits replace the on-disk version before the next stage runs.
                   </div>
                   <textarea
                     value={modifyText}
@@ -488,10 +585,9 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
                       setModifyText(e.target.value);
                       if (modifyError) setModifyError(null);
                     }}
-                    onBlur={validateModify}
                     spellCheck={false}
-                    rows={8}
-                    aria-label="Plan patch JSON"
+                    rows={16}
+                    aria-label="Edit artifact markdown"
                     aria-invalid={!!modifyError}
                     style={{
                       width: '100%',
@@ -538,7 +634,7 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
                 style={actionBtnStyle('secondary')}
               >
                 <Send size={13} strokeWidth={1.75} aria-hidden="true" />
-                Re-plan with note
+                Rerun with note
               </button>
 
               {inline === 'replan' && (
@@ -546,14 +642,47 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
                   <div style={{
                     fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 6,
                   }}>
-                    Tell the planner what to change. This re-runs planning with your guidance.
+                    Roll the pipeline back to a prior stage and replay it with your feedback.
                   </div>
+                  {pipelineStages && pipelineStages.length > 0 && (
+                    <label style={{
+                      display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8,
+                    }}>
+                      <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                        Roll back to stage
+                      </span>
+                      <select
+                        value={rerunTarget}
+                        onChange={(e) => setRerunTarget(Number(e.target.value))}
+                        aria-label="Rerun-from stage"
+                        style={{
+                          background: 'var(--bg-base)',
+                          border: '1px solid var(--separator)',
+                          borderRadius: 'var(--radius-sm)',
+                          padding: '6px 8px',
+                          color: 'var(--text-primary)',
+                          fontFamily: 'var(--font-sans)',
+                          fontSize: 13,
+                          outline: 'none',
+                        }}
+                      >
+                        {pipelineStages
+                          .map((s, idx) => ({ s, idx }))
+                          .filter(({ idx }) => typeof currentStageIndex !== 'number' || idx <= currentStageIndex)
+                          .map(({ s, idx }) => (
+                            <option key={s.name} value={idx}>
+                              {idx + 1}. {s.label}{idx === currentStageIndex ? ' (current)' : ''}
+                            </option>
+                          ))}
+                      </select>
+                    </label>
+                  )}
                   <textarea
                     value={note}
                     onChange={(e) => setNote(e.target.value)}
                     rows={5}
-                    placeholder="e.g. Don't touch the billing service; prefer a feature flag."
-                    aria-label="Note to planner"
+                    placeholder="e.g. The analyst missed PII handling for adopter records — redo with that constraint."
+                    aria-label="Note for rerun"
                     style={{
                       width: '100%',
                       background: 'var(--bg-base)',
@@ -577,7 +706,7 @@ export function PlanReviewModal({ data, onResolve, onClose }: PlanReviewModalPro
                         cursor: note.trim() ? 'pointer' : 'not-allowed',
                       }}
                     >
-                      Submit note
+                      Rerun stage
                     </button>
                     <button
                       onClick={() => setInline(null)}
