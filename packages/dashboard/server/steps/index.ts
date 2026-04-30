@@ -39,6 +39,7 @@ export {
   createClarifyStep,
   parseClarifyQuestions,
   formatQAPairs,
+  buildClarifySynthesisPrompt,
   CLARIFY_QA_ARTIFACT_ID,
 } from './clarify.step.js';
 export type {
@@ -47,6 +48,15 @@ export type {
   ClarifyQAPair,
   ClarifyEvent,
 } from './clarify.step.js';
+export {
+  runClarifyForProject,
+  createClarifyStageStep,
+} from './clarify-stage.step.js';
+export type {
+  RunClarifyForProjectOptions,
+  RunClarifyForProjectResult,
+  ClarifyStageStepOptions,
+} from './clarify-stage.step.js';
 export { attachCostBudgetHook } from './cost-budget.hook.js';
 export type {
   CostBudgetHookOptions,

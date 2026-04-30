@@ -119,11 +119,22 @@ export function formatQAPairs(qaPairs: ClarifyQAPair[]): string {
     .join('\n\n');
 }
 
+/**
+ * Build the synthesis prompt the resumed clarifier agent receives after
+ * the user has answered every question. Lifted verbatim from
+ * `pipeline-runner.ts:runClarifyStage()` so cache-key parity with the
+ * legacy holds. Exported for Phase 4f.4 (`runClarifyForProject`) which
+ * orchestrates the explore → QA → synthesize round-trip.
+ */
+export function buildClarifySynthesisPrompt(qaText: string): string {
+  return `Here are the clarifying questions and the user's answers:\n\n${qaText}\n\n`
+    + 'Now synthesize a CLARIFICATION.md document that combines the questions, '
+    + "answers, and your codebase understanding into clear context for the next "
+    + 'stages. Output ONLY the markdown content.';
+}
+
 const SYNTHESIS_PROMPT_TEMPLATE = (qaText: string): string =>
-  `Here are the clarifying questions and the user's answers:\n\n${qaText}\n\n`
-  + 'Now synthesize a CLARIFICATION.md document that combines the questions, '
-  + "answers, and your codebase understanding into clear context for the next "
-  + 'stages. Output ONLY the markdown content.';
+  buildClarifySynthesisPrompt(qaText);
 
 /**
  * Build the clarify Q&A Step. The Step's input is the explore-phase

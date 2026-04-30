@@ -47,6 +47,9 @@ import {
   runBuildForOneRepo,
 } from './steps/per-repo-build.step.js';
 import {
+  runClarifyForProject,
+} from './steps/clarify-stage.step.js';
+import {
   extractAcceptanceCriteria,
   extractAffectedRepos,
   extractApiEndpoints,
@@ -1545,150 +1548,64 @@ export class PipelineRunner extends EventEmitter {
 
   // ── Interactive Clarify (one question at a time) ─────────────────
 
-  /**
-   * Parse numbered questions from the clarifier agent's output.
-   * Matches patterns like:
-   *   1. **[Topic]**: Question text?
-   *   2. Question text?
-   *   1) Question text?
-   */
-  private parseQuestions(output: string): string[] {
-    const lines = output.split('\n');
-    const questions: string[] = [];
-    let current = '';
-
-    for (const line of lines) {
-      // Detect start of a new numbered question
-      const isNewQ = /^\s*\d+[\.\)]\s+/.test(line);
-      if (isNewQ) {
-        if (current.trim()) questions.push(current.trim());
-        current = line.replace(/^\s*\d+[\.\)]\s+/, '');
-      } else if (current) {
-        // Continuation of current question (non-empty, not a closing line)
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.toLowerCase().startsWith('please answer')) {
-          current += '\n' + line;
-        }
-      }
-    }
-    if (current.trim()) questions.push(current.trim());
-
-    // Deduplicate — agent may produce identical questions under different numbers
-    const seen = new Set<string>();
-    return questions.filter((q) => {
-      if (q.length <= 10) return false; // skip very short fragments
-      // Normalize: strip bold markers, whitespace, and leading topic labels for comparison
-      const normalized = q.replace(/\*\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-      if (seen.has(normalized)) return false;
-      seen.add(normalized);
-      return true;
-    });
-  }
-
   private async runClarifyStage(index: number): Promise<{ artifact: string; cost: number }> {
-    // Phase A: Agent explores codebase and generates questions
-    const explorePrompt = this.buildClarifyExplorePrompt();
-    const projectPrompt = this.buildProjectPrompt(STAGES[0]);
-
-    const agent = this.agentManager.spawn({
-      name: `clarifier-${this.config.project}`,
-      persona: 'clarifier',
+    const result = await runClarifyForProject({
+      agentManager: this.agentManager,
       project: this.config.project,
-      stage: 'clarify',
-      prompt: explorePrompt,
+      workspaceDir: this.workspaceDir,
       model: this.resolveModelForStage('clarify'),
-      cwd: this.workspaceDir,
-      projectPrompt,
-      permissionMode: 'bypassPermissions',
-      disallowedTools: ['Write', 'Edit', 'NotebookEdit', 'Bash'],
       maxOutputTokens: maxOutputTokensForStage('clarify'),
+      explorePrompt: this.buildClarifyExplorePrompt(),
+      projectPrompt: this.buildProjectPrompt(STAGES[0]),
+      isCancelled: () => this.cancelled,
+      onAgentSpawned: (agentId) => {
+        this.state.stages[index].agentId = agentId;
+        this.broadcastState();
+        this.emit('stage-start', index, agentId);
+      },
+      onTruncation: (agentName, outputTokens) => {
+        this.handleOutputTruncation(agentName, outputTokens);
+      },
+      onClarifyQuestion: (questionIndex, totalQuestions, question) => {
+        this.emit('clarify-question', {
+          stageIndex: index,
+          questionIndex,
+          totalQuestions,
+          question,
+        });
+      },
+      onWaitingForInput: (agentId) => {
+        this.state.stages[index].status = 'waiting';
+        this.state.status = 'waiting';
+        this.state.waitingForInput = true;
+        this.broadcastState();
+        this.emit('waiting-for-input', index, agentId);
+      },
+      onAnswerReceived: (answer) => {
+        this.emit('user-input', { stageIndex: index, text: answer });
+        this.state.waitingForInput = false;
+        this.broadcastState();
+      },
+      onClarifyAck: (questionIndex, totalQuestions, hasMore) => {
+        this.emit('clarify-ack', {
+          stageIndex: index,
+          questionIndex,
+          totalQuestions,
+          hasMore,
+        });
+      },
+      onSynthesizeStart: () => {
+        this.state.stages[index].status = 'running';
+        this.state.status = 'running';
+        this.state.waitingForInput = false;
+        this.broadcastState();
+      },
+      inputResolver: () => new Promise<string>((resolve) => {
+        this.inputResolve = resolve;
+      }),
     });
 
-    this.state.stages[index].agentId = agent.id;
-    this.broadcastState();
-    this.emit('stage-start', index, agent.id);
-
-    // Wait for agent to finish generating questions
-    const exploreResult = await this.waitForAgent(agent.id);
-    let totalCost = exploreResult.cost;
-
-    // Phase B: Parse questions and ask them one by one
-    const questions = this.parseQuestions(exploreResult.artifact);
-    const qaPairs: Array<{ question: string; answer: string }> = [];
-
-    if (questions.length === 0) {
-      // Fallback: treat entire output as a single question block
-      questions.push(exploreResult.artifact);
-    }
-
-    for (let qi = 0; qi < questions.length; qi++) {
-      if (this.cancelled) break;
-
-      const question = questions[qi];
-
-      // Emit the question as a visible activity
-      this.emit('clarify-question', {
-        stageIndex: index,
-        questionIndex: qi,
-        totalQuestions: questions.length,
-        question,
-      });
-
-      // Wait for user's answer
-      this.state.stages[index].status = 'waiting';
-      this.state.status = 'waiting';
-      this.state.waitingForInput = true;
-      this.broadcastState();
-      this.emit('waiting-for-input', index, agent.id);
-
-      const answer = await new Promise<string>((resolve) => {
-        this.inputResolve = resolve;
-      });
-
-      if (this.cancelled || !answer) break;
-
-      // Record the Q&A pair
-      qaPairs.push({ question, answer });
-
-      // Emit acknowledgment
-      this.emit('user-input', { stageIndex: index, text: answer });
-      this.emit('clarify-ack', {
-        stageIndex: index,
-        questionIndex: qi,
-        totalQuestions: questions.length,
-        hasMore: qi < questions.length - 1,
-      });
-
-      this.state.waitingForInput = false;
-      this.broadcastState();
-    }
-
-    if (this.cancelled || qaPairs.length === 0) {
-      return { artifact: exploreResult.artifact, cost: totalCost };
-    }
-
-    // Phase C: Resume agent with all Q&A pairs to synthesize clarification
-    this.state.stages[index].status = 'running';
-    this.state.status = 'running';
-    this.state.waitingForInput = false;
-    this.broadcastState();
-
-    const qaText = qaPairs.map((qa, i) =>
-      `**Q${i + 1}**: ${qa.question}\n**A${i + 1}**: ${qa.answer}`,
-    ).join('\n\n');
-
-    this.agentManager.sendInput(agent.id,
-      `Here are the clarifying questions and the user's answers:\n\n${qaText}\n\nNow synthesize a CLARIFICATION.md document that combines the questions, answers, and your codebase understanding into clear context for the next stages. Output ONLY the markdown content.`,
-    );
-
-    // Wait for the resumed agent to finish
-    const synthesizeResult = await this.waitForAgent(agent.id);
-    totalCost += synthesizeResult.cost;
-
-    return {
-      artifact: synthesizeResult.artifact || exploreResult.artifact,
-      cost: totalCost,
-    };
+    return { artifact: result.artifact, cost: result.cost };
   }
 
   // ── Per-repo stage execution ───────────────────────────────────────
