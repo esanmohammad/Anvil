@@ -20,3 +20,8 @@ export { RestartPolicy } from './restart-policy.js';
 export { TimeoutGuard } from './timeout-guard.js';
 export { StageValidator } from './stage-validator.js';
 export { AgentManager, type SpawnFn } from './agent-manager.js';
+
+// Phase 1 of the agent-manager consolidation: type skeletons for the unified
+// agent-lifecycle layer. Runtime behavior lands in Phase 2; these exports
+// exist now so consumers can rename imports incrementally.
+export * from './session/index.js';
