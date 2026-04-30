@@ -9,6 +9,11 @@ datasources:
     isDefault: false
     jsonData:
       httpMethod: GET
+      # Required for queryType: traceql (raw TraceQL search) in Grafana 11.x.
+      # Backed by Tempo's stream_over_http_enabled flag — the plugin uses
+      # HTTP/2 chunked transfer to /api/search/stream when this is on.
+      streamingEnabled:
+        search: true
       tracesToLogsV2:
         datasourceUid: loki
         spanStartTimeShift: -5m

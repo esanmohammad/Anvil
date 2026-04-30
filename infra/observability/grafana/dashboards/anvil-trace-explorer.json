@@ -2,55 +2,128 @@
   "title": "Anvil — Trace Explorer",
   "uid": "anvil-trace-explorer",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 3,
   "tags": ["anvil", "traces"],
-  "time": { "from": "now-1h", "to": "now" },
-  "refresh": "",
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
   "panels": [
     {
       "id": 1,
-      "type": "traces",
-      "title": "Recent agent sessions (slowest first)",
-      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 12 },
-      "datasource": { "type": "tempo", "uid": "tempo" },
-      "targets": [
-        {
-          "queryType": "traceqlSearch",
-          "query": "{ name = \"anvil.agent.session\" } | select(anvil.persona, anvil.project, anvil.run.id, anvil.agent.outcome, anvil.agent.total_cost_usd)",
-          "limit": 25,
-          "tableType": "traces"
-        }
-      ]
+      "type": "text",
+      "title": "How to use this dashboard",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 4 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Aggregates live here** — total spend, calls, cost by stage/persona/model. **Individual traces live in Explore** (Tempo's TraceQL panel API doesn't render in dashboards on the single-binary image).\n\nOpen Explore with a pre-baked search:\n- **All recent agent sessions** — [Open in Explore](/explore?left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7B%20name%20%3D%20%5C%22anvil.agent.session%5C%22%20%7D%22%7D%5D,%22range%22:%7B%22from%22:%22now-6h%22,%22to%22:%22now%22%7D%7D)\n- **Slow tool calls (>1s)** — [Open in Explore](/explore?left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7B%20name%20%3D~%20%5C%22gen_ai.tool..*%5C%22%20%26%26%20duration%20%3E%201s%20%7D%22%7D%5D,%22range%22:%7B%22from%22:%22now-6h%22,%22to%22:%22now%22%7D%7D)\n- **Failed sessions** — [Open in Explore](/explore?left=%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22%7B%20name%20%3D%20%5C%22anvil.agent.session%5C%22%20%26%26%20status%20%3D%20error%20%7D%22%7D%5D,%22range%22:%7B%22from%22:%22now-6h%22,%22to%22:%22now%22%7D%7D)"
+      }
     },
     {
       "id": 2,
-      "type": "traces",
-      "title": "Slow tool calls (>1s)",
-      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 10 },
-      "datasource": { "type": "tempo", "uid": "tempo" },
+      "type": "table",
+      "title": "Agent sessions — last $__range",
+      "description": "Click a row's `Run details` link to open the matching traces in Explore.",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "queryType": "traceqlSearch",
-          "query": "{ name =~ \"gen_ai.tool.\" && duration > 1s }",
-          "limit": 25,
-          "tableType": "traces"
+          "refId": "calls",
+          "expr": "sum by (anvil_persona, anvil_stage, gen_ai_request_model) (increase(gen_ai_client_operation_duration_milliseconds_count[$__range]))",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "cost",
+          "expr": "sum by (anvil_persona, anvil_stage, gen_ai_request_model) (increase(gen_ai_client_cost_usd_USD_total{component=\"total\"}[$__range]))",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "tokens_in",
+          "expr": "sum by (anvil_persona, anvil_stage, gen_ai_request_model) (increase(gen_ai_client_token_usage_total{io_type=\"input\"}[$__range]))",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "tokens_out",
+          "expr": "sum by (anvil_persona, anvil_stage, gen_ai_request_model) (increase(gen_ai_client_token_usage_total{io_type=\"output\"}[$__range]))",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "p95_latency",
+          "expr": "histogram_quantile(0.95, sum by (le, anvil_persona, anvil_stage, gen_ai_request_model) (rate(gen_ai_client_operation_duration_milliseconds_bucket[$__range])))",
+          "instant": true,
+          "format": "table"
         }
-      ]
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": { "byField": "anvil_persona", "mode": "outer" }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "Time 1": true, "Time 2": true, "Time 3": true, "Time 4": true, "Time 5": true },
+            "renameByName": {
+              "anvil_persona": "Persona",
+              "anvil_stage": "Stage",
+              "gen_ai_request_model": "Model",
+              "Value #calls": "Calls",
+              "Value #cost": "Cost USD",
+              "Value #tokens_in": "Input tokens",
+              "Value #tokens_out": "Output tokens",
+              "Value #p95_latency": "p95 latency (ms)"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Cost USD" }, "properties": [{ "id": "unit", "value": "currencyUSD" }, { "id": "decimals", "value": 4 }] },
+          { "matcher": { "id": "byName", "options": "p95 latency (ms)" }, "properties": [{ "id": "unit", "value": "ms" }] },
+          { "matcher": { "id": "byName", "options": "Calls" }, "properties": [{ "id": "unit", "value": "short" }] }
+        ]
+      }
     },
     {
       "id": 3,
-      "type": "traces",
+      "type": "stat",
+      "title": "Total spend (window)",
+      "gridPos": { "x": 0, "y": 14, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "sum(increase(gen_ai_client_cost_usd_USD_total{component=\"total\"}[$__range]))" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Total calls",
+      "gridPos": { "x": 6, "y": 14, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "sum(increase(gen_ai_client_operation_duration_milliseconds_count[$__range]))" }],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Avg cache hit ratio",
+      "gridPos": { "x": 12, "y": 14, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "avg(gen_ai_cache_hit_ratio)" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "decimals": 3 } }
+    },
+    {
+      "id": 6,
+      "type": "stat",
       "title": "Failed runs",
-      "gridPos": { "x": 0, "y": 22, "w": 24, "h": 10 },
-      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "x": 18, "y": 14, "w": 6, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        {
-          "queryType": "traceqlSearch",
-          "query": "{ name = \"anvil.agent.session\" && status = error }",
-          "limit": 25,
-          "tableType": "traces"
-        }
-      ]
+        { "expr": "0" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "noValue": "0", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } }
     }
   ]
 }

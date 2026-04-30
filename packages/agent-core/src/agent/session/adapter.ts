@@ -62,6 +62,15 @@ export interface AdapterRequest {
   disallowedTools?: string[];
   allowedTools?: string[];
   maxOutputTokens?: number;
+  /** Pipeline stage (e.g. 'requirements', 'build', 'spike'). Surfaces on
+   *  every span and metric so dashboards can slice by stage. */
+  stage?: string;
+  /** Agent persona (e.g. 'analyst', 'engineer'). Same. */
+  persona?: string;
+  /** Project the spawn belongs to. */
+  project?: string;
+  /** Run id grouping multiple spawns into one logical pipeline run. */
+  runId?: string;
 }
 
 /**
@@ -96,5 +105,9 @@ export function buildAdapterRequest(
     disallowedTools: spec.disallowedTools,
     allowedTools: spec.allowedTools,
     maxOutputTokens: spec.maxOutputTokens,
+    stage: spec.stage,
+    persona: spec.persona,
+    project: spec.project,
+    runId: spec.runId,
   };
 }

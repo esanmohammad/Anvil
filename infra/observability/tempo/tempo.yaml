@@ -4,6 +4,11 @@ server:
   http_listen_port: 3200
   grpc_listen_port: 9095
 
+# Required for Grafana's traceql queryType (raw TraceQL search) — without
+# this, the datasource hits a gRPC code path that returns
+# "backend TraceQL search queries are not supported".
+stream_over_http_enabled: true
+
 distributor:
   receivers:
     otlp:
