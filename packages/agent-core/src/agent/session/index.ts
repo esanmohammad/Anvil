@@ -6,9 +6,24 @@
 export {
   AgentSession,
   emptyCost,
+  generateSessionId,
+  appendOutput,
+  pushActivity,
+  accumulateCost,
 } from './session.js';
 
-export { AgentSessionRegistry } from './session-registry.js';
+export {
+  AgentSessionRegistry,
+  type AgentSessionRegistryOpts,
+} from './session-registry.js';
+
+export type {
+  AgentAdapter,
+  AgentAdapterEvents,
+  AgentAdapterFactory,
+  AdapterRequest,
+} from './adapter.js';
+export { buildAdapterRequest } from './adapter.js';
 
 export type {
   AgentActivity,

@@ -16,6 +16,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { EventEmitter } from 'node:events';
 import {
   AgentSession,
   AgentSessionNotFoundError,
@@ -23,6 +24,7 @@ import {
   SessionResumeNotSupportedError,
   emptyCost,
   type AgentActivity,
+  type AgentAdapter,
   type AgentCheckpointHook,
   type AgentCostHook,
   type AgentSessionEvents,
@@ -32,6 +34,14 @@ import {
   type CostInfo,
   type SessionSpec,
 } from '../index.js';
+
+// Minimal fake adapter for the type-shape locks. Not exercised; only
+// satisfies the `adapterFactory` constructor argument.
+class NoopAdapter extends EventEmitter implements AgentAdapter {
+  start(): void { /* no-op */ }
+  kill(): void { /* no-op */ }
+}
+const noopFactory = () => new NoopAdapter();
 
 // ── 1. SessionSpec accepts dashboard's SpawnConfig shape ────────────────
 
@@ -214,47 +224,29 @@ describe('AgentSession skeleton', () => {
   };
 
   it('constructs with a pending state', () => {
-    const session = new AgentSession(spec);
+    const session = new AgentSession(spec, { adapterFactory: noopFactory });
     assert.equal(session.status, 'pending');
     assert.equal(session.output, '');
   });
 
-  it('throws Phase 2 placeholder on start()', () => {
-    const session = new AgentSession(spec);
-    assert.throws(() => session.start(), /Phase 2/);
+  it('honors id override', () => {
+    const session = new AgentSession(spec, { adapterFactory: noopFactory, id: 'custom-id' });
+    assert.equal(session.id, 'custom-id');
+    assert.equal(session.sessionId, 'custom-id');
   });
 
-  it('throws Phase 2 placeholder on sendInput()', () => {
-    const session = new AgentSession(spec);
-    assert.throws(() => session.sendInput('hello'), /Phase 2/);
-  });
-
-  it('throws Phase 2 placeholder on kill()', () => {
-    const session = new AgentSession(spec);
-    assert.throws(() => session.kill(), /Phase 2/);
+  it('id defaults to a UUID v4', () => {
+    const session = new AgentSession(spec, { adapterFactory: noopFactory });
+    assert.match(session.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
 });
 
 describe('AgentSessionRegistry skeleton', () => {
   it('constructs and accepts hook setters', () => {
-    const reg = new AgentSessionRegistry();
+    const reg = new AgentSessionRegistry({ adapterFactory: noopFactory });
     reg.setCostHook(() => {});
     reg.setCheckpointHook({ lookup: () => ({ hit: false }) });
     assert.equal(reg.getAgent('missing'), undefined);
-  });
-
-  it('throws Phase 2 placeholder on spawn()', () => {
-    const reg = new AgentSessionRegistry();
-    const spec: SessionSpec = {
-      name: 't',
-      persona: 'p',
-      project: 'pr',
-      stage: 's',
-      prompt: '',
-      model: 'm',
-      cwd: '/tmp',
-    };
-    assert.throws(() => reg.spawn(spec), /Phase 2/);
   });
 });
 
