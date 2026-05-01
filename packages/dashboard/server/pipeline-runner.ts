@@ -29,6 +29,8 @@ import {
   allowedToolsForStage,
   permissionClassesForStage,
 } from '@anvil/core-pipeline';
+import { pickAliveModelFromChainSync, prefetchLiveness } from './provider-liveness.js';
+import type { ProviderName } from '@anvil/agent-core';
 import { parseTasks, bundleFiles } from './engineer-task-bundler.js';
 import type { ParsedTask } from './engineer-task-bundler.js';
 import { sliceSpecForRefs } from './engineer-spec-slicer.js';
@@ -315,6 +317,22 @@ export interface PipelineRunnerEvents {
  * if/when Phase 4b grows an LLM extractor, append it here.
  */
 const LOCAL_TIER_STAGES = new Set<string>(['clarify', 'ship']);
+
+/**
+ * Map a model id to its provider for the liveness chain walker.
+ * Mirrors the heuristic in agent-core's `default-adapter-factory.
+ * resolveProvider` — kept inline to avoid pulling that whole module
+ * into the sync resolver path.
+ */
+function providerOfModelId(modelId: string): ProviderName {
+  const id = modelId.toLowerCase();
+  if (id.startsWith('ollama:')) return 'ollama';
+  if (id.startsWith('gemini-')) return 'gemini';
+  if (id.startsWith('gpt-') || id.startsWith('o1') || id.startsWith('o3') || id.startsWith('o4') || id.startsWith('chatgpt-')) return 'openai';
+  if (id.includes('/')) return 'openrouter';
+  if (/^[a-z0-9_.-]+:[a-z0-9_.-]+$/.test(id) && id !== 'claude' && !id.startsWith('claude-')) return 'ollama';
+  return 'claude';
+}
 
 // ── Token-stats helpers ───────────────────────────────────────────────
 
@@ -1119,7 +1137,17 @@ export class PipelineRunner extends EventEmitter {
     //    missing or doesn't cover the stage.
     try {
       const resolved = registryResolveStage(stageName);
-      return resolved.primary;
+      // Phase 11 — walk the resolved chain via the liveness cache.
+      // When the primary's provider is dead (Ollama down, missing API
+      // key) we fall to the next live tier instead of letting the
+      // adapter throw mid-stage. The cache is pre-warmed at run start.
+      const picked = pickAliveModelFromChainSync(resolved, providerOfModelId);
+      if (picked.fellBackFrom) {
+        console.warn(
+          `[pipeline] ${stageName}: ${picked.fellBackFrom} provider down; falling back to ${picked.model}`,
+        );
+      }
+      return picked.model;
     } catch (err) {
       if (err instanceof UnknownStageError) {
         // Stage not declared in policy yaml — drop to legacy paths.
@@ -1156,6 +1184,15 @@ export class PipelineRunner extends EventEmitter {
    */
   private allowedToolsForCurrentStage(stageName: string): string[] {
     return allowedToolsForStage(stageName);
+  }
+
+  /**
+   * Pre-warm the provider-liveness cache so the sync resolver chain
+   * walker has fresh data. Called once at pipeline start. Probes run
+   * in parallel; failures are non-fatal.
+   */
+  protected async prefetchProviderLiveness(): Promise<void> {
+    await prefetchLiveness(['ollama', 'claude', 'openai', 'openrouter', 'gemini', 'gemini-cli']);
   }
 
   /**
@@ -1356,6 +1393,12 @@ export class PipelineRunner extends EventEmitter {
     try {
       // Phase 0: Ensure workspace exists
       await this.setupWorkspace();
+
+      // Pre-warm provider liveness so the sync resolver chain walker
+      // (called per stage) reads fresh data. Non-blocking failure mode:
+      // if any probe fails, the cache stays cold for that provider and
+      // the walker treats it as alive (status quo).
+      await this.prefetchProviderLiveness().catch(() => undefined);
 
       // Create or resume feature record
       const isResume = this.config.resumeFromStage != null && this.config.featureSlug;
