@@ -22,6 +22,12 @@ import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import { resolveModelByTier } from './model-tier-resolver.js';
+import {
+  resolveModelForStage as registryResolveStage,
+  ModelResolutionError,
+  UnknownStageError,
+  allowedToolsForStage,
+} from '@anvil/core-pipeline';
 import { parseTasks, bundleFiles } from './engineer-task-bundler.js';
 import type { ParsedTask } from './engineer-task-bundler.js';
 import { sliceSpecForRefs } from './engineer-spec-slicer.js';
@@ -1077,26 +1083,56 @@ export class PipelineRunner extends EventEmitter {
    * so new models are picked up automatically without code changes.
    */
   private resolveModelForStage(stageName: string): string {
-    // 1. factory.yaml per-stage override always wins
+    // 1. factory.yaml per-stage override always wins (project-specific
+    //    pinning beats every other rule).
     const yamlModels = this.projectLoader.getConfig(this.config.project)?.pipeline?.models;
     if (yamlModels?.[stageName]) return yamlModels[stageName];
 
-    // 2. Phase 5 of TOKEN-OPTIMIZATION-PLAN — opt-in local-model overlay.
-    //    `ANVIL_LOCAL_MODEL=qwen2.5-coder:7b` (or similar) routes the
-    //    cheap-tier stages (clarify + ship + manifest extraction) to a
-    //    local Ollama model when the daemon is up. Stays off by default
-    //    so production runs keep deterministic Claude behaviour.
+    // 2. Registry-driven resolver — reads stage-policy.yaml +
+    //    ~/.anvil/models.yaml and picks the cheapest model that meets
+    //    the stage's capability/complexity bar. This is where local
+    //    routing finally kicks in for clarify/build/etc when Ollama
+    //    is up; falls through to legacy paths if the registry is
+    //    missing or doesn't cover the stage.
+    try {
+      const resolved = registryResolveStage(stageName);
+      return resolved.primary;
+    } catch (err) {
+      if (err instanceof UnknownStageError) {
+        // Stage not declared in policy yaml — drop to legacy paths.
+      } else if (err instanceof ModelResolutionError) {
+        // Policy declares it but no model satisfies — log + fall through.
+        console.warn(`[pipeline] resolver: ${err.message}; falling back to legacy chain`);
+      } else {
+        console.warn(`[pipeline] resolver crashed:`, err);
+      }
+    }
+
+    // 3. ANVIL_LOCAL_MODEL legacy override — kept for deterministic
+    //    local runs that bypass the registry entirely. Stays off by
+    //    default; only fires when the env var is explicitly set.
     const localModel = process.env.ANVIL_LOCAL_MODEL?.trim();
     if (localModel && LOCAL_TIER_STAGES.has(stageName)) {
       return localModel;
     }
 
-    // 3. If no tier selected, use the single model from the UI dropdown
+    // 4. If no tier selected, use the single model from the UI dropdown
     const tier = this.config.modelTier;
     if (!tier) return this.config.model;
 
-    // 4. Tier-based routing — resolve from provider registry
+    // 5. Tier-based legacy routing — last resort
     return resolveModelByTier(tier, stageName, this.config.model);
+  }
+
+  /**
+   * Per-stage tool-permission set, populated into SpawnConfig.allowedTools
+   * so the agent-core LanguageModelBridge can construct a properly-scoped
+   * BuiltinToolExecutor for non-Claude providers. Claude CLI uses its own
+   * tool allow/deny list (driven by persona); for Claude paths this
+   * supplies the same intent but is harmless when Claude ignores it.
+   */
+  private allowedToolsForCurrentStage(stageName: string): string[] {
+    return allowedToolsForStage(stageName);
   }
 
   /**
