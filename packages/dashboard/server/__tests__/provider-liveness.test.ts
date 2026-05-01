@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 
 import {
   pickAliveModelFromChain,
+  pickAliveModelFromChainSync,
   isProviderAlive,
   _resetLivenessCache,
 } from '../provider-liveness.js';
@@ -87,5 +88,39 @@ describe('pickAliveModelFromChain', () => {
     const r = await pickAliveModelFromChain(chain, providerOf);
     assert.equal(r.model, 'qwen3:14b');
     assert.equal(r.fellBackFrom, undefined);
+  });
+});
+
+describe('pickAliveModelFromChainSync — excludeModels (burned set)', () => {
+  it('skips burned primary, returns next live entry with fellBackFrom set', () => {
+    // Simulate primary alive (cache positive) — but it's been burned earlier.
+    globalThis.fetch = (async () => new Response('{}', { status: 200 })) as typeof fetch;
+    process.env.ANTHROPIC_API_KEY = 'sk-test';
+    const burned = new Set(['qwen3:14b']);
+    const r = pickAliveModelFromChainSync(chain, providerOf, burned);
+    assert.equal(r.model, 'claude-haiku-4-5-20251001');
+    assert.equal(r.fellBackFrom, 'qwen3:14b', 'should record where we came from');
+  });
+
+  it('walks past multiple burned entries to the first non-burned alive', () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-test';
+    const burned = new Set(['qwen3:14b', 'claude-haiku-4-5-20251001']);
+    const r = pickAliveModelFromChainSync(chain, providerOf, burned);
+    assert.equal(r.model, 'claude-sonnet-4-6');
+    assert.equal(r.fellBackFrom, 'qwen3:14b');
+  });
+
+  it('returns primary when no entries are burned (cold cache + empty set)', () => {
+    const r = pickAliveModelFromChainSync(chain, providerOf, new Set());
+    assert.equal(r.model, 'qwen3:14b');
+    assert.equal(r.fellBackFrom, undefined);
+  });
+
+  it('returns primary as last resort when EVERY chain entry is burned', () => {
+    const burned = new Set(['qwen3:14b', 'claude-haiku-4-5-20251001', 'claude-sonnet-4-6']);
+    const r = pickAliveModelFromChainSync(chain, providerOf, burned);
+    // Adapter surfaces the real error; we don't fabricate a "no-providers"
+    // shell. Primary returned even though it's burned.
+    assert.equal(r.model, 'qwen3:14b');
   });
 });

@@ -69,26 +69,45 @@ export async function pickAliveModelFromChain(
  * the primary unchanged when the cache is cold. Pair with
  * `prefetchLiveness()` at run start so the cache is warm by the time
  * stages fire.
+ *
+ * `excludeModels` is the runtime-burned set the pipeline-runner
+ * maintains: models that hit a retryable UpstreamError (429 quota,
+ * rate-limit, 5xx) earlier in this run. They're skipped even if
+ * their provider's liveness probe says alive — the provider IS
+ * alive, the upstream model is just out of capacity.
  */
 export function pickAliveModelFromChainSync(
   chain: ResolvedChain,
   providerOf: (modelId: string) => ProviderName,
+  excludeModels: ReadonlySet<string> = new Set(),
 ): { model: string; provider: ProviderName; fellBackFrom?: string } {
-  const primaryProvider = providerOf(chain.primary);
-  const primaryRecord = cache.get(primaryProvider);
-  // Cold cache or alive primary → no fallback.
-  if (!primaryRecord || primaryRecord.alive) {
-    return { model: chain.primary, provider: primaryProvider };
-  }
+  const candidates: Array<{ model: string; isFallback: boolean }> = [
+    { model: chain.primary, isFallback: false },
+    ...chain.fallbacks.map((fb) => ({ model: fb.model, isFallback: true })),
+  ];
 
-  for (const fb of chain.fallbacks) {
-    const p = providerOf(fb.model);
-    const rec = cache.get(p);
+  let firstSkippedPrimary: string | undefined;
+  for (const c of candidates) {
+    if (excludeModels.has(c.model)) {
+      if (!c.isFallback) firstSkippedPrimary = c.model;
+      continue;
+    }
+    const provider = providerOf(c.model);
+    const rec = cache.get(provider);
     if (!rec || rec.alive) {
-      return { model: fb.model, provider: p, fellBackFrom: chain.primary };
+      return {
+        model: c.model,
+        provider,
+        ...(c.isFallback || firstSkippedPrimary
+          ? { fellBackFrom: firstSkippedPrimary ?? chain.primary }
+          : {}),
+      };
     }
   }
-  return { model: chain.primary, provider: primaryProvider };
+  // Nothing in the chain alive AND not burned — return primary so
+  // the adapter surfaces the real error rather than us fabricating
+  // a 'no-providers-alive' shell.
+  return { model: chain.primary, provider: providerOf(chain.primary) };
 }
 
 /**

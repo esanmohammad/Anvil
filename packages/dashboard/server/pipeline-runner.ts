@@ -324,6 +324,23 @@ const LOCAL_TIER_STAGES = new Set<string>(['clarify', 'ship']);
  * resolveProvider` — kept inline to avoid pulling that whole module
  * into the sync resolver path.
  */
+/**
+ * Duck-type check for the agent-core `UpstreamError` shape. Avoid
+ * `instanceof` because esbuild's bundling can desync class identity
+ * across modules — the shape check is more robust and survives
+ * version skew between agent-core and the dashboard's compiled bundle.
+ */
+function isRetryableUpstreamError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: string; retryable?: unknown; status?: unknown };
+  if (e.retryable === true) return true;
+  // Belt-and-suspenders for older bundles that may not carry .retryable
+  if (e.name === 'UpstreamError' && typeof e.status === 'number') {
+    return e.status === 429 || e.status === 502 || e.status === 503 || e.status === 504;
+  }
+  return false;
+}
+
 function providerOfModelId(modelId: string): ProviderName {
   const id = modelId.toLowerCase();
   if (id.startsWith('ollama:')) return 'ollama';
@@ -499,6 +516,13 @@ export class PipelineRunner extends EventEmitter {
   private projectInfo: ProjectInfo | null = null;
   private repoPaths: Record<string, string> = {};
   private cancelled = false;
+  /**
+   * Models that hit a retryable UpstreamError this run (429 quota,
+   * rate-limit, 5xx). Skipped by the chain walker on subsequent
+   * resolves so we don't keep hammering a model whose upstream is
+   * out of capacity. Reset only by starting a new run.
+   */
+  private runtimeBurnedModels = new Set<string>();
   private memoryStore: MemoryStore;
   private kbManager: KnowledgeBaseManager | null;
   private afterStageHook: AfterStageHook | null = null;
@@ -1137,14 +1161,20 @@ export class PipelineRunner extends EventEmitter {
     //    missing or doesn't cover the stage.
     try {
       const resolved = registryResolveStage(stageName);
-      // Phase 11 — walk the resolved chain via the liveness cache.
-      // When the primary's provider is dead (Ollama down, missing API
-      // key) we fall to the next live tier instead of letting the
-      // adapter throw mid-stage. The cache is pre-warmed at run start.
-      const picked = pickAliveModelFromChainSync(resolved, providerOfModelId);
+      // Phase 11 — walk the resolved chain via the liveness cache,
+      // skipping models burned earlier this run (retryable upstream
+      // failures). When the primary's provider is dead OR its model
+      // is burned, we fall to the next live tier instead of letting
+      // the adapter throw mid-stage. The cache is pre-warmed at
+      // run start; the burn-set is mutated by runStageWithFallback.
+      const picked = pickAliveModelFromChainSync(
+        resolved,
+        providerOfModelId,
+        this.runtimeBurnedModels,
+      );
       if (picked.fellBackFrom) {
         console.warn(
-          `[pipeline] ${stageName}: ${picked.fellBackFrom} provider down; falling back to ${picked.model}`,
+          `[pipeline] ${stageName}: ${picked.fellBackFrom} skipped; falling back to ${picked.model}`,
         );
       }
       return picked.model;
@@ -1203,6 +1233,54 @@ export class PipelineRunner extends EventEmitter {
    */
   protected async prefetchProviderLiveness(): Promise<void> {
     await prefetchLiveness(['ollama', 'claude', 'openai', 'openrouter', 'gemini', 'gemini-cli']);
+  }
+
+  /**
+   * Wrap a stage spawn with chain-fallback on retryable upstream
+   * errors. When the inner attempt throws an UpstreamError-shape with
+   * `retryable === true` (429 quota, rate-limit, 5xx), the failed
+   * model is added to `runtimeBurnedModels` and the stage is retried
+   * with the next chain entry. Caps at MAX_FALLBACK_ATTEMPTS so a
+   * fully-broken chain surfaces quickly instead of looping forever.
+   *
+   * Non-retryable errors (auth, 400 bad request, the user's own
+   * cancel) propagate unchanged — those need a config fix, not a
+   * retry.
+   */
+  private async runStageWithFallback<T>(
+    stageName: string,
+    attempt: (model: string) => Promise<T>,
+  ): Promise<T> {
+    const MAX_ATTEMPTS = 5;
+    let lastErr: unknown;
+    for (let i = 0; i < MAX_ATTEMPTS; i += 1) {
+      const model = this.resolveModelForStage(stageName);
+      try {
+        return await attempt(model);
+      } catch (err) {
+        lastErr = err;
+        const retryable = isRetryableUpstreamError(err);
+        if (!retryable) throw err;
+
+        // Burn this model for the rest of the run + log + emit a
+        // routing event the dashboard activity log can surface.
+        this.runtimeBurnedModels.add(model);
+        const status = (err as { status?: number }).status ?? '?';
+        const summary = (err as Error).message?.slice(0, 200) ?? 'unknown';
+        console.warn(
+          `[pipeline] ${stageName}: ${model} hit ${status} (retryable); burning + falling back`,
+        );
+        this.emit('project-event', {
+          source: 'routing',
+          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
+          level: 'warn',
+        });
+        // Loop continues — pickModelForStage now skips this model.
+      }
+    }
+    // Exhausted the chain — bubble the last error so the stage fails
+    // cleanly with the original upstream message.
+    throw lastErr;
   }
 
   /**
@@ -1968,11 +2046,11 @@ export class PipelineRunner extends EventEmitter {
   // ── Interactive Clarify (one question at a time) ─────────────────
 
   private async runClarifyStage(index: number): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-    const result = await runClarifyForProject({
+    const result = await this.runStageWithFallback('clarify', (model) => runClarifyForProject({
       agentManager: this.agentManager,
       project: this.config.project,
       workspaceDir: this.workspaceDir,
-      model: this.resolveModelForStage('clarify'),
+      model,
       allowedTools: this.allowedToolsForCurrentStage('clarify'),
       maxOutputTokens: maxOutputTokensForStage('clarify'),
       explorePrompt: this.buildClarifyExplorePrompt(),
@@ -2023,7 +2101,7 @@ export class PipelineRunner extends EventEmitter {
       inputResolver: () => new Promise<string>((resolve) => {
         this.inputResolve = resolve;
       }),
-    });
+    }));
 
     return {
       artifact: result.artifact,
@@ -2107,12 +2185,12 @@ export class PipelineRunner extends EventEmitter {
       const prompt = this.buildRepoStagePrompt(stage, repoName, prevArtifact);
 
       promises.push(
-        runPerRepoStageForRepo({
+        this.runStageWithFallback(stage.name, (model) => runPerRepoStageForRepo({
           agentManager: this.agentManager,
           project: this.config.project,
           stageName: stage.name,
           persona: stage.persona,
-          model: this.resolveModelForStage(stage.name),
+          model,
           allowedTools: this.allowedToolsForCurrentStage(stage.name),
           maxOutputTokens: maxOutputTokensForStage(stage.name),
           repoName,
@@ -2129,7 +2207,7 @@ export class PipelineRunner extends EventEmitter {
           onTruncation: (agentName, outputTokens) => {
             this.handleOutputTruncation(agentName, outputTokens);
           },
-        })
+        }))
           .then((result) => {
             // Mark repo as completed
             const repoState = this.state.stages[index].repos[repoIdx];
@@ -2211,12 +2289,12 @@ export class PipelineRunner extends EventEmitter {
   ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
     const repoArtifacts = this.loadRepoArtifacts(repoName);
 
-    const result = await runBuildForOneRepo({
+    const result = await this.runStageWithFallback(stage.name, (model) => runBuildForOneRepo({
       agentManager: this.agentManager,
       project: this.config.project,
       stageName: stage.name,
       persona: stage.persona,
-      model: this.resolveModelForStage(stage.name),
+      model,
       allowedTools: this.allowedToolsForCurrentStage(stage.name),
       maxOutputTokens: maxOutputTokensForStage(stage.name),
       repoName,
@@ -2238,7 +2316,7 @@ export class PipelineRunner extends EventEmitter {
       onProjectEvent: (level, message) => {
         this.emit('project-event', { source: 'pipeline', message, level });
       },
-    });
+    }));
 
     const repoStateDone = this.state.stages[stageIndex].repos[repoIdx];
     if (repoStateDone) {
@@ -2293,7 +2371,7 @@ export class PipelineRunner extends EventEmitter {
     //   - clarifier / others: read-only exploration allowed, no mutation.
     const disallowedTools = disallowedToolsForPersona(stage.persona);
 
-    const result = await spawnAndWait({
+    const result = await this.runStageWithFallback(stage.name, (model) => spawnAndWait({
       agentManager: this.agentManager,
       spec: {
         name: `${stage.persona}-${this.config.project}`,
@@ -2301,7 +2379,7 @@ export class PipelineRunner extends EventEmitter {
         project: this.config.project,
         stage: stage.name,
         prompt,
-        model: this.resolveModelForStage(stage.name),
+        model,
         cwd: this.workspaceDir,
         projectPrompt,
         permissionMode: 'bypassPermissions',
@@ -2321,7 +2399,7 @@ export class PipelineRunner extends EventEmitter {
       onTruncation: (agentName, outputTokens) => {
         this.handleOutputTruncation(agentName, outputTokens);
       },
-    });
+    }));
     return {
       artifact: result.artifact,
       cost: result.cost,
@@ -2523,13 +2601,13 @@ export class PipelineRunner extends EventEmitter {
     for (const repoName of this.state.repoNames) {
       repoPaths[repoName] = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
     }
-    const result = await runFixLoop({
+    const result = await this.runStageWithFallback('fix-loop', (model) => runFixLoop({
       agentManager: this.agentManager,
       project: this.config.project,
       // fix-loop has its own stage policy (free-tier: local→cheap)
       // because it's a tight mechanical retry loop. Falls back to the
       // validate stage's policy if 'fix-loop' isn't in the registry.
-      model: this.resolveModelForStage('fix-loop'),
+      model,
       allowedTools: this.allowedToolsForCurrentStage('fix-loop'),
       maxOutputTokens: maxOutputTokensForStage('build'),
       workspaceDir: this.workspaceDir,
@@ -2546,7 +2624,7 @@ export class PipelineRunner extends EventEmitter {
       onTruncation: (agentName, outputTokens) => {
         this.handleOutputTruncation(agentName, outputTokens);
       },
-    });
+    }));
     if (result.newSingleId !== null) {
       this.fixLoopAgentSingle = result.newSingleId;
     }
