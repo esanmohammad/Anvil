@@ -12,6 +12,7 @@ import type {
   ProviderCapabilities,
 } from './types.js';
 import { emitContent, emitResult } from './stream-format.js';
+import { LocalExecutor, localExecutor } from './router/local-executor.js';
 
 function getBaseUrl(): string {
   return (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
@@ -33,6 +34,13 @@ export class OllamaAdapter implements ModelAdapter {
   };
 
   private abortController: AbortController | null = null;
+
+  /**
+   * @param executor — Single-slot FIFO queue used when a call sets
+   * `config.exclusiveSlot === true`. Defaults to the process-wide
+   * singleton; tests inject a fresh instance for isolation.
+   */
+  constructor(private readonly executor: LocalExecutor = localExecutor) {}
 
   supportsModel(_modelId: string): boolean {
     // Only used when explicitly configured; auto-detection is via registry rules.
@@ -65,6 +73,16 @@ export class OllamaAdapter implements ModelAdapter {
   }
 
   async run(
+    config: ModelAdapterConfig,
+    output: NodeJS.WritableStream,
+  ): Promise<ModelAdapterResult> {
+    if (config.exclusiveSlot) {
+      return this.executor.withModel(config.model, () => this.runInner(config, output));
+    }
+    return this.runInner(config, output);
+  }
+
+  private async runInner(
     config: ModelAdapterConfig,
     output: NodeJS.WritableStream,
   ): Promise<ModelAdapterResult> {

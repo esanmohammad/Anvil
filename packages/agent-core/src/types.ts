@@ -182,6 +182,13 @@ export interface ModelAdapterConfig {
    * (set the provider's `max_tokens` knob); others ignore it.
    */
   maxOutputTokens?: number;
+  /**
+   * Routes the call through the process-local FIFO single-slot executor
+   * (`@anvil/agent-core/router/local-executor`). Set true ONLY for local
+   * GPU-resident models that cannot co-reside (Qwen 7B / Gemma 4B class).
+   * Other adapters ignore this flag. Default false = bypass queue.
+   */
+  exclusiveSlot?: boolean;
 }
 
 export interface ModelAdapterResult {
