@@ -1316,6 +1316,16 @@ export class PipelineRunner extends EventEmitter {
         console.log(`[pipeline] Resuming from stage ${resumeStage} (${STAGES[resumeStage]?.name}), loaded ${prevArtifact.length} chars of prior context`);
       }
 
+      // Prefetch hybrid-retriever context once per run. Sync prompt
+      // builders can then read it from the KBManager cache without an
+      // await on the hot path; if the LanceDB store is empty/missing,
+      // the cache stays empty and the legacy keyword path takes over.
+      try {
+        await this.kbManager?.prefetchHybridContext(this.config.project, this.config.feature);
+      } catch (err) {
+        console.warn(`[pipeline] prefetchHybridContext failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
       // Check knowledge base status — agents will explore from scratch if not built (slower + costlier)
       const kbCheck = this.kbManager?.getIndexForPrompt(this.config.project) || this.kbManager?.getAllGraphReports(this.config.project) || '';
       if (!kbCheck) {

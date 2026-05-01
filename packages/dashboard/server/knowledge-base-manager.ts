@@ -183,6 +183,13 @@ export class KnowledgeBaseManager {
   private projectLoader: ProjectLoader;
   private refreshing = false;
   private lastProgress: KBRefreshProgress | null = null;
+  /**
+   * Cache of hybrid-retriever results, keyed by `${project}::${query}`.
+   * Populated by prefetchHybridContext (called from pipeline-runner at run
+   * start) and consumed by getQueryContextForPrompt as a preferred source
+   * over keyword scoring on project_index.json.
+   */
+  private hybridContextCache = new Map<string, string>();
 
   constructor(projectLoader: ProjectLoader) {
     this.projectLoader = projectLoader;
@@ -1146,10 +1153,98 @@ export class KnowledgeBaseManager {
    * Pre-query the KB for a specific feature/task and return focused context.
    * Used during prompt assembly to inject only relevant KB sections.
    */
+  /**
+   * Prefetch the hybrid-retriever context for a (project, query) pair so
+   * sync prompt builders can use it without an await in the hot path.
+   * Pipeline-runner calls this once per run before any stage fires; the
+   * result is cached on `this.hybridContextCache`.
+   *
+   * Failures are silent — getQueryContextForPrompt falls back to the
+   * keyword-scoring path if no cached entry is present.
+   */
+  async prefetchHybridContext(project: string, query: string, maxTokens = 12000): Promise<void> {
+    if (!query) return;
+    const key = this.hybridContextCacheKey(project, query);
+    if (this.hybridContextCache.has(key)) return;
+
+    try {
+      const { getRetriever } = await import('@anvil/knowledge-core');
+      const retriever = await getRetriever(project);
+      const result = await retriever.retrieve(query, { maxTokens });
+      if (result.chunks.length > 0) {
+        const formatted = this.formatHybridChunks(result, query);
+        this.hybridContextCache.set(key, formatted);
+      }
+    } catch (err) {
+      // Vector store missing / not yet indexed — keyword path will take over.
+      console.warn(
+        `[kb] prefetchHybridContext fallback for "${project}": ` +
+        (err instanceof Error ? err.message : String(err)),
+      );
+    }
+  }
+
+  private hybridContextCacheKey(project: string, query: string): string {
+    return `${project}::${query}`;
+  }
+
+  private formatHybridChunks(
+    result: { chunks: Array<{ chunk: { repoName: string; filePath: string; content: string; entityName?: string; entityType?: string; language?: string }; score: number }>; graphContext: string; totalTokens: number },
+    query: string,
+  ): string {
+    const parts: string[] = [];
+    parts.push(`# Knowledge Base Context (hybrid-retrieved for: "${query.slice(0, 100)}")\n`);
+
+    if (result.graphContext && result.graphContext.trim().length > 0) {
+      parts.push(`## Project Architecture\n\n${result.graphContext}\n`);
+    }
+
+    // Group by repo → file for readability.
+    const byRepo = new Map<string, Map<string, typeof result.chunks>>();
+    for (const sc of result.chunks) {
+      const repo = sc.chunk.repoName;
+      const file = sc.chunk.filePath;
+      if (!byRepo.has(repo)) byRepo.set(repo, new Map());
+      const fileMap = byRepo.get(repo)!;
+      if (!fileMap.has(file)) fileMap.set(file, []);
+      fileMap.get(file)!.push(sc);
+    }
+
+    for (const [repo, fileMap] of byRepo) {
+      parts.push(`### ${repo}\n`);
+      for (const [file, scoredChunks] of fileMap) {
+        parts.push(`#### \`${file}\``);
+        scoredChunks.sort((a, b) => b.score - a.score);
+        for (const sc of scoredChunks) {
+          const entity = sc.chunk.entityName
+            ? `${sc.chunk.entityType ?? 'block'}: ${sc.chunk.entityName}`
+            : sc.chunk.entityType ?? 'block';
+          const pct = Math.round(sc.score * 100);
+          parts.push(`// ${entity} (relevance: ${pct}%)`);
+          parts.push('```' + (sc.chunk.language ?? ''));
+          parts.push(sc.chunk.content);
+          parts.push('```\n');
+        }
+      }
+    }
+
+    return parts.join('\n');
+  }
+
   getQueryContextForPrompt(project: string, featureDescription: string, maxChars = 20000): string {
+    // 1. Hybrid-retriever path (vector ⫽ BM25 → RRF → AST expansion → rerank)
+    //    when prefetchHybridContext has been awaited at run start. Falls
+    //    through silently when the LanceDB store is empty.
+    const hybridKey = this.hybridContextCacheKey(project, featureDescription);
+    const hybrid = this.hybridContextCache.get(hybridKey);
+    if (hybrid && hybrid.length > 0) {
+      return hybrid.length > maxChars ? hybrid.slice(0, maxChars) + '\n\n[... truncated]' : hybrid;
+    }
+
+    // 2. Legacy keyword-scoring path on project_index.json.
     const result = this.queryKnowledgeBase(project, featureDescription, maxChars);
     if (result.contextChunks.length === 0 && result.matchedCommunities.length === 0) {
-      // Fallback: return full reports (backward compat)
+      // 3. Fallback: full GRAPH_REPORT.md blob (backward compat).
       return this.getAllGraphReports(project);
     }
 
