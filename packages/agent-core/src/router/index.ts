@@ -68,3 +68,9 @@ export type {
   ModelConsumer,
   LoadModelRegistryOptions,
 } from './model-registry.js';
+export { resolveModel, ModelResolutionError } from './resolver.js';
+export type {
+  ResolveModelOptions,
+  ResolvedChain,
+  ResolutionDiagnostic,
+} from './resolver.js';
