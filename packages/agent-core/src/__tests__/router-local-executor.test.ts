@@ -160,3 +160,66 @@ describe('LocalExecutor — inspect', () => {
     assert.equal(exec.inspect().queueDepth, 0);
   });
 });
+
+describe('LocalExecutor — intruder detection (Phase 4.7)', () => {
+  it('evicts an out-of-band exclusive model resident in Ollama before loading', async () => {
+    const evictions: string[] = [];
+    let probed = false;
+    const exec = new LocalExecutor({
+      evict: async (id) => { evictions.push(id); },
+      // Ollama already has gemma4:e4b loaded out-of-band when our queue runs.
+      probeResident: async () => {
+        probed = true;
+        return ['gemma4:e4b'];
+      },
+      isExclusive: () => true,
+    });
+
+    await exec.withModel('qwen3:14b', async () => undefined);
+
+    assert.ok(probed, 'probe must run before loading');
+    assert.deepEqual(evictions, ['gemma4:e4b'], 'intruder evicted before our load');
+    assert.equal(exec.inspect().loaded, 'qwen3:14b');
+  });
+
+  it('skips eviction when an intruder is co-resident-eligible (e.g. embed model)', async () => {
+    const evictions: string[] = [];
+    const exec = new LocalExecutor({
+      evict: async (id) => { evictions.push(id); },
+      probeResident: async () => ['bge-m3'],
+      // Embed model — flagged as non-exclusive.
+      isExclusive: (id) => id !== 'bge-m3',
+    });
+
+    await exec.withModel('qwen3:14b', async () => undefined);
+
+    assert.deepEqual(evictions, [], 'co-resident utility must NOT be evicted');
+  });
+
+  it('does not double-evict our own tracked model when probe also returns it', async () => {
+    const evictions: string[] = [];
+    const exec = new LocalExecutor({
+      evict: async (id) => { evictions.push(id); },
+      probeResident: async () => ['qwen3:14b'],
+      isExclusive: () => true,
+    });
+
+    // First load — no previous, no eviction.
+    await exec.withModel('qwen3:14b', async () => undefined);
+    // Second load same id — probe sees the same id we already track,
+    // intruder filter must NOT count it as an intruder.
+    await exec.withModel('qwen3:14b', async () => undefined);
+
+    assert.deepEqual(evictions, [], 'same-id probe match is not an intruder');
+  });
+
+  it('survives a probeResident failure by treating residents as []', async () => {
+    const exec = new LocalExecutor({
+      evict: async () => undefined,
+      probeResident: async () => { throw new Error('Ollama unreachable'); },
+    });
+    // Should not throw — probe failure is non-fatal.
+    await exec.withModel('qwen3:14b', async () => undefined);
+    assert.equal(exec.inspect().loaded, 'qwen3:14b');
+  });
+});
