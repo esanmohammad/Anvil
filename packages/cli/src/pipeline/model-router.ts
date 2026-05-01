@@ -12,7 +12,7 @@ import {
   resolveModelForStage,
   ModelResolutionError,
   UnknownStageError,
-} from '../routing/resolve-model-for-stage.js';
+} from '@anvil/core-pipeline';
 
 export type ModelTier = 'fast' | 'balanced' | 'thorough';
 type WeightClass = 'fast' | 'balanced' | 'powerful';

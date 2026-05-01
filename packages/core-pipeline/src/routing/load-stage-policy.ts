@@ -59,14 +59,14 @@ export function findStagePolicyPath(opts: LoadStagePolicyOptions = {}): string {
     if (existsSync(ws)) return ws;
   }
 
-  // Bundled default: shipped alongside this module after build (cli copies
-  // src/routing/*.yaml into dist/routing/ via the build script). Fall back
-  // to the source path during local dev.
+  // Bundled default: shipped alongside this module after build (the
+  // core-pipeline build copies src/routing/*.yaml into dist/routing/).
+  // Fall back to the source path during local dev.
   const here = dirname(fileURLToPath(import.meta.url));
   const bundled = resolve(here, 'stage-policy.yaml');
   if (existsSync(bundled)) return bundled;
 
-  // Source-tree fallback (when consumed from packages/cli/src/...):
+  // Source-tree fallback (when consumed from packages/core-pipeline/src/...):
   const sourceFallback = resolve(here, '..', '..', 'src', 'routing', 'stage-policy.yaml');
   if (existsSync(sourceFallback)) return sourceFallback;
 

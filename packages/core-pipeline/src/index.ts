@@ -65,3 +65,39 @@ export type {
   ApprovalGateHookHandle,
 } from './hooks/index.js';
 export { VERSION } from './version.js';
+
+// — Routing (stage policy + capability/complexity resolver + task envelope)
+export {
+  loadStagePolicy,
+  validateStagePolicy,
+  findStagePolicyPath,
+  StagePolicyLoadError,
+  StagePolicyValidationError,
+} from './routing/load-stage-policy.js';
+export type {
+  StagePolicy,
+  StagePolicyMap,
+  LoadStagePolicyOptions,
+} from './routing/load-stage-policy.js';
+export {
+  resolveModelForStage,
+  initStageRouting,
+  UnknownStageError,
+  ModelResolutionError,
+  _resetStageRoutingCache,
+} from './routing/resolve-model-for-stage.js';
+export type { ResolveModelForStageOptions } from './routing/resolve-model-for-stage.js';
+export {
+  parseTaskEnvelope,
+  parseTaskEnvelopeArray,
+  TaskEnvelopeValidationError,
+} from './routing/task-envelope.js';
+export type {
+  TaskEnvelope,
+  TaskOperation,
+  TaskRouting,
+  TaskAcceptanceCriterion,
+  TaskAcceptancePredicate,
+  TaskAcceptanceProse,
+  TaskTestRequirement,
+} from './routing/task-envelope.js';

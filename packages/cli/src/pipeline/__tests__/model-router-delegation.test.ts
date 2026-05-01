@@ -3,7 +3,7 @@
 // weight-class path when it doesn't.
 
 import { getModelForStage } from '../model-router.js';
-import { _resetStageRoutingCache } from '../../routing/resolve-model-for-stage.js';
+import { _resetStageRoutingCache } from '@anvil/core-pipeline';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

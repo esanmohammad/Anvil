@@ -21,13 +21,14 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; true",
     "dev": "tsc -b --watch",
-    "test": "tsc -b && node --test dist/__tests__/*.test.js"
+    "test": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; node --test dist/__tests__/*.test.js"
   },
   "dependencies": {
     "@anvil/agent-core": "*",
-    "@anvil/memory-core": "*"
+    "@anvil/memory-core": "*",
+    "yaml": "^2.8.3"
   },
   "devDependencies": {
     "@types/node": "^22.15.2"

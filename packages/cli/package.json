@@ -38,7 +38,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm --prefix ../dashboard run build && tsc -b && node ./scripts/bundle-dashboard.mjs && cp src/templates/*.yaml dist/templates/ 2>/dev/null; mkdir -p dist/personas/prompts && cp src/personas/prompts/*.md dist/personas/prompts/ 2>/dev/null; mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; true",
+    "build": "npm --prefix ../dashboard run build && tsc -b && node ./scripts/bundle-dashboard.mjs && cp src/templates/*.yaml dist/templates/ 2>/dev/null; mkdir -p dist/personas/prompts && cp src/personas/prompts/*.md dist/personas/prompts/ 2>/dev/null; true",
     "dev": "tsc -b --watch",
     "test": "echo 'cli has no per-workspace node:test files (knowledge tests moved to @anvil/knowledge-core; hooks integration test runs via root jest)'"
   },
