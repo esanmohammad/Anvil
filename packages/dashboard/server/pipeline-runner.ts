@@ -2425,7 +2425,10 @@ export class PipelineRunner extends EventEmitter {
     const result = await runFixLoop({
       agentManager: this.agentManager,
       project: this.config.project,
-      model: this.resolveModelForStage('validate'),
+      // fix-loop has its own stage policy (free-tier: local→cheap)
+      // because it's a tight mechanical retry loop. Falls back to the
+      // validate stage's policy if 'fix-loop' isn't in the registry.
+      model: this.resolveModelForStage('fix-loop'),
       maxOutputTokens: maxOutputTokensForStage('build'),
       workspaceDir: this.workspaceDir,
       repoNames: this.state.repoNames,

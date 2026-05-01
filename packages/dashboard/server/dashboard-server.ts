@@ -135,6 +135,10 @@ import {
   attachCostTrackerHook,
   attachDashboardStateHook,
   attachLearnersHook,
+  resolveModelForStage as registryResolveStage,
+  ModelResolutionError,
+  UnknownStageError,
+  allowedToolsForStage,
 } from '@anvil/core-pipeline';
 import {
   attachPipelineBusSubscriber,
@@ -5481,17 +5485,45 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
     };
 
     const spikePersona = actionType === 'run-spike' ? 'analyst' : 'engineer';
+    // Map quick-action types to stage-policy ids. spike → research so
+    // free-tier (local-first) routing kicks in for read-only work.
+    const stageMap: Record<typeof actionType, string> = {
+      'run-fix': 'fix',
+      'run-review': 'review',
+      'run-spike': 'research',
+    };
+    const stageId = stageMap[actionType];
+
+    // Resolution precedence (matches pipeline-runner):
+    //   1. Caller-supplied model (UI dropdown override).
+    //   2. Registry-driven resolver from @anvil/core-pipeline.
+    //   3. Hardcoded fallback (sonnet) — last resort.
+    const resolvedModel = (() => {
+      if (model) return model;
+      try {
+        return registryResolveStage(stageId).primary;
+      } catch (err) {
+        if (err instanceof UnknownStageError || err instanceof ModelResolutionError) {
+          console.warn(`[quick-action] resolver: ${err.message}; falling back to sonnet`);
+        } else {
+          console.warn(`[quick-action] resolver crashed:`, err);
+        }
+        return 'sonnet';
+      }
+    })();
+
     const agent = agentManager.spawn({
       name: `${actionType.replace('run-', '')}-${project}`,
       persona: spikePersona,
       project,
-      stage: actionType.replace('run-', ''),
+      stage: stageId,
       prompt: promptMap[actionType] ?? description,
       projectPrompt,
-      model: model ?? 'sonnet',
+      model: resolvedModel,
       cwd,
       permissionMode: 'bypassPermissions',
       disallowedTools: disallowedToolsForPersona(spikePersona),
+      allowedTools: allowedToolsForStage(stageId),
     });
 
     // Register active run
@@ -5501,7 +5533,7 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
       type: runType,
       project,
       description,
-      model: model ?? 'sonnet',
+      model: resolvedModel,
       status: 'running',
       startedAt: Date.now(),
       agentId: agent.id,
