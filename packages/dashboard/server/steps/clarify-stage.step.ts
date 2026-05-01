@@ -96,6 +96,9 @@ export interface RunClarifyForProjectOptions {
   /** Test seams — forwarded to spawnAndWait + waitForAgent. */
   pollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /** Per-stage allow list for tool names — drives BuiltinToolExecutor for
+   *  agentic non-Claude adapters. Clarify defaults to read-only. */
+  allowedTools?: string[];
 }
 
 export interface RunClarifyForProjectResult {
@@ -150,6 +153,7 @@ export async function runClarifyForProject(
       projectPrompt: opts.projectPrompt,
       permissionMode: 'bypassPermissions',
       disallowedTools: [...CLARIFY_DISALLOWED_TOOLS],
+      allowedTools: opts.allowedTools,
       maxOutputTokens: opts.maxOutputTokens,
     },
     isCancelled: opts.isCancelled,

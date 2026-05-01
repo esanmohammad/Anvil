@@ -1973,6 +1973,7 @@ export class PipelineRunner extends EventEmitter {
       project: this.config.project,
       workspaceDir: this.workspaceDir,
       model: this.resolveModelForStage('clarify'),
+      allowedTools: this.allowedToolsForCurrentStage('clarify'),
       maxOutputTokens: maxOutputTokensForStage('clarify'),
       explorePrompt: this.buildClarifyExplorePrompt(),
       projectPrompt: this.buildProjectPrompt(STAGES[0]),
@@ -2112,6 +2113,7 @@ export class PipelineRunner extends EventEmitter {
           stageName: stage.name,
           persona: stage.persona,
           model: this.resolveModelForStage(stage.name),
+          allowedTools: this.allowedToolsForCurrentStage(stage.name),
           maxOutputTokens: maxOutputTokensForStage(stage.name),
           repoName,
           repoPath,
@@ -2215,6 +2217,7 @@ export class PipelineRunner extends EventEmitter {
       stageName: stage.name,
       persona: stage.persona,
       model: this.resolveModelForStage(stage.name),
+      allowedTools: this.allowedToolsForCurrentStage(stage.name),
       maxOutputTokens: maxOutputTokensForStage(stage.name),
       repoName,
       repoPath,
@@ -2527,6 +2530,7 @@ export class PipelineRunner extends EventEmitter {
       // because it's a tight mechanical retry loop. Falls back to the
       // validate stage's policy if 'fix-loop' isn't in the registry.
       model: this.resolveModelForStage('fix-loop'),
+      allowedTools: this.allowedToolsForCurrentStage('fix-loop'),
       maxOutputTokens: maxOutputTokensForStage('build'),
       workspaceDir: this.workspaceDir,
       repoNames: this.state.repoNames,

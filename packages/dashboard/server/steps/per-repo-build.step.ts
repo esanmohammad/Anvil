@@ -76,6 +76,12 @@ export interface RunBuildForRepoOptions {
   pollIntervalMs?: number;
   /** Override sleep primitive (forwarded to spawnAndWait). Test seam. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Per-stage allow list for tool names. Build needs read+write+exec —
+   * without this, agentic non-Claude adapters fall back to read-only and
+   * the engineer can't actually edit code.
+   */
+  allowedTools?: string[];
 }
 
 export interface RunBuildForRepoResult {
@@ -178,6 +184,7 @@ export async function runBuildForOneRepo(
             projectPrompt: opts.projectPrompt,
             permissionMode: 'bypassPermissions',
             disallowedTools: [...BUILD_DISALLOWED_TOOLS],
+            allowedTools: opts.allowedTools,
             maxOutputTokens: opts.maxOutputTokens,
           },
           isCancelled: opts.isCancelled,
@@ -239,6 +246,7 @@ async function runBuildFallback(
       projectPrompt: opts.projectPrompt,
       permissionMode: 'bypassPermissions',
       disallowedTools: [...BUILD_DISALLOWED_TOOLS],
+      allowedTools: opts.allowedTools,
       maxOutputTokens: opts.maxOutputTokens,
     },
     isCancelled: opts.isCancelled,
