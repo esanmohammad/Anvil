@@ -2257,13 +2257,24 @@ export class PipelineRunner extends EventEmitter {
     const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
     const tokens = sumTokenStats(results.map((r) => r.tokens));
     const successResults = results.filter((r) => r.artifact);
+    const failedRepos = results.filter((r) => !r.artifact).map((r) => r.repoName);
 
     // Combine artifacts (legacy "## <repo>\n\n<artifact>" separator format).
     const combined = combinePerRepoArtifacts(successResults);
 
-    // If all repos failed, throw
-    if (successResults.length === 0 && repos.length > 0) {
-      throw new Error(`All repo agents failed for ${stage.name}`);
+    // Per-repo stages are atomic: every repo must produce an artifact
+    // before we advance. Previously this only threw when EVERY repo
+    // failed (legacy partial-success behavior); a single-repo failure
+    // would silently advance with the surviving repo's output, and the
+    // next stage would run with missing context. The user observed
+    // this directly — "frontend is not checked still moved to next
+    // step". Fail-fast here so the dashboard surfaces the failure on
+    // the failing repo's tile and the pipeline halts for retry.
+    if (failedRepos.length > 0) {
+      throw new Error(
+        `Per-repo stage "${stage.name}" failed on ${failedRepos.length} of ${repos.length} repo(s): ${failedRepos.join(', ')}. ` +
+        `Stage cannot advance — retry the run or rerun this stage after fixing the underlying error.`,
+      );
     }
 
     return { artifact: combined, cost: totalCost, tokens };
