@@ -101,3 +101,5 @@ export type {
   TaskAcceptanceProse,
   TaskTestRequirement,
 } from './routing/task-envelope.js';
+export { extractTaskEnvelopes, buildRetryPrompt } from './routing/extract-task-envelopes.js';
+export type { ExtractResult, ExtractFailureReason } from './routing/extract-task-envelopes.js';
