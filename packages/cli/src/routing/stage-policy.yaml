@@ -1,0 +1,65 @@
+# stage-policy.yaml — declares the capability + complexity + tier
+# preference for each pipeline stage. The resolver in @anvil/agent-core
+# walks the model registry (~/.anvil/models.yaml) using these dimensions
+# to pick the cheapest model that meets the stage's quality bar.
+#
+# Stage IDs MUST match cli/src/run/types.ts:STAGE_NAMES + ad-hoc commands
+# (fix, review, plan). Adding a new stage here is meaningful only if the
+# stage actually invokes the resolver.
+#
+# Capability vocabulary  (closed): embed | rerank | code | reasoning | vision
+# Complexity vocabulary  (closed): S | M | L
+# Tier vocabulary        (closed): local | cheap | premium
+#
+# `prefer` is walked left-to-right; within a tier, models are picked in
+# the order they appear in models.yaml. Empty result throws
+# ModelResolutionError — silent fallback is intentionally unsupported.
+
+stages:
+  # — Pipeline stages (STAGE_NAMES) —
+  clarify:
+    capability: reasoning
+    complexity: S
+    prefer: [local, cheap, premium]
+  requirements:
+    capability: reasoning
+    complexity: M
+    prefer: [premium, cheap]
+  project-requirements:
+    capability: reasoning
+    complexity: M
+    prefer: [premium, cheap]
+  specs:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]
+  tasks:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]
+  build:
+    capability: code
+    complexity: M
+    prefer: [local, cheap, premium]
+  validate:
+    capability: code
+    complexity: S
+    prefer: [local, cheap]
+  ship:
+    capability: code
+    complexity: S
+    prefer: [local, cheap]
+
+  # — Ad-hoc commands —
+  fix:
+    capability: code
+    complexity: M
+    prefer: [local, cheap, premium]
+  review:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]
+  plan:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]
