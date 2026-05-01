@@ -1,8 +1,9 @@
 import { Command } from 'commander';
 import { execSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { parse as parseYaml } from 'yaml';
 import { getFFHome } from '../home.js';
 import pc from 'picocolors';
 
@@ -147,28 +148,52 @@ function findProjects(): ProjectEntry[] {
   return entries;
 }
 
-function getWorkspacePath(configPath: string): string | null {
+interface ProjectYamlShape {
+  workspace?: string;
+  repos?: Array<{ name?: string; path?: string }>;
+}
+
+function loadProjectYaml(configPath: string): ProjectYamlShape | null {
   try {
     const raw = readFileSync(configPath, 'utf-8');
-    const match = raw.match(/^workspace:\s+(.+)$/m);
-    if (match) {
-      const ws = match[1].replace(/^["']|["']$/g, '').trim().replace(/^~/, homedir());
-      return ws.startsWith('/') ? ws : join(homedir(), ws);
+    const parsed = parseYaml(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as ProjectYamlShape;
     }
   } catch { /* ignore */ }
   return null;
 }
 
-function getRepoNames(configPath: string): string[] {
-  try {
-    const raw = readFileSync(configPath, 'utf-8');
-    const names: string[] = [];
-    const matches = raw.matchAll(/^\s{2,4}-\s+name:\s+(.+)$/gm);
-    for (const m of matches) {
-      names.push(m[1].trim());
-    }
-    return names;
-  } catch { return []; }
+function getWorkspacePath(yamlContent: ProjectYamlShape | null): string | null {
+  const ws = yamlContent?.workspace;
+  if (typeof ws !== 'string' || ws.length === 0) return null;
+  const expanded = ws.replace(/^~/, homedir());
+  return isAbsolute(expanded) ? expanded : join(homedir(), expanded);
+}
+
+interface RepoEntry {
+  name: string;
+  /** Path as declared in factory.yaml, relative or absolute. */
+  declaredPath: string;
+}
+
+function getRepoEntries(yamlContent: ProjectYamlShape | null): RepoEntry[] {
+  const repos = yamlContent?.repos;
+  if (!Array.isArray(repos)) return [];
+  const out: RepoEntry[] = [];
+  for (const r of repos) {
+    if (!r || typeof r !== 'object' || typeof r.name !== 'string' || r.name.length === 0) continue;
+    // path is optional — fall back to using `name` as the directory.
+    const declaredPath = typeof r.path === 'string' && r.path.length > 0 ? r.path : r.name;
+    out.push({ name: r.name, declaredPath });
+  }
+  return out;
+}
+
+function resolveRepoPath(wsPath: string, declaredPath: string): string {
+  if (isAbsolute(declaredPath)) return declaredPath;
+  // `./foo`, `foo`, `../foo` all resolve relative to the workspace root.
+  return resolve(wsPath, declaredPath);
 }
 
 function checkProjects(): CheckResult {
@@ -185,15 +210,16 @@ function checkProjects(): CheckResult {
   const children: CheckResult[] = [];
 
   for (const proj of projects) {
-    const wsPath = getWorkspacePath(proj.configPath);
-    const repoNames = getRepoNames(proj.configPath);
+    const yaml = loadProjectYaml(proj.configPath);
+    const wsPath = getWorkspacePath(yaml);
+    const repos = getRepoEntries(yaml);
 
     if (!wsPath) {
-      // No workspace configured — just check repo count
+      // No workspace configured — just count repo entries
       children.push({
         name: proj.name,
         ok: true,
-        message: `${repoNames.length} repo(s) configured (no workspace path)`,
+        message: `${repos.length} repo(s) configured (no workspace path)`,
       });
       continue;
     }
@@ -203,14 +229,16 @@ function checkProjects(): CheckResult {
       continue;
     }
 
-    // Count cloned repos
+    // Count cloned repos using each repo's declared `path` (falls back to
+    // `name` when the yaml omits a path). Resolves relative paths against
+    // the workspace root, so `./foo` and absolute paths both work.
     let cloned = 0;
-    for (const repoName of repoNames) {
-      const repoPath = join(wsPath, repoName);
+    for (const repo of repos) {
+      const repoPath = resolveRepoPath(wsPath, repo.declaredPath);
       if (existsSync(repoPath)) cloned++;
     }
 
-    const total = repoNames.length;
+    const total = repos.length;
     const allCloned = cloned === total;
     children.push({
       name: proj.name,
