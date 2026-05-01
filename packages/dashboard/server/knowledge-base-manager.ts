@@ -17,17 +17,35 @@
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
+  rmSync,
   writeFileSync,
   readdirSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { ProjectLoader } from './project-loader.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Branch refs the KB is anchored to, in order of preference. Picking the
+ * canonical default branch (over local HEAD) keeps the index stable
+ * across collaborators — uncommitted edits or feature branches don't
+ * shift the index underneath us.
+ */
+const KB_BUILD_REFS: readonly string[] = ['origin/main', 'main', 'origin/master', 'master'];
+
+/** index_meta.json shape written by `@anvil/knowledge-core`'s indexer. */
+interface KnowledgeCoreIndexMeta {
+  lastIndexedSha: string;
+  lastIndexedAt: string;
+  chunkCount?: number;
+  embeddingProvider?: string;
+}
 
 // ── Constants ─────────────────────────────────────────────────────────
 
@@ -57,6 +75,11 @@ export interface KBRepoStatus {
   nodeCount: number;
   communityCount: number;
   error: string | null;
+  // Vector-store status — populated when knowledge-core has embedded
+  // chunks for this repo into LanceDB. `null` means "not embedded yet".
+  vectorChunks: number | null;
+  embeddingProvider: string | null;
+  lastEmbeddedAt: string | null;
 }
 
 export interface KBProjectStatus {
@@ -64,6 +87,13 @@ export interface KBProjectStatus {
   repos: KBRepoStatus[];
   overallStatus: 'none' | 'partial' | 'ready' | 'stale' | 'building' | 'unavailable';
   lastRefreshed: string | null;
+  /**
+   * In-flight build progress — populated only while
+   * `overallStatus === 'building'`. Lets a client that revisits the
+   * page mid-build pick up the latest message without re-broadcasting
+   * every tick.
+   */
+  currentProgress: KBRefreshProgress | null;
 }
 
 export interface KBRefreshProgress {
@@ -152,6 +182,7 @@ export interface KBQueryResult {
 export class KnowledgeBaseManager {
   private projectLoader: ProjectLoader;
   private refreshing = false;
+  private lastProgress: KBRefreshProgress | null = null;
 
   constructor(projectLoader: ProjectLoader) {
     this.projectLoader = projectLoader;
@@ -164,6 +195,23 @@ export class KnowledgeBaseManager {
 
   isRefreshing(): boolean {
     return this.refreshing;
+  }
+
+  /**
+   * In-flight progress snapshot — lets a freshly-connected dashboard
+   * client see the current state of an in-flight build, instead of
+   * waiting for the next progress event.
+   */
+  getCurrentProgress(): KBRefreshProgress | null {
+    return this.lastProgress;
+  }
+
+  private emitProgress(
+    cb: ((p: KBRefreshProgress) => void) | undefined,
+    p: KBRefreshProgress,
+  ): void {
+    this.lastProgress = p;
+    cb?.(p);
   }
 
   // ── Path helpers ────────────────────────────────────────────────────
@@ -196,21 +244,86 @@ export class KnowledgeBaseManager {
     }
   }
 
-  private writeMetadata(project: string, repo: string, meta: KBMetadata): void {
-    const dir = this.repoDir(project, repo);
-    ensureDir(dir);
-    writeFileSync(this.metadataPath(project, repo), JSON.stringify(meta, null, 2), 'utf-8');
+  // ── Git SHA + worktree (build-from-main anchoring) ──────────────────
+
+  /**
+   * Resolve the SHA we should build the KB from. Prefers `origin/main` →
+   * `main` → `origin/master` → `master`, in that order. Returns `null`
+   * when none of the canonical references exist.
+   *
+   * Anchoring on the canonical default branch (rather than HEAD) means a
+   * feature branch with un-merged work doesn't move the index SHA.
+   */
+  private async getKbBuildSha(repoPath: string): Promise<{ sha: string; ref: string } | null> {
+    for (const ref of KB_BUILD_REFS) {
+      try {
+        const { stdout } = await execFileAsync('git', ['rev-parse', '--verify', ref], {
+          cwd: repoPath,
+          timeout: 5000,
+        });
+        const sha = stdout.trim();
+        if (sha) return { sha, ref };
+      } catch { /* try next ref */ }
+    }
+    return null;
   }
 
-  // ── Git SHA detection ───────────────────────────────────────────────
+  /**
+   * Stand up a detached git worktree at `<sha>` in a tmp dir, hand the
+   * path to `fn`, and clean up afterward. The user's working tree is
+   * never touched — uncommitted edits stay put.
+   */
+  private async withMainWorktree<T>(
+    repoPath: string,
+    sha: string,
+    fn: (worktreePath: string) => Promise<T>,
+  ): Promise<T> {
+    const worktreePath = mkdtempSync(join(tmpdir(), 'anvil-kb-worktree-'));
+    // mkdtemp creates the dir; `git worktree add` rejects an existing
+    // non-empty path, so remove the placeholder before adding.
+    rmSync(worktreePath, { recursive: true, force: true });
 
-  private async getCurrentCommitSha(repoPath: string): Promise<string | null> {
     try {
-      const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+      await execFileAsync('git', ['worktree', 'add', '--detach', '--quiet', worktreePath, sha], {
         cwd: repoPath,
-        timeout: 5000,
+        timeout: 30_000,
       });
-      return stdout.trim();
+    } catch (err) {
+      throw new Error(
+        `git worktree add failed at ${repoPath} for ${sha}: ` +
+        (err instanceof Error ? err.message : String(err)),
+      );
+    }
+
+    try {
+      return await fn(worktreePath);
+    } finally {
+      // Best-effort cleanup; a failure here doesn't undo a successful build.
+      try {
+        await execFileAsync('git', ['worktree', 'remove', '--force', worktreePath], {
+          cwd: repoPath,
+          timeout: 30_000,
+        });
+      } catch (err) {
+        console.warn(
+          `[kb] git worktree remove failed for ${worktreePath}: ` +
+          (err instanceof Error ? err.message : String(err)),
+        );
+        try { rmSync(worktreePath, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  /**
+   * Read the index_meta.json that knowledge-core's KnowledgeIndexer
+   * writes during embedding. Used to surface vector-store status in the
+   * dashboard.
+   */
+  private readKnowledgeCoreMeta(project: string, repo: string): KnowledgeCoreIndexMeta | null {
+    const metaPath = join(this.repoDir(project, repo), 'index_meta.json');
+    if (!existsSync(metaPath)) return null;
+    try {
+      return JSON.parse(readFileSync(metaPath, 'utf-8'));
     } catch {
       return null;
     }
@@ -219,8 +332,18 @@ export class KnowledgeBaseManager {
   // ── Status ──────────────────────────────────────────────────────────
 
   async getRepoStatus(project: string, repoName: string, repoPath: string | null): Promise<KBRepoStatus> {
+    // Stale-detection compares the build SHA (main), not local HEAD.
+    const buildRef = repoPath ? await this.getKbBuildSha(repoPath) : null;
+    const currentSha = buildRef?.sha ?? null;
+
+    // Vector-store status — read from knowledge-core's index_meta.json
+    // (written during the embedding pass).
+    const kcMeta = this.readKnowledgeCoreMeta(project, repoName);
+    const vectorChunks = typeof kcMeta?.chunkCount === 'number' ? kcMeta.chunkCount : null;
+    const embeddingProvider = kcMeta?.embeddingProvider ?? null;
+    const lastEmbeddedAt = kcMeta?.lastIndexedAt ?? null;
+
     const meta = this.readMetadata(project, repoName);
-    const currentSha = repoPath ? await this.getCurrentCommitSha(repoPath) : null;
 
     if (!meta) {
       return {
@@ -232,6 +355,9 @@ export class KnowledgeBaseManager {
         nodeCount: 0,
         communityCount: 0,
         error: null,
+        vectorChunks,
+        embeddingProvider,
+        lastEmbeddedAt,
       };
     }
 
@@ -246,6 +372,9 @@ export class KnowledgeBaseManager {
       nodeCount: meta.nodeCount,
       communityCount: meta.communityCount,
       error: meta.error ?? null,
+      vectorChunks,
+      embeddingProvider,
+      lastEmbeddedAt,
     };
   }
 
@@ -293,6 +422,7 @@ export class KnowledgeBaseManager {
       repos,
       overallStatus,
       lastRefreshed,
+      currentProgress: this.refreshing ? this.lastProgress : null,
     };
   }
 
@@ -306,187 +436,191 @@ export class KnowledgeBaseManager {
       throw new Error('A knowledge base refresh is already in progress');
     }
     this.refreshing = true;
+    this.lastProgress = null;
+
+    interface RepoBuild {
+      name: string;
+      originalPath: string;
+      worktreePath: string;
+      ref: { sha: string; ref: string };
+      language: string;
+    }
+
+    const builds: RepoBuild[] = [];
 
     try {
       const repoPaths = this.projectLoader.getRepoLocalPaths(project);
       const repoNames = Object.keys(repoPaths);
 
-      // Detect workspace structures for all repos upfront
-      const workspaceMaps = new Map<string, any>();
+      // Resolve language hints from project loader (purely informational —
+      // knowledge-core doesn't gate behavior on it).
+      const languageByRepo = new Map<string, string>();
       try {
-        const { detectWorkspace } = await import('@anvil/knowledge-core');
-        for (const repoName of repoNames) {
-          const repoPath = repoPaths[repoName];
-          if (!repoPath || !existsSync(repoPath)) continue;
-          try {
-            const wsMap = detectWorkspace(repoPath);
-            if (wsMap.packages.length > 0) {
-              workspaceMaps.set(repoName, wsMap);
-              console.log(`[kb] Detected workspace in ${repoName}: ${wsMap.packages.length} packages`);
-            }
-          } catch { /* workspace detection is best-effort */ }
+        const projects = await this.projectLoader.listProjects();
+        const sys = projects.find((s) => s.name === project);
+        for (const r of sys?.repos ?? []) {
+          languageByRepo.set(r.name, r.language ?? 'unknown');
         }
-      } catch (err) {
-        console.warn(`[kb] Workspace detection unavailable: ${err}`);
-      }
+      } catch { /* language is best-effort */ }
 
+      // Phase 1 — resolve main SHA per repo + create detached worktrees.
+      // The user's working tree is never touched: the index is anchored
+      // to a stable shared ref (origin/main → main → master), not local
+      // HEAD, so feature-branch divergence won't shift the KB.
       for (let i = 0; i < repoNames.length; i++) {
         const repoName = repoNames[i];
-        const repoPath = repoPaths[repoName];
+        const origPath = repoPaths[repoName];
+        this.emitProgress(onProgress, {
+          project, repo: repoName, phase: 'checking',
+          repoIndex: i, totalRepos: repoNames.length,
+          message: `Resolving build SHA for ${repoName}...`,
+        });
 
-        if (!repoPath || !existsSync(repoPath)) {
-          onProgress?.({
-            project,
-            repo: repoName,
-            phase: 'skipped',
-            repoIndex: i,
-            totalRepos: repoNames.length,
-            message: `Skipping ${repoName} — workspace not found`,
+        if (!origPath || !existsSync(origPath)) {
+          this.emitProgress(onProgress, {
+            project, repo: repoName, phase: 'skipped',
+            repoIndex: i, totalRepos: repoNames.length,
+            message: `Skipping ${repoName} — workspace path not found on disk`,
+          });
+          continue;
+        }
+        const ref = await this.getKbBuildSha(origPath);
+        if (!ref) {
+          this.emitProgress(onProgress, {
+            project, repo: repoName, phase: 'skipped',
+            repoIndex: i, totalRepos: repoNames.length,
+            message: `Skipping ${repoName} — no main/master branch in git history`,
           });
           continue;
         }
 
-        // Check if stale
-        onProgress?.({
-          project,
-          repo: repoName,
-          phase: 'checking',
-          repoIndex: i,
-          totalRepos: repoNames.length,
-          message: `Checking ${repoName}...`,
-        });
-
-        const currentSha = await this.getCurrentCommitSha(repoPath);
-        const meta = this.readMetadata(project, repoName);
-
-        if (meta && meta.status === 'ready' && meta.lastCommitSha === currentSha) {
-          // Touch lastRefreshed so the UI shows "just now" instead of stale hours
-          this.writeMetadata(project, repoName, { ...meta, lastRefreshed: new Date().toISOString() });
-          onProgress?.({
-            project,
-            repo: repoName,
-            phase: 'skipped',
-            repoIndex: i,
-            totalRepos: repoNames.length,
-            message: `${repoName} is up to date`,
-          });
-          continue;
-        }
-
-        // Build
-        onProgress?.({
-          project,
-          repo: repoName,
-          phase: 'building',
-          repoIndex: i,
-          totalRepos: repoNames.length,
-          message: `Building knowledge graph for ${repoName}...`,
-        });
-
+        const worktreePath = mkdtempSync(join(tmpdir(), `anvil-kb-${repoName}-`));
+        rmSync(worktreePath, { recursive: true, force: true });
         try {
-          await this.refreshRepo(project, repoName, repoPath, workspaceMaps.get(repoName));
-
-          onProgress?.({
-            project,
-            repo: repoName,
-            phase: 'complete',
-            repoIndex: i,
-            totalRepos: repoNames.length,
-            message: `${repoName} knowledge base updated`,
-          });
+          await execFileAsync(
+            'git', ['worktree', 'add', '--detach', '--quiet', worktreePath, ref.sha],
+            { cwd: origPath, timeout: 30_000 },
+          );
         } catch (err) {
-          const errorMsg = err instanceof Error ? err.message : String(err);
-          onProgress?.({
-            project,
-            repo: repoName,
-            phase: 'error',
-            repoIndex: i,
-            totalRepos: repoNames.length,
-            message: `Error building ${repoName}: ${errorMsg}`,
+          this.emitProgress(onProgress, {
+            project, repo: repoName, phase: 'error',
+            repoIndex: i, totalRepos: repoNames.length,
+            message: `git worktree add failed for ${repoName} at ${ref.ref}: ${err instanceof Error ? err.message : String(err)}`,
           });
+          continue;
+        }
+        builds.push({
+          name: repoName,
+          originalPath: origPath,
+          worktreePath,
+          ref,
+          language: languageByRepo.get(repoName) ?? 'unknown',
+        });
+      }
+
+      if (builds.length === 0) {
+        throw new Error(
+          'No repos to index — check that each cloned repo has a main/master branch',
+        );
+      }
+
+      // Phase 2 — delegate to knowledge-core's KnowledgeIndexer. Knowledge-
+      // core handles the heavy lifting it was designed for: SHA-based
+      // skip-if-unchanged, incremental chunking via git diff, structural
+      // dedup (the merkle bit), AST graph build, cross-repo edges, and
+      // vector embeddings. The dashboard used to reimplement a thinner
+      // version of this — that path has been removed.
+      const { KnowledgeIndexer, loadKnowledgeConfig } = await import('@anvil/knowledge-core');
+      const config = loadKnowledgeConfig(project);
+      const indexer = new KnowledgeIndexer();
+
+      const reposForIndexer = builds.map((b) => ({
+        name: b.name,
+        path: b.worktreePath,
+        language: b.language,
+      }));
+
+      const buildSummary = builds
+        .map((b) => `${b.name}@${b.ref.ref}(${b.ref.sha.slice(0, 7)})`)
+        .join(', ');
+      this.emitProgress(onProgress, {
+        project, repo: '(indexer)', phase: 'building',
+        repoIndex: 0, totalRepos: builds.length,
+        message: `Indexing ${builds.length} repo(s) at canonical refs: ${buildSummary}`,
+      });
+
+      try {
+        await indexer.indexProject(project, reposForIndexer, config, {
+          onProgress: (msg) => {
+            this.emitProgress(onProgress, {
+              project, repo: '(indexer)', phase: 'building',
+              repoIndex: 0, totalRepos: builds.length, message: msg,
+            });
+          },
+          onDetailedProgress: (p) => {
+            this.emitProgress(onProgress, {
+              project, repo: '(indexer)',
+              phase: p.phase === 'done' ? 'complete' : 'building',
+              repoIndex: p.reposProcessed ?? 0,
+              totalRepos: p.reposTotal ?? builds.length,
+              message: p.message,
+            });
+          },
+        });
+      } finally {
+        // Phase 3 — always clean up worktrees, even on indexer failure.
+        for (const b of builds) {
+          try {
+            await execFileAsync(
+              'git', ['worktree', 'remove', '--force', b.worktreePath],
+              { cwd: b.originalPath, timeout: 30_000 },
+            );
+          } catch (err) {
+            console.warn(
+              `[kb] git worktree remove failed for ${b.worktreePath}: ` +
+              (err instanceof Error ? err.message : String(err)),
+            );
+            try { rmSync(b.worktreePath, { recursive: true, force: true }); } catch { /* ignore */ }
+          }
         }
       }
 
-      // Generate project-level KB synthesis (cross-repo relationships)
-      onProgress?.({
-        project,
-        repo: '(project)',
-        phase: 'building',
-        repoIndex: repoNames.length,
-        totalRepos: repoNames.length + 1,
-        message: `Synthesizing project-level knowledge base...`,
-      });
+      // Phase 4 — dashboard-specific post-processing on top of what
+      // knowledge-core already wrote per repo (graph.json, GRAPH_REPORT.md,
+      // index_meta.json, system_graph_v2.json):
+      //   - SYSTEM_REPORT.md: deterministic cross-repo synthesis read by
+      //     getProjectReport. Guaranteed to exist even when no LLM is
+      //     available (knowledge-core's PROJECT_SUMMARY.md needs an LLM).
+      //   - project_index.json: keyword community/transport index used by
+      //     queryKnowledgeBase + getQueryContextForPrompt.
+      const builtRepoNames = builds.map((b) => b.name);
       try {
-        this.generateProjectReport(project, repoNames);
-        this.buildProjectGraph(project, repoNames, workspaceMaps);
-        this.buildProjectIndex(project, repoNames);
-
-        // Build Graphology-format system_graph_v2.json for the retriever's graph expansion
-        await this.buildRetrieverGraph(project, repoNames, repoPaths, workspaceMaps);
-
-        onProgress?.({
-          project,
-          repo: '(project)',
-          phase: 'complete',
-          repoIndex: repoNames.length,
-          totalRepos: repoNames.length + 1,
-          message: `Project knowledge base synthesized (graph + index built)`,
-        });
+        this.generateProjectReport(project, builtRepoNames);
       } catch (err) {
-        console.warn(`[kb] Failed to generate project report: ${err}`);
+        console.warn(
+          `[kb] generateProjectReport failed: ` +
+          (err instanceof Error ? err.message : String(err)),
+        );
       }
+      try {
+        this.buildProjectIndex(project, builtRepoNames);
+      } catch (err) {
+        console.warn(
+          `[kb] buildProjectIndex failed: ` +
+          (err instanceof Error ? err.message : String(err)),
+        );
+      }
+
+      this.emitProgress(onProgress, {
+        project, repo: '(complete)', phase: 'complete',
+        repoIndex: builds.length, totalRepos: builds.length,
+        message: `Knowledge base updated for ${builds.length} repo(s) at main`,
+      });
 
       return this.getStatus(project);
     } finally {
       this.refreshing = false;
-    }
-  }
-
-  async refreshRepo(project: string, repoName: string, repoPath: string, workspaceMap?: any): Promise<void> {
-    const outputDir = this.repoDir(project, repoName);
-    ensureDir(outputDir);
-
-    const startTime = Date.now();
-
-    try {
-      // Use the in-house AST graph builder via workspace package export
-      const { buildAstGraph, generateGraphReport } = await import('@anvil/knowledge-core');
-
-      const graph = await buildAstGraph(repoPath, { workspaceMap });
-
-      // Write graph.json and GRAPH_REPORT.md
-      writeFileSync(join(outputDir, 'graph.json'), JSON.stringify(graph), 'utf-8');
-      writeFileSync(
-        join(outputDir, 'GRAPH_REPORT.md'),
-        generateGraphReport(repoName, graph),
-        'utf-8',
-      );
-
-      const currentSha = await this.getCurrentCommitSha(repoPath);
-      this.writeMetadata(project, repoName, {
-        lastRefreshed: new Date().toISOString(),
-        lastCommitSha: currentSha ?? '',
-        graphifyVersion: 'anvil-ast-builder',
-        fileCount: graph.nodes.filter((n: any) => n.type === 'module').length,
-        nodeCount: graph.nodes.length,
-        communityCount: 0,
-        buildDurationMs: Date.now() - startTime,
-        status: 'ready',
-      });
-    } catch (err: any) {
-      const currentSha = await this.getCurrentCommitSha(repoPath);
-      this.writeMetadata(project, repoName, {
-        lastRefreshed: new Date().toISOString(),
-        lastCommitSha: currentSha ?? '',
-        graphifyVersion: 'anvil-ast-builder',
-        fileCount: 0,
-        nodeCount: 0,
-        communityCount: 0,
-        buildDurationMs: Date.now() - startTime,
-        status: 'error',
-        error: (err.message || String(err)).slice(0, 500),
-      });
-      throw err;
+      this.lastProgress = null;
     }
   }
 
@@ -1056,58 +1190,11 @@ export class KnowledgeBaseManager {
   /**
    * Extract transport edges from project.yaml using a stateful line scanner.
    * Handles Kafka produces/consumes, depends_on (redis, mongo), and HTTP interfaces.
+   *
+   * Note: system_graph_v2.json is written directly by knowledge-core's
+   * KnowledgeIndexer (via ProjectGraphBuilder), so the dashboard no longer
+   * needs its own builder.
    */
-  /**
-   * Build system_graph_v2.json in Graphology export format.
-   * This is the graph the retriever loads for BFS-based graph expansion.
-   * Merges per-repo graph.json files + cross-repo edges into one Graphology graph.
-   */
-  private async buildRetrieverGraph(
-    project: string,
-    repoNames: string[],
-    repoPaths: Record<string, string>,
-    workspaceMaps: Map<string, any>,
-  ): Promise<void> {
-    try {
-      const { ProjectGraphBuilder, detectCrossRepoEdges } = await import('@anvil/knowledge-core');
-
-      const graphBuilder = new ProjectGraphBuilder();
-      await graphBuilder.init();
-
-      // Merge per-repo graphs
-      for (const repoName of repoNames) {
-        const graphPath = join(this.repoDir(project, repoName), 'graph.json');
-        if (!existsSync(graphPath)) continue;
-        try {
-          const graphData = JSON.parse(readFileSync(graphPath, 'utf-8'));
-          graphBuilder.addRepoGraph(repoName, graphData);
-        } catch { continue; }
-      }
-
-      // Cross-repo edges
-      const repos = repoNames
-        .filter(name => repoPaths[name])
-        .map(name => ({ name, path: repoPaths[name], language: '' }));
-
-      if (repos.length > 1 || workspaceMaps.size > 0) {
-        try {
-          const crossEdges = await detectCrossRepoEdges(repos, workspaceMaps);
-          graphBuilder.addCrossRepoEdges(crossEdges);
-        } catch { /* cross-repo detection is best-effort */ }
-      }
-
-      // Community detection
-      graphBuilder.detectCommunities();
-
-      // Write in Graphology format — this is what getRetriever() loads
-      const outputPath = join(this.projectDir(project), 'system_graph_v2.json');
-      writeFileSync(outputPath, JSON.stringify(graphBuilder.exportJson(), null, 2), 'utf-8');
-      console.log(`[kb] Built retriever graph for "${project}": ${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges`);
-    } catch (err) {
-      console.warn(`[kb] Failed to build retriever graph: ${err}`);
-    }
-  }
-
   private extractTransportsFromProject(project: string): TransportEdge[] {
     const transports: TransportEdge[] = [];
 
