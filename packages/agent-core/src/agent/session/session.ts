@@ -140,7 +140,12 @@ export class AgentProcess extends EventEmitter {
     const req: AdapterRequest = buildAdapterRequest(
       { ...this.spec, prompt: text },
       this.sessionId,
-      { resume: true, cwdOverride: process.cwd() },
+      // No cwdOverride — Claude's session storage is keyed by cwd, so a
+      // resume MUST use the same working directory as the original spawn.
+      // Forcing process.cwd() here breaks `claude --resume <id>` with
+      // "No conversation found" whenever the dashboard's cwd differs
+      // from the project workspace it spawned the agent in.
+      { resume: true },
     );
     const resumeAdapter = this.factory(req);
     if (
