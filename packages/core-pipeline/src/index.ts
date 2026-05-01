@@ -103,3 +103,9 @@ export type {
 } from './routing/task-envelope.js';
 export { extractTaskEnvelopes, buildRetryPrompt } from './routing/extract-task-envelopes.js';
 export type { ExtractResult, ExtractFailureReason } from './routing/extract-task-envelopes.js';
+export {
+  STAGE_TOOL_PERMISSIONS,
+  allowedToolsForStage,
+  permissionClassesForStage,
+} from './routing/stage-permissions.js';
+export type { ToolClass } from './routing/stage-permissions.js';
