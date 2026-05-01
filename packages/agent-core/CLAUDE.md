@@ -13,7 +13,11 @@ belong in ADRs, not here.
 - Seven `ModelAdapter` implementations: `claude`, `openai`, `gemini`,
   `openrouter`, `ollama`, `gemini-cli`, `adk`. One file each at the package
   root. Plus a meta-adapter `FallbackAdapter` (deprecated; superseded by
-  `LlmRouter`).
+  `LlmRouter`). Two adapters drive a true agentic loop:
+    - `claude` — Claude CLI subprocess; ships its own tool runtime.
+    - `ollama` — multi-turn `tools:[...]` loop hitting `/api/chat`,
+      pairs each call to a `BuiltinToolExecutor` (see `src/tools/`)
+      that this package ships for non-Claude paths.
 - `ProviderRegistry` singleton — auto-registers all 7 adapters via static
   ESM imports (`src/registry.ts`). Wraps every adapter with
   `instrumentModelAdapter` at registration time.
@@ -40,6 +44,14 @@ belong in ADRs, not here.
 - MCP client (`src/mcp/`) — `loadMcpServers` + `McpAgentClient` +
   `buildAgentToolset`. Config discovery walks `mcp.json` /
   `.mcp/servers.json` / `.claude/mcp.json`.
+- Built-in tool executor (`src/tools/`) — `BuiltinToolExecutor`,
+  `resolveSafe`, OpenAI-tool-compatible JSON Schema for the seven
+  built-ins (`read_file`, `write_file`, `edit`, `bash`, `grep`, `glob`,
+  `list`). Used by non-Claude agentic adapters (Ollama today; future
+  agentic OpenAI/Gemini paths). `LanguageModelBridge` constructs one
+  per spawn for non-Claude providers and threads it through
+  `ModelAdapterConfig.toolExecutor`. Path-guard rejects every escape
+  vector tested adversarially.
 - Headless `runAgent` (`src/headless/runner.ts`) — Inspect-AI-compatible
   external-agent contract. Returns `AgentTrajectory`. Caller injects a
   `LanguageModel`; no agent-core adapter natively implements one yet.
@@ -131,6 +143,10 @@ when a new flagship rev ships.
   `ModelAdapter` → `LanguageModel` is follow-up work
   (see ADR §9 Phase 5 deviation). `runAgent` and `LlmRouter` callers
   must inject their own `LanguageModel`.
+- No tier-promotion — `OllamaAdapter` is `tier:'agentic'` because it
+  drives a real tool loop, not because it auto-upgrades any underlying
+  model. The agentic capability comes from the loop in the adapter +
+  the `BuiltinToolExecutor` injected by `LanguageModelBridge`.
 - No deprecated `agent/agent-manager.ts` single-shot runner — it was
   deleted; the canonical surface is `agent/session/`.
 
