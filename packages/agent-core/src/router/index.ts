@@ -74,3 +74,8 @@ export type {
   ResolvedChain,
   ResolutionDiagnostic,
 } from './resolver.js';
+export { LocalExecutor, localExecutor } from './local-executor.js';
+export type {
+  LocalExecutorDeps,
+  LocalExecutorInspection,
+} from './local-executor.js';
