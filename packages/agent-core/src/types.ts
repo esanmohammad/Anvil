@@ -185,10 +185,42 @@ export interface ModelAdapterConfig {
   /**
    * Routes the call through the process-local FIFO single-slot executor
    * (`@anvil/agent-core/router/local-executor`). Set true ONLY for local
-   * GPU-resident models that cannot co-reside (Qwen 7B / Gemma 4B class).
+   * GPU-resident models that cannot co-reside (Qwen 14B / Gemma class).
    * Other adapters ignore this flag. Default false = bypass queue.
    */
   exclusiveSlot?: boolean;
+  /**
+   * Optional tool executor for adapters that drive their own agentic
+   * loop (Ollama, future OpenAI/Gemini agentic paths). When set, the
+   * adapter advertises the executor's filtered schemas to the model
+   * and feeds back tool results in-loop. Claude CLI ignores it — it
+   * ships its own tool runtime.
+   */
+  toolExecutor?: ToolExecutorLike;
+  /**
+   * Cap on agentic-loop iterations. Default 32. Adapters that don't
+   * loop ignore the field. Hitting the cap surfaces as
+   * `stopReason: 'iteration_limit'` in the result.
+   */
+  maxToolIterations?: number;
+  /**
+   * Provider-side context-window cap (Ollama `num_ctx`). Bounds VRAM
+   * cost of the conversation history. Adapters that don't expose
+   * this knob ignore the field.
+   */
+  contextWindow?: number;
+}
+
+// `toolExecutor` is structurally typed here to keep `types.ts` free of
+// `tools/` imports — the concrete `ToolExecutor` interface lives in
+// `tools/types.ts` and matches this shape. Adapters that consume it
+// import the concrete type directly.
+export interface ToolExecutorLike {
+  listSchemas(): ToolSchema[];
+  execute(call: ToolCall, ctx: { workingDir: string; abortSignal: AbortSignal }): Promise<{
+    content: string;
+    isError: boolean;
+  }>;
 }
 
 export interface ModelAdapterResult {

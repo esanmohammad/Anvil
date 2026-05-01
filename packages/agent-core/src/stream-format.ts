@@ -23,8 +23,24 @@ export interface TextContentBlock {
 
 export interface ToolUseContentBlock {
   type: 'tool_use';
+  /** Pairing id consumed by `LanguageModelBridge` to match tool_result. */
+  id?: string;
   name: string;
   input: Record<string, unknown>;
+}
+
+export interface ToolResultContentBlock {
+  type: 'tool_result';
+  tool_use_id: string;
+  content: string;
+  is_error?: boolean;
+}
+
+export interface UserMessage {
+  type: 'user';
+  message: {
+    content: ToolResultContentBlock[];
+  };
 }
 
 export interface ThinkingContentBlock {
@@ -57,7 +73,7 @@ export interface ResultMessage {
   session_id?: string;
 }
 
-export type StreamLine = AssistantMessage | ResultMessage;
+export type StreamLine = AssistantMessage | UserMessage | ResultMessage;
 
 // ---------------------------------------------------------------------------
 // Emit helpers — each writes exactly one NDJSON line (JSON + '\n')
@@ -74,18 +90,49 @@ export function emitContent(out: NodeJS.WritableStream, text: string): void {
   out.write(JSON.stringify(line) + '\n');
 }
 
-/** Emit a tool_use content block. */
+/**
+ * Emit a tool_use content block.
+ *
+ * `id` is the pairing identifier the bridge uses to match this call to
+ * its eventual `tool_result`. Adapters that drive their own agentic
+ * loop (Ollama, future OpenAI/Gemini agentic paths) MUST pass an id;
+ * legacy single-shot callers may omit it.
+ */
 export function emitToolUse(
   out: NodeJS.WritableStream,
   name: string,
   input: Record<string, unknown>,
+  id?: string,
 ): void {
+  const block: ToolUseContentBlock = id !== undefined
+    ? { type: 'tool_use', id, name, input }
+    : { type: 'tool_use', name, input };
   const line: AssistantMessage = {
     type: 'assistant',
-    message: {
-      content: [{ type: 'tool_use', name, input }],
-    },
+    message: { content: [block] },
   };
+  out.write(JSON.stringify(line) + '\n');
+}
+
+/**
+ * Emit a tool_result content block (user-role message).
+ *
+ * Used by adapters that own their agentic loop and need to feed tool
+ * outputs back to the model. `LanguageModelBridge` pairs `tool_use_id`
+ * to the open span and closes it on receipt — same pairing logic as
+ * Claude CLI's native stream.
+ */
+export function emitToolResult(
+  out: NodeJS.WritableStream,
+  opts: { toolUseId: string; content: string; isError?: boolean },
+): void {
+  const block: ToolResultContentBlock = {
+    type: 'tool_result',
+    tool_use_id: opts.toolUseId,
+    content: opts.content,
+    ...(opts.isError !== undefined ? { is_error: opts.isError } : {}),
+  };
+  const line: UserMessage = { type: 'user', message: { content: [block] } };
   out.write(JSON.stringify(line) + '\n');
 }
 
