@@ -1181,9 +1181,19 @@ export class PipelineRunner extends EventEmitter {
    * BuiltinToolExecutor for non-Claude providers. Claude CLI uses its own
    * tool allow/deny list (driven by persona); for Claude paths this
    * supplies the same intent but is harmless when Claude ignores it.
+   *
+   * Resolution: stage-policy default → factory.yaml allow extends →
+   * factory.yaml deny strips. Empty result falls back to read-only so a
+   * misconfigured deny list can't accidentally silence the agent.
    */
   private allowedToolsForCurrentStage(stageName: string): string[] {
-    return allowedToolsForStage(stageName);
+    const base = new Set(allowedToolsForStage(stageName));
+    const overrides = this.projectLoader
+      .getConfig(this.config.project)?.pipeline?.permissions?.[stageName];
+    if (overrides?.allow_tools) for (const t of overrides.allow_tools) base.add(t);
+    if (overrides?.deny_tools) for (const t of overrides.deny_tools) base.delete(t);
+    if (base.size === 0) return ['read_file', 'grep', 'glob', 'list'];
+    return [...base].sort();
   }
 
   /**
@@ -2293,6 +2303,10 @@ export class PipelineRunner extends EventEmitter {
         projectPrompt,
         permissionMode: 'bypassPermissions',
         disallowedTools,
+        // Phase 11.5 — per-stage tool-permission overrides from
+        // factory.yaml. The bridge uses this to construct a properly-
+        // scoped BuiltinToolExecutor for non-Claude agentic paths.
+        allowedTools: this.allowedToolsForCurrentStage(stage.name),
         maxOutputTokens: maxOutputTokensForStage(stage.name),
       },
       isCancelled: () => this.cancelled,
