@@ -2,10 +2,10 @@ import { Command } from 'commander';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, readFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { parse as parseYaml } from 'yaml';
-import { info, error } from '../logger.js';
+import { info, error, warn } from '../logger.js';
 
 /**
  * Load `~/.anvil/observability.yaml` (if present) and apply its top-level
@@ -29,6 +29,46 @@ function loadObservabilityConfig(): void {
   } catch (err) {
     error(`Failed to parse ${cfgPath}: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * Probe Ollama on its default port; if missing, try to start `ollama serve`
+ * detached. Best-effort — never blocks dashboard boot. The dashboard's
+ * hybrid search and reranker degrade gracefully if Ollama is unreachable.
+ */
+async function ensureOllama(): Promise<{ ok: boolean; reason?: string }> {
+  const baseUrl = process.env.OLLAMA_HOST ?? 'http://localhost:11434';
+
+  const probe = async (): Promise<boolean> => {
+    try {
+      const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(1500) });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await probe()) return { ok: true };
+
+  // Try to spawn `ollama serve` detached. If the binary is missing, this
+  // throws ENOENT synchronously when we read the spawn error.
+  try {
+    const child = spawn('ollama', ['serve'], { detached: true, stdio: 'ignore' });
+    child.unref();
+    child.on('error', () => {
+      // Will be reported via the post-wait probe below; nothing to do here.
+    });
+  } catch {
+    return { ok: false, reason: 'ollama not installed' };
+  }
+
+  // Wait up to 5s for the server to come up.
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (await probe()) return { ok: true };
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return { ok: false, reason: 'failed to start within 5s' };
 }
 
 /**
@@ -69,6 +109,11 @@ export const dashboardCommand = new Command('dashboard')
   .option('--no-open', 'Do not open browser automatically')
   .action(async (opts: { port: string; open: boolean }) => {
     loadObservabilityConfig();
+
+    const ollama = await ensureOllama();
+    if (!ollama.ok) {
+      warn(`Ollama unavailable (${ollama.reason}); hybrid search + reranker will degrade to legacy paths.`);
+    }
 
     const resolved = resolveDashboardDir();
 
