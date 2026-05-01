@@ -15,7 +15,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { OllamaAdapter } from '../ollama-adapter.js';
+import { OllamaAdapter, trimHistoryIfNeeded, ContextExhaustedError } from '../ollama-adapter.js';
 import { LocalExecutor } from '../router/local-executor.js';
 import type { ModelAdapterConfig, ToolExecutorLike, ToolCall, ToolSchema } from '../types.js';
 
@@ -269,6 +269,48 @@ describe('OllamaAdapter — agentic loop', () => {
     );
 
     assert.equal(fx.calls[0].arguments.pattern, 'foo');
+  });
+
+  it('trims oldest tool_result when history exceeds soft cap', () => {
+    const messages = [
+      { role: 'system' as const, content: 'system prompt' },
+      { role: 'user' as const, content: 'do task' },
+      { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'a' } } }] },
+      // First tool result is huge — should get dropped.
+      { role: 'tool' as const, content: 'A'.repeat(20_000), tool_call_id: 't1' },
+      { role: 'assistant' as const, content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'b' } } }] },
+      { role: 'tool' as const, content: 'short', tool_call_id: 't2' },
+    ];
+
+    // numCtx ≈ 2000 tokens, soft cap ≈ 1700. With 20k chars of tool
+    // content (≈ 5000 tokens estimated), trim must drop the big result.
+    trimHistoryIfNeeded(messages, 2000, 'qwen3:14b');
+
+    const toolMessages = messages.filter((m) => m.role === 'tool');
+    assert.equal(toolMessages.length, 1, 'one tool result should remain');
+    assert.equal(toolMessages[0].content, 'short');
+  });
+
+  it('throws ContextExhaustedError when even trimming cannot bring history below num_ctx', () => {
+    const messages = [
+      { role: 'system' as const, content: 'A'.repeat(40_000) }, // ~10k tokens, untrimmable
+      { role: 'user' as const, content: 'go' },
+    ];
+    assert.throws(
+      () => trimHistoryIfNeeded(messages, 2000, 'qwen3:14b'),
+      ContextExhaustedError,
+    );
+  });
+
+  it('does NOT trim when history fits comfortably', () => {
+    const messages = [
+      { role: 'system' as const, content: 'short system' },
+      { role: 'user' as const, content: 'hi' },
+      { role: 'tool' as const, content: 'ok', tool_call_id: 't1' },
+    ];
+    const before = JSON.stringify(messages);
+    trimHistoryIfNeeded(messages, 16384, 'qwen3:14b');
+    assert.equal(JSON.stringify(messages), before, 'no mutation expected');
   });
 
   it('passes num_ctx in the request options', async () => {

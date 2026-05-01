@@ -37,6 +37,39 @@ import { LocalExecutor, localExecutor } from './router/local-executor.js';
 
 const DEFAULT_MAX_ITERATIONS = 32;
 const DEFAULT_CONTEXT_WINDOW = 16_384;
+/**
+ * Crude tokens-per-byte heuristic. Real tokenizer counts vary by model
+ * but for the purposes of OVERFLOW DETECTION (i.e. "are we about to
+ * blow num_ctx?") a 4-bytes-per-token approximation is conservative
+ * enough — we trim before we'd hit the wall, never after.
+ */
+const BYTES_PER_TOKEN = 4;
+/**
+ * Soft trim threshold — when accumulated history reaches this fraction
+ * of num_ctx, drop oldest tool_result blocks. Keeps a safety margin so
+ * the prompt still has room to grow within one turn.
+ */
+const SOFT_TRIM_RATIO = 0.85;
+
+/** Thrown when the conversation history can't be trimmed below num_ctx
+ *  (e.g. one tool result alone exceeds the window). The dashboard
+ *  resolver catches this and re-runs the stage with an escalation chain
+ *  that skips local. */
+export class ContextExhaustedError extends Error {
+  readonly model: string;
+  readonly numCtx: number;
+  readonly historyTokens: number;
+  constructor(model: string, numCtx: number, historyTokens: number) {
+    super(
+      `Conversation history (${historyTokens} tokens) exceeds num_ctx=${numCtx} for model "${model}" ` +
+      `even after trimming. Escalate to a model with a larger context window.`,
+    );
+    this.name = 'ContextExhaustedError';
+    this.model = model;
+    this.numCtx = numCtx;
+    this.historyTokens = historyTokens;
+  }
+}
 
 function getBaseUrl(): string {
   return (process.env.OLLAMA_HOST || 'http://localhost:11434').replace(/\/+$/, '');
@@ -171,6 +204,12 @@ export class OllamaAdapter implements ModelAdapter {
 
     try {
       for (let iter = 0; iter < maxIter; iter++) {
+        // Bound conversation history before each turn. Drops oldest
+        // tool_result blocks (least informative — the model already saw
+        // them once) keeping the system + user + recent turns intact.
+        // If trimming can't bring history below num_ctx, escalate.
+        trimHistoryIfNeeded(messages, numCtx, config.model);
+
         const turn = await this.runOneTurn(messages, tools, numCtx, config, output);
         aggregatedText += turn.text;
         totalIn += turn.inputTokens;
@@ -381,4 +420,54 @@ function countToolCalls(messages: ChatMessage[]): number {
     if (m.role === 'assistant' && m.tool_calls) n += m.tool_calls.length;
   }
   return n;
+}
+
+/**
+ * Crude tokens approximation — bytes / 4. Used only to decide when to
+ * trim, never as a billing input.
+ */
+function estimateTokens(messages: ChatMessage[]): number {
+  let bytes = 0;
+  for (const m of messages) {
+    bytes += m.content.length;
+    if (m.tool_calls) {
+      for (const tc of m.tool_calls) {
+        bytes += tc.function.name.length;
+        bytes += typeof tc.function.arguments === 'string'
+          ? tc.function.arguments.length
+          : JSON.stringify(tc.function.arguments).length;
+      }
+    }
+  }
+  return Math.ceil(bytes / BYTES_PER_TOKEN);
+}
+
+/**
+ * Drop the oldest tool-role messages until the history fits below
+ * SOFT_TRIM_RATIO × numCtx. Keeps system + user prompts intact (they
+ * carry the original task framing) and keeps the most recent turns
+ * intact (where the active state of the loop lives). If we can't trim
+ * enough — e.g. a single tool_result is bigger than the window —
+ * escalate via ContextExhaustedError.
+ */
+export function trimHistoryIfNeeded(
+  messages: ChatMessage[],
+  numCtx: number,
+  model: string,
+): void {
+  const cap = Math.floor(numCtx * SOFT_TRIM_RATIO);
+  if (estimateTokens(messages) <= cap) return;
+
+  // Walk forward from the start, skipping system/user, drop the FIRST
+  // tool message we find. Repeat until under cap or no more droppable
+  // tool messages exist.
+  while (estimateTokens(messages) > cap) {
+    const dropIndex = messages.findIndex((m) => m.role === 'tool');
+    if (dropIndex === -1) break;
+    messages.splice(dropIndex, 1);
+  }
+
+  if (estimateTokens(messages) > numCtx) {
+    throw new ContextExhaustedError(model, numCtx, estimateTokens(messages));
+  }
 }
