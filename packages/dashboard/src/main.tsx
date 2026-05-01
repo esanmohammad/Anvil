@@ -614,29 +614,42 @@ function App() {
             return [...prev, ...deduped];
           });
 
-          // Extract file changes from tool_use activities
+          // Extract file changes from tool_use activities. Two naming
+          // conventions live in the activity stream simultaneously:
+          //   - Claude CLI emits PascalCase: Edit / Write
+          //   - BuiltinToolExecutor (Ollama / OpenCode / OpenRouter
+          //     agentic paths) emits snake_case: edit / write_file
+          // Earlier this branch only matched Claude's casing, so every
+          // edit kimi/qwen made was silently dropped from the panel.
+          const editTools = new Set(['Edit', 'edit']);
+          const writeTools = new Set(['Write', 'write_file']);
           const newChanges: ChangeEntry[] = [];
           for (const activity of newActivities) {
             if (activity.kind !== 'tool_use') continue;
-            const tool = activity.tool;
-            if (tool !== 'Edit' && tool !== 'Write') continue;
+            const tool = activity.tool ?? '';
+            const isEdit = editTools.has(tool);
+            const isWrite = writeTools.has(tool);
+            if (!isEdit && !isWrite) continue;
 
-            // Parse the JSON content to extract file path and diff
+            // Parse the JSON content to extract file path and diff.
+            // Field name differs across conventions:
+            //   Claude:   file_path
+            //   Builtin:  path
             let filePath = '';
             let diff: string | undefined;
             const content = activity.content ?? '';
 
             try {
               const input = JSON.parse(content);
-              filePath = input.file_path ?? '';
+              filePath = (input.file_path ?? input.path ?? '') as string;
 
-              if (tool === 'Edit' && input.old_string && input.new_string) {
+              if (isEdit && input.old_string && input.new_string) {
                 const oldLines = (input.old_string as string).split('\n');
                 const newLines = (input.new_string as string).split('\n');
                 diff = `--- ${filePath}\n+++ ${filePath}\n` +
                   oldLines.map((l: string) => `- ${l}`).join('\n') + '\n' +
                   newLines.map((l: string) => `+ ${l}`).join('\n');
-              } else if (tool === 'Write' && input.content) {
+              } else if (isWrite && input.content) {
                 const lines = (input.content as string).split('\n');
                 diff = lines.map((l: string) => `+ ${l}`).join('\n');
               }
@@ -648,13 +661,17 @@ function App() {
 
             if (!filePath) continue;
 
-            // Shorten path for display
-            const shortPath = filePath.replace(/^\/Users\/[^/]+\/workspace\/[^/]+\//, '');
+            // Shorten path for display — strip the workspace prefix
+            // (matches both the `~/workspace/<repo>/` legacy layout and
+            // `~/prototyping/<project>/<repo>/` factory.yaml layout).
+            const shortPath = filePath
+              .replace(/^\/Users\/[^/]+\/workspace\/[^/]+\//, '')
+              .replace(/^\/Users\/[^/]+\/prototyping\/[^/]+\/[^/]+\//, '');
 
             newChanges.push({
               file: shortPath,
-              tool: tool as 'Edit' | 'Write',
-              summary: tool === 'Edit' ? 'Modified' : 'Created',
+              tool: (isEdit ? 'Edit' : 'Write') as 'Edit' | 'Write',
+              summary: isEdit ? 'Modified' : 'Created',
               timestamp: activity.timestamp,
               diff,
               repo: activity.repo,

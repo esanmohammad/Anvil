@@ -62,19 +62,35 @@ function mapCapabilities(caps: ProviderCapabilities): AdapterCapabilities {
 // ── Tool-use summary ─────────────────────────────────────────────────────
 
 function summarizeToolUse(name: string, input: Record<string, unknown>): string {
+  // Two casings live in this stream simultaneously: Claude CLI ships
+  // PascalCase tool names (Read/Edit/Write/Bash/Grep/Glob), and the
+  // BuiltinToolExecutor (used by Ollama / OpenCode / OpenRouter
+  // agentic adapters) emits snake_case (read_file/edit/write_file/
+  // bash/grep/glob/list). Field shapes also differ on the path arg —
+  // Claude uses `file_path`, Builtin uses `path`. Normalize so the
+  // dashboard activity log shows the same human label regardless.
+  const path = (input.file_path ?? input.path ?? 'file') as string;
   switch (name) {
     case 'Read':
-      return `Reading ${input.file_path ?? 'file'}`;
+    case 'read_file':
+      return `Reading ${path}`;
     case 'Edit':
-      return `Editing ${input.file_path ?? 'file'}`;
+    case 'edit':
+      return `Editing ${path}`;
     case 'Write':
-      return `Writing ${input.file_path ?? 'file'}`;
+    case 'write_file':
+      return `Writing ${path}`;
     case 'Bash':
+    case 'bash':
       return `Running: ${String(input.command ?? input.description ?? '').slice(0, 120)}`;
     case 'Grep':
+    case 'grep':
       return `Searching for "${String(input.pattern ?? '').slice(0, 60)}"${input.path ? ` in ${input.path}` : ''}`;
     case 'Glob':
+    case 'glob':
       return `Finding files: ${input.pattern ?? ''}`;
+    case 'list':
+      return `Listing ${input.path ?? '.'}`;
     case 'Agent':
       return `Spawning sub-agent: ${input.description ?? ''}`;
     case 'Skill':
