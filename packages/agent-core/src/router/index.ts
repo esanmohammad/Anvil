@@ -51,3 +51,20 @@ export {
   ROUTER_ATTEMPT_SPAN,
   RouterAttr,
 } from './telemetry.js';
+export {
+  loadModelRegistry,
+  parseModelRegistry,
+  findModelsConfigPath,
+  ModelRegistryParseError,
+  ModelRegistryValidationError,
+} from './model-registry.js';
+export type {
+  ModelEntry,
+  ModelRegistry,
+  ModelAvailability,
+  ModelCapability,
+  ModelComplexity,
+  ModelTier,
+  ModelConsumer,
+  LoadModelRegistryOptions,
+} from './model-registry.js';
