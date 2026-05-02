@@ -3808,6 +3808,59 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         break;
       }
 
+      case 'get-routing': {
+        try {
+          const { resolveModelForStage } = await import('@anvil/core-pipeline');
+          const { loadModelRegistry } = await import('@anvil/agent-core');
+          const registry = loadModelRegistry({});
+          const byId = new Map(registry.models.map((m) => [m.id, m]));
+
+          const STAGES_BY_FLOW: Record<string, string[]> = {
+            build:    ['clarify', 'requirements', 'repo-requirements', 'specs', 'tasks', 'build', 'validate', 'ship'],
+            fix:      ['fix', 'fix-loop', 'validate'],
+            research: ['research'],
+            plan:     ['plan'],
+            review:   ['review'],
+          };
+
+          const annotate = (modelId: string) => {
+            const entry = byId.get(modelId);
+            return {
+              model: modelId,
+              tier: entry?.tier ?? 'unknown',
+              provider: entry?.provider ?? 'unknown',
+            };
+          };
+
+          const flows: Record<string, Array<{ stage: string; chain: ReturnType<typeof annotate>[]; error?: string }>> = {};
+          for (const [flow, stages] of Object.entries(STAGES_BY_FLOW)) {
+            flows[flow] = stages.map((stage) => {
+              try {
+                const resolved = resolveModelForStage(stage);
+                const chain = [annotate(resolved.primary), ...resolved.fallbacks.map((fb) => annotate(fb.model))];
+                return { stage, chain };
+              } catch (err: unknown) {
+                const message = err instanceof Error ? err.message : String(err);
+                return { stage, chain: [], error: message };
+              }
+            });
+          }
+
+          ws.send(JSON.stringify({
+            type: 'routing',
+            payload: {
+              flows,
+              stagePolicyPath: process.env.ANVIL_STAGE_POLICY ?? join(ANVIL_HOME, 'stage-policy.yaml'),
+              modelsYamlPath: join(ANVIL_HOME, 'models.yaml'),
+            },
+          }));
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Routing resolve failed: ${message}` } }));
+        }
+        break;
+      }
+
       case 'get-budget-status': {
         try {
           const budgetConfig = projectLoader.getBudgetConfig(msg.project ?? '');

@@ -30,6 +30,7 @@ import {
 import { FindingList, type FindingGroup } from '../common/FindingList.js';
 import { Toast } from '../common/Toast.js';
 import { useResolvableFinding } from '../common/useResolvableFinding.js';
+import { RoutingCard } from '../common/RoutingCard.js';
 
 export interface ReviewPageProps {
   project: string | null;
@@ -90,12 +91,6 @@ interface Review {
 }
 
 // ── Constants ──────────────────────────────────────────────────────────
-
-const models = [
-  { value: 'claude-sonnet-4-6', label: 'Sonnet 4' },
-  { value: 'claude-opus-4-6', label: 'Opus 4' },
-  { value: 'gpt-4o', label: 'GPT-4o' },
-];
 
 const ALL_PERSONAS: Persona[] = ['architect', 'security', 'style', 'tester', 'domain'];
 
@@ -171,7 +166,6 @@ function countBySeverity(findings: ReviewFinding[]): Record<Severity, number> {
 export function ReviewPage({ project, ws }: ReviewPageProps) {
   // Input form
   const [prUrl, setPrUrl] = useState('');
-  const [model, setModel] = useState('claude-sonnet-4-6');
   const [personas, setPersonas] = useState<Persona[]>(ALL_PERSONAS);
   const [personasOpen, setPersonasOpen] = useState(false);
 
@@ -257,9 +251,9 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
       action: 'run-review-pr',
       project,
       prUrl: prUrl.trim(),
-      options: { model, personas },
+      options: { personas },
     }));
-  }, [canStart, ws, project, prUrl, model, personas]);
+  }, [canStart, ws, project, prUrl, personas]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && canStart) {
@@ -531,23 +525,6 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
             outline: 'none',
           }}
         />
-        <select
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          aria-label="Model"
-          style={{
-            appearance: 'none', height: 40, padding: '0 12px',
-            background: 'var(--bg-elevated-2)',
-            border: '1px solid var(--separator)',
-            borderRadius: 'var(--radius-sm)',
-            color: 'var(--text-secondary)',
-            fontSize: 12, fontFamily: 'var(--font-sans)',
-            cursor: 'pointer', outline: 'none',
-          }}
-        >
-          {models.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
-        </select>
-
         {/* Persona multi-select */}
         <div ref={personasWrapperRef} style={{ position: 'relative' }}>
           <button
@@ -642,6 +619,9 @@ export function ReviewPage({ project, ws }: ReviewPageProps) {
           {loading ? 'Reviewing…' : review ? 'Re-review' : 'Start review'}
         </button>
       </div>
+
+      {/* Routing — read-only, sourced from ~/.anvil/stage-policy.yaml */}
+      <RoutingCard flow="review" ws={ws} compact />
 
       {/* Banner */}
       {banner && (

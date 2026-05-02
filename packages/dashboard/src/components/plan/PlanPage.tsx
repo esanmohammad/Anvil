@@ -15,17 +15,12 @@ import {
   TestsEditor,
   EstimateEditor,
 } from './edit/SectionEditors';
+import { RoutingCard } from '../common/RoutingCard.js';
 
 export interface PlanPageProps {
   project: string | null;
   ws: WebSocket | null;
 }
-
-const models = [
-  { value: 'claude-sonnet-4-6', label: 'Sonnet 4' },
-  { value: 'claude-opus-4-6', label: 'Opus 4' },
-  { value: 'gpt-4o', label: 'GPT-4o' },
-];
 
 // ── Types (mirror server plan-store.ts) ────────────────────────────────
 
@@ -327,7 +322,6 @@ function Bullets({ items, empty = '—' }: { items: string[]; empty?: string }) 
 
 export function PlanPage({ project, ws }: PlanPageProps) {
   const [feature, setFeature] = useState('');
-  const [model, setModel] = useState('claude-sonnet-4-6');
   const [plan, setPlan] = useState<Plan | null>(null);
   const [validation, setValidation] = useState<PlanValidation | null>(null);
   const [loading, setLoading] = useState(false);
@@ -423,8 +417,8 @@ export function PlanPage({ project, ws }: PlanPageProps) {
     setPlan(null);
     setValidation(null);
     setBanner(null);
-    ws.send(JSON.stringify({ action: 'run-plan', project, feature: feature.trim(), options: { model } }));
-  }, [ws, project, feature, model, loading]);
+    ws.send(JSON.stringify({ action: 'run-plan', project, feature: feature.trim(), options: {} }));
+  }, [ws, project, feature, loading]);
 
   // Build per-label guidance for the prompts sent to the variants runner.
   // Each variant receives the same feature but a tailored "Approach" hint.
@@ -463,14 +457,14 @@ export function PlanPage({ project, ws }: PlanPageProps) {
       project,
       feature: feature.trim(),
       variants,
-      options: { model },
+      options: {},
     }));
     setBanner({ level: 'info', message: `Drafting ${labels.length} variants — opening Compare…` });
     const q = `project=${encodeURIComponent(project)}&feature=${encodeURIComponent(feature.trim())}`;
     window.setTimeout(() => {
       window.location.hash = `/plan/compare?${q}`;
     }, 250);
-  }, [ws, project, feature, model, loading, variantLabels, hintForLabel]);
+  }, [ws, project, feature, loading, variantLabels, hintForLabel]);
 
   const handleRegenSection = useCallback((section: PlanSection) => {
     if (!ws || !project || !plan) return;
@@ -480,9 +474,9 @@ export function PlanPage({ project, ws }: PlanPageProps) {
       project,
       planSlug: plan.slug,
       section,
-      options: { model },
+      options: {},
     }));
-  }, [ws, project, plan, model]);
+  }, [ws, project, plan]);
 
   const handleValidate = useCallback(() => {
     if (!ws || !project || !plan) return;
@@ -496,13 +490,13 @@ export function PlanPage({ project, ws }: PlanPageProps) {
       project,
       planSlug: plan.slug,
       force,
-      options: { model },
+      options: {},
     }));
     setBanner({ level: 'info', message: 'Pipeline starting — opening Active Runs…' });
     // Navigate to Active Runs after a short delay so the user sees the plan
     // accepted feedback before the view changes.
     window.setTimeout(() => { window.location.hash = '/runs'; }, 400);
-  }, [ws, project, plan, model]);
+  }, [ws, project, plan]);
 
   const handleCopy = useCallback(() => {
     if (!plan) return;
@@ -664,21 +658,6 @@ export function PlanPage({ project, ws }: PlanPageProps) {
             outline: 'none',
           }}
         />
-        <select
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          style={{
-            appearance: 'none', height: 40, padding: '0 12px',
-            background: 'var(--bg-elevated-2)',
-            border: '1px solid var(--separator)',
-            borderRadius: 'var(--radius-sm)',
-            color: 'var(--text-secondary)',
-            fontSize: 12, fontFamily: 'var(--font-sans)',
-            cursor: 'pointer', outline: 'none',
-          }}
-        >
-          {models.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
-        </select>
         <button
           onClick={handleGenerate}
           disabled={loading || !canGenerate}
@@ -719,6 +698,9 @@ export function PlanPage({ project, ws }: PlanPageProps) {
           Generate variants
         </button>
       </div>
+
+      {/* Routing — read-only, sourced from ~/.anvil/stage-policy.yaml */}
+      <RoutingCard flow="plan" ws={ws} compact />
 
       {/* Variants sub-form */}
       {variantsOpen && (
@@ -819,25 +801,7 @@ export function PlanPage({ project, ws }: PlanPageProps) {
             </button>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <label htmlFor="variants-model" style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
-              Model
-            </label>
-            <select
-              id="variants-model"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              style={{
-                appearance: 'none', height: 28, padding: '0 10px',
-                background: 'var(--bg-base)',
-                border: '1px solid var(--separator)',
-                borderRadius: 'var(--radius-sm)',
-                color: 'var(--text-secondary)',
-                fontSize: 12, fontFamily: 'var(--font-sans)',
-                cursor: 'pointer', outline: 'none',
-              }}
-            >
-              {models.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
-            </select>
+            <RoutingCard flow="plan" ws={ws} compact />
             <button
               onClick={handleGenerateVariants}
               disabled={loading || !canGenerate || variantLabels.filter((l) => l.trim()).length < 2}
