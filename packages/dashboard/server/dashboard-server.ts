@@ -1372,15 +1372,12 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       broadcastRuns();
       broadcastActiveRuns();
 
-      // Auto-save learnings to memory store
-      if (agent.status === 'done' && agent.output) {
-        try {
-          const output = agent.output;
-          const summary = output.length > 500 ? output.slice(0, 500) + '...' : output;
-          const prefix = activeRun.type === 'spike' ? 'Research' : 'Fix';
-          memoryStore.add(activeRun.project, 'memory', `[${prefix}: ${activeRun.description}]\n${summary}`);
-        } catch { /* */ }
-      }
+      // Memory hygiene (PR 4): auto-saving the first 500 chars of agent
+      // output as `[Fix|Research: …]` was bookkeeping noise — the model
+      // saw a wall of unranked snippets per run. End-of-run reflection
+      // through memory-core's reflectOnRun lands in a follow-up;
+      // recordPrEpisode covers the high-signal case (PRs) at the
+      // pipeline-runner level, not here.
 
       // Remove from active runs immediately — completed runs go to history
       activeRuns.delete(activeRun.id);
@@ -4717,7 +4714,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
    *
    * Stores: stages, per-stage costs/timing, total cost, model, repos, PRs, duration
    */
-  function persistRunRecord(state: PipelineRunState, runId?: string): void {
+  async function persistRunRecord(state: PipelineRunState, runId?: string): Promise<void> {
     const now = new Date().toISOString();
     const startTime = new Date(state.startedAt).getTime();
     const durationMs = Date.now() - startTime;
@@ -4786,23 +4783,40 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       console.warn('[dashboard] Failed to update feature record:', err);
     }
 
-    // 4. Auto-save learnings to memory store
-    try {
-      const project = state.project;
-      const clarification = featureStore.readArtifact(project, state.featureSlug, 'CLARIFICATION.md');
-      if (clarification && clarification.length > 50) {
-        // Extract a concise learning from the clarification
-        const summary = `[${state.feature}] Clarification learnings:\n${clarification.slice(0, 300)}`;
-        memoryStore.add(project, 'memory', summary);
+    // 4. Memory hygiene (PR 4): the previous post-run auto-savers
+    // (300-char clarification snippet + outcome bookkeeping line) were
+    // pure noise — they preserved the question, not the answer, and
+    // pushed real lessons off the 4KB cap. Replaced by:
+    //   - recordPrEpisode below for completed runs that produced a PR
+    //     (structured low-noise, auto-ratified per memory-core plan §12).
+    //   - reflectOnRun in a follow-up — needs a tuned reflection prompt
+    //     and a small-tier LLM invoker to extract real learnings.
+    if (state.status === 'completed' && prUrls.length > 0) {
+      try {
+        const { recordPrEpisode } = await import('@anvil/memory-core');
+        for (const prUrl of prUrls) {
+          recordPrEpisode(
+            memoryStore.unwrap(),
+            {
+              prUrl,
+              intent: state.feature,
+              plan: state.featureSlug,
+              filesChanged: [],
+              commitShas: [],
+              testsAdded: [],
+              ciStatus: 'pending',
+              durationMs: Date.now() - new Date(state.startedAt ?? Date.now()).getTime(),
+              costUsd: state.totalCost ?? 0,
+            },
+            {
+              namespace: { scope: 'project', projectId: state.project },
+              runId: state.runId,
+            },
+          );
+        }
+      } catch (err) {
+        console.warn('[dashboard] recordPrEpisode failed:', err);
       }
-
-      // Record the run outcome
-      const outcome = state.status === 'completed'
-        ? `[${state.feature}] Completed successfully. Cost: $${state.totalCost.toFixed(2)}, Model: ${state.model}, Repos: ${state.repoNames.join(', ')}`
-        : `[${state.feature}] Failed at stage ${state.stages.find((s) => s.status === 'failed')?.label ?? 'unknown'}. Error: ${state.stages.find((s) => s.error)?.error?.slice(0, 100) ?? 'unknown'}`;
-      memoryStore.add(project, 'memory', outcome);
-    } catch (err) {
-      console.warn('[dashboard] Failed to save memory:', err);
     }
   }
 

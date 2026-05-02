@@ -106,6 +106,16 @@ export class MemoryStore {
     });
   }
 
+  /**
+   * Expose the underlying HybridMemoryStore for memory-core primitives that
+   * need direct access (recordPrEpisode, reflectOnRun, ProposalQueue,
+   * MemoryInspector, BM25 retrieval). The façade's add/replace/remove
+   * surface remains the canonical write path for dashboard UI mutations.
+   */
+  unwrap(): HybridMemoryStore {
+    return this.store;
+  }
+
   // ── One-time markdown migration per project ──────────────────────
 
   private migrateOnce(project: string): void {
