@@ -2,12 +2,24 @@
 @import './tokens.css';
 @import './components.css';
 
-/* Typography note: tokens.css declares Geist + Geist Mono as the
- * primary stack, with system-ui / JetBrains Mono / Consolas as
- * fallbacks. We don't ship a webfont — Geist is preferred when the
- * user has it locally (Vercel users often do), otherwise system
- * sans/mono renders just fine. Vendor woff2 here later if we want
- * a guaranteed identity. */
+/* Geist + Geist Mono are vendored at /fonts/ (variable axis woff2). */
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/Geist-Variable.woff2') format('woff2-variations'),
+       url('/fonts/Geist-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/GeistMono-Variable.woff2') format('woff2-variations'),
+       url('/fonts/GeistMono-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
 
 /* Reset & base */
 *,
