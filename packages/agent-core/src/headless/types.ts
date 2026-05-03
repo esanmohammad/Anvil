@@ -1,102 +1,34 @@
 /**
- * Headless `runAgent` entry — types are Inspect-AI-compatible per ADR §5/§6/§7.
+ * Headless `runAgent` entry types — kept here as a thin re-export shim.
  *
- * Schema is locked. Future eval harnesses (Inspect AI, SWE-bench runners,
- * custom benchmark scripts) consume `AgentTrajectory` directly without
- * conversion. If their contract drifts, write an adapter — don't refactor
- * this shape.
+ * Per AGENT-PROCESS-CONSOLIDATION-ADR §C2 the canonical location for the
+ * Inspect-AI-compatible types is now `agent/session/headless-types.ts`.
+ * Phase 5 of the consolidation deletes this `headless/` directory; until
+ * then, this shim keeps the existing `runAgent` runner compiling without
+ * duplicate type declarations.
  */
 
 import type { LanguageModel, ToolSchema } from '../types.js';
+import type { WorkspaceConfig } from '../agent/session/headless-types.js';
 
-export interface WorkspaceConfig {
-  /** Absolute path to the project workspace (where mcp.json + .claude/skills/ live). */
-  rootDir: string;
-  /** Optional override for factory.yaml path (forwarded to subprocess adapters). */
-  factoryYamlPath?: string;
-  /** Extra env vars passed to subprocess adapters (CLI providers). */
-  env?: Record<string, string>;
-}
-
-export interface AgentTask {
-  /** Human-readable task statement. Becomes the first user message. */
-  prompt: string;
-
-  /** Optional system-prompt prefix (rendered before the skills block). */
-  systemPrompt?: string;
-
-  /**
-   * Allowed built-in tools. Intersected with skill `allowed-tools`
-   * constraints. MCP-discovered tools are added unconditionally.
-   */
-  allowedTools?: string[];
-
-  /** Model identifier ('claude-sonnet-4-6', 'gpt-4o', 'gemini-2.5-pro', ...). */
-  model: string;
-
-  /** Provider hint: 'anthropic-cli' | 'anthropic-api' | 'openai-api' | ... */
-  provider?: string;
-
-  /** Max tokens per assistant turn. */
-  maxTokens?: number;
-
-  /** Sampling temperature. */
-  temperature?: number;
-
-  /**
-   * Optional task ID for trace correlation — surfaced as `anvil.task_id`
-   * on every `gen_ai.invoke` span emitted within this run.
-   */
-  taskId?: string;
-}
-
-export interface TrajectoryMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
-  /** Tool name when role === 'tool'. */
-  name?: string;
-  /** Originating assistant tool_call id when role === 'tool'. */
-  toolCallId?: string;
-}
-
-export interface TrajectoryToolCall {
-  callId: string;
-  name: string;
-  arguments: Record<string, unknown>;
-  result?: unknown;
-  error?: string;
-  durationMs: number;
-}
-
-export interface TrajectoryUsage {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens?: number;
-  cacheWriteTokens?: number;
-}
-
-export interface AgentTrajectory {
-  messages: TrajectoryMessage[];
-  toolCalls: TrajectoryToolCall[];
-  /** Concrete model the run resolved to (post-fallback). */
-  model: string;
-  /** Aggregated across every LLM call in the run. */
-  usage: TrajectoryUsage;
-  /** Aggregated USD cost across every LLM call. */
-  costUsd: number;
-  /** Final assistant text (after the last non-tool turn). */
-  finalAnswer: string;
-  finishReason: 'end' | 'tool-use' | 'length' | 'error';
-  /** Populated only when finishReason === 'error'. */
-  error?: string;
-  durationMs: number;
-}
+// Re-export the canonical types so external imports
+// (`@anvil/agent-core/headless`) keep working until Phase 5.
+export type {
+  AgentTask,
+  AgentTrajectory,
+  TrajectoryMessage,
+  TrajectoryToolCall,
+  TrajectoryUsage,
+  WorkspaceConfig,
+} from '../agent/session/headless-types.js';
 
 /**
  * Built-in tool dispatcher. Receives the bare tool name + arguments + the
  * workspace for cwd context; returns whatever the tool produced (any JSON-
  * serializable value). Throws on tool failure (caught by the loop and
  * surfaced as `tool` message + `error` on the trajectory tool call).
+ *
+ * Used only by the legacy `runAgent` runner; removed in Phase 5.
  */
 export type BuiltInToolDispatcher = (
   name: string,
@@ -108,8 +40,9 @@ export interface RunAgentOptions {
   /**
    * Required: the LanguageModel that runs the inference loop. As of
    * 2026-04-29, no agent-core adapter implements `LanguageModel` natively
-   * (per observability ADR §3.4); callers must inject one. Tests use a
-   * mock; production callers will inject the bridge once it ships.
+   * (per observability ADR §3.4); callers must inject one.
+   *
+   * Used only by the legacy `runAgent` runner; removed in Phase 5.
    */
   model: LanguageModel;
 

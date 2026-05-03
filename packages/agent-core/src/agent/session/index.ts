@@ -48,6 +48,23 @@ export {
   type RunWithAgentResult,
 } from './run-with-agent.js';
 
+// Eval-facing trajectory collector. Wraps an `AgentProcess` and aggregates
+// an Inspect-AI-shaped `AgentTrajectory`. Replaces the headless `runAgent`
+// per AGENT-PROCESS-CONSOLIDATION-ADR §C1.
+export {
+  collectTrajectory,
+  type CollectTrajectoryOptions,
+} from './collect-trajectory.js';
+
+export type {
+  AgentTask,
+  AgentTrajectory,
+  TrajectoryMessage,
+  TrajectoryToolCall,
+  TrajectoryUsage,
+  WorkspaceConfig,
+} from './headless-types.js';
+
 export type {
   AgentActivity,
   AgentCheckpointHook,
