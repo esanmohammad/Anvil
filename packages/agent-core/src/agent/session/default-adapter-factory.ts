@@ -15,6 +15,7 @@
  */
 
 import { execSync } from 'node:child_process';
+import { trace } from '@opentelemetry/api';
 import { ProviderRegistry } from '../../registry.js';
 import type { ModelAdapter, ProviderName } from '../../types.js';
 import type {
@@ -24,7 +25,7 @@ import type {
 } from './adapter.js';
 import { LanguageModelBridge } from './language-model-bridge.js';
 import { composeSkillContext } from '../../skills/index.js';
-import { findMcpConfigPath } from '../../mcp/index.js';
+import { findMcpConfigPath, loadMcpServers } from '../../mcp/index.js';
 
 // ── Provider resolution ──────────────────────────────────────────────────
 
@@ -142,6 +143,10 @@ export function enrichRequestWithWorkspace(
   if (provider === 'claude') {
     const mcpPath = findMcpConfigPath({ workspaceRoot: request.workspaceDir });
     if (!mcpPath) return request;
+    // Phase 6: surface MCP discovery on the active session span. claude-cli
+    // owns the actual server connections, so we only know servers exist —
+    // not how many tools they advertise.
+    annotateSpanWithMcp(request.workspaceDir, { tools: undefined });
     return { ...request, claudeMcpConfigPath: mcpPath };
   }
 
@@ -151,6 +156,11 @@ export function enrichRequestWithWorkspace(
     workspaceRoot: request.workspaceDir,
     allowedTools: request.allowedTools,
   });
+
+  // Phase 6: surface skill + MCP discovery on the active session span.
+  annotateSpanWithSkills(ctx.activated.skills.map((s) => s.frontmatter.name));
+  annotateSpanWithMcp(request.workspaceDir, { tools: undefined });
+
   if (ctx.activated.skills.length === 0 && !ctx.toolsConstrained) {
     return request;
   }
@@ -159,6 +169,40 @@ export function enrichRequestWithWorkspace(
     projectPrompt: ctx.systemPrompt || undefined,
     allowedTools: ctx.allowedTools,
   };
+}
+
+/**
+ * Set `anvil.skills.activated.count` + `anvil.skills.activated.names` on
+ * the active OTel span (the `anvil.agent.session` span when called from
+ * inside `AgentProcess.start()`'s session context). Absence-stays-absent
+ * per observability ADR §O7: when no skills load, no attribute is emitted.
+ */
+function annotateSpanWithSkills(activatedNames: string[]): void {
+  if (activatedNames.length === 0) return;
+  const span = trace.getActiveSpan();
+  if (!span) return;
+  span.setAttribute('anvil.skills.activated.count', activatedNames.length);
+  span.setAttribute('anvil.skills.activated.names', activatedNames.join(','));
+}
+
+/**
+ * Set `anvil.mcp.servers.count` (and `anvil.mcp.tools.count` when known)
+ * on the active OTel span. We resolve mcp.json once here — the file read
+ * is cheap, and this is the only place that knows whether MCP discovery
+ * found anything for the workspace.
+ */
+function annotateSpanWithMcp(
+  workspaceDir: string,
+  meta: { tools?: number | undefined },
+): void {
+  const servers = loadMcpServers({ workspaceRoot: workspaceDir });
+  if (servers.length === 0) return;
+  const span = trace.getActiveSpan();
+  if (!span) return;
+  span.setAttribute('anvil.mcp.servers.count', servers.length);
+  if (typeof meta.tools === 'number') {
+    span.setAttribute('anvil.mcp.tools.count', meta.tools);
+  }
 }
 
 /** Type alias matching `AgentAdapterFactory` — exported for explicit typing. */

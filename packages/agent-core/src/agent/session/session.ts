@@ -106,7 +106,11 @@ export class AgentProcess extends EventEmitter {
   start(): void {
     this.openSessionSpan();
     const req = buildAdapterRequest(this.spec, this.sessionId);
-    const adapter = this.factory(req);
+    // Run the factory inside the session-span's context so any setAttribute
+    // calls inside `defaultAdapterFactory` (e.g. `anvil.skills.activated.*`,
+    // `anvil.mcp.*` from Phase 6) land on the session span. Without the
+    // wrapper the factory runs with no active span and the attrs go nowhere.
+    const adapter = this.runWithSessionContext(() => this.factory(req));
     if (
       typeof this.spec.maxOutputTokens === 'number'
       && this.spec.maxOutputTokens > 0

@@ -1,6 +1,6 @@
 # Plan: Consolidate on `AgentProcess` — drop `runAgent` headless entry
 
-> **Status:** Phase 0 — ADR locked 2026-05-03. Phase 1 next.
+> **Status: Shipped (2026-05-03).** All 7 phases (0–6) live on `feat/plan-generation`. See ADR §7 for the per-phase commit log + deviations.
 > **Companion ADR:** [`AGENT-PROCESS-CONSOLIDATION-ADR.md`](./AGENT-PROCESS-CONSOLIDATION-ADR.md).
 > **Supersedes:** [`AGENT-HARNESS-PLAN.md`](./AGENT-HARNESS-PLAN.md) — the headless `runAgent` entry it shipped is removed by this initiative.
 

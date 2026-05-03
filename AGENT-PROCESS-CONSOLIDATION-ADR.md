@@ -219,10 +219,17 @@ Filled in as each phase ships. See `AGENT-PROCESS-CONSOLIDATION-PLAN.md` for the
 
 | Phase | Status | Commit | Deviations |
 |---|---|---|---|
-| 0 — ADR + plan + banner | 🚧 in flight | — | — |
-| 1 — Skills + MCP into spawn path | ⏳ pending | — | — |
-| 2 — `collectTrajectory` | ⏳ pending | — | — |
-| 3 — CLI `anvil run --task` | ⏳ pending | — | — |
-| 4 — Dashboard `workspaceDir` wire-up | ⏳ pending | — | — |
-| 5 — Remove `runAgent` | ⏳ pending | — | — |
-| 6 — Telemetry attrs + close-out | ⏳ pending | — | — |
+| 0 — ADR + plan + banner | ✅ shipped 2026-05-03 | `996f1f9` | — |
+| 1 — Skills + MCP into spawn path | ✅ shipped 2026-05-03 | `8466886` | Phase 1 test #5 (Claude path skill non-injection) had to drop the `claudeMcpConfigPath === undefined` sub-assertion because the user's `~/.claude/mcp.json` rank-5 fallback in `findMcpConfigPath` is environment-dependent. The test still verifies the primary intent (no skill block injection on Claude). |
+| 2 — `collectTrajectory` | ✅ shipped 2026-05-03 | `6d42b18` | None. Trajectory shape kept identical; `src/headless/types.ts` rewritten as a re-export shim so existing `runAgent` runner kept compiling until Phase 5 deleted it. |
+| 3 — CLI `anvil run --task` | ✅ shipped 2026-05-03 | `ca8e922` | Replaced the existing `comingSoon('run', 'Run a feature pipeline')` placeholder. The "future feature pipeline" is its own initiative; the new `anvil run --task` is the headless one-shot agent runner. No test added (cli has no per-workspace `node:test` files; the `--help` smoke is the gate). |
+| 4 — Dashboard `workspaceDir` wire-up | ✅ shipped 2026-05-03 | `b2da892` | Took a shortcut over the plan: instead of editing ~10 dashboard call sites, defaulted `workspaceDir = cwd` inside `defaultAdapterFactory`. Same outcome (every dashboard spawn picks up skills + MCP automatically), one diff hunk instead of N. |
+| 5 — Remove `runAgent` | ✅ shipped 2026-05-03 | `c636d18` | None. `src/headless/` deleted; ARCHITECTURE.md, FLOW.md, README.md, CLAUDE.md, skill-loader comments all updated to reference `collectTrajectory` instead. agent-core baseline 380/380 (down from 390 — the 10-test delta is the deleted `runAgent.test.ts`). |
+| 6 — Telemetry attrs + close-out | ✅ shipped 2026-05-03 | _this commit_ | Tool-source per-call attribution (`anvil.tool.source = builtin | mcp:<server>`) deferred to a follow-up. The bridge would need to know per-tool MCP origins to tag spans correctly; on the Claude path claude-cli owns the MCP connection and the bridge can't see the routing. Session-level attrs (`anvil.skills.activated.*`, `anvil.mcp.servers.count`) ship now. |
+
+## Out of scope / known follow-ups
+
+1. **Per-tool source attribute (`anvil.tool.source`).** Plan said to add this on `gen_ai.tool.<name>` child spans; deferred. Requires plumbing MCP-tool name set into `LanguageModelBridge.openToolSpan`. Self-contained future change.
+2. **`anvil.mcp.tools.count` attribute.** Currently stays absent because `loadMcpServers` only reads the config; counting tools requires connecting to each server (expensive). When `buildAgentToolset` runs in a Phase-7 non-Claude MCP integration, that's the natural place to set this attribute.
+3. **MCP tool merging into non-Claude bridge** (carried over from Phase 1's `§C5` deferral). Would let Ollama/OpenRouter/OpenCode call MCP-discovered tools, not just claude-cli.
+4. **CLI test coverage for `anvil run`.** cli has no per-workspace `node:test` setup. Adding even a smoke test for streaming + JSON modes would require introducing a test runner there.
