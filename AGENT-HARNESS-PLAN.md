@@ -1,6 +1,6 @@
 # Plan: Agent harness — SKILL.md loader, MCP client at agent layer, headless entry
 
-> **Status: Shipped (2026-04-29).** All 7 phases (0–6) live in `@anvil/agent-core`. Phase 5 (cli `--task` flag wire-up) was explicitly skipped as optional per plan §5.1. Companion ADR: [`AGENT-HARNESS-ADR.md`](./AGENT-HARNESS-ADR.md). See ADR §9 for the per-phase commit log + deviations.
+> **Status: Shipped (2026-04-29) — Superseded (2026-05-03)** by [`AGENT-PROCESS-CONSOLIDATION-PLAN.md`](./AGENT-PROCESS-CONSOLIDATION-PLAN.md). The skills loader and MCP client this plan delivered are **retained** and now consumed by `AgentProcess`'s spawn path (everywhere — dashboard, cli, evals). The headless `runAgent` entry is **removed**; eval consumers use `collectTrajectory(task, workspace)` instead. Companion ADR: [`AGENT-HARNESS-ADR.md`](./AGENT-HARNESS-ADR.md). See ADR §9 for the per-phase commit log + deviations.
 >
 > Originally proposed self-contained plan; depends on [`AGENT-CORE-EXTRACT-PLAN.md`](./AGENT-CORE-EXTRACT-PLAN.md) and [`AGENT-OBSERVABILITY-PLAN.md`](./AGENT-OBSERVABILITY-PLAN.md) (both shipped).
 
