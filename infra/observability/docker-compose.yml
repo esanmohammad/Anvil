@@ -1,113 +1,100 @@
 name: anvil-observability
 
-networks:
-  obs:
-    driver: bridge
-
-volumes:
-  tempo-data:
-  prometheus-data:
-  loki-data:
-  grafana-data:
+# Self-hosted Langfuse stack for Anvil agent observability. Brings up
+# Langfuse 3.x + Postgres + ClickHouse + Redis + MinIO so the OTLP HTTP
+# endpoint at http://localhost:${LANGFUSE_PORT:-3000}/api/public/otel/v1/traces
+# accepts spans from every Anvil run.
+#
+# Usage:
+#
+#   docker compose -f infra/observability/docker-compose.yml up -d
+#   # Wait ~30 s for Langfuse to migrate; open http://localhost:3000
+#   # Sign up, create a project, copy the public/secret keys.
+#
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel/v1/traces \
+#   OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(echo -n pk-lf-xxx:sk-lf-xxx | base64)" \
+#   ANVIL_OTEL_RECORD_CONTENT=1 \
+#   anvil index ./fixture
+#
+#   # Refresh http://localhost:3000 — spans appear in the Traces tab with
+#   # cost USD, cache tokens, tool-call count, and (since
+#   # ANVIL_OTEL_RECORD_CONTENT=1) the prompt + completion text.
+#
+# Tear down:
+#
+#   docker compose -f infra/observability/docker-compose.yml down -v
+#
+# Notes:
+#   * Versions pinned to current stable as of 2026-05. Bump as needed; the
+#     OTLP HTTP endpoint contract is stable across Langfuse 3.x.
+#   * Persistence volumes are named so a `down` without -v keeps state. Use
+#     -v to fully reset.
+#   * Set LANGFUSE_PORT to remap host port if 3000 collides with another
+#     local service (e.g. `LANGFUSE_PORT=3300 docker compose ... up -d`).
 
 services:
-  # ── OpenTelemetry Collector ──────────────────────────────────────────────
-  # Single ingress for traces, metrics, and logs. Fans out to Tempo / Prom /
-  # Loki and adds resource enrichment + batching. Exposed on host so Anvil
-  # ships to localhost:4317/4318.
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.123.0
-    container_name: anvil-otel-collector
-    restart: unless-stopped
-    command: ["--config=/etc/otel/config.yaml"]
-    volumes:
-      - ./collector/config.yaml:/etc/otel/config.yaml:ro
-    ports:
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-      - "13133:13133" # health_check
-      - "8888:8888"   # collector self-metrics
+  langfuse-server:
+    image: langfuse/langfuse:3
     depends_on:
-      tempo:
-        condition: service_started
-      prometheus:
-        condition: service_started
-      loki:
-        condition: service_started
-    networks: [obs]
-
-  # ── Tempo (traces) ───────────────────────────────────────────────────────
-  tempo:
-    image: grafana/tempo:2.7.2
-    container_name: anvil-tempo
-    restart: unless-stopped
-    command: ["-config.file=/etc/tempo/tempo.yaml"]
-    user: "0"
-    volumes:
-      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
-      - tempo-data:/var/tempo
+      - postgres
+      - clickhouse
+      - redis
+      - minio
     ports:
-      - "3200:3200"   # Tempo HTTP API
-    networks: [obs]
-
-  # ── Prometheus (metrics) ─────────────────────────────────────────────────
-  # 3.x has a native OTLP write receiver enabled via flag below.
-  prometheus:
-    image: prom/prometheus:v3.5.0
-    container_name: anvil-prometheus
-    restart: unless-stopped
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --web.enable-otlp-receiver
-      - --web.enable-remote-write-receiver
-      - --web.enable-lifecycle
-      - --enable-feature=native-histograms
-      - --enable-feature=exemplar-storage
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    ports:
-      - "9090:9090"
-    networks: [obs]
-
-  # ── Loki (logs) ──────────────────────────────────────────────────────────
-  loki:
-    image: grafana/loki:3.5.0
-    container_name: anvil-loki
-    restart: unless-stopped
-    command: ["-config.file=/etc/loki/loki.yaml"]
-    user: "0"
-    volumes:
-      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
-      - loki-data:/loki
-    ports:
-      - "3100:3100"
-    networks: [obs]
-
-  # ── Grafana (UI) ─────────────────────────────────────────────────────────
-  # Anonymous + admin role so you can hit http://localhost:3001 with no login.
-  grafana:
-    image: grafana/grafana:11.6.5
-    container_name: anvil-grafana
-    restart: unless-stopped
+      - "${LANGFUSE_PORT:-3000}:3000"
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
-      GF_AUTH_DISABLE_LOGIN_FORM: "true"
-      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor traceQLStreaming metricsSummary"
-      GF_LOG_LEVEL: "warn"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:${LANGFUSE_PORT:-3000}
+      NEXTAUTH_SECRET: localdev-not-a-secret
+      SALT: localdev-salt
+      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_INIT_ORG_ID: anvil-local
+      LANGFUSE_INIT_PROJECT_ID: anvil-agent-core
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langfuse
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-      - grafana-data:/var/lib/grafana
-    ports:
-      - "3001:3000"
-    depends_on:
-      tempo:
-        condition: service_started
-      prometheus:
-        condition: service_started
-      loki:
-        condition: service_started
-    networks: [obs]
+      - langfuse_postgres:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    environment:
+      CLICKHOUSE_DB: default
+    volumes:
+      - langfuse_clickhouse:/var/lib/clickhouse
+
+  redis:
+    image: redis:7
+    volumes:
+      - langfuse_redis:/data
+
+  minio:
+    image: minio/minio
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    command: server /data --console-address ":9001"
+    volumes:
+      - langfuse_minio:/data
+
+volumes:
+  langfuse_postgres:
+  langfuse_clickhouse:
+  langfuse_redis:
+  langfuse_minio:

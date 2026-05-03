@@ -393,55 +393,41 @@ OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(echo -n pk-lf-xxx:sk-lf-xxx | 
 anvil index ./fixture
 ```
 
-#### Self-hosted Langfuse (Helm / docker-compose)
+#### Self-hosted Langfuse (canonical local stack)
+
+A turnkey docker-compose stack lives at
+[`infra/observability/docker-compose.yml`](../../infra/observability/docker-compose.yml)
+(Langfuse 3 + Postgres + ClickHouse + Redis + MinIO):
 
 ```sh
-OTEL_EXPORTER_OTLP_ENDPOINT=https://langfuse.your-cluster/api/public/otel/v1/traces \
-OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(pk:sk)>" \
-anvil index ./fixture
-```
-
-A turnkey local stack lives at [`scripts/otel-stack.yaml`](./scripts/otel-stack.yaml):
-
-```sh
-docker compose -f packages/agent-core/scripts/otel-stack.yaml up -d
+docker compose -f infra/observability/docker-compose.yml up -d
 # open http://localhost:3000, sign up, create project, copy pk + sk
-ANVIL_OTEL_CONSOLE=1 \
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel/v1/traces \
 OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $(echo -n pk-lf-xxx:sk-lf-xxx | base64)" \
 ANVIL_OTEL_RECORD_CONTENT=1 \
 anvil index ./fixture
 ```
 
-#### Self-hosted Phoenix (Arize, OSS)
+The dashboard auto-detects this stack on startup (probes
+`localhost:3000/api/public/otel/v1/traces`); zero env-var config needed
+in the common case.
+
+If port 3000 collides with another local service:
 
 ```sh
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:6006/v1/traces \
-anvil index ./fixture
+LANGFUSE_PORT=3300 docker compose -f infra/observability/docker-compose.yml up -d
 ```
 
-#### Honeycomb
+For self-hosting outside docker-compose (e.g. Helm), point the OTLP
+endpoint at your Langfuse server's `/api/public/otel/v1/traces`.
 
-```sh
-OTEL_EXPORTER_OTLP_ENDPOINT=https://api.honeycomb.io/v1/traces \
-OTEL_EXPORTER_OTLP_HEADERS="x-honeycomb-team=YOUR_KEY" \
-anvil index ./fixture
-```
+#### A different OTLP backend
 
-#### Datadog (LLM Observability)
-
-```sh
-OTEL_EXPORTER_OTLP_ENDPOINT=https://trace.agent.datadoghq.com/v1/traces \
-OTEL_EXPORTER_OTLP_HEADERS="DD-API-KEY=YOUR_KEY" \
-anvil index ./fixture
-```
-
-#### Self-hosted Tempo / Jaeger / OTel Collector
-
-```sh
-OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318/v1/traces \
-anvil index ./fixture
-```
+Langfuse is the supported backend for Anvil. The wire format is plain
+OTLP HTTP, so any other GenAI-aware OTLP receiver works in principle —
+just point `OTEL_EXPORTER_OTLP_ENDPOINT` at it. We don't ship recipes
+for those because we don't test against them; you're on your own for
+attribute-rendering nuances.
 
 ### Privacy: prompt + completion content
 
