@@ -27,6 +27,7 @@
   <a href="#what-you-can-do-with-anvil"><img src="https://img.shields.io/badge/-Features-1f2937?style=for-the-badge" alt="Features"></a>
   <a href="#observability-opt-in"><img src="https://img.shields.io/badge/-Observability-1f2937?style=for-the-badge" alt="Observability"></a>
   <a href="examples/"><img src="https://img.shields.io/badge/-Examples-1f2937?style=for-the-badge" alt="Examples"></a>
+  <a href="https://drive.google.com/file/d/1IHTQiLEQ4tulpdbUzI2iD5dmy82jBK-m/view?usp=sharing"><img src="https://img.shields.io/badge/-Demo-ef4444?style=for-the-badge&logo=googledrive&logoColor=white" alt="Demo"></a>
 </p>
 
 <p>
@@ -41,8 +42,10 @@
 
 <br />
 
+[![Anvil pipeline builder showcase](./assets/AI_Pipeline_Builder_Showcase.gif)](https://drive.google.com/file/d/1IHTQiLEQ4tulpdbUzI2iD5dmy82jBK-m/view?usp=sharing)
+
 <sub><i>Dashboard preview &mdash; pipeline orchestration, live agent activity, knowledge graph, cost ledger.<br />
-Screenshots coming soon. For now, run <code>anvil dashboard</code> to see it live.</i></sub>
+<b><a href="https://drive.google.com/file/d/1IHTQiLEQ4tulpdbUzI2iD5dmy82jBK-m/view?usp=sharing">Click the gif to watch the full demo</a></b></i></sub>
 
 <br /><br />
 
