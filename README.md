@@ -170,9 +170,27 @@ and the fix-retry loop are locked to free tier — they cannot
 escalate, by design.** A typical run with Ollama or OpenCode burns
 single-digit dollars on cloud calls.
 
-If a model 429s mid-run, the chain-walker burns it for the rest of
-the run and falls through to the next entry in the same tier — same
-provider or different, your call.
+### Auto-failover when a provider misbehaves
+
+If a model 429s, 5xx's, hits a quota wall, or fails its liveness probe
+mid-run, Anvil's chain-walker **burns it for the rest of the run** and
+falls through to the next entry in the same tier — same provider or
+different, your call. The pipeline doesn't pause, doesn't surface a
+stack trace at the user, and doesn't double-charge by retrying the same
+broken model. Every fallback hop emits a routing event so you can see
+exactly which model was skipped and why.
+
+```
+clarify   →  adk:gemini-2.5-flash   ❌  (provider liveness fail)
+          ↪  opencode/kimi-k2.6     ✅  (next in chain, same tier)
+build     →  opencode/qwen3.5-plus  ❌  (429 — Alibaba upstream)
+          ↪  opencode/glm-5.1       ✅  (model burned for run, fallback proceeds)
+```
+
+Two layers of detection: a **proactive** liveness probe at run start
+(Ollama `/api/tags`, env-var presence for cloud) and a **reactive**
+duck-typed `UpstreamError` check on every adapter call. Configurable
+per-run cap on retry attempts in `models.yaml` (`walker.max_attempts`).
 
 ### Cost ledger, live
 
@@ -301,6 +319,36 @@ default. Privacy-safe prompt redaction. Real per-call cost ledger.
 
 </td>
 </tr>
+<tr>
+<td width="33%" valign="top">
+
+### Auto-failover
+Provider goes down, hits a quota wall, or fails its liveness probe?
+The chain-walker burns the model for the rest of the run and walks
+to the next entry in the same tier — proactive (liveness probe at
+run start) plus reactive (`UpstreamError` duck-typing on every call).
+No paused runs, no double charges.
+
+</td>
+<td width="33%" valign="top">
+
+### Resume + rollback
+Every run is checkpointed per stage. Resume from the failing stage
+without re-running the cheap stages before it. Roll back any shipped
+run with one click — branch + PR delete, restored workspace, audit
+log preserved.
+
+</td>
+<td width="33%" valign="top">
+
+### MCP server
+Anvil's knowledge-base retriever ships as a standalone MCP server.
+Use it from Claude Code, Claude Desktop, Cursor, or any MCP client —
+same hybrid retrieval (vector + BM25 + graph + rerank), same project
+graph, no dashboard required.
+
+</td>
+</tr>
 </table>
 
 ---
@@ -340,14 +388,16 @@ disk only.
 
 ### Quick local stack: Langfuse
 
-A local Langfuse instance is the fastest way to see Anvil traces:
+Anvil ships a tuned Langfuse compose file at
+[`infra/observability/`](infra/observability/) — Langfuse 3.x +
+Postgres + ClickHouse + Redis + MinIO, pre-wired for the OTLP HTTP
+endpoint Anvil exports to. No external clone needed:
 
 ```sh
-# Spin up Langfuse on http://localhost:3000
-git clone https://github.com/langfuse/langfuse && cd langfuse
-docker compose up -d
+# Spin up the bundled stack on http://localhost:3000
+docker compose -f infra/observability/docker-compose.yml up -d
 
-# In ~/.anvil/.env
+# In ~/.anvil/.env (use the keys you create in the Langfuse UI)
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel/v1/traces
 OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer pk-lf-...
 OTEL_SERVICE_NAME=anvil-dashboard
@@ -355,7 +405,8 @@ OTEL_SERVICE_NAME=anvil-dashboard
 
 Anvil's dashboard auto-detects the local Langfuse on port 3000 — if
 it's running and you haven't set `OTEL_EXPORTER_OTLP_ENDPOINT`
-yourself, the dashboard wires it up automatically.
+yourself, the dashboard wires it up automatically. Tear down with
+`docker compose -f infra/observability/docker-compose.yml down -v`.
 
 ### What you'll see
 
