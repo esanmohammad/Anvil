@@ -1,8 +1,10 @@
 // Success recorder — Section C.2
 
-import { createMemoryEntry } from '../entry-factory.js';
 import { createMemoryStore } from '../index.js';
-import type { MemoryEntry } from '../types.js';
+import {
+  createMemoryEntry,
+  type MemoryEntry,
+} from '@anvil/memory-core/legacy/index.js';
 
 /**
  * Record a successful feature implementation.

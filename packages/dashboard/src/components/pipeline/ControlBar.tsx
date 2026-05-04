@@ -113,9 +113,9 @@ export function ControlBar({
             }}
             className="btn btn-sm"
             style={{
-              background: 'rgba(52, 211, 153, 0.1)',
+              background: 'var(--accent-muted)',
               color: 'var(--accent)',
-              border: '1px solid rgba(52, 211, 153, 0.2)',
+              border: '1px solid var(--accent-muted)',
               gap: 4,
             }}
           >

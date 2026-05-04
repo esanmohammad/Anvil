@@ -4,8 +4,9 @@ import {
   Clock, BarChart3, Server, Brain,
   PanelLeftClose, PanelLeft, ChevronDown,
   GitCompareArrows, TestTube, Map, Settings,
-  Anvil,
+  Shield, FileCode, AlertTriangle, DollarSign,
 } from 'lucide-react';
+import { AnvilLogo } from '../common/AnvilLogo.js';
 
 export interface NavItem {
   id: string;
@@ -44,8 +45,13 @@ const iconMap: Record<string, React.ComponentType<{ size?: number; strokeWidth?:
   project: Server,
   'knowledge-graph': Brain,
   'review': GitCompareArrows,
-  'test-gen': TestTube,
+  'tests': TestTube,
+  'guards': Shield,
+  'contracts': FileCode,
+  'triage': AlertTriangle,
   'plan': Map,
+  'cost-breaches': DollarSign,
+  'memory': Brain,
   'settings': Settings,
 };
 
@@ -183,8 +189,8 @@ export function Sidebar({ items, activeId, collapsed, onNavigate, onToggleCollap
           letterSpacing: '-0.02em',
           whiteSpace: 'nowrap',
         }}>
-          <Anvil size={18} strokeWidth={1.75} />
-          {!collapsed && 'Anvil'}
+          <AnvilLogo size={20} />
+          {!collapsed && 'ANVIL'}
         </span>
       </div>
 

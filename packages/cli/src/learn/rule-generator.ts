@@ -1,7 +1,7 @@
 // Rule generator — Wave 9, Section E
 // Synthesizes detected patterns into convention rules
 
-import type { ConventionRule } from '../conventions/rules/types.js';
+import type { ConventionRule } from '@anvil/convention-core';
 import type { CiConfig } from './ci-scanner.js';
 import type { TestPattern } from './test-scanner.js';
 import type { RunPattern } from './run-analyzer.js';

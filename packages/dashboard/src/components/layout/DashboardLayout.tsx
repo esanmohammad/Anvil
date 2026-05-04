@@ -61,7 +61,6 @@ export function DashboardLayout({
         {/* Contextual header */}
         {(headerLeft || headerRight) && (
           <header
-            className="frosted"
             style={{
               height: 'var(--header-height)',
               display: 'flex',
@@ -69,7 +68,7 @@ export function DashboardLayout({
               justifyContent: 'space-between',
               padding: '0 var(--space-lg)',
               borderBottom: '1px solid var(--separator)',
-              background: 'rgba(17,17,17,0.8)',
+              background: 'var(--bg-elevated-1)',
               flexShrink: 0,
             }}
           >

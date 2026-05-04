@@ -16,6 +16,11 @@
     }
   },
   "references": [
+    { "path": "packages/agent-core" },
+    { "path": "packages/knowledge-core" },
+    { "path": "packages/memory-core" },
+    { "path": "packages/convention-core" },
+    { "path": "packages/core-pipeline" },
     { "path": "packages/cli" },
     { "path": "packages/dashboard" }
   ]

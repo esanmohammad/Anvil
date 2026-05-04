@@ -58,6 +58,18 @@ export function ForceGraph({
     return () => clearTimeout(timer);
   }, [data]);
 
+  // Re-fit whenever the canvas resizes. The simulation was centered on an
+  // earlier (usually smaller) bounding box, so without this the cluster
+  // stays pinned to the old center and most of the viewport reads empty.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      graphRef.current?.zoomToFit(300, 40);
+      // Nudge d3 to re-center on the new dimensions.
+      graphRef.current?.d3ReheatSimulation?.();
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [width, height]);
+
   const handleNodeHover = useCallback((node: any) => {
     const id = node?.id ?? null;
     setHoveredNode(id);
@@ -132,7 +144,7 @@ export function ForceGraph({
       const r = Math.max(2, size / (globalScale > 2 ? 1 : 2));
       ctx.beginPath();
       ctx.arc(x, y, r, 0, 2 * Math.PI);
-      ctx.fillStyle = isSearchMatch ? '#fbbf24' : isHovered || isSelected ? lightenColor(color, 0.3) : color;
+      ctx.fillStyle = isSearchMatch ? '#D4A24A' : isHovered || isSelected ? lightenColor(color, 0.3) : color;
       ctx.fill();
 
       if (isHovered || isSelected) {
@@ -147,7 +159,7 @@ export function ForceGraph({
         ctx.font = `${fontSize}px sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
-        ctx.fillStyle = isSearchMatch ? '#fbbf24' : 'rgba(255,255,255,0.85)';
+        ctx.fillStyle = isSearchMatch ? '#D4A24A' : 'rgba(255,255,255,0.85)';
         ctx.fillText(label, x, y + r + 2 / globalScale);
       }
     }

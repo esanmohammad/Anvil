@@ -11,8 +11,12 @@ import { HomePage } from './components/home/HomePage.js';
 import { KnowledgeGraphPage } from './components/knowledge-graph/KnowledgeGraphPage.js';
 
 import { ReviewPage } from './components/review/ReviewPage.js';
-import { TestGenPage } from './components/test-gen/TestGenPage.js';
+import { TestSpecPage } from './components/test/TestSpecPage.js';
+import { BoundTestsRegistry } from './components/bound-tests/BoundTestsRegistry.js';
+import { ContractsMapPage } from './components/contracts/ContractsMapPage.js';
+import { TriagePanel } from './components/ci-triage/TriagePanel.js';
 import { PlanPage } from './components/plan/PlanPage.js';
+import { PlanCompare } from './components/plan/PlanCompare.js';
 import { SettingsPage } from './components/settings/SettingsPage.js';
 import type { ActivityEntry } from './components/output/ActivityLine.js';
 import { OutputPanel } from './components/output/OutputPanel.js';
@@ -26,6 +30,16 @@ import type { ProjectInfo } from './context/ProjectContext.js';
 import type { RunSummary } from './components/history/RunRow.js';
 import type { OutputChunk } from '../server/types.js';
 import { ArrowLeft, Square, RotateCcw, Play } from 'lucide-react';
+import { CostBreachModal } from './components/pipeline/CostBreachModal.js';
+import type { CostBreachModalBreach } from './components/pipeline/CostBreachModal.js';
+import { CostBreachToast } from './components/pipeline/CostBreachToast.js';
+import { CostMeter } from './components/pipeline/CostMeter.js';
+import { StageSpendPanel } from './components/pipeline/StageSpendPanel.js';
+import { PausedBanner } from './components/pipeline/PausedBanner.js';
+import { PlanReviewModal } from './components/pipeline/PlanReviewModal.js';
+import { usePausedRuns } from './components/pipeline/usePausedRuns.js';
+import { CostBreachHistoryPage } from './components/cost-breaches/CostBreachHistoryPage.js';
+import { MemoryPage } from './components/memory/MemoryPage.js';
 
 // ---------------------------------------------------------------------------
 // Raw content cleaner — strips JSON, tool inputs, commands from Claude's text
@@ -96,6 +110,10 @@ interface DashboardStageState {
     cost: number;
     error: string | null;
   }>;
+  /** Phase 8 — registry-resolved model id for this stage. */
+  resolvedModel?: string;
+  /** Phase 8 — tool-permission classes enforced for this stage. */
+  permissionClasses?: ('read' | 'write' | 'exec')[];
 }
 
 interface DashboardPipeline {
@@ -174,6 +192,11 @@ function toPipelineData(pipeline: DashboardPipeline | null): PipelineData | null
         cost: r.cost,
         error: r.error,
       })),
+      // Phase 8 — propagate routing decision from the server so the
+      // pipeline view can show "build → qwen3:14b" badges + 🔒/📝/⚡
+      // permission glyphs.
+      resolvedModel: s.resolvedModel,
+      permissionClasses: s.permissionClasses,
     })),
     totalCost: pipeline.cost.estimatedCost,
     pendingApproval: null,
@@ -262,13 +285,34 @@ function App() {
   const [activities, setActivities] = useState<ActivityEntry[]>([]);
   const [changes, setChanges] = useState<ChangeEntry[]>([]);
   const [prs, setPrs] = useState<import('./components/pr-board/usePRData.js').PRData[]>([]);
+  const [prsLoading, setPrsLoading] = useState(false);
   const [historySelectedRunId, setHistorySelectedRunId] = useState<string | null>(null);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [actionPending, setActionPending] = useState<string | null>(null); // 'build' | 'fix' | 'research' | null
   const [activeRunsList, setActiveRunsList] = useState<Array<{
     id: string; type: string; project: string; description: string;
     model: string; status: string; startedAt: number; activityCount: number;
+    completedAt?: number;
+    stages?: Array<{
+      name: 'fix' | 'validate' | 'fix-loop';
+      status: 'pending' | 'running' | 'completed' | 'failed';
+      attempt?: number;
+      error?: string;
+      cost?: number;
+      startedAt?: string;
+      completedAt?: string;
+    }>;
+    error?: string;
+    totalCost?: number;
   }>>([]);
+  const [pendingBreach, setPendingBreach] = useState<(CostBreachModalBreach & { runId: string; project: string }) | null>(null);
+  const [breachModalOpen, setBreachModalOpen] = useState<boolean>(false);
+  const [breachDismissed, setBreachDismissed] = useState<boolean>(false);
+  const [runCost, setRunCost] = useState<{ runId: string; usd: number; limitUsd?: number; perStageUsd: Record<string, number> } | null>(null);
+  // Local UI state for the paused-run review modal. The pause data itself
+  // comes from the usePausedRuns hook below — this only tracks whether the
+  // user clicked "Review" on the banner.
+  const [reviewModalOpen, setReviewModalOpen] = useState<boolean>(false);
   const [viewingRunActivities, setViewingRunActivities] = useState<ActivityEntry[]>([]);
   const [overviewData, setOverviewData] = useState<{
     memories: Array<{ id: string; key: string; value: string; category: string; timestamp: number }>;
@@ -299,6 +343,22 @@ function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttempts = useRef(0);
   const MAX_RECONNECTS = 10;
+
+  // Paused-pipeline state. The hook subscribes to pipeline-paused /
+  // pipeline-resumed WS events; we only render the banner + modal for the
+  // run currently being viewed. Banner stays visible the whole time the
+  // pause is open; the modal opens on demand via the banner's Review button.
+  const pausedRunsWs = wsConnected ? wsRef.current : null;
+  const pausedRunsState = usePausedRuns(pausedRunsWs, currentProject?.name ?? null);
+  const activePause = pausedRunsState.pauses.find(
+    (p) => p?.pause?.runId === urlRunId && p?.pause?.status === 'paused-awaiting-user',
+  );
+
+  // Auto-close the review modal when the server-side pause goes away
+  // (timeout or external cancel) so the modal doesn't sit on a stale view.
+  useEffect(() => {
+    if (!activePause && reviewModalOpen) setReviewModalOpen(() => false);
+  }, [activePause, reviewModalOpen]);
 
   // Derived
   const activePipeline = toPipelineData(dashboardState?.activePipeline ?? null);
@@ -413,6 +473,7 @@ function App() {
 
       case 'prs':
         if (Array.isArray(msg.payload)) setPrs(msg.payload);
+        setPrsLoading(false);
         break;
 
       case 'overview':
@@ -450,6 +511,43 @@ function App() {
       case 'active-runs':
         if (Array.isArray(msg.payload)) setActiveRunsList(msg.payload);
         break;
+
+      case 'cost-snapshot': {
+        const snap = (msg.payload && typeof msg.payload === 'object') ? msg.payload as {
+          pendingBreach?: CostBreachModalBreach & { runId: string };
+          project?: string;
+          runId?: string;
+          run?: { usd: number; limitUsd?: number; perStageUsd: Record<string, number> };
+        } : null;
+        const pending = snap?.pendingBreach;
+        if (pending) {
+          setPendingBreach(() => pending);
+        } else if (snap && snap.runId === undefined) {
+          // Wildcard snapshot is project-wide truth — clear if it reports no breach.
+          setPendingBreach(() => null);
+          setBreachDismissed(() => false);
+        } else if (snap?.runId) {
+          // Run-scoped snapshot only authoritative for its own run.
+          setPendingBreach((prev) => (prev?.runId === snap.runId ? null : prev));
+        }
+        if (snap?.runId && snap.run) {
+          const runId = snap.runId;
+          const run = snap.run;
+          setRunCost(() => ({ runId, usd: run.usd, limitUsd: run.limitUsd, perStageUsd: run.perStageUsd }));
+        }
+        break;
+      }
+
+      case 'cost-breach': {
+        const payload = msg.payload as { breach?: { status?: string; runId?: string; project?: string } } | undefined;
+        const status = payload?.breach?.status;
+        // When breach resolves (raised/rejected/auto-resolved), close modal + toast.
+        if (status && status !== 'pending') {
+          setPendingBreach(() => null);
+          setBreachDismissed(() => false);
+        }
+        break;
+      }
 
       case 'agent-spawned': {
         // Don't clear actionPending here — wait for first agent-output
@@ -529,29 +627,42 @@ function App() {
             return [...prev, ...deduped];
           });
 
-          // Extract file changes from tool_use activities
+          // Extract file changes from tool_use activities. Two naming
+          // conventions live in the activity stream simultaneously:
+          //   - Claude CLI emits PascalCase: Edit / Write
+          //   - BuiltinToolExecutor (Ollama / OpenCode / OpenRouter
+          //     agentic paths) emits snake_case: edit / write_file
+          // Earlier this branch only matched Claude's casing, so every
+          // edit kimi/qwen made was silently dropped from the panel.
+          const editTools = new Set(['Edit', 'edit']);
+          const writeTools = new Set(['Write', 'write_file']);
           const newChanges: ChangeEntry[] = [];
           for (const activity of newActivities) {
             if (activity.kind !== 'tool_use') continue;
-            const tool = activity.tool;
-            if (tool !== 'Edit' && tool !== 'Write') continue;
+            const tool = activity.tool ?? '';
+            const isEdit = editTools.has(tool);
+            const isWrite = writeTools.has(tool);
+            if (!isEdit && !isWrite) continue;
 
-            // Parse the JSON content to extract file path and diff
+            // Parse the JSON content to extract file path and diff.
+            // Field name differs across conventions:
+            //   Claude:   file_path
+            //   Builtin:  path
             let filePath = '';
             let diff: string | undefined;
             const content = activity.content ?? '';
 
             try {
               const input = JSON.parse(content);
-              filePath = input.file_path ?? '';
+              filePath = (input.file_path ?? input.path ?? '') as string;
 
-              if (tool === 'Edit' && input.old_string && input.new_string) {
+              if (isEdit && input.old_string && input.new_string) {
                 const oldLines = (input.old_string as string).split('\n');
                 const newLines = (input.new_string as string).split('\n');
                 diff = `--- ${filePath}\n+++ ${filePath}\n` +
                   oldLines.map((l: string) => `- ${l}`).join('\n') + '\n' +
                   newLines.map((l: string) => `+ ${l}`).join('\n');
-              } else if (tool === 'Write' && input.content) {
+              } else if (isWrite && input.content) {
                 const lines = (input.content as string).split('\n');
                 diff = lines.map((l: string) => `+ ${l}`).join('\n');
               }
@@ -563,16 +674,21 @@ function App() {
 
             if (!filePath) continue;
 
-            // Shorten path for display
-            const shortPath = filePath.replace(/^\/Users\/[^/]+\/workspace\/[^/]+\//, '');
+            // Shorten path for display — strip the workspace prefix
+            // (matches both the `~/workspace/<repo>/` legacy layout and
+            // `~/prototyping/<project>/<repo>/` factory.yaml layout).
+            const shortPath = filePath
+              .replace(/^\/Users\/[^/]+\/workspace\/[^/]+\//, '')
+              .replace(/^\/Users\/[^/]+\/prototyping\/[^/]+\/[^/]+\//, '');
 
             newChanges.push({
               file: shortPath,
-              tool: tool as 'Edit' | 'Write',
-              summary: tool === 'Edit' ? 'Modified' : 'Created',
+              tool: (isEdit ? 'Edit' : 'Write') as 'Edit' | 'Write',
+              summary: isEdit ? 'Modified' : 'Created',
               timestamp: activity.timestamp,
               diff,
               repo: activity.repo,
+              stage: activity.stage,
             });
           }
           if (newChanges.length > 0) setChanges((prev) => [...prev, ...newChanges]);
@@ -590,6 +706,8 @@ function App() {
             tool: 'Write' as const,
             summary: a.summary || 'Artifact',
             timestamp: a.timestamp || Date.now(),
+            repo: a.repo,
+            stage: a.stage,
           }]);
         }
         break;
@@ -652,6 +770,49 @@ function App() {
       sendWs({ action: 'get-state' });
     }
   }, [urlRunId]);
+
+  // Subscribe to per-project cost-snapshot push so the modal/toast/meter all
+  // see breaches the moment the backend emits them. Server pushes a fresh
+  // snapshot on every cost ledger entry + every breach state change. Subscribe
+  // at the project level (no runId) so we catch breaches across all runs.
+  useEffect(() => {
+    const project = currentProject?.name;
+    if (!project) return;
+    sendWs({ action: 'subscribe-cost', project });
+    return () => { sendWs({ action: 'unsubscribe-cost', project }); };
+  }, [currentProject?.name]);
+
+  // Run-scoped subscription — when viewing /run/:id, also subscribe to that
+  // specific run so the run header CostMeter and StageSpendPanel get fresh
+  // per-run data on every cost ledger record.
+  useEffect(() => {
+    const project = currentProject?.name;
+    if (!project || !urlRunId) {
+      setRunCost(() => null);
+      return;
+    }
+    sendWs({ action: 'subscribe-cost', project, runId: urlRunId });
+    return () => { sendWs({ action: 'unsubscribe-cost', project, runId: urlRunId }); };
+  }, [currentProject?.name, urlRunId]);
+
+  // Tab-title pulse — when a breach is pending and the page isn't focused,
+  // prepend a marker so users in other tabs notice. Restored on resolve.
+  useEffect(() => {
+    const baseTitle = 'Anvil';
+    if (pendingBreach) {
+      document.title = `⚠ Cost breach · ${baseTitle}`;
+    } else {
+      document.title = baseTitle;
+    }
+    return () => { document.title = baseTitle; };
+  }, [pendingBreach]);
+
+  // Auto-open modal whenever a fresh breach lands (unless user explicitly
+  // dismissed it for this lifecycle — they can still re-open from the toast).
+  useEffect(() => {
+    if (pendingBreach && !breachDismissed) setBreachModalOpen(true);
+    if (!pendingBreach) setBreachModalOpen(false);
+  }, [pendingBreach, breachDismissed]);
 
   // Global keyboard shortcut
   useEffect(() => {
@@ -819,7 +980,6 @@ function App() {
         return <ProjectOverview
           projectName={currentProject?.name ?? 'None'}
           repos={overviewData.repos}
-          memories={overviewData.memories}
           conventions={overviewData.conventions}
           features={overviewData.features}
           kbStatus={overviewData.kbStatus ?? null}
@@ -896,7 +1056,7 @@ function App() {
                 <span style={{
                   fontSize: 11, fontWeight: 500, padding: '2px 8px',
                   borderRadius: 'var(--radius-xs)',
-                  background: 'rgba(52,211,153,0.12)', color: 'var(--color-success)',
+                  background: 'rgba(111,175,138,0.12)', color: 'var(--color-success)',
                   flexShrink: 0,
                 }}>
                   build
@@ -922,7 +1082,12 @@ function App() {
               </button>
             )}
             <div className="stagger" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-              {activeRunsList.map((r) => (
+              {[...activeRunsList].sort((a, b) => {
+                // Sort: running > paused > failed > completed; within same bucket, newest first.
+                const rank = (s: string) => s === 'running' ? 0 : s === 'paused' ? 1 : s === 'failed' ? 2 : 3;
+                const dr = rank(a.status) - rank(b.status);
+                return dr !== 0 ? dr : b.startedAt - a.startedAt;
+              }).map((r) => (
                 <button
                   key={r.id}
                   onClick={() => {
@@ -931,43 +1096,96 @@ function App() {
                   }}
                   className="card"
                   style={{
-                    display: 'flex', alignItems: 'center', gap: 12, width: '100%',
+                    display: 'flex', flexDirection: 'column', gap: 8, width: '100%',
                     cursor: 'pointer', textAlign: 'left', fontFamily: 'var(--font-sans)',
                   }}
                 >
-                  <span style={{
-                    width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
-                    background: r.status === 'running' ? 'var(--color-success)' : r.status === 'completed' ? 'var(--color-success)' : 'var(--color-error)',
-                    ...(r.status === 'running' ? { animation: 'pulse 2s ease-in-out infinite' } : {}),
-                  }} />
-                  <span style={{
-                    fontSize: 11, fontWeight: 500, padding: '2px 8px',
-                    borderRadius: 'var(--radius-xs)',
-                    background: r.type === 'build' ? 'rgba(52,211,153,0.12)' : r.type === 'fix' ? 'rgba(251,191,36,0.12)' : 'rgba(96,165,250,0.12)',
-                    color: r.type === 'build' ? 'var(--color-success)' : r.type === 'fix' ? 'var(--color-warning)' : 'var(--color-info)',
-                    flexShrink: 0,
-                  }}>
-                    {r.type === 'spike' ? 'research' : r.type}
-                  </span>
-                  <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color: 'var(--text-primary)' }}>{r.description}</span>
-                  <span style={{
-                    fontSize: 11, color: 'var(--text-tertiary)',
-                    fontFamily: 'var(--font-mono)',
-                    padding: '1px 6px', borderRadius: 'var(--radius-xs)',
-                    background: 'var(--bg-elevated-3)',
-                  }}>{r.project}</span>
-                  {r.status === 'running' && (
-                    <span
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        sendWs({ action: 'cancel-pipeline' });
-                        sendWs({ action: 'stop-run', runId: r.id });
-                      }}
-                      className="btn btn-danger btn-sm"
-                      style={{ flexShrink: 0 }}
-                    >
-                      Stop
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%' }}>
+                    <span style={{
+                      width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+                      background: r.status === 'running' ? 'var(--color-success)' : r.status === 'completed' ? 'var(--color-success)' : 'var(--color-error)',
+                      ...(r.status === 'running' ? { animation: 'pulse 2s ease-in-out infinite' } : {}),
+                    }} />
+                    <span style={{
+                      fontSize: 11, fontWeight: 500, padding: '2px 8px',
+                      borderRadius: 'var(--radius-xs)',
+                      background: r.type === 'build' ? 'rgba(111,175,138,0.12)' : r.type === 'fix' ? 'rgba(212,162,74,0.12)' : 'rgba(107,138,171,0.12)',
+                      color: r.type === 'build' ? 'var(--color-success)' : r.type === 'fix' ? 'var(--color-warning)' : 'var(--color-info)',
+                      flexShrink: 0,
+                    }}>
+                      {r.type === 'spike' ? 'research' : r.type}
                     </span>
+                    <span
+                      title={r.description}
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        fontSize: 13, fontWeight: 500,
+                        color: 'var(--text-primary)',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >{r.description}</span>
+                    <span style={{
+                      fontSize: 11, color: 'var(--text-tertiary)',
+                      fontFamily: 'var(--font-mono)',
+                      padding: '1px 6px', borderRadius: 'var(--radius-xs)',
+                      background: 'var(--bg-elevated-3)',
+                    }}>{r.project}</span>
+                    {r.status === 'running' && (
+                      <span
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          sendWs({ action: 'cancel-pipeline' });
+                          sendWs({ action: 'stop-run', runId: r.id });
+                        }}
+                        className="btn btn-danger btn-sm"
+                        style={{ flexShrink: 0 }}
+                      >
+                        Stop
+                      </span>
+                    )}
+                  </div>
+                  {r.stages && r.stages.length > 0 && (
+                    <div style={{
+                      display: 'flex', alignItems: 'center', gap: 6,
+                      paddingLeft: 20,
+                      fontSize: 11, fontFamily: 'var(--font-mono)',
+                      color: 'var(--text-tertiary)',
+                    }}>
+                      {r.stages.map((s, i) => {
+                        const dotColor =
+                          s.status === 'completed' ? 'var(--color-success)' :
+                          s.status === 'failed' ? 'var(--color-error)' :
+                          s.status === 'running' ? 'var(--accent)' :
+                          'var(--text-quaternary)';
+                        const labelColor =
+                          s.status === 'running' ? 'var(--text-primary)' :
+                          s.status === 'completed' ? 'var(--text-secondary)' :
+                          s.status === 'failed' ? 'var(--color-error)' :
+                          'var(--text-tertiary)';
+                        return (
+                          <React.Fragment key={`${s.name}-${i}`}>
+                            {i > 0 && <span style={{ color: 'var(--text-quaternary)' }}>→</span>}
+                            <span
+                              style={{
+                                display: 'inline-flex', alignItems: 'center', gap: 4,
+                                color: labelColor,
+                              }}
+                              title={s.error ?? `${s.name} ${s.status}${s.attempt ? ` (attempt ${s.attempt})` : ''}`}
+                            >
+                              <span style={{
+                                width: 6, height: 6, borderRadius: '50%',
+                                background: dotColor,
+                                ...(s.status === 'running' ? { animation: 'pulse 2s ease-in-out infinite' } : {}),
+                              }} />
+                              {s.name}{s.attempt && s.attempt > 1 ? `·${s.attempt}` : ''}
+                            </span>
+                          </React.Fragment>
+                        );
+                      })}
+                    </div>
                   )}
                 </button>
               ))}
@@ -1015,8 +1233,27 @@ function App() {
           );
         }
 
+        const showStageSpend = runCost && runCost.runId === urlRunId && Object.values(runCost.perStageUsd).some((v) => v > 0);
         return (
-          <div style={{ height: '100%', overflow: 'hidden' }}>
+          <div style={{ height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+            {activePause && (
+              <PausedBanner
+                data={activePause}
+                onReview={() => setReviewModalOpen(() => true)}
+                onCancel={() => pausedRunsState.resume(activePause.pause.runId, 'cancel')}
+              />
+            )}
+            {showStageSpend && runCost && (
+              <div style={{
+                padding: '8px 16px', borderBottom: '1px solid var(--separator)',
+                display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0,
+                background: 'var(--bg-elevated-1)',
+              }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <StageSpendPanel perStageUsd={runCost.perStageUsd} totalUsd={runCost.usd} defaultCollapsed />
+                </div>
+              </div>
+            )}
             {runActivities.length === 0 ? (
               <PendingView label="Waiting for output..." />
             ) : (
@@ -1058,33 +1295,53 @@ function App() {
             features={features}
             projects={projects.map((s) => ({ name: s.name, repoCount: s.repoCount ?? 0 }))}
             prs={prs.map((p) => ({ status: p.status, repo: p.repo }))}
+            ws={wsRef.current}
           />
         );
+
+      case 'cost-breaches':
+        return <CostBreachHistoryPage project={currentProject?.name ?? null} ws={wsRef.current} />;
+
+      case 'memory':
+        return <MemoryPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'pr-board':
         return (
           <PRBoardContainer
             prs={prs}
-            loading={false}
+            loading={prsLoading}
             onPRClick={(pr) => { if (pr.url) window.open(pr.url, '_blank'); }}
           />
         );
 
+      // ── Stateful pages — kept mounted as siblings below so progress
+      //    (running specs, generating plans, streaming reviews) survives
+      //    route changes. Return null here; the persistent host renders them.
       case 'review':
-        return <ComingSoonOverlay label="Review"><ReviewPage project={currentProject?.name ?? null} ws={wsRef.current} /></ComingSoonOverlay>;
-
-      case 'test-gen':
-        return <ComingSoonOverlay label="Test Generation"><TestGenPage project={currentProject?.name ?? null} ws={wsRef.current} /></ComingSoonOverlay>;
-
+      case 'tests':
       case 'plan':
-        return <ComingSoonOverlay label="Plan"><PlanPage project={currentProject?.name ?? null} ws={wsRef.current} /></ComingSoonOverlay>;
+        return null;
+
+      case 'plan-compare':
+        return <PlanCompare ws={wsRef.current} />;
+
+      case 'guards':
+        return <BoundTestsRegistry project={currentProject?.name ?? null} ws={wsRef.current} />;
+
+      case 'contracts':
+        return <ContractsMapPage project={currentProject?.name ?? null} ws={wsRef.current} />;
+
+      case 'triage':
+        return <TriagePanel project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'settings':
         return <SettingsPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'history':
         return <RunHistoryList
+          ws={wsRef.current}
           runs={runs}
+          loading={projectsLoading}
           initialSelectedId={historySelectedRunId}
           getRunStages={(runId: string) => {
             const run = runs.find((r) => r.id === runId);
@@ -1108,20 +1365,24 @@ function App() {
       label: r.label,
       path: r.path,
       primary: true,
-      badge: r.id === 'runs' ? activeRunsList.length || undefined : undefined,
+      comingSoon: r.comingSoon,
+      badge: r.id === 'runs'
+        ? activeRunsList.filter((run) => run.status === 'running' || run.status === 'paused').length || undefined
+        : undefined,
     })),
     ...secondaryRoutes.map((r) => ({
       id: r.id,
       label: r.label,
       path: r.path,
       secondary: true,
+      comingSoon: r.comingSoon,
     })),
   ];
 
   const handleNavigation = useCallback((item: NavItem) => {
     navigate(item.path);
     if (item.id === 'runs') sendWs({ action: 'get-active-runs' });
-    if (item.id === 'pr-board') sendWs({ action: 'refresh-prs' });
+    if (item.id === 'pr-board') { setPrsLoading(true); sendWs({ action: 'refresh-prs' }); }
     if (item.id === 'project') sendWs({ action: 'get-overview', project: currentProject?.name });
     if (item.id === 'knowledge-graph') sendWs({ action: 'get-kb-status', project: currentProject?.name });
   }, [navigate, currentProject]);
@@ -1151,13 +1412,16 @@ function App() {
     </>
   ) : null;
 
+  const showGlobalCostChip = !isRunView && runCost && (runCost.limitUsd ?? 0) > 0;
   const headerRight = isRunView ? (
     <>
-      {activePipeline?.totalCost != null && activePipeline.totalCost > 0 && (
+      {runCost && runCost.runId === urlRunId && (runCost.limitUsd ?? 0) > 0 ? (
+        <CostMeter totalUsd={runCost.usd} limitUsd={runCost.limitUsd!} compact />
+      ) : activePipeline?.totalCost != null && activePipeline.totalCost > 0 ? (
         <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)' }}>
           ${activePipeline.totalCost.toFixed(2)}
         </span>
-      )}
+      ) : null}
       {isPipelineLive && (
         <button
           onClick={() => {
@@ -1182,8 +1446,8 @@ function App() {
           }}
           className="btn btn-sm"
           style={{
-            background: 'rgba(52,211,153,0.1)', color: 'var(--accent)',
-            border: '1px solid rgba(52,211,153,0.2)', gap: 4,
+            background: 'var(--accent-muted)', color: 'var(--accent)',
+            border: '1px solid var(--accent-muted)', gap: 4,
           }}
         >
           {runs.find((r) => r.id === urlRunId)?.status === 'failed' ? (
@@ -1194,6 +1458,15 @@ function App() {
         </button>
       )}
     </>
+  ) : showGlobalCostChip && runCost ? (
+    <button
+      type="button"
+      onClick={() => navigate(`/run/${runCost.runId}`)}
+      title="Open run"
+      style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer' }}
+    >
+      <CostMeter totalUsd={runCost.usd} limitUsd={runCost.limitUsd!} compact />
+    </button>
   ) : null;
 
   return (
@@ -1221,8 +1494,105 @@ function App() {
         headerRight={headerRight}
       >
         {renderView()}
+        {/* ── Persistent page host ─────────────────────────────────────
+            These pages stay mounted across route changes so in-flight
+            work (a running test spec, a streaming plan, an open review)
+            is not lost. `key={projectName}` forces a clean remount when
+            the user switches projects. */}
+        <div
+          style={{
+            height: '100%',
+            display: currentRoute.id === 'tests' ? 'block' : 'none',
+          }}
+        >
+          <TestSpecPage
+            key={currentProject?.name ?? '__no_project__'}
+            project={currentProject?.name ?? null}
+            ws={wsRef.current}
+          />
+        </div>
+        <div
+          style={{
+            height: '100%',
+            display: currentRoute.id === 'plan' ? 'block' : 'none',
+          }}
+        >
+          <PlanPage
+            key={currentProject?.name ?? '__no_project__'}
+            project={currentProject?.name ?? null}
+            ws={wsRef.current}
+          />
+        </div>
+        <div
+          style={{
+            height: '100%',
+            display: currentRoute.id === 'review' ? 'block' : 'none',
+          }}
+        >
+          <ReviewPage
+            key={currentProject?.name ?? '__no_project__'}
+            project={currentProject?.name ?? null}
+            ws={wsRef.current}
+          />
+        </div>
       </DashboardLayout>
       <CommandPalette commands={commands} isOpen={cmdPaletteOpen} onClose={() => setCmdPaletteOpen(false)} />
+      {reviewModalOpen && activePause && (
+        <PlanReviewModal
+          data={activePause}
+          currentArtifact={
+            activePipeline?.stages?.[activePipeline.currentStage ?? 0]?.artifact ?? ''
+          }
+          pipelineStages={
+            activePipeline?.stages?.map((s: { name: string; label: string }) => ({
+              name: s.name,
+              label: s.label,
+            })) ?? []
+          }
+          currentStageIndex={activePipeline?.currentStage}
+          onResolve={(decision) => {
+            pausedRunsState.resume(activePause.pause.runId, decision);
+            setReviewModalOpen(() => false);
+          }}
+          onClose={() => setReviewModalOpen(() => false)}
+        />
+      )}
+      {pendingBreach && breachModalOpen && (
+        <CostBreachModal
+          breach={pendingBreach}
+          onRaise={(deltaUsd: number) => {
+            sendWs({ action: 'respond-cost-breach', runId: pendingBreach.runId, decision: 'raise', deltaUsd });
+            setBreachModalOpen(() => false);
+          }}
+          onReject={() => {
+            sendWs({ action: 'respond-cost-breach', runId: pendingBreach.runId, decision: 'reject' });
+            setBreachModalOpen(() => false);
+          }}
+          onExtend={(seconds: number) => {
+            sendWs({ action: 'respond-cost-breach', runId: pendingBreach.runId, decision: 'extend', extendSeconds: seconds });
+          }}
+          onClose={() => {
+            setBreachModalOpen(() => false);
+            setBreachDismissed(() => true);
+          }}
+        />
+      )}
+      {pendingBreach && !breachModalOpen && (
+        <CostBreachToast
+          breach={{
+            runId: pendingBreach.runId,
+            project: pendingBreach.project,
+            currentUsd: pendingBreach.currentUsd,
+            limitUsd: pendingBreach.limitUsd,
+            graceEndsAt: pendingBreach.graceEndsAt,
+          }}
+          onOpen={() => {
+            setBreachDismissed(() => false);
+            setBreachModalOpen(() => true);
+          }}
+          onDismiss={() => setBreachDismissed(() => true)}
+        />
+      )}
     </ProjectProvider>
   );
 }
@@ -1237,38 +1607,6 @@ function PendingView({ label }: { label: string }) {
       <span style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>
         {label}
       </span>
-    </div>
-  );
-}
-
-/** Overlay that blurs the child page and shows a "Coming Soon" badge */
-function ComingSoonOverlay({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div style={{ position: 'relative', height: '100%', overflow: 'hidden' }}>
-      <div style={{ filter: 'blur(2px) grayscale(0.4)', opacity: 0.45, pointerEvents: 'none', height: '100%' }}>
-        {children}
-      </div>
-      <div style={{
-        position: 'absolute', inset: 0,
-        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-        gap: 12,
-      }}>
-        <span style={{
-          padding: '6px 16px',
-          borderRadius: 'var(--radius-full)',
-          background: 'var(--bg-elevated-2)',
-          border: '1px solid var(--separator)',
-          color: 'var(--text-secondary)',
-          fontSize: 14, fontWeight: 600,
-          fontFamily: 'var(--font-sans)',
-          letterSpacing: '-0.01em',
-        }}>
-          {label} — Coming Soon
-        </span>
-        <span style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>
-          This feature is under development.
-        </span>
-      </div>
     </div>
   );
 }

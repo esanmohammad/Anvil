@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
-import { Hammer, Bug, Search, ChevronDown, ArrowRight, AlertTriangle, GitBranch } from 'lucide-react';
+import { Hammer, Bug, Search, ChevronDown, ArrowRight, GitBranch } from 'lucide-react';
+import { RoutingCard, type RoutingFlow } from '../common/RoutingCard.js';
 
 export type ActionMode = 'build' | 'fix' | 'research';
 
@@ -278,37 +279,20 @@ export function HomePage({
   onStartFeature,
   onQuickAction,
   onResumeFeature,
-  availableModels,
   ws,
 }: HomePageProps) {
   const [text, setText] = useState('');
-  const [selectedModel, setSelectedModel] = useState('');
-  const [modelTier, setModelTier] = useState<'fast' | 'balanced' | 'thorough' | null>(null);
   const [actionMode, setActionMode] = useState<ActionMode>('build');
-  const [budget, setBudget] = useState<{ used: number; limit: number } | null>(null);
   const [branches, setBranches] = useState<string[]>(['main']);
   const [baseBranch, setBaseBranch] = useState('main');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Set default model when availableModels arrives
-  useEffect(() => {
-    if (availableModels?.defaultModel && !selectedModel) {
-      setSelectedModel(availableModels.defaultModel);
-    }
-  }, [availableModels, selectedModel]);
-
-  // Fetch budget status and branches when project changes
+  // Fetch branches when project changes
   useEffect(() => {
     if (!ws || ws.readyState !== WebSocket.OPEN || !selectedProject) return;
     const handler = (evt: MessageEvent) => {
       try {
         const msg = JSON.parse(evt.data);
-        if (msg.type === 'budget-status' && msg.payload) {
-          const p = msg.payload;
-          if (p.maxPerDay || p.dailyLimit) {
-            setBudget({ used: p.todaySpent ?? p.dailyUsed ?? 0, limit: p.maxPerDay ?? p.dailyLimit ?? 200 });
-          }
-        }
         if (msg.type === 'branches' && msg.payload) {
           setBranches(msg.payload.branches || ['main']);
           setBaseBranch(msg.payload.default || 'main');
@@ -316,43 +300,14 @@ export function HomePage({
       } catch { /* ignore non-JSON */ }
     };
     ws.addEventListener('message', handler);
-    ws.send(JSON.stringify({ action: 'get-budget-status', project: selectedProject }));
     ws.send(JSON.stringify({ action: 'get-branches', project: selectedProject }));
     return () => ws.removeEventListener('message', handler);
   }, [ws, selectedProject]);
 
-  // Derive provider from selected model
-  const selectedProvider = useMemo(() => {
-    if (!availableModels || !selectedModel) return null;
-    for (const p of availableModels.providers) {
-      if (p.models.includes(selectedModel)) return p;
-    }
-    return null;
-  }, [availableModels, selectedModel]);
-
-  const providerUnavailable = selectedProvider ? !selectedProvider.available : false;
-
   const currentMode = modeConfig.find((m) => m.id === actionMode)!;
-  const canSubmit = selectedProject && text.trim().length > 0 && selectedModel && !providerUnavailable;
+  const canSubmit = !!selectedProject && text.trim().length > 0;
 
-  // Build model dropdown options — CLI providers active, API providers shown as MVP2
-  const modelOptions: DropdownOption[] = useMemo(() => {
-    if (!availableModels) return [];
-    const opts: DropdownOption[] = [];
-    for (const provider of availableModels.providers) {
-      const isCli = provider.tier === 'agentic' || provider.name === 'claude' || provider.name === 'gemini-cli';
-      for (const model of provider.models) {
-        opts.push({
-          value: model,
-          label: model,
-          group: isCli ? provider.name : `${provider.name} (MVP 2)`,
-          disabled: isCli ? !provider.available : true,
-          suffix: !isCli ? 'coming soon' : !provider.available ? 'not installed' : undefined,
-        });
-      }
-    }
-    return opts;
-  }, [availableModels]);
+  const routingFlow: RoutingFlow = actionMode === 'build' ? 'build' : actionMode === 'fix' ? 'fix' : 'research';
 
   // Build mode dropdown options
   const modeOptions: DropdownOption[] = modeConfig.map((m) => ({
@@ -379,9 +334,7 @@ export function HomePage({
     if (actionMode === 'build') {
       onStartFeature(trimmed, {
         project: selectedProject!,
-        model: selectedModel,
-        modelTier: modelTier ?? undefined,
-        provider: selectedProvider?.name,
+        model: '',
         baseBranch,
       });
     } else if (onQuickAction) {
@@ -389,11 +342,11 @@ export function HomePage({
         type: currentMode.actionType,
         description: trimmed,
         project: selectedProject!,
-        model: selectedModel,
+        model: '',
       });
     }
     setText('');
-  }, [canSubmit, text, actionMode, selectedProject, selectedModel, modelTier, selectedProvider, onStartFeature, onQuickAction, currentMode, baseBranch]);
+  }, [canSubmit, text, actionMode, selectedProject, onStartFeature, onQuickAction, currentMode, baseBranch]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -477,12 +430,7 @@ repos:
     language: go
   - name: frontend
     path: ./frontend
-    language: typescript
-
-budget:
-  max_per_run: 100
-  max_per_day: 200
-  alert_at: 80`}
+    language: typescript`}
           </pre>
         </div>
       </div>
@@ -565,63 +513,6 @@ budget:
           minWidth={90}
         />
 
-        {/* Model dropdown */}
-        {modelOptions.length > 0 ? (
-          <CustomDropdown
-            value={selectedModel}
-            options={modelOptions}
-            onChange={(v) => { setSelectedModel(v); setModelTier(null); }}
-            placeholder="Model..."
-            minWidth={160}
-          />
-        ) : (
-          <div style={{
-            height: 32,
-            padding: '0 12px',
-            background: 'var(--bg-elevated-2)',
-            border: '1px solid var(--separator)',
-            borderRadius: 'var(--radius-sm)',
-            color: 'var(--text-tertiary)',
-            fontSize: 12,
-            fontFamily: 'var(--font-sans)',
-            display: 'flex',
-            alignItems: 'center',
-          }}>
-            Loading models...
-          </div>
-        )}
-
-        {/* Model tier selector — overrides single model with per-stage routing */}
-        <div style={{ display: 'flex', gap: 2, height: 32 }}>
-          {([
-            { id: 'fast' as const, label: '$', title: 'Fast — lightweight model for most stages, mid-range for build' },
-            { id: 'balanced' as const, label: '$$', title: 'Balanced — mid-range for specs/build/validate, lightweight for the rest' },
-            { id: 'thorough' as const, label: '$$$', title: 'Thorough — mid-range for most stages, top-tier for specs' },
-          ]).map((tier, i) => (
-            <button
-              key={tier.id}
-              type="button"
-              title={tier.title}
-              onClick={() => setModelTier(modelTier === tier.id ? null : tier.id)}
-              style={{
-                padding: '0 10px',
-                height: 32,
-                background: modelTier === tier.id ? 'var(--accent)' : 'var(--bg-elevated-2)',
-                border: `1px solid ${modelTier === tier.id ? 'var(--accent)' : 'var(--separator)'}`,
-                borderRadius: i === 0 ? 'var(--radius-sm) 0 0 var(--radius-sm)' : i === 2 ? '0 var(--radius-sm) var(--radius-sm) 0' : '0',
-                color: modelTier === tier.id ? '#fff' : 'var(--text-secondary)',
-                cursor: 'pointer',
-                fontSize: 11,
-                fontWeight: modelTier === tier.id ? 600 : 400,
-                fontFamily: 'var(--font-sans)',
-                borderLeft: i > 0 ? 'none' : undefined,
-              }}
-            >
-              {tier.label}
-            </button>
-          ))}
-        </div>
-
         {/* Project dropdown */}
         <CustomDropdown
           value={selectedProject ?? ''}
@@ -683,65 +574,8 @@ budget:
         </button>
       </div>
 
-      {/* Missing provider warning */}
-      {providerUnavailable && selectedProvider && (
-        <div
-          role="alert"
-          style={{
-            width: '100%',
-            padding: '10px 14px',
-            background: 'rgba(251,191,36,0.08)',
-            border: '1px solid rgba(251,191,36,0.25)',
-            borderRadius: 'var(--radius-md)',
-            display: 'flex',
-            alignItems: 'flex-start',
-            gap: 10,
-            marginBottom: 12,
-          }}
-        >
-          <AlertTriangle size={16} strokeWidth={1.75} style={{ color: 'var(--color-warning)', flexShrink: 0, marginTop: 1 }} />
-          <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-            <strong>{selectedProvider.name}</strong> API key not configured.
-            {selectedProvider.envVar && (
-              <span style={{ color: 'var(--text-tertiary)' }}> ({selectedProvider.envVar})</span>
-            )}
-            <br />
-            <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-              Go to <strong>Settings</strong> to add it.
-            </span>
-          </div>
-        </div>
-      )}
-
-      {/* Budget indicator */}
-      {budget && (
-        <div style={{ width: '100%', marginBottom: 16 }}>
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            marginBottom: 4,
-          }}>
-            <span style={{ fontSize: 11, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>
-              Today: ${budget.used.toFixed(2)} / ${budget.limit.toFixed(2)}
-            </span>
-          </div>
-          <div style={{
-            height: 3,
-            background: 'var(--bg-elevated-3)',
-            borderRadius: 'var(--radius-full)',
-            overflow: 'hidden',
-          }}>
-            <div style={{
-              height: '100%',
-              width: `${Math.min((budget.used / budget.limit) * 100, 100)}%`,
-              background: budget.used / budget.limit > 0.9 ? 'var(--color-error)' : budget.used / budget.limit > 0.7 ? 'var(--color-warning)' : 'var(--accent)',
-              borderRadius: 'var(--radius-full)',
-              transition: 'width var(--duration-slow) ease-out',
-            }} />
-          </div>
-        </div>
-      )}
+      {/* Routing — read-only, sourced from ~/.anvil/stage-policy.yaml */}
+      <RoutingCard flow={routingFlow} ws={ws ?? null} />
 
       {/* Continue — in-progress features */}
       {inProgressFeatures.length > 0 && (

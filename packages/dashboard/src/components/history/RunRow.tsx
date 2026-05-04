@@ -82,14 +82,17 @@ export function RunRow({ run, isSelected, onClick }: RunRowProps) {
         <span style={{
           fontSize: 11, fontWeight: 500, padding: '1px 6px',
           borderRadius: 'var(--radius-xs)',
-          background: run.runType === 'fix' ? 'rgba(251,191,36,0.12)' : 'rgba(96,165,250,0.12)',
+          background: run.runType === 'fix' ? 'rgba(212,162,74,0.12)' : 'rgba(107,138,171,0.12)',
           color: run.runType === 'fix' ? 'var(--color-warning)' : 'var(--color-info)',
         }}>
           {run.runType === 'spike' ? 'research' : run.runType}
         </span>
       )}
 
-      <span style={{ flex: 1, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+      <span
+        title={run.feature}
+        style={{ flex: 1, minWidth: 0, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+      >
         {run.feature}
       </span>
 

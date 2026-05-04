@@ -1,0 +1,36 @@
+{
+  "name": "@anvil/core-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Core pipeline runner for Anvil — typed Step<I,O> graph, EventBus, StepRegistry, lifecycle hooks. Replaces cli's monolithic orchestrator if-tree.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; true",
+    "dev": "tsc -b --watch",
+    "test": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; node --test dist/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "@anvil/agent-core": "*",
+    "@anvil/memory-core": "*",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2"
+  }
+}

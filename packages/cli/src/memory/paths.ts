@@ -1,9 +1,15 @@
 // Memory path resolution — Section A.3
+// Phase 4: namespace-aware path resolver layered on top of the legacy
+// project-or-global path resolver.
 
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync, existsSync } from 'node:fs';
 import { getFFDirs } from '../home.js';
+import {
+  namespaceToRelativePath,
+  type MemoryNamespace,
+} from '@anvil/memory-core';
 
 /**
  * Sanitize a project name for use as a directory name.
@@ -51,4 +57,35 @@ export function resolveMemoryPath(project?: string): string {
   }
 
   return memPath;
+}
+
+/**
+ * Phase 4: resolve the directory for a `MemoryNamespace` tuple under
+ * `~/.anvil/memory/`. Mirrors `resolveMemoryPath` but follows the v2
+ * layout: global / user/<id> / project/<id> / repo/<projectId>/<repoId>.
+ *
+ * Falls back to the legacy `~/.anvil/memory/<project>/` directory when
+ * the project namespace points at an existing legacy directory — so
+ * existing data keeps loading without a migration.
+ */
+export function resolveNamespacePath(ns: MemoryNamespace): string {
+  const dirs = getFFDirs();
+  const v2Path = expandTilde(join(dirs.memory, namespaceToRelativePath(ns)));
+
+  // Backwards compatibility: if no v2 directory exists yet but a legacy
+  // `~/.anvil/memory/<projectId>/` does, return the legacy path so
+  // existing data is not stranded. The migration importer (Phase 13)
+  // will move it forward.
+  if (ns.scope === 'project' && ns.projectId && !existsSync(v2Path)) {
+    const legacy = expandTilde(
+      join(dirs.memory, sanitizeSystemName(ns.projectId)),
+    );
+    if (existsSync(legacy)) return legacy;
+  }
+  if (ns.scope === 'global' && !existsSync(v2Path)) {
+    if (existsSync(dirs.memoryGlobal)) return dirs.memoryGlobal;
+  }
+
+  if (!existsSync(v2Path)) mkdirSync(v2Path, { recursive: true });
+  return v2Path;
 }

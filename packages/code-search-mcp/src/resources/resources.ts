@@ -5,9 +5,9 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
-import { getKnowledgeBasePath } from '../core/config.js';
-import { loadAllProfiles } from '../core/repo-profiler.js';
-import { loadProfile } from '../core/repo-profiler.js';
+import { getKnowledgeBasePath } from '@anvil/knowledge-core';
+import { loadAllProfiles } from '@anvil/knowledge-core';
+import { loadProfile } from '@anvil/knowledge-core';
 
 export function registerResources(ctx: ServerContext) {
   return [

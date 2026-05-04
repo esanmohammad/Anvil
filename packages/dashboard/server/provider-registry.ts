@@ -33,7 +33,12 @@ export interface ModelInfo {
   displayName: string;    // e.g. 'Claude Sonnet 4.6', 'GPT-4o'
   provider: string;       // provider name
   capabilities: Capability[];
-  tier?: 'fast' | 'balanced' | 'powerful';  // rough performance tier
+  /**
+   * Rough performance/cost tier. `'local'` is the Phase 5 zero-cost tier —
+   * fully on-device (Ollama). Distinguished from `'fast'` so the resolver
+   * can prefer it for clarify/ship without disturbing remote-fast routing.
+   */
+  tier?: 'fast' | 'balanced' | 'powerful' | 'local';
 }
 
 export interface DiscoveryResult {
@@ -118,6 +123,24 @@ function detectProviders(): ProviderInfo[] {
 
   // ── API Providers (chat — single prompt/response via API key) ──
 
+  // Anthropic (Claude API key — consumed by the Claude CLI subprocess
+  // when auth'd via env, and by the adk adapter for the Claude path).
+  const anthropicAvailable = hasEnv('ANTHROPIC_API_KEY');
+  providers.push({
+    name: 'anthropic',
+    displayName: 'Anthropic API',
+    type: 'api',
+    available: anthropicAvailable,
+    envVar: 'ANTHROPIC_API_KEY',
+    capabilities: ['agentic', 'chat'],
+    setupHint: 'Set ANTHROPIC_API_KEY environment variable',
+    models: [
+      { id: 'claude-opus-4-7',           displayName: 'Claude Opus 4.7',   provider: 'anthropic', capabilities: ['chat'], tier: 'powerful' },
+      { id: 'claude-sonnet-4-6',         displayName: 'Claude Sonnet 4.6', provider: 'anthropic', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'claude-haiku-4-5-20251001', displayName: 'Claude Haiku 4.5',  provider: 'anthropic', capabilities: ['chat'], tier: 'fast' },
+    ],
+  });
+
   // OpenAI
   const openaiAvailable = hasEnv('OPENAI_API_KEY');
   providers.push({
@@ -126,32 +149,41 @@ function detectProviders(): ProviderInfo[] {
     type: 'api',
     available: openaiAvailable,
     envVar: 'OPENAI_API_KEY',
-    capabilities: ['chat', 'embedding'],
+    capabilities: ['agentic', 'chat', 'embedding'],
     setupHint: 'Set OPENAI_API_KEY environment variable',
     models: [
-      { id: 'gpt-4o', displayName: 'GPT-4o', provider: 'openai', capabilities: ['chat'], tier: 'powerful' },
-      { id: 'gpt-4o-mini', displayName: 'GPT-4o Mini', provider: 'openai', capabilities: ['chat'], tier: 'fast' },
-      { id: 'o3-mini', displayName: 'o3-mini', provider: 'openai', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'gpt-5',      displayName: 'GPT-5',      provider: 'openai', capabilities: ['chat'], tier: 'powerful' },
+      { id: 'gpt-5-mini', displayName: 'GPT-5 Mini', provider: 'openai', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'gpt-5-nano', displayName: 'GPT-5 Nano', provider: 'openai', capabilities: ['chat'], tier: 'fast' },
+      { id: 'o4-mini',    displayName: 'o4-mini',    provider: 'openai', capabilities: ['chat'], tier: 'balanced' },
     ],
   });
 
-  // Gemini API
-  const geminiApiAvailable = hasEnv('GOOGLE_API_KEY', 'GEMINI_API_KEY');
+  // Google ADK — agentic Gemini + Anthropic via Google's Agent
+  // Development Kit. Replaces the standalone `gemini` HTTP adapter for
+  // the pipeline path: ADK is `tier: agentic` (full tool loop), the
+  // bare HTTP adapter is `tier: function-calling` (no loop). Lights up
+  // when either ANTHROPIC_API_KEY or GEMINI_API_KEY is set since ADK
+  // dispatches to either family.
+  const adkAvailable = hasEnv('ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY');
   providers.push({
-    name: 'gemini-api',
-    displayName: 'Gemini API',
+    name: 'adk',
+    displayName: 'ADK (Anthropic + Gemini)',
     type: 'api',
-    available: geminiApiAvailable,
-    envVar: 'GOOGLE_API_KEY',
-    capabilities: ['chat', 'embedding'],
-    setupHint: 'Set GOOGLE_API_KEY or GEMINI_API_KEY environment variable',
+    available: adkAvailable,
+    envVar: 'GEMINI_API_KEY',
+    capabilities: ['agentic', 'chat'],
+    setupHint: 'Set GEMINI_API_KEY for Gemini path, ANTHROPIC_API_KEY for Claude-via-ADK path.',
     models: [
-      { id: 'gemini-2.5-pro-preview-05-06', displayName: 'Gemini 2.5 Pro', provider: 'gemini-api', capabilities: ['chat'], tier: 'powerful' },
-      { id: 'gemini-2.5-flash-preview-05-20', displayName: 'Gemini 2.5 Flash', provider: 'gemini-api', capabilities: ['chat'], tier: 'fast' },
+      { id: 'adk:gemini-2.5-pro',        displayName: 'Gemini 2.5 Pro (ADK)',        provider: 'adk', capabilities: ['agentic', 'chat'], tier: 'powerful' },
+      { id: 'adk:gemini-2.5-flash',      displayName: 'Gemini 2.5 Flash (ADK)',      provider: 'adk', capabilities: ['agentic', 'chat'], tier: 'balanced' },
+      { id: 'adk:gemini-2.5-flash-lite', displayName: 'Gemini 2.5 Flash Lite (ADK)', provider: 'adk', capabilities: ['agentic', 'chat'], tier: 'fast' },
+      { id: 'adk:claude-sonnet-4-6',     displayName: 'Claude Sonnet 4.6 (ADK)',     provider: 'adk', capabilities: ['agentic', 'chat'], tier: 'balanced' },
+      { id: 'adk:claude-opus-4-7',       displayName: 'Claude Opus 4.7 (ADK)',       provider: 'adk', capabilities: ['agentic', 'chat'], tier: 'powerful' },
     ],
   });
 
-  // OpenRouter
+  // OpenRouter — model menu samples each major vendor; keep slugs current.
   const openrouterAvailable = hasEnv('OPENROUTER_API_KEY');
   providers.push({
     name: 'openrouter',
@@ -159,12 +191,40 @@ function detectProviders(): ProviderInfo[] {
     type: 'api',
     available: openrouterAvailable,
     envVar: 'OPENROUTER_API_KEY',
-    capabilities: ['chat'],
+    capabilities: ['agentic', 'chat'],
     setupHint: 'Set OPENROUTER_API_KEY environment variable',
     models: [
-      { id: 'anthropic/claude-sonnet-4', displayName: 'Claude Sonnet 4 (via OR)', provider: 'openrouter', capabilities: ['chat'], tier: 'balanced' },
-      { id: 'openai/gpt-4o', displayName: 'GPT-4o (via OR)', provider: 'openrouter', capabilities: ['chat'], tier: 'powerful' },
-      { id: 'google/gemini-2.5-pro', displayName: 'Gemini 2.5 Pro (via OR)', provider: 'openrouter', capabilities: ['chat'], tier: 'powerful' },
+      { id: 'anthropic/claude-opus-4.7',   displayName: 'Claude Opus 4.7 (via OR)',   provider: 'openrouter', capabilities: ['chat'], tier: 'powerful' },
+      { id: 'anthropic/claude-sonnet-4.6', displayName: 'Claude Sonnet 4.6 (via OR)', provider: 'openrouter', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'openai/gpt-5',                displayName: 'GPT-5 (via OR)',             provider: 'openrouter', capabilities: ['chat'], tier: 'powerful' },
+      { id: 'openai/gpt-5-mini',           displayName: 'GPT-5 Mini (via OR)',        provider: 'openrouter', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'google/gemini-2.5-pro',       displayName: 'Gemini 2.5 Pro (via OR)',    provider: 'openrouter', capabilities: ['chat'], tier: 'powerful' },
+      { id: 'google/gemini-2.5-flash',     displayName: 'Gemini 2.5 Flash (via OR)',  provider: 'openrouter', capabilities: ['chat'], tier: 'balanced' },
+    ],
+  });
+
+  // OpenCode Go — agentic local-tier replacement for Ollama. Hosted
+  // open coding models behind https://opencode.ai/zen/go/v1.
+  const opencodeAvailable = hasEnv('OPENCODE_API_KEY');
+  providers.push({
+    name: 'opencode',
+    displayName: 'OpenCode Go',
+    type: 'api',
+    available: opencodeAvailable,
+    envVar: 'OPENCODE_API_KEY',
+    capabilities: ['agentic', 'chat'],
+    setupHint: 'Subscribe at https://opencode.ai/zen and paste the API key here. Models inherited from the local tier in ~/.anvil/models.yaml.',
+    models: [
+      { id: 'opencode/qwen3.5-plus', displayName: 'Qwen3.5 Plus', provider: 'opencode', capabilities: ['chat'], tier: 'fast' },
+      { id: 'opencode/qwen3.6-plus', displayName: 'Qwen3.6 Plus', provider: 'opencode', capabilities: ['chat'], tier: 'fast' },
+      { id: 'opencode/kimi-k2.6', displayName: 'Kimi K2.6', provider: 'opencode', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'opencode/glm-5.1', displayName: 'GLM-5.1', provider: 'opencode', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'opencode/deepseek-v4-flash', displayName: 'DeepSeek V4 Flash', provider: 'opencode', capabilities: ['chat'], tier: 'fast' },
+      { id: 'opencode/deepseek-v4-pro', displayName: 'DeepSeek V4 Pro', provider: 'opencode', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'opencode/glm-5', displayName: 'GLM-5', provider: 'opencode', capabilities: ['chat'], tier: 'fast' },
+      { id: 'opencode/kimi-k2.5', displayName: 'Kimi K2.5', provider: 'opencode', capabilities: ['chat'], tier: 'fast' },
+      { id: 'opencode/minimax-m2.7', displayName: 'MiniMax M2.7', provider: 'opencode', capabilities: ['chat'], tier: 'balanced' },
+      { id: 'opencode/mimo-v2.5-pro', displayName: 'MiMo V2.5 Pro', provider: 'opencode', capabilities: ['chat'], tier: 'balanced' },
     ],
   });
 
@@ -174,7 +234,7 @@ function detectProviders(): ProviderInfo[] {
     displayName: 'Ollama (Local)',
     type: 'api',
     available: false,  // will be updated async
-    capabilities: ['chat', 'embedding', 'reranking'],
+    capabilities: ['agentic', 'chat', 'embedding', 'reranking'],
     setupHint: 'Install Ollama from https://ollama.ai and run: ollama serve',
     models: [],  // will be populated async
   });
@@ -271,12 +331,14 @@ async function detectOllamaModels(): Promise<{ available: boolean; models: Model
       const caps: Capability[] = ['chat'];
       if (name.includes('embed') || name.includes('bge')) caps.push('embedding');
       if (name.includes('qwen') || name.includes('rerank')) caps.push('reranking');
+      // Phase 5: Ollama models are the local tier. Anything served from
+      // localhost is zero-cost and fastest-to-first-byte for short stages.
       return {
         id: name,
         displayName: name,
         provider: 'ollama',
         capabilities: caps,
-        tier: 'balanced' as const,
+        tier: 'local' as const,
       };
     });
 

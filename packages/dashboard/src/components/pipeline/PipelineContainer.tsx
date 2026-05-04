@@ -60,6 +60,11 @@ export interface PipelineStageData {
   cost?: number;
   perRepo?: boolean;
   repos?: RepoState[];
+  /** Model id resolved by the registry-driven resolver. Surfaced as a
+   *  badge so users can see "build → qwen3:14b" routing in real time. */
+  resolvedModel?: string;
+  /** Permission classes enforced for this stage's tool executor. */
+  permissionClasses?: ('read' | 'write' | 'exec')[];
 }
 
 export interface PipelineData {
@@ -128,13 +133,16 @@ export function PipelineContainer({
     if (!userSelected && isRunning) setSelectedStage(currentStage);
   }, [currentStage, isRunning, userSelected, setSelectedStage]);
 
-  // Build stage chips data
+  // Build stage chips data. Prefer the per-stage resolvedModel that the
+  // server stamps when the registry resolver fires; fall back to the
+  // legacy modelPerStage map for stages that haven't run yet.
   const modelPerStage = pipelineData?.modelPerStage;
   const stageChips: StageChipData[] = (pipelineData?.stages ?? []).map((s, idx) => ({
     name: s.name,
     status: s.status === 'waiting' ? 'running' : s.status,
     cost: s.cost,
-    modelLabel: modelPerStage?.[idx],
+    modelLabel: s.resolvedModel ?? modelPerStage?.[idx],
+    permissionClasses: s.permissionClasses,
   }));
 
   const inputPlaceholder = isWaiting
@@ -199,6 +207,16 @@ export function PipelineContainer({
       .filter((t) => t.length > 0)
       .join('\n\n');
     filteredChanges = changes.filter((c) => {
+      // Prefer the explicit stage tag the server stamps on artifact /
+      // tool_use change broadcasts — survives async ordering issues that
+      // a [first-activity, last-activity] timestamp window can't, and
+      // surfaces every per-repo artifact under the parent stage.
+      if (c.stage) {
+        return c.stage === selectedStageRaw
+          || c.stage.startsWith(selectedStageRaw + ':');
+      }
+      // Legacy entries without a stage tag — fall back to the timestamp
+      // window so older runs / non-broadcasted writes still render.
       if (filteredActivities.length === 0) return false;
       const minTs = filteredActivities[0].timestamp;
       const maxTs = filteredActivities[filteredActivities.length - 1].timestamp;
@@ -328,8 +346,8 @@ export function PipelineContainer({
                   style={{
                     display: 'flex', alignItems: 'center', gap: 6,
                     padding: '6px 12px', fontSize: 12, fontWeight: 500,
-                    background: 'rgba(52,211,153,0.1)', color: 'var(--accent)',
-                    border: '1px solid rgba(52,211,153,0.2)',
+                    background: 'var(--accent-muted)', color: 'var(--accent)',
+                    border: '1px solid var(--accent-muted)',
                     borderRadius: 'var(--radius-sm)', cursor: 'pointer',
                     fontFamily: 'var(--font-sans)',
                   }}
@@ -412,7 +430,12 @@ export function PipelineContainer({
           activities={filteredActivities}
           rawOutput={filteredRaw}
           changes={filteredChanges}
-          isRunning={isRunning}
+          isRunning={isRunning && (
+            selectedStage == null
+              ? true
+              : pipelineData?.stages?.[selectedStage]?.status === 'running'
+                || pipelineData?.stages?.[selectedStage]?.status === 'waiting'
+          )}
           onSendInput={onSendInput}
           inputPlaceholder={inputPlaceholder}
         />

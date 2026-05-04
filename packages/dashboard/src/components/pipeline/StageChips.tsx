@@ -10,6 +10,7 @@ export interface StageChipData {
   status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   cost?: number;
   modelLabel?: string;
+  permissionClasses?: ('read' | 'write' | 'exec')[];
 }
 
 export interface StageChipsProps {
@@ -22,7 +23,7 @@ export interface StageChipsProps {
 const stageDisplayNames: Record<string, string> = {
   clarify: 'Understanding',
   requirements: 'Requirements',
-  'project-requirements': 'Architecture',
+  'repo-requirements': 'Architecture',
   specs: 'Specification',
   tasks: 'Task Planning',
   build: 'Implementation',
@@ -94,7 +95,7 @@ export function StageChips({ stages, currentStage: _currentStage, onStageSelect,
               disabled={isPending}
               style={{
                 display: 'flex',
-                alignItems: 'center',
+                alignItems: 'flex-start',
                 gap: 10,
                 padding: '6px 8px',
                 background: isSelected ? 'var(--accent-subtle)' : 'transparent',
@@ -121,52 +122,77 @@ export function StageChips({ stages, currentStage: _currentStage, onStageSelect,
               }}
             >
               {/* Status indicator */}
-              {isCompleted && (
-                <CheckCircle2 size={16} strokeWidth={1.75} style={{ color: 'var(--accent)', flexShrink: 0 }} />
-              )}
-              {isRunning && (
-                <div className="status-dot-spin" style={{ width: 16, height: 16, flexShrink: 0 }} />
-              )}
-              {isFailed && (
-                <AlertTriangle size={16} strokeWidth={1.75} style={{ color: 'var(--color-error)', flexShrink: 0 }} />
-              )}
-              {isSkipped && (
-                <MinusCircle size={16} strokeWidth={1.75} style={{ color: 'var(--text-quaternary)', flexShrink: 0 }} />
-              )}
-              {isPending && (
-                <Circle size={16} strokeWidth={1.75} style={{ color: 'var(--text-quaternary)', flexShrink: 0 }} />
-              )}
-
-              {/* Stage name */}
-              <span style={{ flex: 1 }}>
-                {getDisplayName(stage.name)}
+              <span style={{ display: 'flex', alignItems: 'center', height: 20, flexShrink: 0 }}>
+                {isCompleted && (
+                  <CheckCircle2 size={16} strokeWidth={1.75} style={{ color: 'var(--accent)' }} />
+                )}
+                {isRunning && (
+                  <div className="status-dot-spin" style={{ width: 16, height: 16 }} />
+                )}
+                {isFailed && (
+                  <AlertTriangle size={16} strokeWidth={1.75} style={{ color: 'var(--color-error)' }} />
+                )}
+                {isSkipped && (
+                  <MinusCircle size={16} strokeWidth={1.75} style={{ color: 'var(--text-quaternary)' }} />
+                )}
+                {isPending && (
+                  <Circle size={16} strokeWidth={1.75} style={{ color: 'var(--text-quaternary)' }} />
+                )}
               </span>
 
-              {/* Model badge */}
-              {stage.modelLabel && (
-                <span style={{
-                  fontSize: 10,
-                  fontFamily: 'var(--font-mono)',
-                  color: 'var(--text-tertiary)',
-                  background: 'var(--bg-elevated-3)',
-                  padding: '1px 5px',
-                  borderRadius: 'var(--radius-sm)',
-                  lineHeight: '16px',
-                }}>
-                  {stage.modelLabel}
+              {/* Stage name (full width) + model/cost row below */}
+              <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <span
+                  style={{
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    lineHeight: '20px',
+                  }}
+                >
+                  {getDisplayName(stage.name)}
                 </span>
-              )}
 
-              {/* Cost */}
-              {isCompleted && stage.cost != null && stage.cost > 0 && (
-                <span style={{
-                  fontSize: 11,
-                  fontFamily: 'var(--font-mono)',
-                  color: 'var(--text-tertiary)',
-                }}>
-                  ${stage.cost.toFixed(2)}
-                </span>
-              )}
+                {(stage.modelLabel || (isCompleted && stage.cost != null)) && (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                    {stage.modelLabel && (
+                      <span
+                        title={`Resolved: ${stage.modelLabel}`}
+                        style={{
+                          fontSize: 10,
+                          fontFamily: 'var(--font-mono)',
+                          color: 'var(--text-tertiary)',
+                          background: 'var(--bg-elevated-3)',
+                          padding: '1px 5px',
+                          borderRadius: 'var(--radius-sm)',
+                          lineHeight: '14px',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          maxWidth: '100%',
+                        }}
+                      >
+                        {stage.modelLabel}
+                      </span>
+                    )}
+                    {isCompleted && stage.cost != null && (
+                      // Show cost even when $0.00 — confirms the stage was
+                      // tracked (e.g. fully cache-hit Anthropic call) instead
+                      // of leaving the user wondering whether it was missed.
+                      <span style={{
+                        fontSize: 11,
+                        fontFamily: 'var(--font-mono)',
+                        color: 'var(--text-tertiary)',
+                        flexShrink: 0,
+                      }}
+                      title={stage.cost === 0 ? 'Stage completed at $0.00 (likely full cache hit)' : undefined}
+                      >
+                        ${stage.cost.toFixed(2)}
+                      </span>
+                    )}
+                  </span>
+                )}
+              </span>
             </button>
           );
         })}

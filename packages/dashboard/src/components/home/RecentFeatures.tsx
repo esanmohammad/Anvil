@@ -1,5 +1,6 @@
 import React from 'react';
 import { CheckCircle2, XCircle, Clock } from 'lucide-react';
+import { Skeleton } from '../common/Skeleton.js';
 
 export interface RecentFeaturesProps {
   features: Array<{
@@ -10,6 +11,7 @@ export interface RecentFeaturesProps {
     totalCost: number;
     updatedAt: string;
   }>;
+  loading?: boolean;
   onResume?: (project: string, slug: string) => void;
 }
 
@@ -30,7 +32,40 @@ function relativeTime(dateStr: string): string {
   return `${days}d ago`;
 }
 
-export function RecentFeatures({ features, onResume }: RecentFeaturesProps) {
+export function RecentFeatures({ features, loading = false, onResume }: RecentFeaturesProps) {
+  if (loading) {
+    return (
+      <div style={{
+        display: 'flex',
+        gap: 10,
+        overflowX: 'hidden',
+        paddingBottom: 8,
+      }}>
+        {Array.from({ length: 4 }, (_, i) => (
+          <div
+            key={i}
+            style={{
+              minWidth: 200,
+              maxWidth: 240,
+              padding: 14,
+              background: 'var(--bg-elevated-2)',
+              border: '1px solid var(--separator)',
+              borderRadius: 'var(--radius-md)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+              flexShrink: 0,
+            }}
+          >
+            <Skeleton height={11} width="50%" />
+            <Skeleton height={13} width="80%" />
+            <Skeleton height={11} width="40%" />
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   if (features.length === 0) {
     return (
       <div style={{

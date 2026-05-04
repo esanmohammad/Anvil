@@ -12,7 +12,7 @@ import { scanTestPatterns } from '../learn/test-scanner.js';
 import { analyzePastRuns } from '../learn/run-analyzer.js';
 import { generateRules } from '../learn/rule-generator.js';
 import { IndexReader } from '../run/index-reader.js';
-import { extractConventions } from '../conventions/extractor.js';
+import { extractConventions } from '@anvil/convention-core';
 import pc from 'picocolors';
 
 export const learnEnhancedCommand = new Command('learn')
@@ -41,7 +41,11 @@ export const learnEnhancedCommand = new Command('learn')
     // 2. Extract basic conventions (existing Wave 4 functionality)
     info('Extracting coding conventions...');
     try {
-      extractConventions(projectName, repoPaths);
+      extractConventions(
+        { conventionsDir: anvilDirs.conventions, rulesDir: anvilDirs.conventionRules },
+        projectName,
+        repoPaths,
+      );
       success('Coding conventions extracted');
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

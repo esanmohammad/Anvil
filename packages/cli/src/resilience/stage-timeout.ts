@@ -16,7 +16,7 @@ export interface TimeoutResult {
 const DEFAULT_TIMEOUTS: StageTimeoutConfig = {
   clarify: 5 * 60_000,
   requirements: 10 * 60_000,
-  'project-requirements': 10 * 60_000,
+  'repo-requirements': 10 * 60_000,
   specs: 15 * 60_000,
   tasks: 15 * 60_000,
   build: 15 * 60_000,

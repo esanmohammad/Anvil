@@ -1,4 +1,4 @@
-/* Component classes — Claude-inspired Anvil Dashboard */
+/* Component classes — Anvil Dashboard (terminal-forge) */
 
 /* Cards */
 .card {
@@ -69,12 +69,12 @@
   font-size: var(--text-base);
 }
 .btn-primary {
-  background: linear-gradient(135deg, var(--accent), #2bc48a);
+  background: var(--accent);
   color: var(--text-inverse);
   box-shadow: var(--shadow-sm);
 }
 .btn-primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, #3ee0a8, var(--accent));
+  background: var(--accent-hover);
   box-shadow: var(--shadow-md);
 }
 .btn-secondary {
@@ -93,12 +93,12 @@
   background: var(--surface-hover);
 }
 .btn-danger {
-  background: rgba(248, 113, 113, 0.12);
+  background: rgba(201, 115, 115, 0.12);
   color: var(--color-error);
-  border: 1px solid rgba(248, 113, 113, 0.2);
+  border: 1px solid rgba(201, 115, 115, 0.20);
 }
 .btn-danger:hover:not(:disabled) {
-  background: rgba(248, 113, 113, 0.2);
+  background: rgba(201, 115, 115, 0.20);
 }
 
 /* Inputs */
@@ -149,15 +149,15 @@
   color: var(--accent);
 }
 .badge-error {
-  background: rgba(248, 113, 113, 0.16);
+  background: rgba(201, 115, 115, 0.16);
   color: var(--color-error);
 }
 .badge-warning {
-  background: rgba(251, 191, 36, 0.16);
+  background: rgba(212, 162, 74, 0.16);
   color: var(--color-warning);
 }
 .badge-success {
-  background: rgba(52, 211, 153, 0.16);
+  background: rgba(111, 175, 138, 0.16);
   color: var(--color-success);
 }
 .badge-neutral {
@@ -165,7 +165,7 @@
   color: var(--text-secondary);
 }
 .badge-info {
-  background: rgba(96, 165, 250, 0.16);
+  background: rgba(107, 138, 171, 0.16);
   color: var(--color-info);
 }
 

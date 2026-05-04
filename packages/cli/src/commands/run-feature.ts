@@ -11,12 +11,10 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { AgentRunner } from '../pipeline/stages/types.js';
-import { ProviderRegistry } from '../providers/registry.js';
-import type { ProviderName } from '../providers/types.js';
+import { ProviderRegistry, type ProviderName } from '@anvil/agent-core';
 import { error, success, info, warn } from '../logger.js';
 import { estimatePipelineCost, formatCostEstimate } from '../pipeline/cost-estimator.js';
-import { getModelForStage } from '../pipeline/model-router.js';
-import type { ModelTier } from '../pipeline/model-router.js';
+import { resolveModelForStage, ModelResolutionError, UnknownStageError } from '@anvil/core-pipeline';
 import { StageProgress } from '../ui/progress.js';
 import { printPipelineSummary } from '../ui/summary.js';
 import type { PipelineSummaryData, StageSummary } from '../ui/summary.js';
@@ -172,7 +170,6 @@ export const runFeatureCommand = new Command('run')
   .option('--approval', 'Require approval between stages')
   .option('--dry-run', 'Show estimated cost and plan without running')
   .option('-y, --yes', 'Skip cost confirmation prompt')
-  .option('--tier <tier>', 'Model routing tier: fast, balanced, thorough', 'balanced')
   .description('Run the full Anvil pipeline')
   .action(async (project: string, feature: string, opts: any) => {
     // --check-providers: print availability of all registered providers and exit
@@ -205,7 +202,6 @@ export const runFeatureCommand = new Command('run')
 
     const repoCount = countProjectRepos(project);
     const model = opts.model || 'claude-sonnet-4-6';
-    const tier = (opts.tier || 'balanced') as ModelTier;
 
     // Estimate KB size from knowledge-base directory
     const kbSize = estimateKbSize(project);
@@ -228,14 +224,21 @@ export const runFeatureCommand = new Command('run')
       console.error('');
       console.error(`  Project: ${project} (${repoCount} repo${repoCount !== 1 ? 's' : ''})`);
       console.error(`  Model:   ${model}`);
-      console.error(`  Tier:    ${tier}`);
       console.error('');
       console.error(pc.bold('  Pipeline Plan:'));
       for (let i = 0; i < estimate.stages.length; i++) {
         const s = estimate.stages[i];
-        const stageModel = getModelForStage(s.name, tier);
-        const shortModel = stageModel.includes('haiku') ? 'haiku' : stageModel.includes('opus') ? 'opus' : 'sonnet';
-        console.error(`    ${i + 1}. ${s.name.padEnd(22)} → ${shortModel.padEnd(8)} ~$${s.estimatedCost.toFixed(2)}`);
+        let stageModel: string;
+        try {
+          stageModel = resolveModelForStage(s.name).primary;
+        } catch (err) {
+          if (err instanceof ModelResolutionError || err instanceof UnknownStageError) {
+            stageModel = '(unconfigured)';
+          } else {
+            throw err;
+          }
+        }
+        console.error(`    ${i + 1}. ${s.name.padEnd(22)} → ${stageModel}  ~$${s.estimatedCost.toFixed(2)}`);
       }
       console.error('');
       console.error(`  Estimated cost: ${formatCostEstimate(estimate)}`);

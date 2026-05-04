@@ -3,7 +3,7 @@
  */
 
 import type { ServerContext } from '../server.js';
-import { getRetriever } from '../core/indexer.js';
+import { getRetriever } from '@anvil/knowledge-core';
 
 export function registerSearchTools() {
   return [

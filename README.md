@@ -1,48 +1,103 @@
 <div align="center">
 
-# Anvil
+<br />
 
-**AI agents that ship features across multi-repo codebases**
+<picture>
+  <img alt="Anvil" src="https://img.shields.io/badge/A%20N%20V%20I%20L-1a1a1a?style=for-the-badge&labelColor=1a1a1a&color=1a1a1a" height="80" />
+</picture>
 
-[![v0.0.3](https://img.shields.io/badge/anvil-v0.0.3-8B5CF6?style=flat-square)](https://github.com/esanmohammad/Anvil)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-[![MCP](https://img.shields.io/badge/MCP-compatible-7C3AED?style=flat-square)](https://modelcontextprotocol.io)
-[![Privacy](https://img.shields.io/badge/telemetry-none-22c55e?style=flat-square)]()
+<br /><br />
 
-[Pipeline](#anvil-pipeline) · [Code Search](#code-search-mcp) · [Quick Start](#quick-start) · [Docs](#configuration) · [Demo](https://drive.google.com/file/d/1xsJWrYI5C6aaoE5_n4DbOTaFie1L2d7G/view?usp=drive_link)
+# The provider-agnostic AI development pipeline
+
+<h3>
+  <i>Use your own keys. Mix providers per stage. Pay per token, not per seat.</i>
+</h3>
+
+<p>
+  Anvil ships features end-to-end — clarify, plan, build, review, PR —<br />
+  across every repo in your project, on whatever model is cheapest for each stage.<br />
+  <b>No vendor lock-in. No markup. No hosted plan.</b>
+</p>
 
 <br />
 
-[![Anvil dashboard showcase](./assets/Anvil_showcase.gif)](https://drive.google.com/file/d/1xsJWrYI5C6aaoE5_n4DbOTaFie1L2d7G/view?usp=drive_link)
+<p>
+  <a href="docs/getting-started.md"><img src="https://img.shields.io/badge/-Get%20started-2563eb?style=for-the-badge&logo=rocket&logoColor=white" alt="Get started"></a>
+  <a href="#what-you-can-do-with-anvil"><img src="https://img.shields.io/badge/-Features-1f2937?style=for-the-badge" alt="Features"></a>
+  <a href="#observability-opt-in"><img src="https://img.shields.io/badge/-Observability-1f2937?style=for-the-badge" alt="Observability"></a>
+  <a href="examples/"><img src="https://img.shields.io/badge/-Examples-1f2937?style=for-the-badge" alt="Examples"></a>
+  <a href="https://drive.google.com/file/d/1IHTQiLEQ4tulpdbUzI2iD5dmy82jBK-m/view?usp=sharing"><img src="https://img.shields.io/badge/-Demo-ef4444?style=for-the-badge&logo=googledrive&logoColor=white" alt="Demo"></a>
+</p>
 
-_Click the gif to watch the full demo_
+<p>
+  <img src="https://img.shields.io/badge/version-0.1.0-3b82f6.svg" alt="Version 0.1.0" />
+  <img src="https://img.shields.io/badge/license-MIT-3b82f6.svg" alt="MIT" />
+  <img src="https://img.shields.io/badge/node-%E2%89%A518-339933.svg" alt="Node 18+" />
+  <img src="https://img.shields.io/badge/TypeScript-5.8-3178c6.svg" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/providers-8-a855f7.svg" alt="8 providers" />
+  <img src="https://img.shields.io/badge/local%20models-Ollama%20%2B%20OpenCode-22c55e.svg" alt="Local models" />
+  <img src="https://img.shields.io/badge/MVP%202-active-f97316.svg" alt="MVP 2 active" />
+</p>
+
+<br />
+
+[![Anvil pipeline builder showcase](./assets/AI_Pipeline_Builder_Showcase.gif)](https://drive.google.com/file/d/1IHTQiLEQ4tulpdbUzI2iD5dmy82jBK-m/view?usp=sharing)
+
+<sub><i>Dashboard preview &mdash; pipeline orchestration, live agent activity, knowledge graph, cost ledger.<br />
+<b><a href="https://drive.google.com/file/d/1IHTQiLEQ4tulpdbUzI2iD5dmy82jBK-m/view?usp=sharing">Click the gif to watch the full demo</a></b></i></sub>
+
+<br /><br />
 
 </div>
 
 ---
 
+<div align="center">
+
+### **Plan on Claude. Build on Ollama. Review on GPT. Ship on a local model.**
+### One pipeline. Eight providers. Whatever's cheapest for each stage.
+
+</div>
+
+---
+
+## Why teams pick Anvil
+
 <table>
 <tr>
 <td width="50%" valign="top">
 
-### Anvil Pipeline
-
-**Describe a feature -- get PRs across all repos.**
-
-An 8-stage pipeline driven by AI agents with full architectural awareness: AST-parsed knowledge graphs, cross-repo dependency detection, convention learning, and cost-controlled model routing.
-
-[Get started](#quick-start)
+#### Mix providers within a single pipeline
+Routing is per-stage, not per-run. A single feature can flow through
+three different providers without you lifting a finger. The pipeline
+doesn't care which one ran which step.
 
 </td>
 <td width="50%" valign="top">
 
-### Code Search MCP
+#### Cheap by design
+Routing-by-stage means premium models only show up where premium
+models actually matter. Read-only research and tight fix loops stay
+on the free tier — *always*. Live cost ledger per call.
 
-**11 MCP tools for any AI client.**
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
 
-A standalone MCP server that gives Claude Code, Cursor, or any MCP client semantic search, dependency graphs, cross-repo analysis, and impact tracing over your codebase.
+#### No vendor SDK lock-in
+Every HTTP adapter is hand-rolled `fetch()`. No `@anthropic-ai/sdk`,
+no `openai` package, no LangChain, no Vercel AI SDK. Drop a model —
+your code keeps compiling.
 
-[Get started](#code-search-mcp)
+</td>
+<td width="50%" valign="top">
+
+#### Bring your own keys, or don't
+Ollama works fully offline. OpenCode's $10/mo Zen subscription
+replaces the entire local tier — no GPU required. Cloud is for the
+few stages that warrant it.
 
 </td>
 </tr>
@@ -50,111 +105,250 @@ A standalone MCP server that gives Claude Code, Cursor, or any MCP client semant
 
 ---
 
-## Quick Start
+## Quick start
 
-**Install from npm (recommended):**
-
-```bash
+```sh
+# 1. Install
 npm install -g @esankhan3/anvil-cli
-anvil doctor
+
+# 2. Set up a project (interactive — answers a handful of questions)
+anvil init
+
+# 3. Open the dashboard and ship
 anvil dashboard
 ```
 
-**Or clone and build from source:**
+That's the whole onboarding. `anvil init` creates `~/.anvil/`,
+seeds `models.yaml`, scaffolds your project's `factory.yaml`, and
+runs a health check. `anvil dashboard` boots the WebSocket
+control plane and opens the UI.
 
-```bash
-git clone https://github.com/esanmohammad/Anvil.git && cd anvil
-npm install && npm run build --workspaces
-./packages/cli/dist/index.js dashboard
-```
-
-Open `http://localhost:5173`, select your project, and describe what you want to build.
-
-- **Node.js >= 20**
-- **git** and **gh** (GitHub CLI) for PR creation
-- **Claude CLI** (`npm i -g @anthropic-ai/claude-code`) -- primary agent provider
-- **Gemini CLI** (optional) -- alternative provider
+> **First time?** The full walk-through — prerequisites, where to
+> get provider keys, what `anvil init` will ask you, troubleshooting
+> — lives in [`docs/getting-started.md`](docs/getting-started.md).
 
 ---
 
-## Anvil Pipeline
+## Provider-agnostic by design
 
-**Describe a feature. Anvil clarifies, plans, codes, tests, and opens PRs -- across every repo in your project.**
+Eight providers ship in the box. One config file picks them per
+stage. Each adapter speaks the same streaming format, the same
+`UpstreamError` retry shape, the same per-call cost calculation.
 
-```mermaid
-graph LR
-    A[Clarify] --> B[Requirements]
-    B --> C[Repo Reqs]
-    C --> D[Specs]
-    D --> E[Tasks]
-    E --> F[Build]
-    F --> G[Validate]
-    G --> H[Ship]
+<div align="center">
+
+| Provider | Tier slot | Best for |
+|:---|:---:|:---|
+| **OpenCode** (Zen) | `local` | Hosted open-coding models, $10/mo flat — replaces GPU-heavy Ollama |
+| **Ollama** | `local` | Fully offline, your own GPU, embeddings + reranking |
+| **Claude** (CLI) | `cheap` / `premium` | Best-in-class reasoning, native tool use |
+| **OpenAI** | `cheap` / `premium` | GPT-5, o-series reasoning |
+| **Gemini** | `cheap` / `premium` | Long context, Gemini 2.5 Pro |
+| **OpenRouter** | any | Single key, hundreds of models |
+| **Google ADK** | `premium` | When you need ADK's runner semantics |
+| **Gemini CLI** | utility | Subprocess fallback |
+
+</div>
+
+### One run, three providers, fourteen cents
+
+Routing is per-stage, not per-run. The same feature can flow
+through three providers without you lifting a finger:
+
+```
+  clarify     →  Ollama / OpenCode   local           ~ $0.00
+  plan        →  Claude Sonnet       deep analysis   ~ $0.05
+  build       →  Ollama / OpenCode   local           ~ $0.00
+  test        →  Ollama / OpenCode   local           ~ $0.00
+  validate    →  Claude Haiku        cheap + fast    ~ $0.01
+  review      →  Claude Sonnet       judgment-heavy  ~ $0.08
+  ship        →  Ollama / OpenCode   local           ~ $0.00
+                                                  ──────────
+                                                    ~ $0.14
 ```
 
-| Stage | What happens |
-|:--|:--|
-| **Clarify** | Agent explores the codebase, asks targeted questions, you answer in the dashboard |
-| **Requirements** | High-level cross-repo plan: architecture, scope, success criteria |
-| **Repo Requirements** | Per-repo breakdown with data flows, API changes, inter-service deps |
-| **Specs** | Technical specs per repo: API contracts, schemas, migrations |
-| **Tasks** | Granular implementation tasks with file-level scope and execution order |
-| **Build** | Agents write code on feature branches, parallel across independent repos |
-| **Validate** | Build, lint, test -- automatic fix loop (up to 5 iterations) |
-| **Ship** | Commit, push, open cross-linked PRs on GitHub |
+It's just YAML in `~/.anvil/stage-policy.yaml`. Premium models only
+appear where premium models actually matter. **Read-only research
+and the fix-retry loop are locked to free tier — they cannot
+escalate, by design.** A typical run with Ollama or OpenCode burns
+single-digit dollars on cloud calls.
 
-Each stage is checkpointed to `~/.anvil/features/`. Six agent personas (Clarifier, Architect, Analyst, Engineer, Tester, Lead) are assigned per stage. Model routing uses cost tiers -- $/$$/$$$ -- overridable per stage in `factory.yaml`.
+### Auto-failover when a provider misbehaves
+
+If a model 429s, 5xx's, hits a quota wall, or fails its liveness probe
+mid-run, Anvil's chain-walker **burns it for the rest of the run** and
+falls through to the next entry in the same tier — same provider or
+different, your call. The pipeline doesn't pause, doesn't surface a
+stack trace at the user, and doesn't double-charge by retrying the same
+broken model. Every fallback hop emits a routing event so you can see
+exactly which model was skipped and why.
+
+```
+clarify   →  adk:gemini-2.5-flash   ❌  (provider liveness fail)
+          ↪  opencode/kimi-k2.6     ✅  (next in chain, same tier)
+build     →  opencode/qwen3.5-plus  ❌  (429 — Alibaba upstream)
+          ↪  opencode/glm-5.1       ✅  (model burned for run, fallback proceeds)
+```
+
+Two layers of detection: a **proactive** liveness probe at run start
+(Ollama `/api/tags`, env-var presence for cloud) and a **reactive**
+duck-typed `UpstreamError` check on every adapter call. Configurable
+per-run cap on retry attempts in `models.yaml` (`walker.max_attempts`).
+
+### Cost ledger, live
+
+Every adapter call attaches a real `gen_ai.usage.cost` attribute
+computed from a vendored LiteLLM pricing snapshot. The dashboard
+shows you per-call, per-stage, per-run spend in real time. The
+OpenTelemetry export carries the same numbers if you want them in
+Langfuse, Tempo, or Honeycomb.
+
+**No estimates. No surprises.**
 
 ---
 
-## Key Features
+## What you can do with Anvil
 
 <table>
 <tr>
-<td width="50%" valign="top">
+<td width="33%" valign="top">
 
-**Knowledge Graph**
-
-AST parsing extracts functions, classes, imports, and relationships into `graph.json` per repo. 14 cross-repo edge detection strategies cover npm workspaces, shared types, HTTP routes, Kafka topics, gRPC services, database tables, and more. Interactive force-directed visualization in the dashboard.
-
-</td>
-<td width="50%" valign="top">
-
-**Memory and Learning**
-
-Auto-learns from successes, failures, and fix patterns after every pipeline run. Project memory and user profile persist across runs and are injected into agent prompts, so future runs improve without manual tuning.
+### Pipeline
+Nine-stage feature pipeline — clarify, plan, build, test, validate,
+ship — fanned out across every repo in your project. Per-stage
+tool permissions, validate-fix retry loops, chain-fallback across
+models when a provider 429s.
 
 </td>
-</tr>
-<tr>
-<td width="50%" valign="top">
+<td width="33%" valign="top">
 
-**Resilience and Recovery**
-
-Every stage is checkpointed. Resume after crash, sleep, budget hit, or manual stop -- full context restored. Interrupted pipelines appear in Active Runs on dashboard restart.
+### Plan
+Generates a structured markdown plan before any code is written.
+Files touched, contracts crossed, risks flagged, cost estimated.
+Plan validators catch missing tests, missing rollback strategies,
+wrong stage routing. The agent can't skip planning.
 
 </td>
-<td width="50%" valign="top">
+<td width="33%" valign="top">
 
-**Convention Detection**
-
-Automatically extracts file naming patterns, test conventions, import ordering, and error handling styles. Rules graduate from detected to validated to enforced as confidence increases.
+### PR Review
+Multi-pass automated review with evidence gates, incident binding,
+KB context, scope matching, dismissal filtering, and a verifier
+that runs the produced tests. Posts inline comments + a summary
+to GitHub.
 
 </td>
 </tr>
 <tr>
-<td width="50%" valign="top">
+<td width="33%" valign="top">
 
-**Budget Controls**
-
-Per-run and daily spend limits with browser notifications. Pipeline pauses cleanly when limits are hit and resumes after budget reset.
+### Memory
+Long-term project memory with five types — working, episodic,
+semantic, procedural, profile. Auto-learners propose; a sleeptime
+ratifier decides. Code-fact drift detection keeps memories honest
+when the underlying file changes.
 
 </td>
-<td width="50%" valign="top">
+<td width="33%" valign="top">
 
-**Auth Recovery**
+### Project
+Multi-repo first. One `factory.yaml` describes your repos,
+languages, build commands, and cross-repo connections. Ships
+with templates for TypeScript, Go, Python, Rust, monorepos, and
+Django + Celery.
 
-If your LLM provider auth expires mid-pipeline, the pipeline pauses, sends a browser notification, auto-opens re-login, and resumes once authenticated. No lost work.
+</td>
+<td width="33%" valign="top">
+
+### Knowledge Base
+AST-aware chunking via tree-sitter, hybrid retrieval (vector +
+BM25 + graph + rerank), project graph with 14 cross-repo edge
+strategies. Same engine the dashboard uses also exposed as an MCP
+server for any client.
+
+</td>
+</tr>
+<tr>
+<td width="33%" valign="top">
+
+### Settings
+Provider keys, model registry, stage policy, OTel endpoint — all
+editable in the dashboard UI. Writes to `~/.anvil/.env` with a
+strict allowlist; no env-var injection.
+
+</td>
+<td width="33%" valign="top">
+
+### Convention
+Extracts your codebase's real conventions — naming, imports,
+tests, error handling — formats them as living docs, and promotes
+recurring violations into hard rules. The agent stops making the
+same mistake twice.
+
+</td>
+<td width="33%" valign="top">
+
+### History
+Every run, replayable. Diffs, PR URLs, reviewer verdicts, cost
+breakdown, model fallbacks taken. Resume any failed run from the
+failed stage; rollback any shipped run with one click.
+
+</td>
+</tr>
+<tr>
+<td width="33%" valign="top">
+
+### Research
+Read-only investigation — *"what does this service do?"* or
+*"why does this fail?"* — that never escalates to premium models.
+Stays free-tier no matter what, because read-only shouldn't cost
+more.
+
+</td>
+<td width="33%" valign="top">
+
+### Bug Fix
+Targeted fix workflow with a tight retry loop. Locked to local +
+cheap tier so a failing test doesn't burn premium tokens trying
+the same thing five times.
+
+</td>
+<td width="33%" valign="top">
+
+### Observability
+OpenTelemetry spans with GenAI semantic conventions. Plug in
+Langfuse, Tempo, Honeycomb, or anything OTLP-compatible. Off by
+default. Privacy-safe prompt redaction. Real per-call cost ledger.
+
+</td>
+</tr>
+<tr>
+<td width="33%" valign="top">
+
+### Auto-failover
+Provider goes down, hits a quota wall, or fails its liveness probe?
+The chain-walker burns the model for the rest of the run and walks
+to the next entry in the same tier — proactive (liveness probe at
+run start) plus reactive (`UpstreamError` duck-typing on every call).
+No paused runs, no double charges.
+
+</td>
+<td width="33%" valign="top">
+
+### Resume + rollback
+Every run is checkpointed per stage. Resume from the failing stage
+without re-running the cheap stages before it. Roll back any shipped
+run with one click — branch + PR delete, restored workspace, audit
+log preserved.
+
+</td>
+<td width="33%" valign="top">
+
+### MCP server
+Anvil's knowledge-base retriever ships as a standalone MCP server.
+Use it from Claude Code, Claude Desktop, Cursor, or any MCP client —
+same hybrid retrieval (vector + BM25 + graph + rerank), same project
+graph, no dashboard required.
 
 </td>
 </tr>
@@ -162,102 +356,229 @@ If your LLM provider auth expires mid-pipeline, the pipeline pauses, sends a bro
 
 ---
 
-## Code Search MCP
+## Observability (opt-in)
 
-A standalone MCP server that gives any MCP client deep understanding of your codebase. Point it at a directory or GitHub org -- it discovers repos, parses code with tree-sitter, builds vector embeddings, constructs AST graphs, and detects cross-repo dependencies.
+Telemetry is **off by default**. When you turn it on, every adapter
+call emits an OpenTelemetry span with GenAI semantic conventions —
+prompt + completion tokens, cost, latency, model, provider, error
+class. Plug in any OTLP-compatible backend.
 
-**Install for Claude Code:**
+### Two switches, one env var each
 
-```bash
-claude mcp add code-search -- npx @esankhan3/code-search-mcp --local /path/to/repos
+```sh
+# 1. Export to a real OTLP collector — Langfuse, Tempo, Honeycomb, …
+echo 'OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel/v1/traces' >> ~/.anvil/.env
+echo 'OTEL_SERVICE_NAME=anvil-dashboard' >> ~/.anvil/.env
+
+# 2. Or dump spans to stderr — useful for debugging without a collector
+echo 'ANVIL_OTEL_CONSOLE=1' >> ~/.anvil/.env
 ```
 
-**Tool categories:**
+Restart the dashboard and traces start flowing.
 
-Search: `search_code`, `search_semantic`, `search_exact` | Graph: `get_repo_graph`, `get_cross_repo_edges` | Navigation: `find_callers`, `find_dependencies`, `impact_analysis` | Info: `list_repos`, `get_repo_profile`, `index_status`
+### Privacy + noise controls
 
-Full docs: [`packages/code-search-mcp/README.md`](packages/code-search-mcp/README.md)
+| Variable | Default | What it does |
+|:---|:---:|:---|
+| `ANVIL_OTEL_DISABLED` | unset | Hard kill-switch — set to `1` to disable everything |
+| `ANVIL_OTEL_RECORD_CONTENT` | `0` | Set `1` to include prompt + completion text on spans (truncated to 8 KB per attribute) |
+| `OTEL_LOG_LEVEL` | `NONE` | Set to `ERROR` / `INFO` / `DEBUG` to surface SDK errors when debugging |
+| `ANVIL_OTEL_BATCH` | unset | Set `1` to batch span exports (lower IO, slightly delayed arrival) |
+
+By default, spans carry **structure but not content** — model, cost,
+latency, error class, all attached. Prompts and completions stay on
+disk only.
+
+### Quick local stack: Langfuse
+
+Anvil ships a tuned Langfuse compose file at
+[`infra/observability/`](infra/observability/) — Langfuse 3.x +
+Postgres + ClickHouse + Redis + MinIO, pre-wired for the OTLP HTTP
+endpoint Anvil exports to. No external clone needed:
+
+```sh
+# Spin up the bundled stack on http://localhost:3000
+docker compose -f infra/observability/docker-compose.yml up -d
+
+# In ~/.anvil/.env (use the keys you create in the Langfuse UI)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:3000/api/public/otel/v1/traces
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer pk-lf-...
+OTEL_SERVICE_NAME=anvil-dashboard
+```
+
+Anvil's dashboard auto-detects the local Langfuse on port 3000 — if
+it's running and you haven't set `OTEL_EXPORTER_OTLP_ENDPOINT`
+yourself, the dashboard wires it up automatically. Tear down with
+`docker compose -f infra/observability/docker-compose.yml down -v`.
+
+### What you'll see
+
+- One **`anvil.agent.session`** parent span per pipeline stage,
+  linking every adapter call and resume into a single trace.
+- A **`gen_ai.invoke`** child span per LLM call, with
+  `gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`,
+  `gen_ai.usage.output_tokens`, and a real **`gen_ai.usage.cost`**
+  in USD.
+- **`gen_ai.tool.<name>`** child spans for every tool call the agent
+  makes, closed when the matching `tool_result` arrives.
+- A **routing-decision** attribute group (`anvil.routing.*`) on the
+  invoke span so you can see why a particular model was picked, and
+  which models got burned mid-run.
+
+The OTLP export carries the same numbers the dashboard's cost panel
+shows. One source of truth.
 
 ---
 
-## Privacy
+## How it all fits together
 
-**Zero telemetry. Zero logging. Zero phone-home.**
+Anvil is a TypeScript monorepo. Each package owns one concern; the
+dashboard ties them together.
 
-- Fully local -- dashboard, pipeline, knowledge graph, and indexing all run on your machine
-- You choose the LLM -- your code only goes to the provider you explicitly select
-- Open source MIT -- every line auditable, no obfuscated binaries
+```
+                         ┌────────────────────────┐
+                         │     anvil dashboard    │  the control plane
+                         │   (React + WebSocket)  │
+                         └────────────┬───────────┘
+                                      │ orchestrates
+                                      ▼
+                  ┌───────────────────────────────────────┐
+                  │         pipeline-runner               │
+                  │  9-stage walker · per-repo fan-out    │
+                  │  validate-fix loop · chain-fallback   │
+                  └───┬──────┬──────┬──────────┬──────┬───┘
+                      │      │      │          │      │
+                      ▼      ▼      ▼          ▼      ▼
+                  ┌──────┐ ┌────┐ ┌──────┐ ┌──────┐ ┌──────────┐
+                  │agent-│ │core│ │knwldg│ │memory│ │convention│
+                  │ core │ │pipe│ │ core │ │ core │ │  -core   │
+                  └──┬───┘ └─┬──┘ └───┬──┘ └───┬──┘ └────┬─────┘
+                     │       │        │        │         │
+                     ▼       ▼        ▼        ▼         ▼
+                       ~/.anvil/  · models.yaml · stage-policy.yaml
+                                  · runs/<id>/  · features/<slug>/
+                                  · knowledge-base/<project>/
+                                  · memories/  · conventions/
+```
+
+Three different fronts ride on the same engine:
+
+- **`anvil` CLI** — `init`, `doctor`, `dashboard` (the front door)
+- **Dashboard** — full pipeline control with live agent activity
+- **`code-search-mcp`** — same retriever exposed over MCP, usable
+  from Claude Code, Claude Desktop, Cursor, or any MCP client
+
+### Per-package deep dives
+
+| Package | What it owns |
+|:---|:---|
+| [`@esankhan3/anvil-cli`](packages/cli/) | CLI entry point + bundled dashboard |
+| [`@anvil-dev/dashboard`](packages/dashboard/) | React UI + WebSocket pipeline orchestrator |
+| [`@anvil/agent-core`](packages/agent-core/) | 8 LLM adapters, router, cost, OTel |
+| [`@anvil/core-pipeline`](packages/core-pipeline/) | Typed `Step<I,O>` graph + EventBus + hooks |
+| [`@anvil/knowledge-core`](packages/knowledge-core/) | AST chunks, graph, hybrid retrieval |
+| [`@anvil/memory-core`](packages/memory-core/) | Five-type memory, bi-temporal, drift detection |
+| [`@anvil/convention-core`](packages/convention-core/) | Convention extractor + promotion ledger |
+| [`@esankhan3/code-search-mcp`](packages/code-search-mcp/) | MCP server wrapping `knowledge-core` |
 
 ---
 
 ## Configuration
 
-A single `factory.yaml` in `~/.anvil/projects/<name>/` configures the pipeline:
+Three files run the show, all in `~/.anvil/`:
 
-```yaml
-version: 1
-project: my-platform
-workspace: ~/workspace/my-platform
+| File | What it does |
+|:---|:---|
+| `.env` | Provider keys + observability switches |
+| `models.yaml` | The model registry — local, cheap, premium tiers |
+| `stage-policy.yaml` | Which tier handles which pipeline stage |
 
-repos:
-  - name: api-gateway
-    path: ./api-gateway
-    language: go
-    github: myorg/api-gateway
-    commands:
-      build: make build
-      test: make test
+Working examples live in [`examples/anvil-home/`](examples/anvil-home/).
+Bootstrap with:
 
-budget:
-  max_per_run: 50
-  max_per_day: 150
-
-pipeline:
-  models:
-    clarify: claude-sonnet-4-6
-    build: claude-sonnet-4-6
+```sh
+cp examples/anvil-home/.env.example      ~/.anvil/.env  && chmod 600 ~/.anvil/.env
+cp examples/anvil-home/models.yaml       ~/.anvil/models.yaml
+cp examples/anvil-home/stage-policy.yaml ~/.anvil/stage-policy.yaml
 ```
 
-Providers: **Claude CLI** (up to 1M context on Opus 4.7 / Sonnet 4.6 / Opus 4.6, 200K on Haiku 4.5) and **Gemini CLI** (1M context). Both run full tool use. Additional providers planned.
-
-Context windows are resolved per-model via a family-rule catalog (`packages/dashboard/server/model-catalog.ts`) — no per-version hardcoding. Override any model with `ANVIL_CONTEXT_WINDOW_<MODEL_ID>=<tokens>` if you're on a custom endpoint.
-
-| Command | Description |
-|:--|:--|
-| `anvil init` | Scaffold a new project with `factory.yaml` |
-| `anvil doctor` | Check Node.js, git, gh, and provider availability |
-| `anvil dashboard` | Launch the web dashboard |
+`anvil init` does the equivalent for `models.yaml` automatically.
 
 ---
 
-## Contributing
+## Project setup examples
 
-```bash
-git clone https://github.com/esanmohammad/Anvil.git && cd anvil
-npm install && npm run build --workspaces
-cd packages/dashboard && npm run dev      # dashboard dev mode
-cd packages/code-search-mcp && node build.mjs  # build MCP server
-```
+Three opinionated starters in [`examples/`](examples/):
 
-## Packages
+- **[TypeScript monorepo](examples/typescript-monorepo/)** — Next.js
+  storefront + Express API, Postgres, Redis
+- **[Go microservices](examples/go-microservices/)** — multi-service
+  Go workspace
+- **[Python ML](examples/python-ml/)** — training + serving split
 
-Published on npm — install directly, no build step needed.
+Copy a `factory.yaml`, adjust paths, and `anvil init` against your
+own workspace.
 
-| Package | Install | What it is |
-|:--|:--|:--|
-| [`@esankhan3/anvil-cli`](https://www.npmjs.com/package/@esankhan3/anvil-cli) | `npm i -g @esankhan3/anvil-cli` | CLI + dashboard bundled together. Provides the `anvil` command (`init`, `doctor`, `dashboard`). [README](packages/cli/README.md) |
-| [`@esankhan3/code-search-mcp`](https://www.npmjs.com/package/@esankhan3/code-search-mcp) | `npx @esankhan3/code-search-mcp` | Standalone MCP server for multi-repo code search, AST graphs, and cross-repo impact analysis. Works with any MCP client. [README](packages/code-search-mcp/README.md) |
+---
 
-> **`packages/dashboard`** is an internal monorepo source folder — its compiled output (React bundle + Node server) is bundled inside `@esankhan3/anvil-cli` and published together. It is not published as a standalone npm package.
+## Built with
 
-## License
+We rely on the best of the open ecosystem:
 
-MIT -- Copyright (c) 2024-2026 Esan Mohammad
+[`tree-sitter`](https://tree-sitter.github.io/) ·
+[`LanceDB`](https://lancedb.com/) ·
+[`graphology`](https://graphology.github.io/) ·
+[`OpenTelemetry`](https://opentelemetry.io/) ·
+[`Model Context Protocol`](https://modelcontextprotocol.io/) ·
+[`React`](https://react.dev/) ·
+[`Vite`](https://vitejs.dev/) ·
+[`commander`](https://github.com/tj/commander.js)
+
+---
+
+## Status
+
+<table>
+<tr>
+<td valign="top" width="50%">
+
+**MVP 2 — Active**
+
+The dashboard is the canonical interface. The CLI ships
+`init`, `doctor`, `dashboard` today; more direct-scripting
+commands are on deck.
+
+</td>
+<td valign="top" width="50%">
+
+**Stable**
+
+Pipeline orchestration · multi-provider routing · knowledge
+indexing · memory ratification · convention extraction ·
+PR review · OpenTelemetry · dashboard UI.
+
+</td>
+</tr>
+</table>
+
+**In flight:** durable execution · richer plan validators · deeper
+RAG-eval · additional MCP tools.
+
+---
 
 <div align="center">
 
-Built with [TypeScript](https://www.typescriptlang.org/) | [React](https://react.dev/) | [Tree-sitter](https://tree-sitter.github.io/) | [LanceDB](https://lancedb.com/) | [Graphology](https://graphology.github.io/)
+## License
 
-[Issues](https://github.com/esanmohammad/Anvil/issues) · [Discussions](https://github.com/esanmohammad/Anvil/discussions)
+[MIT](LICENSE) — bring it to your team, fork it, ship it.
+
+<br />
+
+<sub><b>No hosted plan. No telemetry sent to us.<br />
+Your code, your keys, your budget. That's the deal.</b></sub>
+
+<br /><br />
+
+<sub>Built for engineers who want their AI tools to <b>respect their stack and their wallet</b>.</sub>
 
 </div>

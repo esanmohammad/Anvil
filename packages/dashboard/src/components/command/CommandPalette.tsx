@@ -79,13 +79,12 @@ export function CommandPalette({ commands, isOpen, onClose }: CommandPaletteProp
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div
-        className="frosted"
         style={{
           width: '100%',
           maxWidth: 520,
-          background: 'rgba(28,28,30,0.92)',
-          border: '1px solid var(--separator)',
-          borderRadius: 'var(--radius-lg)',
+          background: 'var(--bg-elevated-2)',
+          border: '1px solid var(--separator-strong)',
+          borderRadius: 'var(--radius-md)',
           boxShadow: 'var(--shadow-lg)',
           overflow: 'hidden',
           animation: 'fadeInUp var(--duration-fast) var(--ease-default)',

@@ -14,7 +14,7 @@ import type { RunRecord } from '../run/types.js';
 const STAGE_NAME_MAP: Record<string, number> = {
   clarify: 0,
   requirements: 1,
-  'project-requirements': 2,
+  'repo-requirements': 2,
   specs: 3,
   tasks: 4,
   build: 5,

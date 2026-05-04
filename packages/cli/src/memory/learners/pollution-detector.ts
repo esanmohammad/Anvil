@@ -1,8 +1,10 @@
 // Pollution detector — Section C.4
 
-import type { MemoryStore } from '../memory-store.js';
 import { getMemoryUsage } from '../usage-tracker.js';
-import type { MemoryEntry } from '../types.js';
+import type {
+  MemoryStore,
+  MemoryEntry,
+} from '@anvil/memory-core/legacy/index.js';
 
 /**
  * Detect memories that appear in 3+ failed runs and reduce their confidence by 20.

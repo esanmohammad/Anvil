@@ -9,11 +9,11 @@ const ARTIFACT_NAME = 'SPEC.md';
 
 export async function runProjectSpecsStage(
   ctx: StageContext,
-  projectRequirements: string,
+  repoRequirements: string,
   project: { name: string; repos: string[] },
 ): Promise<StageOutput> {
   const userPrompt = [
-    `# Project Requirements\n\n${projectRequirements}`,
+    `# Repo Requirements\n\n${repoRequirements}`,
     `# Project: ${project.name}`,
     `# Repos\n\n${project.repos.map((r) => `- ${r}`).join('\n')}`,
   ].join('\n\n');

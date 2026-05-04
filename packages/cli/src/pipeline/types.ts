@@ -14,7 +14,7 @@ export interface StageDefinition {
 export const PIPELINE_STAGES: StageDefinition[] = [
   { index: 0, name: 'clarify', persona: 'clarifier', parallelism: 'serial', timeout: 300000, validationRequired: true },
   { index: 1, name: 'requirements', persona: 'analyst', parallelism: 'serial', timeout: 600000, validationRequired: true },
-  { index: 2, name: 'project-requirements', persona: 'analyst', parallelism: 'parallel-per-project', timeout: 600000, validationRequired: true },
+  { index: 2, name: 'repo-requirements', persona: 'analyst', parallelism: 'parallel-per-project', timeout: 600000, validationRequired: true },
   { index: 3, name: 'specs', persona: 'architect', parallelism: 'parallel-per-project', timeout: 900000, validationRequired: true },
   { index: 4, name: 'tasks', persona: 'lead', parallelism: 'parallel-per-project', timeout: 900000, validationRequired: true },
   { index: 5, name: 'build', persona: 'engineer', parallelism: 'serial', timeout: 1800000, validationRequired: false },

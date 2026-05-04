@@ -12,7 +12,7 @@ export { GarbageDetector, type GarbageReport, type GarbageIssue, type GarbageDet
 // Section B — Output Validation Gates
 export { ValidatorRegistry, type StageValidator, type ValidationResult } from './validator-registry.js';
 export { ClarifyValidator } from './validators/clarify-validator.js';
-export { AnalystValidator, ProjectRequirementsValidator } from './validators/analyst-validator.js';
+export { AnalystValidator, RepoRequirementsValidator } from './validators/analyst-validator.js';
 export { ArchitectValidator } from './validators/architect-validator.js';
 export { LeadValidator } from './validators/lead-validator.js';
 export { EngineerValidator } from './validators/engineer-validator.js';

@@ -1,0 +1,42 @@
+{
+  "name": "@anvil/knowledge-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared knowledge stack (chunking, AST, embedders, vector store, hybrid retrieval) for cli + code-search-mcp.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b --watch",
+    "test": "tsc -b && node --test dist/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "@anvil/agent-core": "*",
+    "@lancedb/lancedb": "0.27.2",
+    "apache-arrow": "17.0.0",
+    "graphology": "0.26.0",
+    "graphology-communities-louvain": "2.0.2",
+    "graphology-metrics": "2.4.0",
+    "graphology-types": "0.24.8",
+    "tree-sitter-wasms": "0.1.13",
+    "web-tree-sitter": "0.26.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2"
+  }
+}

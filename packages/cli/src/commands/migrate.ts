@@ -2,7 +2,6 @@
 // Detect schema changes and generate database migrations via agent
 
 import { Command } from 'commander';
-import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -11,6 +10,7 @@ import { info, success, error, warn } from '../logger.js';
 import { findProject } from '../project/loader.js';
 import { getFFDirs } from '../home.js';
 import { execSync } from 'node:child_process';
+import { runWithAgent } from '@anvil/agent-core';
 
 const SCHEMA_PATTERNS = [
   '*.prisma',
@@ -281,72 +281,27 @@ export const migrateCommand = new Command('migrate')
 
         info('Spawning agent to generate migrations...');
 
-        // Spawn claude with the migration prompt
         const targetDir = repoDirs[0]?.path || process.cwd();
 
-        const bin = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? process.env.CLAUDE_BIN ?? 'claude';
-        const agentProcess = spawn(
-          bin,
-          [
-            '-p',
-            userPrompt,
-            '--output-format',
-            'stream-json',
-            '--verbose',
-          ],
-          {
+        try {
+          const result = await runWithAgent({
+            name: 'migrate',
+            persona: 'cli',
+            project: projectName,
+            stage: 'build',
+            prompt: userPrompt,
+            projectPrompt,
+            model: 'claude-3-5-sonnet',
             cwd: targetDir,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            env: {
-              ...process.env,
-              CLAUDE_SYSTEM_PROMPT: projectPrompt,
-            },
-          },
-        );
-
-        let stdout = '';
-        let stderr = '';
-
-        agentProcess.stdout.on('data', (data: Buffer) => {
-          const chunk = data.toString();
-          stdout += chunk;
-
-          // Stream progress indicators from NDJSON
-          for (const line of chunk.split('\n').filter(Boolean)) {
-            try {
-              const event = JSON.parse(line);
-              if (event.type === 'assistant' && event.message?.content) {
-                for (const block of event.message.content) {
-                  if (block.type === 'text' && block.text) {
-                    // Show truncated progress
-                    const preview = block.text.slice(0, 120).replace(/\n/g, ' ');
-                    info(pc.dim(preview));
-                  }
-                }
-              }
-            } catch {
-              // Not valid JSON line — skip
-            }
-          }
-        });
-
-        agentProcess.stderr.on('data', (data: Buffer) => {
-          stderr += data.toString();
-        });
-
-        const exitCode = await new Promise<number>((resolve) => {
-          agentProcess.on('close', (code) => resolve(code ?? 1));
-          agentProcess.on('error', (err) => {
-            error(`Failed to spawn agent: ${err.message}`);
-            resolve(1);
           });
-        });
-
-        if (exitCode !== 0) {
-          error(`Agent exited with code ${exitCode}`);
-          if (stderr) {
-            warn(stderr.slice(0, 500));
+          // Stream progress indicators from the assembled output.
+          for (const line of result.output.split('\n').filter(Boolean).slice(0, 6)) {
+            const preview = line.slice(0, 120).replace(/\n/g, ' ');
+            info(pc.dim(preview));
           }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          error(`Agent failed: ${msg}`);
           process.exitCode = 1;
           return;
         }

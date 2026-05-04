@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { RunRow } from './RunRow.js';
 import { RunDetail } from './RunDetail.js';
+import { RowSkeleton, Skeleton } from '../common/Skeleton.js';
 import type { RunSummary } from './RunRow.js';
 import type { PipelineStage } from '../../../server/types.js';
 
@@ -8,11 +9,13 @@ export interface RunHistoryListProps {
   runs: RunSummary[];
   getRunStages: (runId: string) => PipelineStage[];
   initialSelectedId?: string | null;
+  ws?: WebSocket | null;
+  loading?: boolean;
 }
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 
-export function RunHistoryList({ runs, getRunStages, initialSelectedId }: RunHistoryListProps) {
+export function RunHistoryList({ runs, getRunStages, initialSelectedId, ws, loading = false }: RunHistoryListProps) {
   const [selectedRun, setSelectedRun] = useState<string | null>(initialSelectedId ?? null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const selected = runs.find((r) => r.id === selectedRun);
@@ -43,15 +46,21 @@ export function RunHistoryList({ runs, getRunStages, initialSelectedId }: RunHis
           </button>
         ))}
         <div style={{ flex: 1 }} />
-        <span style={{ fontSize: 12, color: 'var(--text-tertiary)', alignSelf: 'center' }}>
-          {filteredRuns.length} {filteredRuns.length === 1 ? 'run' : 'runs'}
-        </span>
+        {loading ? (
+          <Skeleton width={60} height={14} />
+        ) : (
+          <span style={{ fontSize: 12, color: 'var(--text-tertiary)', alignSelf: 'center' }}>
+            {filteredRuns.length} {filteredRuns.length === 1 ? 'run' : 'runs'}
+          </span>
+        )}
       </div>
 
       <div style={{ display: 'flex', flex: 1, minHeight: 0, gap: 'var(--space-md)' }}>
         {/* Run list */}
         <div style={{ flex: 1, overflow: 'auto' }}>
-          {filteredRuns.length === 0 ? (
+          {loading ? (
+            <RowSkeleton count={8} height={56} />
+          ) : filteredRuns.length === 0 ? (
             <div style={{
               padding: 'var(--space-2xl)', textAlign: 'center',
               color: 'var(--text-tertiary)', fontSize: 14,
@@ -78,7 +87,7 @@ export function RunHistoryList({ runs, getRunStages, initialSelectedId }: RunHis
             background: 'var(--bg-elevated-1)',
             borderRadius: 'var(--radius-md)',
           }}>
-            <RunDetail run={selected} stages={getRunStages(selected.id)} />
+            <RunDetail run={selected} stages={getRunStages(selected.id)} ws={ws} />
           </div>
         )}
       </div>

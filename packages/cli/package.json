@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-cli",
-  "version": "0.0.3",
+  "version": "0.1.0",
   "description": "Anvil — AI-powered feature development pipeline (CLI + dashboard)",
   "type": "module",
   "license": "MIT",
@@ -38,23 +38,22 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm --prefix ../dashboard run build && tsc -b && node ./scripts/bundle-dashboard.mjs && cp src/templates/*.yaml dist/templates/ 2>/dev/null; true",
+    "build": "npm --prefix ../dashboard run build && tsc -b && node ./scripts/bundle-dashboard.mjs && cp src/templates/*.yaml dist/templates/ 2>/dev/null; mkdir -p dist/personas/prompts && cp src/personas/prompts/*.md dist/personas/prompts/ 2>/dev/null; true",
     "dev": "tsc -b --watch",
-    "test": "tsc -b && node --test dist/knowledge/__tests__/*.test.js"
+    "test": "echo 'cli has no per-workspace node:test files (knowledge tests moved to @anvil/knowledge-core; hooks integration test runs via root jest)'"
   },
   "dependencies": {
+    "@anvil/agent-core": "*",
+    "@anvil/convention-core": "*",
+    "@anvil/core-pipeline": "*",
+    "@anvil/knowledge-core": "*",
+    "@anvil/memory-core": "*",
     "commander": "^13.1.0",
-    "graphology": "0.26.0",
-    "graphology-communities-louvain": "2.0.2",
-    "graphology-metrics": "2.4.0",
-    "graphology-types": "0.24.8",
     "lucide-react": "1.8.0",
     "picocolors": "^1.1.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-force-graph-2d": "1.29.1",
-    "tree-sitter-wasms": "0.1.13",
-    "web-tree-sitter": "0.26.8",
     "ws": "^8.18.0",
     "yaml": "^2.7.1"
   },

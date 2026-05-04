@@ -5,5 +5,12 @@
     "rootDir": "./src",
     "composite": true
   },
+  "references": [
+    { "path": "../agent-core" },
+    { "path": "../knowledge-core" },
+    { "path": "../memory-core" },
+    { "path": "../convention-core" },
+    { "path": "../core-pipeline" }
+  ],
   "include": ["src/**/*.ts"]
 }

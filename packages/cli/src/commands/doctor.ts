@@ -1,8 +1,9 @@
 import { Command } from 'commander';
 import { execSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { parse as parseYaml } from 'yaml';
 import { getFFHome } from '../home.js';
 import pc from 'picocolors';
 
@@ -71,17 +72,58 @@ function checkGeminiCli(): CheckResult {
   return { name: 'gemini', ok: true, optional: true, message: extractVersion(out) };
 }
 
+type AuthStore = Record<string, { key?: string }>;
+
+function loadAuthStore(): AuthStore {
+  const authPath = join(homedir(), '.anvil', 'auth.json');
+  if (!existsSync(authPath)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(authPath, 'utf-8'));
+    return parsed && typeof parsed === 'object' ? (parsed as AuthStore) : {};
+  } catch {
+    return {};
+  }
+}
+
+function readAnvilEnvFile(): Record<string, string> {
+  const envPath = join(homedir(), '.anvil', '.env');
+  if (!existsSync(envPath)) return {};
+  try {
+    const content = readFileSync(envPath, 'utf-8');
+    const out: Record<string, string> = {};
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx < 1) continue;
+      out[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function isProviderConfigured(envVars: string[], authStore: AuthStore, dotenv: Record<string, string>, authKeys: string[]): boolean {
+  if (envVars.some((v) => !!process.env[v])) return true;
+  if (envVars.some((v) => !!dotenv[v])) return true;
+  if (authKeys.some((k) => !!authStore[k]?.key)) return true;
+  return false;
+}
+
 function checkProviderKeys(): CheckResult {
   const children: CheckResult[] = [];
+  const auth = loadAuthStore();
+  const dotenv = readAnvilEnvFile();
 
-  const openaiKey = !!process.env.OPENAI_API_KEY;
-  children.push({ name: 'OpenAI', ok: openaiKey, optional: true, message: openaiKey ? 'OPENAI_API_KEY set' : 'OPENAI_API_KEY not set' });
+  const openai = isProviderConfigured(['OPENAI_API_KEY'], auth, dotenv, ['openai']);
+  children.push({ name: 'OpenAI', ok: openai, optional: true, message: openai ? 'API key set' : 'OPENAI_API_KEY not set' });
 
-  const geminiKey = !!(process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY);
-  children.push({ name: 'Gemini', ok: geminiKey, optional: true, message: geminiKey ? 'API key set' : 'GOOGLE_API_KEY / GEMINI_API_KEY not set' });
+  const gemini = isProviderConfigured(['GOOGLE_API_KEY', 'GEMINI_API_KEY'], auth, dotenv, ['gemini']);
+  children.push({ name: 'Gemini', ok: gemini, optional: true, message: gemini ? 'API key set' : 'GOOGLE_API_KEY / GEMINI_API_KEY not set' });
 
-  const openrouterKey = !!process.env.OPENROUTER_API_KEY;
-  children.push({ name: 'OpenRouter', ok: openrouterKey, optional: true, message: openrouterKey ? 'OPENROUTER_API_KEY set' : 'OPENROUTER_API_KEY not set' });
+  const openrouter = isProviderConfigured(['OPENROUTER_API_KEY'], auth, dotenv, ['openrouter']);
+  children.push({ name: 'OpenRouter', ok: openrouter, optional: true, message: openrouter ? 'API key set' : 'OPENROUTER_API_KEY not set' });
 
   const ollamaAvail = tryExec('curl -s http://localhost:11434/api/tags 2>/dev/null');
   children.push({ name: 'Ollama', ok: !!ollamaAvail, optional: true, message: ollamaAvail ? 'running on localhost:11434' : 'not running' });
@@ -147,28 +189,52 @@ function findProjects(): ProjectEntry[] {
   return entries;
 }
 
-function getWorkspacePath(configPath: string): string | null {
+interface ProjectYamlShape {
+  workspace?: string;
+  repos?: Array<{ name?: string; path?: string }>;
+}
+
+function loadProjectYaml(configPath: string): ProjectYamlShape | null {
   try {
     const raw = readFileSync(configPath, 'utf-8');
-    const match = raw.match(/^workspace:\s+(.+)$/m);
-    if (match) {
-      const ws = match[1].replace(/^["']|["']$/g, '').trim().replace(/^~/, homedir());
-      return ws.startsWith('/') ? ws : join(homedir(), ws);
+    const parsed = parseYaml(raw);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as ProjectYamlShape;
     }
   } catch { /* ignore */ }
   return null;
 }
 
-function getRepoNames(configPath: string): string[] {
-  try {
-    const raw = readFileSync(configPath, 'utf-8');
-    const names: string[] = [];
-    const matches = raw.matchAll(/^\s{2,4}-\s+name:\s+(.+)$/gm);
-    for (const m of matches) {
-      names.push(m[1].trim());
-    }
-    return names;
-  } catch { return []; }
+function getWorkspacePath(yamlContent: ProjectYamlShape | null): string | null {
+  const ws = yamlContent?.workspace;
+  if (typeof ws !== 'string' || ws.length === 0) return null;
+  const expanded = ws.replace(/^~/, homedir());
+  return isAbsolute(expanded) ? expanded : join(homedir(), expanded);
+}
+
+interface RepoEntry {
+  name: string;
+  /** Path as declared in factory.yaml, relative or absolute. */
+  declaredPath: string;
+}
+
+function getRepoEntries(yamlContent: ProjectYamlShape | null): RepoEntry[] {
+  const repos = yamlContent?.repos;
+  if (!Array.isArray(repos)) return [];
+  const out: RepoEntry[] = [];
+  for (const r of repos) {
+    if (!r || typeof r !== 'object' || typeof r.name !== 'string' || r.name.length === 0) continue;
+    // path is optional — fall back to using `name` as the directory.
+    const declaredPath = typeof r.path === 'string' && r.path.length > 0 ? r.path : r.name;
+    out.push({ name: r.name, declaredPath });
+  }
+  return out;
+}
+
+function resolveRepoPath(wsPath: string, declaredPath: string): string {
+  if (isAbsolute(declaredPath)) return declaredPath;
+  // `./foo`, `foo`, `../foo` all resolve relative to the workspace root.
+  return resolve(wsPath, declaredPath);
 }
 
 function checkProjects(): CheckResult {
@@ -185,15 +251,16 @@ function checkProjects(): CheckResult {
   const children: CheckResult[] = [];
 
   for (const proj of projects) {
-    const wsPath = getWorkspacePath(proj.configPath);
-    const repoNames = getRepoNames(proj.configPath);
+    const yaml = loadProjectYaml(proj.configPath);
+    const wsPath = getWorkspacePath(yaml);
+    const repos = getRepoEntries(yaml);
 
     if (!wsPath) {
-      // No workspace configured — just check repo count
+      // No workspace configured — just count repo entries
       children.push({
         name: proj.name,
         ok: true,
-        message: `${repoNames.length} repo(s) configured (no workspace path)`,
+        message: `${repos.length} repo(s) configured (no workspace path)`,
       });
       continue;
     }
@@ -203,14 +270,16 @@ function checkProjects(): CheckResult {
       continue;
     }
 
-    // Count cloned repos
+    // Count cloned repos using each repo's declared `path` (falls back to
+    // `name` when the yaml omits a path). Resolves relative paths against
+    // the workspace root, so `./foo` and absolute paths both work.
     let cloned = 0;
-    for (const repoName of repoNames) {
-      const repoPath = join(wsPath, repoName);
+    for (const repo of repos) {
+      const repoPath = resolveRepoPath(wsPath, repo.declaredPath);
       if (existsSync(repoPath)) cloned++;
     }
 
-    const total = repoNames.length;
+    const total = repos.length;
     const allCloned = cloned === total;
     children.push({
       name: proj.name,
@@ -282,7 +351,25 @@ export async function runDoctor(): Promise<boolean> {
 
 export const doctorCommand = new Command('doctor')
   .description('Check project health and dependencies')
-  .action(async () => {
+  .option('--bootstrap-models', 'Write ~/.anvil/models.yaml from the bundled default if missing, then pull any ollama models the registry references but does not have installed locally')
+  .action(async (opts: { bootstrapModels?: boolean }) => {
+    if (opts.bootstrapModels) {
+      const { bootstrapModels, BootstrapError } = await import('./bootstrap-models.js');
+      try {
+        const result = await bootstrapModels();
+        if (result.failed.length > 0) {
+          process.exitCode = 1;
+        }
+        return;
+      } catch (err) {
+        process.stderr.write(
+          (err instanceof BootstrapError ? err.message : String(err)) + '\n',
+        );
+        process.exitCode = 1;
+        return;
+      }
+    }
+
     const allOk = await runDoctor();
     if (!allOk) {
       process.exitCode = 1;

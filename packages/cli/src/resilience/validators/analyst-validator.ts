@@ -48,9 +48,9 @@ export class AnalystValidator implements StageValidator {
   }
 }
 
-/** Validator for project-requirements stage (stage 2). */
-export class ProjectRequirementsValidator implements StageValidator {
-  readonly stageName = 'project-requirements';
+/** Validator for repo-requirements stage (stage 2 — per-repo decomposition). */
+export class RepoRequirementsValidator implements StageValidator {
+  readonly stageName = 'repo-requirements';
   private inner = new AnalystValidator();
 
   validate(output: string): ValidationResult {

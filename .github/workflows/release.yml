@@ -19,6 +19,8 @@ jobs:
       - run: npm ci
       - name: Build all packages
         run: |
+          npm -w @anvil/agent-core run build
+          npm -w @anvil/knowledge-core run build
           cd packages/cli && npx tsc -b
           cd ../dashboard && npx vite build
           cd ../code-search-mcp && node build.mjs

@@ -3,8 +3,8 @@
  */
 
 import type { ServerContext } from '../server.js';
-import { loadAllProfiles, loadProfile } from '../core/repo-profiler.js';
-import { discoverRepos } from '../core/indexer.js';
+import { loadAllProfiles, loadProfile } from '@anvil/knowledge-core';
+import { discoverRepos } from '@anvil/knowledge-core';
 
 export function registerProfileTools() {
   return [

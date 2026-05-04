@@ -1,8 +1,10 @@
 // Approach recorder — Section C.3
 
-import { createMemoryEntry } from '../entry-factory.js';
 import { createMemoryStore } from '../index.js';
-import type { MemoryEntry } from '../types.js';
+import {
+  createMemoryEntry,
+  type MemoryEntry,
+} from '@anvil/memory-core/legacy/index.js';
 
 /**
  * Record an approach taken for a feature, especially when escalation happened.

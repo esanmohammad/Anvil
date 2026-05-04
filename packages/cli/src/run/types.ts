@@ -43,7 +43,7 @@ export interface RunRecord {
 export const STAGE_NAMES: readonly string[] = [
   'clarify',
   'requirements',
-  'project-requirements',
+  'repo-requirements',
   'specs',
   'tasks',
   'build',

@@ -1,0 +1,160 @@
+/**
+ * Loads stage-policy.yaml — the per-stage routing requirement map.
+ *
+ * Resolution order (first match wins) — mirrors `models.yaml` so end
+ * users have a single mental model for "where does my customisation
+ * live":
+ *
+ *   1. process.env.ANVIL_STAGE_POLICY (full path)
+ *   2. <workspaceRoot>/.anvil/stage-policy.yaml         — per-workspace
+ *   3. ${ANVIL_HOME or $HOME/.anvil}/stage-policy.yaml  — per-user
+ *   4. Bundled default shipped with @anvil/core-pipeline
+ *
+ * Step 3 is the canonical home for end-user routing customisation —
+ * the same directory that already holds `models.yaml`.
+ */
+
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parse as parseYaml } from 'yaml';
+import type {
+  ModelCapability,
+  ModelComplexity,
+  ModelTier,
+} from '@anvil/agent-core';
+
+export interface StagePolicy {
+  capability: ModelCapability;
+  complexity: ModelComplexity;
+  prefer: ModelTier[];
+}
+
+export interface StagePolicyMap {
+  stages: Record<string, StagePolicy>;
+}
+
+export class StagePolicyLoadError extends Error {
+  constructor(public readonly path: string, public readonly cause: unknown) {
+    super(`Failed to load stage-policy.yaml at ${path}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'StagePolicyLoadError';
+  }
+}
+
+export class StagePolicyValidationError extends Error {
+  constructor(message: string) {
+    super(`stage-policy.yaml validation failed: ${message}`);
+    this.name = 'StagePolicyValidationError';
+  }
+}
+
+const CAPABILITIES: readonly ModelCapability[] = ['embed', 'rerank', 'code', 'reasoning', 'vision'];
+const COMPLEXITIES: readonly ModelComplexity[] = ['S', 'M', 'L'];
+const TIERS: readonly ModelTier[] = ['local', 'cheap', 'premium'];
+
+export interface LoadStagePolicyOptions {
+  workspaceRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  /** Override $HOME — used by tests that want a clean filesystem. */
+  homeDir?: string;
+}
+
+/** Returns the path of the canonical stage-policy.yaml. */
+export function findStagePolicyPath(opts: LoadStagePolicyOptions = {}): string {
+  const env = opts.env ?? process.env;
+
+  // 1. Explicit env override.
+  if (env.ANVIL_STAGE_POLICY) return env.ANVIL_STAGE_POLICY;
+
+  // 2. Per-workspace override.
+  if (opts.workspaceRoot) {
+    const ws = join(opts.workspaceRoot, '.anvil', 'stage-policy.yaml');
+    if (existsSync(ws)) return ws;
+  }
+
+  // 3. Per-user override at ~/.anvil/stage-policy.yaml — canonical home
+  // for end-user routing customisation, mirrors how models.yaml is
+  // resolved.
+  const home = opts.homeDir ?? homedir();
+  const anvilHome = env.ANVIL_HOME ?? join(home, '.anvil');
+  const userOverride = join(anvilHome, 'stage-policy.yaml');
+  if (existsSync(userOverride)) return userOverride;
+
+  // 4. Bundled default: shipped alongside this module after build (the
+  // core-pipeline build copies src/routing/*.yaml into dist/routing/).
+  // Fall back to the source path during local dev.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bundled = resolve(here, 'stage-policy.yaml');
+  if (existsSync(bundled)) return bundled;
+
+  // Source-tree fallback (when consumed from packages/core-pipeline/src/...):
+  const sourceFallback = resolve(here, '..', '..', 'src', 'routing', 'stage-policy.yaml');
+  if (existsSync(sourceFallback)) return sourceFallback;
+
+  return bundled; // surfaces a clear error in load*
+}
+
+export function loadStagePolicy(opts: LoadStagePolicyOptions = {}): StagePolicyMap {
+  const path = findStagePolicyPath(opts);
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (err) {
+    throw new StagePolicyLoadError(path, err);
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(raw);
+  } catch (err) {
+    throw new StagePolicyLoadError(path, err);
+  }
+  return validateStagePolicy(parsed, path);
+}
+
+export function validateStagePolicy(raw: unknown, sourcePath = '<inline>'): StagePolicyMap {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new StagePolicyValidationError(`expected object at top level (${sourcePath})`);
+  }
+  const top = raw as Record<string, unknown>;
+  const stagesRaw = top.stages;
+  if (!stagesRaw || typeof stagesRaw !== 'object' || Array.isArray(stagesRaw)) {
+    throw new StagePolicyValidationError(`'stages' must be an object`);
+  }
+  const out: Record<string, StagePolicy> = {};
+  for (const [stageName, entryRaw] of Object.entries(stagesRaw)) {
+    out[stageName] = validateStagePolicyEntry(entryRaw, stageName);
+  }
+  return { stages: out };
+}
+
+function validateStagePolicyEntry(rawEntry: unknown, stageName: string): StagePolicy {
+  const ctx = `stages.${stageName}`;
+  if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+    throw new StagePolicyValidationError(`${ctx}: expected object`);
+  }
+  const e = rawEntry as Record<string, unknown>;
+  const capability = requireEnum(e.capability, CAPABILITIES, `${ctx}.capability`);
+  const complexity = requireEnum(e.complexity, COMPLEXITIES, `${ctx}.complexity`);
+  if (!Array.isArray(e.prefer) || e.prefer.length === 0) {
+    throw new StagePolicyValidationError(`${ctx}.prefer: must be a non-empty array`);
+  }
+  const prefer: ModelTier[] = [];
+  for (let i = 0; i < e.prefer.length; i++) {
+    prefer.push(requireEnum(e.prefer[i], TIERS, `${ctx}.prefer[${i}]`));
+  }
+  return { capability, complexity, prefer };
+}
+
+function requireEnum<T extends string>(v: unknown, allowed: readonly T[], ctx: string): T {
+  if (typeof v !== 'string' || !allowed.includes(v as T)) {
+    throw new StagePolicyValidationError(`${ctx}: expected one of [${allowed.join(', ')}], got ${describe(v)}`);
+  }
+  return v as T;
+}
+
+function describe(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  return typeof v;
+}

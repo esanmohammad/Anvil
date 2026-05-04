@@ -86,6 +86,16 @@ export interface PipelineConfig {
     validate?: string;
     [key: string]: string | undefined;
   };
+  /**
+   * Phase 11.5 — per-stage tool-permission overrides. Layered ON TOP
+   * of the default stage policy: `allow_tools` extends the allowed set
+   * (e.g. add `bash` to `clarify`); `deny_tools` strips from it. UI
+   * bypass is a separate top-level flag, not in factory.yaml.
+   */
+  permissions?: Record<string, {
+    allow_tools?: string[];
+    deny_tools?: string[];
+  }>;
   approval_gates?: Array<{ after: string }>;
   custom_stages?: Record<string, {
     persona?: string;

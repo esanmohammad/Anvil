@@ -12,7 +12,7 @@ export const searchCommand = new Command('search')
   .option('--format <fmt>', 'Output format: table, json, paths', 'table')
   .action(async (project, query, opts) => {
     try {
-      const { getRetriever } = await import('../knowledge/indexer.js');
+      const { getRetriever } = await import('@anvil/knowledge-core');
       const retriever = await getRetriever(project);
 
       const results = await retriever.retrieve(query, {

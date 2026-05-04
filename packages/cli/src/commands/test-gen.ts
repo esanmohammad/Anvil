@@ -1,13 +1,14 @@
 // CLI command: anvil test-gen [project] — generate tests for changed files
 
 import { Command } from 'commander';
-import { execSync, spawn } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import pc from 'picocolors';
 import { info, success, error, warn } from '../logger.js';
+import { runWithAgent } from '@anvil/agent-core';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -125,68 +126,8 @@ function loadProjectConfig(project: string): Record<string, unknown> | null {
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Stream-JSON result parser
-// ---------------------------------------------------------------------------
-
-interface StreamResult {
-  output: string;
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
-  durationMs: number;
-}
-
-function parseStreamResult(child: ReturnType<typeof spawn>): Promise<StreamResult> {
-  return new Promise((resolve, reject) => {
-    let buffer = '';
-    let output = '';
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let costUsd = 0;
-    let durationMs = 0;
-
-    child.stdout?.on('data', (chunk: Buffer) => {
-      const data = chunk.toString();
-      process.stdout.write(data);
-
-      buffer += data;
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const msg = JSON.parse(trimmed);
-          if (msg.type === 'assistant' && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === 'text' && block.text) {
-                output += block.text;
-              }
-            }
-          } else if (msg.type === 'result') {
-            if (msg.result) output = msg.result;
-            inputTokens = msg.usage?.input_tokens ?? 0;
-            outputTokens = msg.usage?.output_tokens ?? 0;
-            costUsd = msg.total_cost_usd ?? 0;
-            durationMs = msg.duration_ms ?? 0;
-          }
-        } catch { /* skip non-JSON */ }
-      }
-    });
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      process.stderr.write(chunk);
-    });
-
-    child.on('close', (code) => {
-      resolve({ output, inputTokens, outputTokens, costUsd, durationMs });
-    });
-
-    child.on('error', reject);
-  });
-}
+// Stream-JSON result parsing now lives in agent-core's LanguageModelBridge —
+// `runWithAgent()` returns the assembled output + cost directly.
 
 // ---------------------------------------------------------------------------
 // Command
@@ -320,33 +261,25 @@ Rules:
     info('Spawning test generation agent...');
     console.error('');
 
-    const bin = resolveBinary();
-    const args: string[] = [
-      '-p', userPrompt,
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--project-prompt', projectPrompt,
-    ];
-
-    const child = spawn(bin, args, {
+    const result = await runWithAgent({
+      name: 'test-gen',
+      persona: 'cli',
+      project: project ?? 'unknown',
+      stage: 'test',
+      prompt: userPrompt,
+      projectPrompt,
+      model: 'claude-3-5-sonnet',
       cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
     });
-
-    // Close stdin — non-interactive
-    child.stdin?.end();
-
-    const result = await parseStreamResult(child);
 
     // 9. Summary
     console.error('');
     success(`Test generation complete for ${pc.bold(String(fileContents.length))} file(s)`);
-    if (result.costUsd > 0) {
-      console.error(`  Cost: $${result.costUsd.toFixed(4)} (${result.inputTokens} in / ${result.outputTokens} out)`);
+    if (result.cost.totalUsd > 0) {
+      console.error(`  Cost: $${result.cost.totalUsd.toFixed(4)} (${result.cost.inputTokens} in / ${result.cost.outputTokens} out)`);
     }
-    if (result.durationMs > 0) {
-      console.error(`  Duration: ${(result.durationMs / 1000).toFixed(1)}s`);
+    if (result.cost.durationMs > 0) {
+      console.error(`  Duration: ${(result.cost.durationMs / 1000).toFixed(1)}s`);
     }
 
     // 10. Optionally run tests to verify

@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { MemoryList } from './MemoryList.js';
-import type { Memory } from './MemoryList.js';
 import { CheckCircle2, XCircle, Clock, RefreshCw, Brain, Shield, DollarSign, Sparkles } from 'lucide-react';
+import { ComingSoonPanel } from '../common/ComingSoonPanel.js';
 
 export interface SystemRepo {
   name: string;
@@ -38,18 +37,9 @@ export interface ConventionRule {
   severity: 'error' | 'warning' | 'info';
 }
 
-export interface BudgetStatus {
-  dailyLimit: number | null;
-  dailyUsed: number;
-  perRunLimit: number | null;
-  configured: boolean;
-}
-
-
 export interface ProjectOverviewProps {
   projectName: string;
   repos: SystemRepo[];
-  memories: Memory[];
   conventions: string[];
   features: SystemFeature[];
   kbStatus: KBStatus | null;
@@ -59,7 +49,7 @@ export interface ProjectOverviewProps {
   ws?: WebSocket | null;
 }
 
-export function ProjectOverview({ projectName, repos, memories, conventions, features, kbStatus, kbRefreshing, kbProgress, onRefreshKB, ws }: ProjectOverviewProps) {
+export function ProjectOverview({ projectName, repos, conventions, features, kbStatus, kbRefreshing, kbProgress, onRefreshKB, ws }: ProjectOverviewProps) {
   if (!projectName || projectName === 'None') {
     return (
       <div style={{
@@ -71,16 +61,15 @@ export function ProjectOverview({ projectName, repos, memories, conventions, fea
     );
   }
 
-  // Conventions rules state
+  // Conventions rules state. Budget plumbing was removed when the
+  // overview's Budget section moved behind ComingSoonPanel — re-add when
+  // the spend ledger is ready to surface.
   const [conventionRules, setConventionRules] = useState<ConventionRule[]>([]);
-  const [budgetStatus, setBudgetStatus] = useState<BudgetStatus | null>(null);
   const [generatingConventions, setGeneratingConventions] = useState(false);
 
-  // Fetch conventions, budget via WS
   useEffect(() => {
     if (!ws || !projectName) return;
     ws.send(JSON.stringify({ action: 'get-conventions', project: projectName }));
-    ws.send(JSON.stringify({ action: 'get-budget-status', project: projectName }));
   }, [ws, projectName]);
 
   useEffect(() => {
@@ -92,23 +81,12 @@ export function ProjectOverview({ projectName, repos, memories, conventions, fea
           setConventionRules(msg.payload.rules || []);
           setGeneratingConventions(false);
         }
-        if (msg.type === 'budget-status' && msg.payload) {
-          const p = msg.payload;
-          setBudgetStatus({
-            dailyLimit: p.maxPerDay ?? p.dailyLimit ?? null,
-            dailyUsed: p.todaySpent ?? p.dailyUsed ?? 0,
-            perRunLimit: p.maxPerRun ?? p.perRunLimit ?? null,
-            configured: !!(p.maxPerDay || p.maxPerRun || p.dailyLimit || p.perRunLimit),
-          });
-        }
       } catch { /* ignore */ }
     };
     ws.addEventListener('message', handler);
     return () => ws.removeEventListener('message', handler);
   }, [ws]);
 
-  const completed = features.filter((f) => f.status === 'completed').length;
-  const failed = features.filter((f) => f.status === 'failed').length;
   const totalCost = features.reduce((sum, f) => sum + (f.totalCost || 0), 0);
   const languages = [...new Set(repos.map((r) => r.language).filter(Boolean))];
 
@@ -170,10 +148,9 @@ export function ProjectOverview({ projectName, repos, memories, conventions, fea
         />
       </Section>
 
-      {/* Memory */}
-      <Section title="Memory">
-        <MemoryList memories={memories} />
-      </Section>
+      {/* Memory section removed — superseded by the dedicated Memory page;
+          per-project memories no longer surface on the overview to avoid
+          duplicating that view. */}
 
       {/* Conventions — single unified section */}
       <Section title={
@@ -280,55 +257,20 @@ export function ProjectOverview({ projectName, repos, memories, conventions, fea
         )}
       </Section>
 
-      {/* Budget */}
+      {/* Budget — gated behind ComingSoonPanel to match the Settings tab.
+          The full daily/per-run UI is wired up but the underlying spend
+          ledger isn't surfaced consistently yet, so we hold the surface
+          to "Coming soon" rather than ship a half-functional widget. */}
       <Section title={
         <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <DollarSign size={14} style={{ color: 'var(--accent)' }} />
           Budget
         </span>
       }>
-        {!budgetStatus || !budgetStatus.configured ? (
-          <div style={{
-            padding: '14px 16px',
-            background: 'var(--bg-elevated-2)',
-            border: '1px solid var(--separator)',
-            borderRadius: 'var(--radius-md)',
-            color: 'var(--text-tertiary)',
-            fontSize: 13, lineHeight: 1.6,
-          }}>
-            No budget configured. Add a budget section to factory.yaml.
-          </div>
-        ) : (
-          <div style={{
-            padding: '14px 16px',
-            background: 'var(--bg-elevated-2)',
-            border: '1px solid var(--separator)',
-            borderRadius: 'var(--radius-md)',
-          }}>
-            {budgetStatus.dailyLimit != null && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>
-                  <span>Daily budget</span>
-                  <span style={{ fontFamily: 'var(--font-mono)' }}>${budgetStatus.dailyUsed.toFixed(2)} / ${budgetStatus.dailyLimit.toFixed(2)}</span>
-                </div>
-                <div style={{ height: 6, background: 'var(--bg-base)', borderRadius: 3, overflow: 'hidden' }}>
-                  <div style={{
-                    height: '100%',
-                    width: `${Math.min((budgetStatus.dailyUsed / budgetStatus.dailyLimit) * 100, 100)}%`,
-                    background: (budgetStatus.dailyUsed / budgetStatus.dailyLimit) > 0.9 ? 'var(--color-error)' : 'var(--accent)',
-                    borderRadius: 3,
-                    transition: 'width 0.3s ease',
-                  }} />
-                </div>
-              </div>
-            )}
-            {budgetStatus.perRunLimit != null && (
-              <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-                Per-run limit: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>${budgetStatus.perRunLimit.toFixed(2)}</span>
-              </div>
-            )}
-          </div>
-        )}
+        <ComingSoonPanel
+          title="Spend tracking"
+          description="Daily + per-run budget caps with live spend telemetry."
+        />
       </Section>
 
       {/* Feature history — vertical timeline */}

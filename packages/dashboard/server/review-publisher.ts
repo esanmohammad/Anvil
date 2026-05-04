@@ -1,0 +1,282 @@
+/**
+ * review-publisher — posts a Review to GitHub as inline + summary comments.
+ *
+ * Uses the `gh` CLI, which is already a required dependency of Anvil. Each
+ * comment is tagged with a marker like `<!-- anvil-review:v3 -->` so future
+ * reviews can detect and replace prior Anvil comments instead of piling up.
+ */
+
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import type { Review, ReviewFinding } from './review-store.js';
+
+const execFileAsync = promisify(execFile);
+
+// ── Public API ───────────────────────────────────────────────────────────
+
+export interface PublishResult {
+  summaryUrl: string | null;
+  commentsPosted: number;
+  commentsSkipped: number;
+  replaced: boolean;
+  errors: string[];
+}
+
+export interface PublishOptions {
+  /** Only post findings with these severities. Default: blocker + error. */
+  severities?: Array<'blocker' | 'error' | 'warn' | 'info' | 'nit'>;
+  /** Dry run — log what would be posted, don't actually POST. */
+  dryRun?: boolean;
+}
+
+export async function publishReview(review: Review, opts: PublishOptions = {}): Promise<PublishResult> {
+  const severities = new Set(opts.severities ?? ['blocker', 'error']);
+  const result: PublishResult = {
+    summaryUrl: null,
+    commentsPosted: 0,
+    commentsSkipped: 0,
+    replaced: false,
+    errors: [],
+  };
+
+  // 1. Delete prior Anvil comments on this PR (so re-publishes don't stack).
+  try {
+    const report = await deletePriorAnvilComments(review.pr.repo, review.pr.number, opts.dryRun);
+    if (report.deleted > 0) result.replaced = true;
+    for (const f of report.failed) {
+      // Surface each failure — the prior comment is still on the PR. If it
+      // belonged to a now-dismissed finding, the user will see the stale
+      // comment until it is removed manually.
+      result.errors.push(
+        `Could not delete prior ${f.kind} comment ${f.id} (still on PR): ${f.reason}`,
+      );
+    }
+  } catch (err) {
+    result.errors.push(`Failed to clear prior Anvil comments: ${errorMessage(err)}`);
+  }
+
+  // 2. Inline comments for high-severity findings.
+  const toPost = review.findings.filter((f) =>
+    severities.has(f.severity) && f.resolution === 'pending',
+  );
+
+  for (const finding of toPost) {
+    if (opts.dryRun) {
+      result.commentsPosted++;
+      continue;
+    }
+    try {
+      await postInlineComment(review, finding);
+      result.commentsPosted++;
+    } catch (err) {
+      // Fall back: if inline comment fails (position resolution), add a plain PR comment.
+      result.commentsSkipped++;
+      result.errors.push(`Inline comment for ${finding.file}:${finding.line} failed: ${errorMessage(err)}`);
+    }
+  }
+
+  // 3. Summary comment at the end.
+  try {
+    const url = opts.dryRun ? 'dry-run://summary' : await postSummaryComment(review);
+    result.summaryUrl = url;
+  } catch (err) {
+    result.errors.push(`Summary comment failed: ${errorMessage(err)}`);
+  }
+
+  return result;
+}
+
+// ── Formatting ───────────────────────────────────────────────────────────
+
+const MARKER_PREFIX = '<!-- anvil-review:';
+
+function buildSummaryMarkdown(review: Review): string {
+  const counts = countBySeverity(review.findings);
+  const verdictEmoji = review.verdict === 'approve' ? '✅' : review.verdict === 'request-changes' ? '🛑' : '💬';
+  const verdictLabel = review.verdict === 'approve' ? 'Approved' : review.verdict === 'request-changes' ? 'Changes requested' : 'Commented';
+
+  const lines: string[] = [];
+  lines.push(`${MARKER_PREFIX}v${review.version} -->`);
+  lines.push(`## ${verdictEmoji} Anvil Review — ${verdictLabel}`);
+  lines.push('');
+  lines.push(`> ${review.summary || '_No summary written._'}`);
+  lines.push('');
+
+  // Severity table
+  lines.push('| Blocker | Error | Warn | Info | Nit |');
+  lines.push('|:--|:--|:--|:--|:--|');
+  lines.push(`| ${counts.blocker} | ${counts.error} | ${counts.warn} | ${counts.info} | ${counts.nit} |`);
+  lines.push('');
+
+  // Plan compliance
+  if (review.planCompliance) {
+    const pc = review.planCompliance;
+    lines.push('### Plan compliance');
+    lines.push(`- Match rate: **${(pc.matchRate * 100).toFixed(0)}%**`);
+    if (pc.missedSymbols.length) lines.push(`- Missed symbols: ${pc.missedSymbols.map((s) => `\`${s}\``).join(', ')}`);
+    if (pc.missingContracts.length) lines.push(`- Missing contracts: ${pc.missingContracts.map((c) => `\`${c}\``).join(', ')}`);
+    lines.push('');
+  }
+
+  // Findings grouped by category
+  const byCat: Record<string, ReviewFinding[]> = {};
+  for (const f of review.findings) {
+    if (f.resolution !== 'pending') continue;
+    (byCat[f.category] ??= []).push(f);
+  }
+  if (Object.keys(byCat).length) {
+    lines.push('### Findings');
+    for (const [cat, fs] of Object.entries(byCat)) {
+      lines.push(`**${cat}** (${fs.length})`);
+      for (const f of fs.slice(0, 5)) {
+        lines.push(`- ${severityMarker(f.severity)} \`${f.file}:${f.line}\` — ${f.description}`);
+      }
+      if (fs.length > 5) lines.push(`- _…and ${fs.length - 5} more_`);
+    }
+    lines.push('');
+  }
+
+  lines.push(`---`);
+  lines.push(`🤖 Generated by Anvil · Review \`${review.id}\` v${review.version} · Personas: ${review.personas.join(', ')} · ~$${review.estimate.usd.toFixed(2)}`);
+
+  return lines.join('\n');
+}
+
+function buildInlineCommentMarkdown(f: ReviewFinding): string {
+  const parts: string[] = [];
+  parts.push(`${MARKER_PREFIX}finding -->`);
+  parts.push(`${severityMarker(f.severity)} **${f.category}${f.persona ? ` · ${f.persona}` : ''}** — ${f.description}`);
+  if (f.cve) parts.push(`- OWASP/CVE: \`${f.cve}\``);
+  if (f.suggestedFix) {
+    parts.push('');
+    parts.push('<details><summary>Suggested fix</summary>');
+    parts.push('');
+    parts.push('```diff');
+    parts.push(f.suggestedFix.diff.trim());
+    parts.push('```');
+    parts.push('');
+    parts.push(`_${f.suggestedFix.rationale}_`);
+    parts.push('</details>');
+  }
+  return parts.join('\n');
+}
+
+function severityMarker(s: ReviewFinding['severity']): string {
+  return ({ blocker: '🛑', error: '❌', warn: '⚠️', info: 'ℹ️', nit: '💭' } as const)[s];
+}
+
+function countBySeverity(findings: ReviewFinding[]): Record<ReviewFinding['severity'], number> {
+  const out: Record<ReviewFinding['severity'], number> = { blocker: 0, error: 0, warn: 0, info: 0, nit: 0 };
+  for (const f of findings) if (f.resolution === 'pending') out[f.severity]++;
+  return out;
+}
+
+// ── GitHub API via gh CLI ────────────────────────────────────────────────
+
+async function gh(args: string[]): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('gh', args, {
+      encoding: 'utf-8',
+      timeout: 20000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return stdout;
+  } catch (err) {
+    const message = errorMessage(err);
+    if (message.includes('command not found') || message.includes('ENOENT')) {
+      throw new Error('`gh` CLI not found. Install from cli.github.com and run `gh auth login`.');
+    }
+    throw err;
+  }
+}
+
+async function postSummaryComment(review: Review): Promise<string> {
+  const body = buildSummaryMarkdown(review);
+  // Use the issue_comment endpoint (PR is an issue in GH terms).
+  const out = await gh([
+    'api', `repos/${review.pr.repo}/issues/${review.pr.number}/comments`,
+    '-X', 'POST',
+    '-f', `body=${body}`,
+    '--jq', '.html_url',
+  ]);
+  return out.trim();
+}
+
+async function postInlineComment(review: Review, finding: ReviewFinding): Promise<void> {
+  const body = buildInlineCommentMarkdown(finding);
+  // Relative path: in a multi-repo PR the file path may need to be in the
+  // repo's path as GitHub sees it. For simple cases, `file` already is relative.
+  const path = finding.file;
+  const line = finding.line || 1;
+  await gh([
+    'api', `repos/${review.pr.repo}/pulls/${review.pr.number}/comments`,
+    '-X', 'POST',
+    '-f', `body=${body}`,
+    '-f', `commit_id=${review.pr.headSha}`,
+    '-f', `path=${path}`,
+    '-F', `line=${line}`,
+    '-f', 'side=RIGHT',
+  ]);
+}
+
+interface DeletionReport {
+  attempted: number;
+  deleted: number;
+  failed: Array<{ id: number; kind: 'issue' | 'review'; reason: string }>;
+}
+
+async function deletePriorAnvilComments(repo: string, prNumber: number, dryRun = false): Promise<DeletionReport> {
+  // Fetch prior issue comments (summary) + review comments (inline)
+  const [issueComments, reviewComments] = await Promise.all([
+    gh(['api', `repos/${repo}/issues/${prNumber}/comments`, '--paginate', '--jq', '.[] | {id, body}']),
+    gh(['api', `repos/${repo}/pulls/${prNumber}/comments`, '--paginate', '--jq', '.[] | {id, body}']),
+  ]).catch(() => ['', '']);
+
+  const parseNdjson = (text: string): Array<{ id: number; body: string }> =>
+    text.trim().split('\n').filter(Boolean).flatMap((line) => {
+      try { return [JSON.parse(line)]; } catch { return []; }
+    });
+
+  const toDelete: Array<{ id: number; kind: 'issue' | 'review' }> = [
+    ...parseNdjson(issueComments).filter((c) => c.body?.includes(MARKER_PREFIX)).map((c) => ({ id: c.id, kind: 'issue' as const })),
+    ...parseNdjson(reviewComments).filter((c) => c.body?.includes(MARKER_PREFIX)).map((c) => ({ id: c.id, kind: 'review' as const })),
+  ];
+
+  const report: DeletionReport = { attempted: toDelete.length, deleted: 0, failed: [] };
+  if (dryRun) {
+    report.deleted = toDelete.length;
+    return report;
+  }
+
+  for (const c of toDelete) {
+    const endpoint = c.kind === 'issue'
+      ? `repos/${repo}/issues/comments/${c.id}`
+      : `repos/${repo}/pulls/comments/${c.id}`;
+    let lastErr: string | null = null;
+    // One retry with a small backoff handles transient rate limits / network blips.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await gh(['api', endpoint, '-X', 'DELETE']);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = errorMessage(err);
+        // 404 = comment already gone (deleted by a human). Treat as success.
+        if (lastErr.includes('404') || lastErr.toLowerCase().includes('not found')) {
+          lastErr = null;
+          break;
+        }
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+    if (lastErr === null) report.deleted++;
+    else report.failed.push({ id: c.id, kind: c.kind, reason: lastErr });
+  }
+
+  return report;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
+}

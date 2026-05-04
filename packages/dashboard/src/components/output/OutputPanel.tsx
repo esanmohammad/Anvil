@@ -19,6 +19,7 @@ export interface ChangeEntry {
   timestamp: number;
   diff?: string;
   repo?: string;
+  stage?: string;
 }
 
 export interface OutputPanelAgent {
@@ -151,7 +152,7 @@ export function OutputPanel({
   // Filter activities — include clarify-question, clarify-ack, user-message for conversation flow, project for integration events
   const allowedKinds = new Set(['tool_use', 'thinking', 'text', 'clarify-question', 'clarify-ack', 'user-message', 'project']);
   const feedActivities = useMemo(() => {
-    return activities.filter((a) => {
+    const filtered = activities.filter((a) => {
       if (!allowedKinds.has(a.kind)) return false;
       if (searchQuery) {
         const q = searchQuery.toLowerCase();
@@ -163,6 +164,71 @@ export function OutputPanel({
       }
       return true;
     });
+
+    // Two-pass merge to make the feed readable:
+    //
+    // 1. Tool-result pairing — agent-core's bridge emits a `kind:'text'`
+    //    activity right after every tool_use carrying the tool's stdout
+    //    (capped at 4 KB). Without merging, a `read_file` shows up as a
+    //    one-line tool_use row followed by a giant text card with the
+    //    whole file. Folding the text into the tool_use's `content`
+    //    makes it the *expandable* body of the tool button — collapsed
+    //    by default like Claude Code.
+    // 2. Text coalesce — adapters flush emitContent on '\n' or ~80 chars,
+    //    so a long prose answer arrives as N adjacent text entries.
+    //    Joining them lets MarkdownRenderer see one coherent block and
+    //    drops any whitespace-only fragments (empty cards).
+    const TOOLS_WITH_RESULT_TEXT = new Set([
+      'Read', 'read_file',
+      'Bash', 'bash',
+      'Grep', 'grep',
+      'Glob', 'glob',
+      'Edit', 'edit', 'Write', 'write_file',
+      'WebFetch', 'WebSearch',
+    ]);
+    const coalesced: ActivityEntry[] = [];
+    for (const entry of filtered) {
+      if (entry.kind !== 'text') {
+        coalesced.push(entry);
+        continue;
+      }
+      const summary = entry.summary ?? '';
+      const content = entry.content ?? '';
+      if (!summary.trim() && !content.trim()) continue;
+
+      const last = coalesced[coalesced.length - 1];
+
+      // Pass 1: attach to a preceding tool_use as its expandable body.
+      if (last && last.kind === 'tool_use' && TOOLS_WITH_RESULT_TEXT.has(last.tool ?? '')) {
+        const existing = last.content ?? '';
+        const joiner = existing && !existing.endsWith('\n') ? '\n' : '';
+        coalesced[coalesced.length - 1] = {
+          ...last,
+          content: existing + joiner + (summary || content),
+          timestamp: entry.timestamp,
+        };
+        continue;
+      }
+
+      // Pass 2: coalesce with previous text from the same source.
+      const sameSource = last
+        && last.kind === 'text'
+        && last.runId === entry.runId
+        && last.stage === entry.stage
+        && last.repo === entry.repo;
+      if (sameSource) {
+        const joiner = (last.summary ?? '').endsWith('\n') ? '' : '\n';
+        coalesced[coalesced.length - 1] = {
+          ...last,
+          summary: (last.summary ?? '') + joiner + summary,
+          content: [last.content, content].filter(Boolean).join('\n') || undefined,
+          timestamp: entry.timestamp,
+        };
+      } else {
+        coalesced.push(entry);
+      }
+    }
+    return coalesced;
   }, [activities, searchQuery]);
 
   // Empty state
@@ -304,7 +370,7 @@ export function OutputPanel({
                                     <tr key={li}>
                                       <td colSpan={3} style={{
                                         padding: '4px 12px',
-                                        background: 'rgba(96,165,250,0.06)',
+                                        background: 'rgba(107,138,171,0.06)',
                                         color: 'var(--color-info)',
                                         fontSize: 11,
                                         borderTop: li > 0 ? '1px solid var(--separator)' : undefined,
@@ -325,8 +391,8 @@ export function OutputPanel({
                                 const isDel = line.startsWith('-');
                                 const content = (isAdd || isDel) ? line.slice(1) : line.startsWith(' ') ? line.slice(1) : line;
 
-                                const bg = isAdd ? 'rgba(52,211,153,0.08)'
-                                  : isDel ? 'rgba(248,113,113,0.08)'
+                                const bg = isAdd ? 'rgba(111,175,138,0.08)'
+                                  : isDel ? 'rgba(201,115,115,0.08)'
                                   : 'transparent';
                                 const textColor = isAdd ? 'var(--color-success)'
                                   : isDel ? 'var(--color-error)'

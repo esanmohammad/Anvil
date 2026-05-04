@@ -1,0 +1,35 @@
+{
+  "name": "@anvil/convention-core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Project convention extraction, rule engine, and promotion ledger for Anvil. Owns ~/.anvil/conventions/<project>/{conventions.md, rules.json}.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./*.js": {
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "dev": "tsc -b --watch",
+    "test": "tsc -b && node --test dist/__tests__/*.test.js"
+  },
+  "dependencies": {
+    "@anvil/memory-core": "*",
+    "yaml": "^2.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2"
+  }
+}

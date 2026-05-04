@@ -1,0 +1,110 @@
+# stage-policy.yaml — declares the capability + complexity + tier
+# preference for each pipeline stage. The resolver in @anvil/agent-core
+# walks the model registry (~/.anvil/models.yaml) using these dimensions
+# to pick the cheapest model that meets the stage's quality bar.
+#
+# Stage IDs MUST match cli/src/run/types.ts:STAGE_NAMES + ad-hoc commands
+# (fix, review, plan, research, fix-loop). Adding a new stage here is
+# meaningful only if the stage actually invokes the resolver.
+#
+# Capability vocabulary  (closed): embed | rerank | code | reasoning | vision
+# Complexity vocabulary  (closed): S | M | L
+# Tier vocabulary        (closed): local | cheap | premium
+#
+# `prefer` is walked left-to-right; within a tier, models are picked in
+# the order they appear in models.yaml. Empty result throws
+# ModelResolutionError — silent fallback is intentionally unsupported.
+#
+# Routing intent (user vision):
+#   - ANALYSIS deeply by premium → tasks come out detailed.
+#     (requirements, repo-requirements, specs, tasks, plan, review)
+#   - DOING by local where the model is good enough.
+#     (clarify, build, validate, ship, fix, fix-loop, research)
+#   - RESEARCH stays FREE — never escalate read-only investigation
+#     to premium just because Ollama is down.
+
+stages:
+  # ── Pipeline stages (STAGE_NAMES) ──────────────────────────────────────
+  clarify:
+    capability: reasoning
+    complexity: S
+    prefer: [local, cheap, premium]      # short Q&A — local fine
+
+  requirements:
+    capability: reasoning
+    complexity: L                         # L (was M) — force premium-quality analysis
+    prefer: [premium]                     # PREMIUM-ONLY — deep analysis → detailed tasks
+
+  repo-requirements:
+    capability: reasoning
+    complexity: L                         # L (was M) — premium-quality analysis
+    prefer: [premium]                     # PREMIUM-ONLY — per-repo decomposition
+
+  specs:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]                     # PREMIUM-ONLY — long-context spec writing
+
+  tasks:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]                     # PREMIUM-ONLY — task decomposition
+
+  build:
+    capability: code
+    complexity: M
+    prefer: [local, cheap, premium]       # implementation — local first (qwen3:14b)
+
+  # Test-spec authoring stage (dashboard only — cli has no test stage).
+  # Generates test files; doesn't execute them (validate runs the suite).
+  # Code capability + M complexity — writing meaningful tests needs more
+  # judgment than a plain mechanical fix would.
+  test:
+    capability: code
+    complexity: M
+    prefer: [local, cheap, premium]
+
+  validate:
+    capability: code
+    complexity: S
+    prefer: [local, cheap]                # quick lint/test runs
+
+  ship:
+    capability: code
+    complexity: S
+    prefer: [local, cheap]                # git ops + PR descriptions
+
+  # ── Ad-hoc commands ────────────────────────────────────────────────────
+  fix:
+    capability: code
+    complexity: M
+    prefer: [local, cheap, premium]       # mechanical fix — local first
+
+  fix-loop:
+    capability: code
+    complexity: S
+    prefer: [local, cheap]                # tight retry loop — never escalate to premium
+
+  review:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]                     # PREMIUM-ONLY — code review judgment
+
+  research:
+    capability: reasoning
+    complexity: M
+    prefer: [local, cheap]                # FREE-TIER — read-only investigation
+
+  plan:
+    capability: reasoning
+    complexity: L
+    prefer: [premium]                     # PREMIUM-ONLY — feature planning
+
+  # ── Memory hygiene (Phase 4 / PR 4) ────────────────────────────────────
+  # End-of-run reflection extracts typed lessons (semantic / fix-pattern,
+  # approach, episodic, profile) from the run trace. Short, structured —
+  # local first; never pay premium for distillation.
+  reflection:
+    capability: reasoning
+    complexity: S
+    prefer: [local, cheap]                # FREE-TIER — distillation only

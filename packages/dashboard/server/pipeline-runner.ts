@@ -15,14 +15,86 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync, spawn as cpSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { AgentManager } from './agent-manager.js';
+import { AgentManager } from '@anvil/agent-core';
+import {
+  extractConventions as coreExtractConventions,
+  loadConventions as coreLoadConventions,
+} from '@anvil/convention-core';
 import { ProjectLoader } from './project-loader.js';
 import type { ProjectInfo } from './project-loader.js';
 import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
-import { estimateTokens, getModelTokenLimit, budgetPromptContext } from './context-budget.js';
 import { resolveModelByTier } from './model-tier-resolver.js';
+import {
+  resolveModelForStage as registryResolveStage,
+  ModelResolutionError,
+  UnknownStageError,
+  allowedToolsForStage,
+  permissionClassesForStage,
+} from '@anvil/core-pipeline';
+import { pickAliveModelFromChainSync, prefetchLiveness, setLivenessTtlMs } from './provider-liveness.js';
+import { loadModelRegistry, DEFAULT_WALKER_CONFIG } from '@anvil/agent-core';
+import type { ModelRegistry, ProviderName, WalkerConfig } from '@anvil/agent-core';
+import { parseTasks, bundleFiles } from './engineer-task-bundler.js';
+import type { ParsedTask } from './engineer-task-bundler.js';
+import { sliceSpecForRefs } from './engineer-spec-slicer.js';
+import { enforceBudget } from './prompt-budget.js';
+import type { PromptSection } from './prompt-budget.js';
+import { scorePlan, computeRiskTier } from './plan-risk-scorer.js';
+import {
+  FeatureManifestStore,
+  renderManifestForPrompt,
+  type PlannedFile,
+  type TestBehavior,
+} from './feature-manifest.js';
+import {
+  spawnAndWait,
+} from './steps/agent-spawner.js';
+import {
+  runPerRepoStageForRepo,
+  combinePerRepoArtifacts,
+  disallowedToolsForPersona,
+} from './steps/per-repo-stage.step.js';
+import {
+  runBuildForOneRepo,
+} from './steps/per-repo-build.step.js';
+import {
+  runClarifyForProject,
+} from './steps/clarify-stage.step.js';
+import {
+  runFixLoop,
+  hasValidationFailures as hasValidationFailuresHelper,
+} from './steps/fix-loop.step.js';
+import {
+  runTestGenForProject,
+} from './steps/test-gen-stage.step.js';
+import {
+  pullBaseBranchForRepos,
+  runPostBuildGuards,
+  deployProject,
+  createFeatureBranches as createFeatureBranchesHelper,
+} from './steps/workspace-ops.js';
+import {
+  buildProjectPrompt as buildProjectPromptHelper,
+  buildRepoProjectPrompt as buildRepoProjectPromptHelper,
+  buildClarifyExplorePrompt as buildClarifyExplorePromptHelper,
+  buildStagePrompt as buildStagePromptHelper,
+  buildRepoStagePrompt as buildRepoStagePromptHelper,
+  buildPerTaskPrompt as buildPerTaskPromptHelper,
+  type PromptBuilderContext,
+} from './steps/prompt-builders.js';
+import {
+  extractAcceptanceCriteria,
+  extractAffectedRepos,
+  extractApiEndpoints,
+  extractChangeBrief,
+  extractFilesPlanned,
+  extractOpenQuestions,
+  extractTablesTouched,
+  extractTestBehaviors,
+  type ManifestExtractor,
+} from './feature-manifest-extractors.js';
 
 // ── Claude CLI binary ────────────────────────────────────────────────
 
@@ -34,6 +106,20 @@ const CLAUDE_BIN = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? pr
  * Check if the Claude CLI is authenticated.
  * Returns true if logged in, false otherwise.
  */
+/**
+ * Render a Memory.content value (object | string) for prompt injection.
+ * BM25 retrieval returns typed Memory<T> rows; pre-rewire we only ever
+ * stored strings, so the JSON path is the post-rewire shape.
+ */
+function formatContent(content: unknown): string {
+  if (typeof content === 'string') return content.slice(0, 280);
+  try {
+    return JSON.stringify(content).slice(0, 280);
+  } catch {
+    return '';
+  }
+}
+
 function checkClaudeAuth(): boolean {
   try {
     const out = execSync(`${CLAUDE_BIN} auth status --json`, { timeout: 10_000, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -85,59 +171,9 @@ function refreshClaudeAuth(timeoutMs = 120_000): Promise<boolean> {
   });
 }
 
-// ── Persona prompt loader ────────────────────────────────────────────
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-/** Persona prompt cache */
-const personaPromptCache = new Map<string, string>();
-
-/**
- * Load a persona prompt from the CLI persona prompts directory.
- * Checks user overrides at ~/.anvil/personas/ first,
- * then falls back to bundled prompts in packages/cli/src/personas/prompts/.
- */
-function loadPersonaPromptSync(personaName: string): string {
-  if (personaPromptCache.has(personaName)) return personaPromptCache.get(personaName)!;
-
-  const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil');
-
-  // User override
-  const userPath = join(anvilHome, 'personas', `${personaName}.md`);
-  if (existsSync(userPath)) {
-    const content = readFileSync(userPath, 'utf-8');
-    personaPromptCache.set(personaName, content);
-    return content;
-  }
-
-  // Bundled prompts — navigate from dashboard/server/ to cli/src/personas/prompts/
-  const bundledPaths = [
-    join(__dirname, '..', '..', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
-    join(__dirname, '..', '..', '..', 'packages', 'cli', 'src', 'personas', 'prompts', `${personaName}.md`),
-  ];
-
-  for (const p of bundledPaths) {
-    if (existsSync(p)) {
-      const content = readFileSync(p, 'utf-8');
-      personaPromptCache.set(personaName, content);
-      return content;
-    }
-  }
-
-  console.warn(`[pipeline] Persona prompt not found for "${personaName}", using fallback`);
-  return '';
-}
-
-/**
- * Inject template variables into a persona prompt.
- */
-function injectTemplateVars(prompt: string, vars: Record<string, string>): string {
-  let result = prompt;
-  for (const [key, value] of Object.entries(vars)) {
-    result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
-  }
-  return result;
-}
+// Phase 4f.7: Persona prompt loader + injectTemplateVars now live in
+// `./steps/prompt-builders.ts` so the lifted prompt-builder functions can
+// share them. Kept as a re-export below for legacy callsites until 4f.8+.
 
 // ── Stage definitions ─────────────────────────────────────────────────
 
@@ -150,15 +186,63 @@ interface StageDefinition {
 }
 
 const STAGES: StageDefinition[] = [
-  { index: 0, name: 'clarify',           label: 'Understanding',        persona: 'clarifier', perRepo: false },
-  { index: 1, name: 'requirements',      label: 'Planning requirements', persona: 'analyst',   perRepo: false },
-  { index: 2, name: 'repo-requirements', label: 'Repo requirements',    persona: 'analyst',   perRepo: true },
-  { index: 3, name: 'specs',             label: 'Writing specs',        persona: 'architect', perRepo: true },
-  { index: 4, name: 'tasks',             label: 'Creating tasks',       persona: 'lead',      perRepo: true },
-  { index: 5, name: 'build',             label: 'Writing code',         persona: 'engineer',  perRepo: true },
-  { index: 6, name: 'validate',          label: 'Testing',              persona: 'tester',    perRepo: true },
-  { index: 7, name: 'ship',              label: 'Shipping',             persona: 'engineer',  perRepo: false },
+  { index: 0, name: 'clarify',           label: 'Understanding',        persona: 'clarifier',   perRepo: false },
+  { index: 1, name: 'requirements',      label: 'Planning requirements', persona: 'analyst',    perRepo: false },
+  { index: 2, name: 'repo-requirements', label: 'Repo requirements',    persona: 'analyst',     perRepo: true },
+  { index: 3, name: 'specs',             label: 'Writing specs',        persona: 'architect',   perRepo: true },
+  { index: 4, name: 'tasks',             label: 'Creating tasks',       persona: 'lead',        perRepo: true },
+  { index: 5, name: 'build',             label: 'Writing code',         persona: 'engineer',    perRepo: true },
+  { index: 6, name: 'test',              label: 'Generating tests',     persona: 'test-author', perRepo: true },
+  { index: 7, name: 'validate',          label: 'Testing',              persona: 'tester',      perRepo: true },
+  { index: 8, name: 'ship',              label: 'Shipping',             persona: 'engineer',    perRepo: false },
 ];
+
+/** Stages whose artifacts can be fully derived from a Plan — skipped when planSeed is provided. */
+const PLAN_DERIVED_STAGES: string[] = ['requirements', 'repo-requirements', 'specs', 'tasks'];
+
+/**
+ * Per-stage output-token ceilings (Phase 3 — TOKEN-OPTIMIZATION-PLAN).
+ *
+ * Caps how many tokens each stage's agent is allowed to emit so that artifact
+ * bloat (50KB BUILD.md narratives, recap dumps in REQUIREMENTS.md) stops
+ * costing output tokens. The numbers below are conservative starting points
+ * tuned to typical artifact sizes in this repo:
+ *
+ *   - clarify / ship — short Q-and-A or git ops, ≤ 2K
+ *   - requirements / repo-requirements / validate — bullet lists, ≤ 4K
+ *   - specs — APIs + schema + behaviors, ≤ 6K
+ *   - tasks — task breakdown, ≤ 8K
+ *   - test — generated tests across files, ≤ 12K
+ *   - build — real codegen, ≤ 16K (highest because the engineer writes diffs)
+ *
+ * Adapter behavior:
+ *   - api-adapter: passes `max_tokens` in the request body.
+ *   - claude-adapter / gemini-cli-adapter: capabilities.maxOutputTokens=false
+ *     today (CLIs don't expose a flag) — the call is a no-op.
+ *
+ * STAGE_OUTPUT_LIMIT_FALLBACK is used for any stage not present in the table.
+ */
+export const STAGE_OUTPUT_LIMITS: Record<string, number> = {
+  clarify: 2000,
+  requirements: 4000,
+  'repo-requirements': 4000,
+  specs: 6000,
+  tasks: 8000,
+  build: 16000,
+  test: 12000,
+  validate: 4000,
+  ship: 2000,
+};
+export const STAGE_OUTPUT_LIMIT_FALLBACK = 8000;
+
+export function maxOutputTokensForStage(stageName: string): number {
+  return STAGE_OUTPUT_LIMITS[stageName] ?? STAGE_OUTPUT_LIMIT_FALLBACK;
+}
+
+/** Exposed for tests — read-only snapshot of pipeline stage names. */
+export function listStageNames(): string[] {
+  return STAGES.map((s) => s.name);
+}
 
 // ── Per-repo agent tracking ───────────────────────────────────────────
 
@@ -173,6 +257,19 @@ export interface RepoAgentState {
 
 // ── Pipeline state ────────────────────────────────────────────────────
 
+/**
+ * Per-stage token + cache breakdown. Surfaced so the dashboard can render
+ * the cache-hit rate (Phase 1 of TOKEN-OPTIMIZATION-PLAN). All counts are
+ * aggregates across every spawn the stage produced (single agent for
+ * project-wide stages, all repos × tasks for per-repo stages).
+ */
+export interface StageTokenStats {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
 export interface PipelineStageState {
   name: string;
   label: string;
@@ -185,6 +282,20 @@ export interface PipelineStageState {
   error: string | null;
   perRepo: boolean;
   repos: RepoAgentState[];
+  /** Token breakdown for this stage; absent for skipped/pending stages. */
+  tokens?: StageTokenStats;
+  /**
+   * Model id resolved for this stage by the registry-driven resolver.
+   * Surfaced so the UI can show "build → qwen3:14b" badges and so users
+   * can SEE local models firing rather than just inferring from cost.
+   */
+  resolvedModel?: string;
+  /**
+   * Tool-permission classes the stage is running under.
+   * 'read' / 'write' / 'exec'. Surfaced so the UI can show 🔒 / 📝 / ⚡
+   * badges next to each stage.
+   */
+  permissionClasses?: ('read' | 'write' | 'exec')[];
 }
 
 export interface PipelineRunState {
@@ -200,6 +311,8 @@ export interface PipelineRunState {
   model: string;
   repoNames: string[];
   waitingForInput: boolean;
+  /** Run-level token aggregate. cacheHitRatio = cacheReadTokens / (inputTokens + cacheReadTokens). */
+  tokens?: StageTokenStats & { cacheHitRatio: number };
 }
 
 export interface PipelineRunnerEvents {
@@ -210,6 +323,68 @@ export interface PipelineRunnerEvents {
   'pipeline-complete': (state: PipelineRunState) => void;
   'pipeline-fail': (state: PipelineRunState) => void;
   'waiting-for-input': (stageIndex: number, agentId: string) => void;
+}
+
+// ── Local-tier stage list (Phase 5 — Ollama) ──────────────────────────
+
+/**
+ * Stages eligible to be routed to a local Ollama model when
+ * `process.env.ANVIL_LOCAL_MODEL` is set. The list is conservative —
+ * stages whose output feeds engineer/architect/tester are excluded so a
+ * weaker local model can't poison the rest of the pipeline. Manifest
+ * extraction is heuristic (no LLM call today) so it's not in the list;
+ * if/when Phase 4b grows an LLM extractor, append it here.
+ */
+const LOCAL_TIER_STAGES = new Set<string>(['clarify', 'ship']);
+
+/**
+ * Map a model id to its provider for the liveness chain walker.
+ * Mirrors the heuristic in agent-core's `default-adapter-factory.
+ * resolveProvider` — kept inline to avoid pulling that whole module
+ * into the sync resolver path.
+ */
+/**
+ * Duck-type check for the agent-core `UpstreamError` shape. Avoid
+ * `instanceof` because esbuild's bundling can desync class identity
+ * across modules — the shape check is more robust and survives
+ * version skew between agent-core and the dashboard's compiled bundle.
+ */
+function isRetryableUpstreamError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: string; retryable?: unknown; status?: unknown };
+  if (e.retryable === true) return true;
+  // Belt-and-suspenders for older bundles that may not carry .retryable
+  if (e.name === 'UpstreamError' && typeof e.status === 'number') {
+    return e.status === 429 || e.status === 502 || e.status === 503 || e.status === 504;
+  }
+  return false;
+}
+
+function providerOfModelId(modelId: string): ProviderName {
+  const id = modelId.toLowerCase();
+  if (id.startsWith('ollama:')) return 'ollama';
+  if (id.startsWith('gemini-')) return 'gemini';
+  if (id.startsWith('gpt-') || id.startsWith('o1') || id.startsWith('o3') || id.startsWith('o4') || id.startsWith('chatgpt-')) return 'openai';
+  if (id.includes('/')) return 'openrouter';
+  if (/^[a-z0-9_.-]+:[a-z0-9_.-]+$/.test(id) && id !== 'claude' && !id.startsWith('claude-')) return 'ollama';
+  return 'claude';
+}
+
+// ── Token-stats helpers ───────────────────────────────────────────────
+
+function zeroTokenStats(): StageTokenStats {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+}
+
+function sumTokenStats(parts: ReadonlyArray<StageTokenStats>): StageTokenStats {
+  const total = zeroTokenStats();
+  for (const p of parts) {
+    total.inputTokens += p.inputTokens;
+    total.outputTokens += p.outputTokens;
+    total.cacheReadTokens += p.cacheReadTokens;
+    total.cacheWriteTokens += p.cacheWriteTokens;
+  }
+  return total;
 }
 
 // ── Config ────────────────────────────────────────────────────────────
@@ -223,6 +398,20 @@ export interface PipelineConfig {
   modelTier?: ModelTier;     // cost-aware tier — overrides single model with per-stage routing
   baseBranch?: string;       // base branch to checkout/PR against (default: auto-detect main/master)
   skipClarify?: boolean;
+  /** When set and skipClarify=true, this replaces the Clarify artifact fed to the next stage. Used by the Plan flow. */
+  clarifySeedArtifact?: string;
+  /**
+   * When set, stages 1–4 (requirements, repo-requirements, specs, tasks) are
+   * derived deterministically from this Plan instead of running agents.
+   * The Plan flow uses this to skip straight to Build.
+   */
+  planSeed?: {
+    project: string;
+    slug: string;
+    version: number;
+    /** Snapshot of the plan JSON (so changes after execute don't affect the run). */
+    plan: import('./plan-store.js').Plan;
+  };
   skipShip?: boolean;
   deploy?: 'local' | 'remote' | false;  // deploy after shipping
   repos?: string[];          // explicit repo list (overrides auto-detection)
@@ -314,10 +503,31 @@ export function findInterruptedPipelines(anvilHome: string): PipelineCheckpoint[
 
 // ── Pipeline Runner ───────────────────────────────────────────────────
 
+/**
+ * Hook fired after each stage completes. Returning a rejected promise cancels
+ * the pipeline; resolving with `{ pause: true }` suspends execution until
+ * `resume()` is called.
+ */
+export interface AfterStageHook {
+  (info: {
+    runId: string;
+    project: string;
+    stageIndex: number;
+    stageName: string;
+    artifact: string;
+    cost: number;
+    totalCost: number;
+    touchedFiles?: string[];
+    riskTier?: 'low' | 'med' | 'high';
+    confidence?: number;
+  }): Promise<void>;
+}
+
 export class PipelineRunner extends EventEmitter {
   private agentManager: AgentManager;
   private projectLoader: ProjectLoader;
   private featureStore: FeatureStore;
+  private manifestStore: FeatureManifestStore;
   private state: PipelineRunState;
   private config: PipelineConfig;
   private workspaceDir: string;
@@ -325,8 +535,626 @@ export class PipelineRunner extends EventEmitter {
   private projectInfo: ProjectInfo | null = null;
   private repoPaths: Record<string, string> = {};
   private cancelled = false;
+  /**
+   * Models that hit a retryable UpstreamError this run (429 quota,
+   * rate-limit, 5xx). Skipped by the chain walker on subsequent
+   * resolves so we don't keep hammering a model whose upstream is
+   * out of capacity. Reset only by starting a new run.
+   */
+  private runtimeBurnedModels = new Set<string>();
+  /**
+   * Per-stage de-dupe so the proactive liveness fallback nudge fires
+   * once per (stage, original→fallback) pair instead of on every
+   * `resolveModelForStage` call.
+   */
+  private livenessFallbackNotified = new Set<string>();
+  /**
+   * Walker tunables loaded from `~/.anvil/models.yaml`'s top-level
+   * `walker:` block (with compiled-in defaults for missing keys). Cached
+   * once at run start by `prefetchProviderLiveness` so chain-walking +
+   * retry policy don't re-read the yaml on every stage entry.
+   */
+  private walkerConfig: WalkerConfig = { ...DEFAULT_WALKER_CONFIG };
   private memoryStore: MemoryStore;
   private kbManager: KnowledgeBaseManager | null;
+  private afterStageHook: AfterStageHook | null = null;
+  /**
+   * Review-time feedback from the most recent pause resume. Set by the
+   * dashboard's after-stage hook when the user resumes with
+   * `approve-with-note` (or any action carrying a `note`). Read once by
+   * the next stage's prompt builders, then cleared so the note doesn't
+   * leak into stages it wasn't intended for.
+   */
+  private pendingReviewNote: string | null = null;
+  /**
+   * Phase 2: feature manifest is rendered into the projectPrompt of every
+   * stage so downstream agents stop re-deriving fields earlier stages already
+   * produced. Memoised per-snapshot — invalidated whenever a stage patches
+   * the manifest. Bytes are stable for all spawns of the same stage.
+   */
+  private cachedManifestBlock: string | null = null;
+
+  setAfterStageHook(hook: AfterStageHook | null): void { this.afterStageHook = hook; }
+
+  /**
+   * Stash a reviewer's feedback note so the next stage's user prompt
+   * gets a "User note from review:" block prepended. Called by the
+   * dashboard-server after-stage hook the moment a pause resolves.
+   *
+   * Set in two phases so per-repo fanout (which calls getPromptContext
+   * multiple times within a single stage) all sees the same note:
+   *   1. After-stage hook calls `setReviewNote(note)` → pendingReviewNote
+   *   2. Pipeline loop calls `armReviewNoteForCurrentStage()` once at
+   *      stage entry → currentStageReviewNote (read by every prompt build)
+   *   3. Pipeline loop calls `clearStageReviewNote()` once at stage exit
+   */
+  setReviewNote(note: string | null): void {
+    const trimmed = note?.trim() ?? '';
+    this.pendingReviewNote = trimmed.length > 0 ? trimmed : null;
+  }
+  private currentStageReviewNote: string | null = null;
+  /** Move the most recent pause note onto the current stage. No-op when none. */
+  private armReviewNoteForCurrentStage(): void {
+    if (this.pendingReviewNote) {
+      this.currentStageReviewNote = this.pendingReviewNote;
+      this.pendingReviewNote = null;
+    }
+  }
+  /** Clear the per-stage review note so it doesn't bleed into the next stage. */
+  private clearStageReviewNote(): void {
+    this.currentStageReviewNote = null;
+  }
+  /** Read the active review note (for prompt builders). Does NOT clear. */
+  private peekReviewNote(): string | null {
+    return this.currentStageReviewNote;
+  }
+
+  // ── Artifact override (Phase B — modify-artifact) ────────────────────
+
+  /**
+   * Set when the dashboard's after-stage hook resolves a pause with
+   * `modify-artifact`. The pipeline loop reads this AFTER the hook
+   * returns and uses it as the `prevArtifact` for the next stage,
+   * superseding the agent's output. Cleared once consumed.
+   */
+  private prevArtifactOverride: string | null = null;
+
+  /**
+   * Replace the just-completed stage's artifact with reviewer-edited
+   * markdown. Updates in-memory state, the on-disk artifact, broadcasts
+   * the change, and arms the override so the next stage's `prevArtifact`
+   * is the edited body.
+   */
+  applyArtifactEdit(stageIndex: number, editedArtifact: string): void {
+    const stage = STAGES[stageIndex];
+    if (!stage) return;
+    if (this.state.stages[stageIndex]) {
+      this.state.stages[stageIndex].artifact = editedArtifact;
+    }
+    try {
+      this.writeStageArtifact(stageIndex, stage, editedArtifact);
+    } catch (err) {
+      console.warn(`[pipeline] applyArtifactEdit: writeStageArtifact failed: ${err instanceof Error ? err.message : err}`);
+    }
+    this.prevArtifactOverride = editedArtifact;
+    this.broadcastState();
+    this.checkpoint();
+  }
+
+  /** Read-and-clear the artifact override. Returns null when unset. */
+  private consumeArtifactOverride(): string | null {
+    const v = this.prevArtifactOverride;
+    this.prevArtifactOverride = null;
+    return v;
+  }
+
+  // ── Rerun-from + Iterate-with-note (Phases C & F) ─────────────────────
+  //
+  // Both actions reset stage state and bounce the loop counter back; the
+  // difference is *what* gets reset and how the note is framed:
+  //
+  //   rerun-from:
+  //     - Resets stages [target..current] (could rewind multiple stages)
+  //     - Clears manifest fields written by those stages
+  //     - Note → failureContext ("RETRY. The previous run failed: …")
+  //
+  //   iterate-with-note:
+  //     - Resets ONLY the current stage
+  //     - Manifest fields untouched
+  //     - Note → reviewNote ("User note from review (apply throughout)")
+  //
+  // Both share the same pending slot; `pendingRerunMode` decides which
+  // semantics the loop applies on consume.
+
+  private pendingRerunFromStage: number | null = null;
+  private rerunFromNote: string | null = null;
+  private pendingRerunMode: 'rerun-from' | 'iterate' | null = null;
+
+  /**
+   * Reviewer asked to roll the pipeline back to `targetIndex` and replay
+   * with `note` as failure context.
+   */
+  requestRerunFromStage(targetIndex: number, note: string | null): void {
+    if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= STAGES.length) {
+      return;
+    }
+    this.pendingRerunFromStage = targetIndex;
+    this.pendingRerunMode = 'rerun-from';
+    const trimmed = note?.trim() ?? '';
+    this.rerunFromNote = trimmed.length > 0 ? trimmed : null;
+  }
+
+  /**
+   * Reviewer wants to refine the just-paused stage's output with feedback
+   * — keep working-tree state, keep manifest, frame the note as
+   * reviewer-feedback (not retry). The loop will reset just THIS stage
+   * and re-spawn with `reviewNote` set.
+   */
+  iterateCurrentStageWithNote(currentStageIndex: number, note: string | null): void {
+    if (!Number.isInteger(currentStageIndex) || currentStageIndex < 0 || currentStageIndex >= STAGES.length) {
+      return;
+    }
+    this.pendingRerunFromStage = currentStageIndex;
+    this.pendingRerunMode = 'iterate';
+    const trimmed = note?.trim() ?? '';
+    this.rerunFromNote = trimmed.length > 0 ? trimmed : null;
+  }
+
+  private consumeRerunRequest(): {
+    targetIndex: number;
+    note: string | null;
+    mode: 'rerun-from' | 'iterate';
+  } | null {
+    if (this.pendingRerunFromStage === null || this.pendingRerunMode === null) return null;
+    const v = {
+      targetIndex: this.pendingRerunFromStage,
+      note: this.rerunFromNote,
+      mode: this.pendingRerunMode,
+    };
+    this.pendingRerunFromStage = null;
+    this.rerunFromNote = null;
+    this.pendingRerunMode = null;
+    return v;
+  }
+
+  /**
+   * Reset stage state for indices [fromIndex .. toIndex] inclusive so the
+   * pipeline loop can replay them. Per-repo sub-state, costs, errors,
+   * artifacts and agentIds all cleared.
+   */
+  private resetStagesForRerun(fromIndex: number, toIndex: number): void {
+    for (let j = fromIndex; j <= toIndex; j++) {
+      const s = this.state.stages[j];
+      if (!s) continue;
+      s.status = 'pending';
+      s.artifact = '';
+      s.error = null;
+      s.cost = 0;
+      s.startedAt = null;
+      s.completedAt = null;
+      s.agentId = null;
+      s.tokens = undefined;
+      if (Array.isArray(s.repos)) {
+        for (const r of s.repos) {
+          r.status = 'pending';
+          r.artifact = '';
+          r.cost = 0;
+          r.error = null;
+          r.agentId = null;
+        }
+      }
+    }
+  }
+
+  /**
+   * Wipe manifest fields written by stages [fromIndex .. toIndex] so the
+   * "do not re-derive" prefix doesn't carry stale claims into the rerun.
+   */
+  private clearManifestFieldsForStages(fromIndex: number, toIndex: number): void {
+    const stageFields: Record<string, ReadonlyArray<string>> = {
+      requirements: ['acceptanceCriteria', 'affectedRepos'],
+      specs: ['apiEndpoints', 'tablesTouched', 'testBehaviors'],
+      tasks: ['filesPlanned'],
+      build: ['changeBrief'],
+      validate: ['openQuestions'],
+    };
+    for (let j = fromIndex; j <= toIndex; j++) {
+      const stage = STAGES[j];
+      const fields = stageFields[stage.name];
+      if (!fields) continue;
+      for (const f of fields) {
+        try {
+          this.manifestStore.patchField(
+            this.config.project, this.state.featureSlug,
+            f as never, 'unset', null as never, `rerun-from-${stage.name}`,
+          );
+        } catch { /* best-effort — extractor may not have run */ }
+      }
+    }
+    this.invalidateManifestBlock();
+  }
+
+  /**
+   * Best-effort list of files modified by this run so far, prefixed with the
+   * repo name so policy globs like `backend/internal/db/**` can match across
+   * a multi-repo workspace. Uses `git status --porcelain` per repo and
+   * silently skips repos that error.
+   */
+  private getTouchedFiles(): string[] {
+    const files: string[] = [];
+    for (const [repoName, repoPath] of Object.entries(this.repoPaths)) {
+      if (!repoPath) continue;
+      try {
+        const out = execSync('git status --porcelain', {
+          cwd: repoPath, encoding: 'utf-8', timeout: 10_000,
+        });
+        for (const line of out.split('\n')) {
+          if (line.length < 4) continue;
+          const path = (line.slice(3).trim().split(' -> ').pop() ?? '').trim();
+          if (path) files.push(`${repoName}/${path}`);
+        }
+      } catch { /* per-repo best-effort */ }
+    }
+    return files;
+  }
+
+  /**
+   * Risk tier + confidence from the plan seed (when present). Computed once
+   * at runtime so every stage sees the same numbers; undefined when no plan
+   * is available (the policy evaluator falls back to defaults).
+   */
+  private cachedRisk: { tier: 'low' | 'med' | 'high'; confidence: number } | null = null;
+  private getPlanRisk(): { tier?: 'low' | 'med' | 'high'; confidence?: number } {
+    if (this.cachedRisk) return this.cachedRisk;
+    const seed = this.config.planSeed;
+    if (!seed?.plan) return {};
+    try {
+      const score = scorePlan(seed.plan);
+      const confidence = (seed.plan as unknown as { confidence?: number }).confidence;
+      this.cachedRisk = {
+        tier: computeRiskTier(score.overall),
+        confidence: typeof confidence === 'number' ? confidence : 0.5,
+      };
+      return this.cachedRisk;
+    } catch {
+      return {};
+    }
+  }
+
+  // ── Phase 1 cache-stability memoization ─────────────────────────────
+  //
+  // Stable inputs to the system prompt are computed ONCE per run so the
+  // resulting bytes are byte-identical across stages — that's what lets the
+  // provider's prompt cache fire (Anthropic explicit, OpenAI auto, Gemini
+  // auto). Reset is implicit: a new PipelineRunner instance gets fresh caches.
+  private cachedMemoryBlock: string | null = null;
+  private cachedConventionsBlock: string | null = null;
+  private cachedProjectYamlSlice: Map<number, string> = new Map();
+  private cachedKbBlock: Map<string, string> = new Map();
+  private lockedKbTierResolved: 'full' | 'repo-focused' | 'index-only' | null = null;
+
+  /**
+   * KB tier locked for the run. Stages 1–7 share one tier so the KB
+   * subsection of `projectPrompt` is byte-stable across them — that's the
+   * dominant byte mass and the dominant cache buster today. Clarify and
+   * Ship keep their existing exceptions (clarify needs the big-picture
+   * index; ship doesn't need any KB).
+   */
+  private getLockedKbTier(stage: StageDefinition): 'full' | 'repo-focused' | 'index-only' | 'none' {
+    if (stage.name === 'ship') return 'none';
+    if (stage.name === 'clarify') return 'index-only';
+    if (this.lockedKbTierResolved !== null) return this.lockedKbTierResolved;
+    // First lockable call wins. 'repo-focused' is the conservative balance:
+    // big enough for analyst/architect needs, small enough that engineers
+    // don't drown. Bump to 'full' here only if the project is unusually
+    // multi-repo and benefits from cross-repo context every stage.
+    this.lockedKbTierResolved = 'repo-focused';
+    return this.lockedKbTierResolved;
+  }
+
+  /**
+   * Memoised memory block (project + user profile, capped at 4KB).
+   *
+   * Retrieval is BM25-keyed by the run's feature description against
+   * the SQLite hot index — top-K relevant entries. An empty block is
+   * surfaced honestly when nothing relevant is found rather than
+   * falling back to "newest 4KB blob," which leaked stale unrelated
+   * notes into prompts.
+   */
+  private getStableMemoryBlock(): string {
+    if (this.cachedMemoryBlock !== null) return this.cachedMemoryBlock;
+    try {
+      const store = this.memoryStore.unwrap();
+      const projectNs = { scope: 'project' as const, projectId: this.config.project };
+      const userNs = { scope: 'user' as const, projectId: this.config.project };
+      const queryText = this.config.feature || '';
+
+      const projectHits = queryText
+        ? store.query(projectNs, { text: queryText, limit: 8 })
+        : store.query(projectNs, { limit: 8 });
+      const userHits = store.query(userNs, { limit: 5 });
+
+      const projectBlock = projectHits.length > 0
+        ? `## Recent project memories (BM25-ranked for "${queryText.slice(0, 60)}")\n` +
+          projectHits.map((m) => `- [${m.kind}${m.subtype ? `:${m.subtype}` : ''}] ${formatContent(m.content)}`).join('\n')
+        : '';
+      const userBlock = userHits.length > 0
+        ? `## User profile\n` +
+          userHits.map((m) => `- ${formatContent(m.content)}`).join('\n')
+        : '';
+
+      const combined = [projectBlock, userBlock].filter(Boolean).join('\n\n');
+      this.cachedMemoryBlock = combined.length > 4000
+        ? combined.slice(0, 4000) + '\n... [memory truncated]'
+        : combined;
+    } catch (err) {
+      console.warn('[pipeline] BM25 memory retrieval failed:', err);
+      this.cachedMemoryBlock = '';
+    }
+    return this.cachedMemoryBlock;
+  }
+
+  /**
+   * Memoised conventions block. Loads `<conventionsDir>/global.md` and
+   * `<conventionsDir>/<project>/conventions.md` once per run via
+   * @anvil/convention-core. Returns empty string on error or when the
+   * project has no conventions extracted yet — auto-warm runs at pipeline
+   * start to populate the file before clarify.
+   */
+  private getStableConventionsBlock(): string {
+    if (this.cachedConventionsBlock !== null) return this.cachedConventionsBlock;
+    try {
+      // Synchronous read via require-style — convention-core's loadConventions
+      // is async (matches the cli loader's fs/promises shape) so we handle
+      // both. Since pipeline-runner pre-populates this cache via warmConventions
+      // before stages fire, the synchronous fallback below should rarely run.
+      const md = this.conventionsMarkdownSync ?? '';
+      this.cachedConventionsBlock = md.length > 8000 ? md.slice(0, 8000) + '\n... [conventions truncated]' : md;
+    } catch {
+      this.cachedConventionsBlock = '';
+    }
+    return this.cachedConventionsBlock;
+  }
+
+  private conventionsMarkdownSync: string | null = null;
+
+  /**
+   * Warm the conventions cache before stage 1. If `<conventionsDir>/<project>/conventions.md`
+   * is missing, extract it from the workspace; then load + cache the markdown.
+   * Non-fatal — empty block is fine if extraction fails.
+   */
+  private async warmConventions(): Promise<void> {
+    const anvilHome = process.env.ANVIL_HOME ?? process.env.FF_HOME ?? join(homedir(), '.anvil');
+    const paths = {
+      conventionsDir: join(anvilHome, 'conventions'),
+      rulesDir: join(anvilHome, 'conventions', 'rules'),
+    };
+    const projectMd = join(paths.conventionsDir, this.config.project, 'conventions.md');
+
+    if (!existsSync(projectMd)) {
+      // Auto-warm — extract once. Workspace may not exist yet for fresh
+      // projects; fail silently in that case.
+      try {
+        const repoPaths = Object.values(this.repoPaths);
+        if (repoPaths.length > 0 && repoPaths.every((p) => existsSync(p))) {
+          this.emit('project-event', {
+            source: 'conventions',
+            message: `Extracting conventions for "${this.config.project}" (first run)`,
+          });
+          coreExtractConventions(paths, this.config.project, repoPaths);
+        }
+      } catch (err) {
+        console.warn('[pipeline] convention extract failed:', err);
+      }
+    }
+
+    try {
+      const md = await coreLoadConventions(paths, this.config.project);
+      this.conventionsMarkdownSync = md;
+    } catch {
+      this.conventionsMarkdownSync = '';
+    }
+  }
+
+  /** Memoised project YAML slice — same maxLen returns same bytes. */
+  private getStableProjectYamlSlice(maxLen: number): string {
+    const cached = this.cachedProjectYamlSlice.get(maxLen);
+    if (cached !== undefined) return cached;
+    const value = this.projectYaml.slice(0, maxLen) || '(not available)';
+    this.cachedProjectYamlSlice.set(maxLen, value);
+    return value;
+  }
+
+  /**
+   * Memoised KB block keyed by (tier, repoName). Replaces inline kbManager
+   * compositions that varied per stage even when inputs were identical.
+   */
+  private getStableKbBlock(
+    tier: 'full' | 'repo-focused' | 'index-only' | 'none',
+    repoName?: string,
+  ): { content: string; sourceLabel: 'none' | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob' } {
+    if (tier === 'none') return { content: '', sourceLabel: 'none' };
+    const key = `${tier}|${repoName ?? '__project__'}`;
+
+    const cached = this.cachedKbBlock.get(key);
+    if (cached !== undefined) {
+      // Recover the source label from the cached body. Encoded as a
+      // leading sentinel comment we strip on retrieval.
+      const label = (cached.match(/^<!-- anvil:kb-src:(\w[\w-]*) -->/) ?? [])[1] as
+        | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob' | undefined;
+      const content = cached.replace(/^<!-- anvil:kb-src:[\w-]+ -->\n?/, '');
+      return { content, sourceLabel: label ?? 'none' };
+    }
+
+    let content = '';
+    let sourceLabel: 'none' | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob' = 'none';
+    const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
+
+    if (repoName) {
+      const repoKB = this.kbManager?.getGraphReport(this.config.project, repoName) || '';
+      if (tier === 'repo-focused') {
+        content = repoKB ? `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}` : '';
+        if (content) sourceLabel = 'repo-focused';
+      } else if (tier === 'index-only') {
+        content = indexPrompt;
+        if (content) sourceLabel = 'index-only';
+      } else if (indexPrompt) {
+        const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
+        content = `${indexPrompt}\n\n---\n\n## YOUR TARGET REPO: ${repoName}\n\n${repoKB || '(no repo-specific KB)'}\n\n---\n\n${queryContext}`;
+        sourceLabel = 'full-with-index';
+      } else {
+        const fullKB = this.kbManager?.getAllGraphReports(this.config.project) || '';
+        if (repoKB) {
+          content = `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}`;
+          const otherRepos = fullKB.split('\n\n---\n\n').filter((s) => !s.includes(`## ${repoName}\n`));
+          if (otherRepos.length > 0) {
+            content += `\n\n---\n\n## OTHER REPOS (for cross-repo context)\n\n${otherRepos.join('\n\n---\n\n')}`;
+          }
+        } else {
+          content = fullKB;
+        }
+        if (content) sourceLabel = 'full-blob';
+      }
+    } else {
+      // Project-wide (non-repo) prompt path.
+      if (indexPrompt) {
+        const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
+        content = `${indexPrompt}\n\n---\n\n${queryContext}`;
+        sourceLabel = 'full-with-index';
+      } else {
+        content = this.kbManager?.getAllGraphReports(this.config.project) || '';
+        if (content) sourceLabel = 'full-blob';
+      }
+    }
+
+    if (content) {
+      this.cachedKbBlock.set(key, `<!-- anvil:kb-src:${sourceLabel} -->\n${content}`);
+    }
+    return { content, sourceLabel };
+  }
+
+  // ── Phase 2 manifest helpers ────────────────────────────────────────
+
+  /**
+   * Render the current feature manifest as a stable text block. Cached
+   * within a stage so multiple per-repo spawns reuse the same bytes; the
+   * cache is invalidated whenever the manifest is patched.
+   */
+  private getStableManifestBlock(): string {
+    if (this.cachedManifestBlock !== null) return this.cachedManifestBlock;
+    try {
+      const m = this.manifestStore.read(this.config.project, this.state.featureSlug);
+      this.cachedManifestBlock = renderManifestForPrompt(m);
+    } catch {
+      this.cachedManifestBlock = '';
+    }
+    return this.cachedManifestBlock;
+  }
+
+  /** Discard the cached render so the next read picks up patched fields. */
+  private invalidateManifestBlock(): void {
+    this.cachedManifestBlock = null;
+  }
+
+  /**
+   * Pre-fill the manifest from a plan seed. Called before stage 5 (build)
+   * runs so engineers see acceptance criteria, repo impact, planned files,
+   * and test behaviors as `final` and don't re-derive them. Plans don't
+   * always have explicit API/table sections, so those are left `unset`.
+   */
+  private populateManifestFromPlan(plan: import('./plan-store.js').Plan): void {
+    const project = this.config.project;
+    const slug = this.state.featureSlug;
+    this.manifestStore.ensure(project, slug, this.config.feature);
+
+    const writer = 'plan-seed';
+
+    // Acceptance criteria — derived from the plan's in-scope list when present.
+    if (plan.scope?.inScope?.length) {
+      this.manifestStore.patchField(
+        project, slug, 'acceptanceCriteria', 'final',
+        plan.scope.inScope.slice(),
+        writer,
+      );
+    }
+
+    // Affected repos — directly from plan.repos[].name.
+    const repoNames = (plan.repos ?? []).map((r) => r.name).filter((n): n is string => !!n);
+    if (repoNames.length > 0) {
+      this.manifestStore.patchField(
+        project, slug, 'affectedRepos', 'final',
+        repoNames,
+        writer,
+      );
+    }
+
+    // Files planned — flatten plan.repos[].files into PlannedFile entries.
+    // Plans don't track create/modify/delete kinds, so default to 'modify'.
+    const filesPlanned: PlannedFile[] = [];
+    for (const repo of plan.repos ?? []) {
+      for (const file of repo.files ?? []) {
+        filesPlanned.push({ repo: repo.name, path: file, kind: 'modify' });
+      }
+    }
+    if (filesPlanned.length > 0) {
+      this.manifestStore.patchField(
+        project, slug, 'filesPlanned', 'final',
+        filesPlanned,
+        writer,
+      );
+    }
+
+    // Test behaviors — synthesize from plan.tests buckets.
+    const testBehaviors: TestBehavior[] = [];
+    for (const desc of plan.tests?.unit ?? []) testBehaviors.push({ description: desc });
+    for (const desc of plan.tests?.integration ?? []) testBehaviors.push({ description: desc });
+    for (const desc of plan.tests?.manual ?? []) testBehaviors.push({ description: desc });
+    if (testBehaviors.length > 0) {
+      this.manifestStore.patchField(
+        project, slug, 'testBehaviors', 'final',
+        testBehaviors,
+        writer,
+      );
+    }
+
+    this.invalidateManifestBlock();
+  }
+
+  /**
+   * After a stage's artifact lands, extract structured fields and patch the
+   * manifest. Uses a heuristic deterministic parser today — the cheap-model
+   * extraction call is wired through later phases so we avoid an extra spawn
+   * per stage while still capturing the obvious wins from plan-seeded runs
+   * and from artifacts that already use predictable headings.
+   */
+  private async extractAndUpdateManifest(stage: StageDefinition, artifact: string): Promise<void> {
+    const fieldsForStage: Partial<Record<string, ManifestExtractor[]>> = {
+      requirements: [extractAcceptanceCriteria, extractAffectedRepos],
+      specs: [extractApiEndpoints, extractTablesTouched, extractTestBehaviors],
+      tasks: [extractFilesPlanned],
+      build: [extractChangeBrief],
+      validate: [extractOpenQuestions],
+    };
+    const extractors = fieldsForStage[stage.name];
+    if (!extractors || extractors.length === 0) return;
+
+    let mutated = false;
+    for (const extractor of extractors) {
+      try {
+        const result = extractor(artifact);
+        if (!result) continue;
+        this.manifestStore.patchField(
+          this.config.project, this.state.featureSlug,
+          result.field, result.status, result.value as never,
+          stage.name,
+        );
+        mutated = true;
+      } catch (err) {
+        console.warn(`[pipeline] manifest extractor ${stage.name} failed:`, err);
+      }
+    }
+    if (mutated) this.invalidateManifestBlock();
+  }
 
   // For interactive clarify — resolves when user provides input
   private inputResolve: ((text: string) => void) | null = null;
@@ -343,6 +1171,7 @@ export class PipelineRunner extends EventEmitter {
     this.agentManager = agentManager;
     this.projectLoader = projectLoader;
     this.featureStore = featureStore;
+    this.manifestStore = new FeatureManifestStore(featureStore);
     this.config = config;
     this.memoryStore = memoryStore ?? new MemoryStore();
     this.kbManager = kbManager ?? null;
@@ -404,6 +1233,7 @@ export class PipelineRunner extends EventEmitter {
       model: config.model,
       repoNames: [],
       waitingForInput: false,
+      tokens: { ...zeroTokenStats(), cacheHitRatio: 0 },
     };
   }
 
@@ -419,16 +1249,240 @@ export class PipelineRunner extends EventEmitter {
    * so new models are picked up automatically without code changes.
    */
   private resolveModelForStage(stageName: string): string {
-    // 1. factory.yaml per-stage override always wins
+    const picked = this.pickModelForStage(stageName);
+    this.recordResolvedStageState(stageName, picked);
+    return picked;
+  }
+
+  /**
+   * Pure resolution chain — no state mutation. Extracted so the public
+   * resolver can layer on the state-recording side effect for UI surfacing.
+   */
+  private pickModelForStage(stageName: string): string {
+    // 1. factory.yaml per-stage override always wins (project-specific
+    //    pinning beats every other rule).
     const yamlModels = this.projectLoader.getConfig(this.config.project)?.pipeline?.models;
     if (yamlModels?.[stageName]) return yamlModels[stageName];
 
-    // 2. If no tier selected, use the single model from the UI dropdown
+    // 2. Registry-driven resolver — reads stage-policy.yaml +
+    //    ~/.anvil/models.yaml and picks the cheapest model that meets
+    //    the stage's capability/complexity bar. This is where local
+    //    routing finally kicks in for clarify/build/etc when Ollama
+    //    is up; falls through to legacy paths if the registry is
+    //    missing or doesn't cover the stage.
+    try {
+      const resolved = registryResolveStage(stageName);
+      // Phase 11 — walk the resolved chain via the liveness cache,
+      // skipping models burned earlier this run (retryable upstream
+      // failures). When the primary's provider is dead OR its model
+      // is burned, we fall to the next live tier instead of letting
+      // the adapter throw mid-stage. The cache is pre-warmed at
+      // run start; the burn-set is mutated by runStageWithFallback.
+      const picked = pickAliveModelFromChainSync(
+        resolved,
+        providerOfModelId,
+        this.runtimeBurnedModels,
+      );
+      if (picked.fellBackFrom) {
+        console.warn(
+          `[pipeline] ${stageName}: ${picked.fellBackFrom} skipped; falling back to ${picked.model}`,
+        );
+        const key = `${stageName}|${picked.fellBackFrom}->${picked.model}`;
+        if (!this.livenessFallbackNotified.has(key)) {
+          this.livenessFallbackNotified.add(key);
+          this.emit('project-event', {
+            source: 'routing',
+            message: `${picked.fellBackFrom} unavailable for ${stageName} (provider auth/liveness); falling back to ${picked.model}`,
+            level: 'warn',
+          });
+        }
+      }
+      return picked.model;
+    } catch (err) {
+      if (err instanceof UnknownStageError) {
+        // Stage not declared in policy yaml — drop to legacy paths.
+      } else if (err instanceof ModelResolutionError) {
+        // Policy declares it but no model satisfies — log + fall through.
+        console.warn(`[pipeline] resolver: ${err.message}; falling back to legacy chain`);
+      } else {
+        console.warn(`[pipeline] resolver crashed:`, err);
+      }
+    }
+
+    // 3. ANVIL_LOCAL_MODEL legacy override — kept for deterministic
+    //    local runs that bypass the registry entirely. Stays off by
+    //    default; only fires when the env var is explicitly set.
+    const localModel = process.env.ANVIL_LOCAL_MODEL?.trim();
+    if (localModel && LOCAL_TIER_STAGES.has(stageName)) {
+      return localModel;
+    }
+
+    // 4. If no tier selected, use the single model from the UI dropdown
     const tier = this.config.modelTier;
     if (!tier) return this.config.model;
 
-    // 3. Tier-based routing — resolve from provider registry
+    // 5. Tier-based legacy routing — last resort
     return resolveModelByTier(tier, stageName, this.config.model);
+  }
+
+  /**
+   * Per-stage tool-permission set, populated into SpawnConfig.allowedTools
+   * so the agent-core LanguageModelBridge can construct a properly-scoped
+   * BuiltinToolExecutor for non-Claude providers. Claude CLI uses its own
+   * tool allow/deny list (driven by persona); for Claude paths this
+   * supplies the same intent but is harmless when Claude ignores it.
+   *
+   * Resolution: stage-policy default → factory.yaml allow extends →
+   * factory.yaml deny strips. Empty result falls back to read-only so a
+   * misconfigured deny list can't accidentally silence the agent.
+   */
+  private allowedToolsForCurrentStage(stageName: string): string[] {
+    const base = new Set(allowedToolsForStage(stageName));
+    const overrides = this.projectLoader
+      .getConfig(this.config.project)?.pipeline?.permissions?.[stageName];
+    if (overrides?.allow_tools) for (const t of overrides.allow_tools) base.add(t);
+    if (overrides?.deny_tools) for (const t of overrides.deny_tools) base.delete(t);
+    if (base.size === 0) return ['read_file', 'grep', 'glob', 'list'];
+    return [...base].sort();
+  }
+
+  /**
+   * Pre-warm the provider-liveness cache so the sync resolver chain
+   * walker has fresh data. Called once at pipeline start. Probes run
+   * in parallel; failures are non-fatal.
+   */
+  protected async prefetchProviderLiveness(): Promise<void> {
+    // Load the walker block from ~/.anvil/models.yaml + apply its TTL
+    // override before any cache writes happen. Failures are non-fatal —
+    // if the registry can't be read we keep the compiled-in defaults.
+    let registry: ModelRegistry | null = null;
+    try {
+      registry = loadModelRegistry();
+      this.walkerConfig = registry.walker;
+      setLivenessTtlMs(this.walkerConfig.liveness_ttl_ms);
+    } catch (err) {
+      console.warn(`[pipeline] walker: registry load failed, using defaults: ${(err as Error).message}`);
+      this.walkerConfig = { ...DEFAULT_WALKER_CONFIG };
+    }
+
+    // Auto-derive the prefetch list from registry providers. Falls back
+    // to the canonical superset when the registry is empty so probes
+    // still light up for clean installs.
+    const providers = registry && registry.models.length > 0
+      ? Array.from(new Set(registry.models.map((m) => m.provider)))
+      : ['ollama', 'claude', 'openai', 'openrouter', 'gemini', 'gemini-cli', 'opencode', 'adk'] as ProviderName[];
+    await prefetchLiveness(providers);
+  }
+
+  /**
+   * Wrap a stage spawn with chain-fallback on retryable upstream
+   * errors. When the inner attempt throws an UpstreamError-shape with
+   * `retryable === true` (429 quota, rate-limit, 5xx), the failed
+   * model is added to `runtimeBurnedModels` and the stage is retried
+   * with the next chain entry. Caps at MAX_FALLBACK_ATTEMPTS so a
+   * fully-broken chain surfaces quickly instead of looping forever.
+   *
+   * Non-retryable errors (auth, 400 bad request, the user's own
+   * cancel) propagate unchanged — those need a config fix, not a
+   * retry.
+   */
+  private async runStageWithFallback<T>(
+    stageName: string,
+    attempt: (model: string) => Promise<T>,
+  ): Promise<T> {
+    // Read from the walker block in models.yaml (cached at run start by
+    // prefetchProviderLiveness). Falls back to compiled-in default when
+    // the registry didn't load cleanly.
+    const MAX_ATTEMPTS = this.walkerConfig.max_attempts;
+    let lastErr: unknown;
+    for (let i = 0; i < MAX_ATTEMPTS; i += 1) {
+      const model = this.resolveModelForStage(stageName);
+      try {
+        return await attempt(model);
+      } catch (err) {
+        lastErr = err;
+        const retryable = isRetryableUpstreamError(err);
+        if (!retryable) throw err;
+
+        // Burn this model for the rest of the run + log + emit a
+        // routing event the dashboard activity log can surface.
+        this.runtimeBurnedModels.add(model);
+        const status = (err as { status?: number }).status ?? '?';
+        const summary = (err as Error).message?.slice(0, 200) ?? 'unknown';
+        console.warn(
+          `[pipeline] ${stageName}: ${model} hit ${status} (retryable); burning + falling back`,
+        );
+        this.emit('project-event', {
+          source: 'routing',
+          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
+          level: 'warn',
+        });
+        // Loop continues — pickModelForStage now skips this model.
+      }
+    }
+    // Exhausted the chain — bubble the last error so the stage fails
+    // cleanly with the original upstream message.
+    throw lastErr;
+  }
+
+  /**
+   * Stamp the per-stage state with the resolved model + permission set
+   * the moment the resolver is consulted. Called from resolveModelForStage
+   * which fires once per stage entry, so the UI sees the routing
+   * decision in real time.
+   */
+  private recordResolvedStageState(stageName: string, model: string): void {
+    const stageIdx = this.state.stages.findIndex((s) => s.name === stageName);
+    if (stageIdx === -1) return;
+    const stage = this.state.stages[stageIdx];
+    // Don't clobber an explicit override that's already been recorded
+    // (e.g. by an earlier per-task call within the same stage).
+    if (stage.resolvedModel && stage.resolvedModel === model) return;
+    stage.resolvedModel = model;
+    stage.permissionClasses = permissionClassesForStage(stageName);
+    this.broadcastState();
+  }
+
+  /**
+   * Soft guardrail (P12): warn if a system prompt exceeds 60KB. Caching
+   * efficiency degrades when prefixes balloon, so this fires a project-event
+   * to flag regressions before they pile up. Pure telemetry — does not trim.
+   */
+  /**
+   * Build the bundled-dependency snapshot the lifted prompt-builders
+   * (Phase 4f.7) consume. Closes over PipelineRunner state so the cache
+   * stability invariants (P1 — byte-identical bytes across stages of one
+   * run) flow through unchanged.
+   */
+  private getPromptContext(): PromptBuilderContext {
+    return {
+      project: this.config.project,
+      feature: this.config.feature,
+      model: this.config.model,
+      workspaceDir: this.workspaceDir,
+      baseBranch: this.getBaseBranch(),
+      failureContext: this.config.failureContext,
+      // Surfaced for the immediate next stage only — pipeline loop arms
+      // it on stage entry and clears it on stage exit, so per-repo fanout
+      // sees the same note across calls.
+      reviewNote: this.peekReviewNote() ?? undefined,
+      actionType: this.config.actionType,
+      repoNames: this.state.repoNames,
+      featureSlug: this.state.featureSlug,
+      projectYaml: this.projectYaml,
+      projectInfo: this.projectInfo,
+      repoPaths: this.repoPaths,
+      getStableMemoryBlock: () => this.getStableMemoryBlock(),
+      getStableConventionsBlock: () => this.getStableConventionsBlock(),
+      getStableProjectYamlSlice: (n) => this.getStableProjectYamlSlice(n),
+      getStableKbBlock: (tier, repoName) => this.getStableKbBlock(tier, repoName),
+      getStableManifestBlock: () => this.getStableManifestBlock(),
+      getLockedKbTier: (stage) => this.getLockedKbTier(stage as StageDefinition),
+      loadRepoArtifacts: (repoName) => this.loadRepoArtifacts(repoName),
+      loadHighLevelRequirements: () => this.loadHighLevelRequirements(),
+      kbManager: this.kbManager,
+      emit: (event, payload) => this.emit(event, payload),
+    };
   }
 
   /** Persist pipeline state to disk for crash recovery */
@@ -549,6 +1603,19 @@ export class PipelineRunner extends EventEmitter {
       // Phase 0: Ensure workspace exists
       await this.setupWorkspace();
 
+      // Pre-warm provider liveness so the sync resolver chain walker
+      // (called per stage) reads fresh data. Non-blocking failure mode:
+      // if any probe fails, the cache stays cold for that provider and
+      // the walker treats it as alive (status quo).
+      await this.prefetchProviderLiveness().catch(() => undefined);
+
+      // Pre-warm conventions block — extracts on first run if missing,
+      // then loads the markdown into the run-scoped cache so every
+      // stage prompt's {{conventions}} slot is populated identically.
+      await this.warmConventions().catch((err: unknown) => {
+        console.warn('[pipeline] convention warm failed:', err);
+      });
+
       // Create or resume feature record
       const isResume = this.config.resumeFromStage != null && this.config.featureSlug;
       let featureRecord;
@@ -564,6 +1631,18 @@ export class PipelineRunner extends EventEmitter {
         this.state.featureSlug = featureRecord.slug;
       }
 
+      // Phase 2: ensure a manifest exists for the feature, then pre-fill from
+      // the plan seed when present so stage 5 (build) sees acceptanceCriteria,
+      // affectedRepos, filesPlanned, and testBehaviors as `final`.
+      this.manifestStore.ensure(this.config.project, this.state.featureSlug, this.config.feature);
+      if (this.config.planSeed?.plan) {
+        try {
+          this.populateManifestFromPlan(this.config.planSeed.plan);
+        } catch (err) {
+          console.warn('[pipeline] populateManifestFromPlan failed:', err);
+        }
+      }
+
       // Load prior artifacts if resuming
       let prevArtifact = '';
       const resumeStage = this.config.resumeFromStage ?? 0;
@@ -571,6 +1650,16 @@ export class PipelineRunner extends EventEmitter {
       if (isResume) {
         prevArtifact = this.loadPriorArtifacts(resumeStage);
         console.log(`[pipeline] Resuming from stage ${resumeStage} (${STAGES[resumeStage]?.name}), loaded ${prevArtifact.length} chars of prior context`);
+      }
+
+      // Prefetch hybrid-retriever context once per run. Sync prompt
+      // builders can then read it from the KBManager cache without an
+      // await on the hot path; if the LanceDB store is empty/missing,
+      // the cache stays empty and the legacy keyword path takes over.
+      try {
+        await this.kbManager?.prefetchHybridContext(this.config.project, this.config.feature);
+      } catch (err) {
+        console.warn(`[pipeline] prefetchHybridContext failed: ${err instanceof Error ? err.message : String(err)}`);
       }
 
       // Check knowledge base status — agents will explore from scratch if not built (slower + costlier)
@@ -611,9 +1700,21 @@ export class PipelineRunner extends EventEmitter {
 
         // Skip stages if configured
         if (stage.name === 'clarify' && this.config.skipClarify) {
+          const seed = this.config.clarifySeedArtifact ?? 'Clarification skipped.';
           this.state.stages[i].status = 'skipped';
-          this.state.stages[i].artifact = 'Clarification skipped.';
-          prevArtifact = 'Clarification skipped.';
+          this.state.stages[i].artifact = seed;
+          prevArtifact = seed;
+          // Persist seed as CLARIFICATION.md so downstream resume picks it up.
+          if (this.config.clarifySeedArtifact) {
+            try {
+              this.featureStore.writeArtifact(
+                this.config.project,
+                this.state.featureSlug,
+                'CLARIFICATION.md',
+                this.config.clarifySeedArtifact,
+              );
+            } catch { /* not fatal */ }
+          }
           this.broadcastState();
           this.checkpoint();
           continue;
@@ -624,6 +1725,105 @@ export class PipelineRunner extends EventEmitter {
           this.checkpoint();
           continue;
         }
+
+        // Plan-seed skip: stages 1–4 derive deterministically from the plan.
+        if (this.config.planSeed && PLAN_DERIVED_STAGES.includes(stage.name)) {
+          const { plan } = this.config.planSeed;
+          const { renderRequirements, renderRepoRequirements, renderRepoSpecs, renderRepoTasks }
+            = await import('./plan-to-artifacts.js');
+
+          const project = this.config.project;
+          const slug = this.state.featureSlug;
+
+          if (stage.name === 'requirements') {
+            const artifact = renderRequirements(plan);
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = artifact;
+            prevArtifact = artifact;
+            try { this.featureStore.writeArtifact(project, slug, 'REQUIREMENTS.md', artifact); } catch { /* non-fatal */ }
+          } else {
+            // Per-repo: write one artifact per repo + populate repos[] entries
+            const filenameByStage: Record<string, string> = {
+              'repo-requirements': 'REQUIREMENTS.md',
+              specs: 'SPECS.md',
+              tasks: 'TASKS.md',
+            };
+            const rendererByStage: Record<string, (p: typeof plan, r: string) => string> = {
+              'repo-requirements': renderRepoRequirements,
+              specs: renderRepoSpecs,
+              tasks: renderRepoTasks,
+            };
+            const filename = filenameByStage[stage.name];
+            const renderer = rendererByStage[stage.name];
+
+            const combined: string[] = [];
+            this.state.stages[i].repos = this.state.repoNames.map((repoName) => {
+              const artifact = renderer(plan, repoName);
+              try {
+                this.featureStore.writeArtifact(project, slug, `repos/${repoName}/${filename}`, artifact);
+              } catch { /* non-fatal */ }
+              combined.push(`## ${repoName}\n${artifact}`);
+              return {
+                repoName,
+                agentId: null,
+                status: 'completed' as const,
+                cost: 0,
+                artifact,
+                error: null,
+              };
+            });
+
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = combined.join('\n\n');
+            prevArtifact = this.state.stages[i].artifact;
+          }
+
+          this.state.stages[i].completedAt = new Date().toISOString();
+          this.broadcastState();
+          this.checkpoint();
+          continue;
+        }
+
+        // Test-gen stage: deterministic behavior extraction + grounding + scaffold
+        // emission. Opt-in via planSeed (we need Behaviors from somewhere); without
+        // a plan, we skip so existing non-plan flows are unchanged.
+        if (stage.name === 'test') {
+          if (!this.config.planSeed) {
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = 'Test stage skipped (no plan seed).';
+            prevArtifact = this.state.stages[i].artifact;
+            this.state.stages[i].completedAt = new Date().toISOString();
+            this.broadcastState();
+            this.checkpoint();
+            continue;
+          }
+          try {
+            const artifact = await this.runTestGenStage(i);
+            this.state.stages[i].status = 'completed';
+            this.state.stages[i].artifact = artifact;
+            this.state.stages[i].completedAt = new Date().toISOString();
+            prevArtifact = artifact;
+            this.broadcastState();
+            this.checkpoint();
+          } catch (err) {
+            // Non-fatal: test-gen failure shouldn't block validate. Downgrade to skipped.
+            const msg = err instanceof Error ? err.message : String(err);
+            console.warn('[pipeline] test-gen failed, continuing to validate:', msg);
+            this.state.stages[i].status = 'skipped';
+            this.state.stages[i].artifact = `Test stage skipped (${msg}).`;
+            this.state.stages[i].completedAt = new Date().toISOString();
+            this.broadcastState();
+            this.checkpoint();
+          }
+          continue;
+        }
+
+        console.log(`[pipeline] Entering stage "${stage.name}" (${i + 1}/${STAGES.length})`);
+
+        // Move any pending reviewer note from the prior pause onto this
+        // stage so every spawn (per-repo fanout, per-task build) sees the
+        // same note. Cleared after the stage completes.
+        this.armReviewNoteForCurrentStage();
 
         // Ensure Claude CLI auth is valid before spawning agents
         await this.ensureAuth(stage.name);
@@ -647,7 +1847,7 @@ export class PipelineRunner extends EventEmitter {
         this.emit('stage-start', i, '');
 
         try {
-          let result: { artifact: string; cost: number };
+          let result: { artifact: string; cost: number; tokens: StageTokenStats };
 
           if (stage.name === 'clarify') {
             result = await this.runClarifyStage(i);
@@ -663,14 +1863,130 @@ export class PipelineRunner extends EventEmitter {
           this.state.stages[i].completedAt = new Date().toISOString();
           this.state.stages[i].artifact = result.artifact;
           this.state.stages[i].cost = result.cost;
+          this.state.stages[i].tokens = result.tokens;
           this.state.totalCost += result.cost;
+          this.aggregateRunTokens(result.tokens);
+          this.logCacheTelemetry(stage.name, result.tokens);
           prevArtifact = result.artifact;
           this.broadcastState();
           this.checkpoint(); // Save: stage completed
           this.emit('stage-complete', i, result.artifact, result.cost);
 
-          // Write artifact to feature folder
-          this.writeStageArtifact(i, stage, result.artifact);
+          // ── After-stage hook — policy-driven pause / learning / etc. ──
+          if (this.afterStageHook) {
+            try {
+              const risk = this.getPlanRisk();
+              await this.afterStageHook({
+                runId: this.state.runId,
+                project: this.config.project,
+                stageIndex: i,
+                stageName: stage.name,
+                artifact: result.artifact,
+                cost: result.cost,
+                totalCost: this.state.totalCost,
+                touchedFiles: this.getTouchedFiles(),
+                riskTier: risk.tier,
+                confidence: risk.confidence,
+              });
+              if (this.cancelled) break;
+            } catch (err) {
+              console.warn(`[pipeline] after-stage hook rejected at ${stage.name}:`, err);
+              this.cancelled = true;
+              break;
+            }
+          }
+
+          // Phases C + F — rerun-from / iterate-with-note: bounce the
+          // loop counter back to a prior stage. `mode` discriminates:
+          //   - 'rerun-from': wipe stages [target..i] + clear manifest;
+          //     frame the note as failureContext ("RETRY, previous run
+          //     failed").
+          //   - 'iterate':    wipe only stage `i` (== target); leave
+          //     manifest alone; frame the note via reviewNote ("User note
+          //     from review, apply throughout").
+          const rerun = this.consumeRerunRequest();
+          if (rerun !== null) {
+            const target = rerun.targetIndex;
+            if (rerun.mode === 'iterate') {
+              // Single-stage refinement — preserve everything else.
+              this.resetStagesForRerun(target, target);
+              if (rerun.note) this.setReviewNote(rerun.note);
+              console.log(`[pipeline] Iterate requested → re-running stage ${target} (${STAGES[target].name}) with reviewer feedback`);
+            } else {
+              // Multi-stage rewind — wipe through and reframe as retry.
+              this.resetStagesForRerun(target, i);
+              this.clearManifestFieldsForStages(target, i);
+              if (rerun.note) {
+                this.config.failureContext =
+                  `Rerun requested by reviewer at stage "${STAGES[target].name}":\n${rerun.note}`;
+              }
+              console.log(`[pipeline] Rerun-from requested → resetting to stage ${target} (${STAGES[target].name})`);
+            }
+            prevArtifact = target > 0
+              ? (this.state.stages[target - 1]?.artifact ?? '')
+              : '';
+            this.broadcastState();
+            this.checkpoint();
+            // The loop's i++ at end of iteration will land on `target`.
+            i = target - 1;
+            continue;
+          }
+
+          // Phase B — modify-artifact: if the reviewer edited the artifact
+          // during the after-stage pause, applyArtifactEdit has already
+          // re-written disk state + broadcast. Pick up the edited body so
+          // the next stage receives it as `prevArtifact`.
+          const edited = this.consumeArtifactOverride();
+          if (edited !== null) {
+            prevArtifact = edited;
+          } else {
+            // No edit — write the agent's artifact (skipped on edit since
+            // applyArtifactEdit already wrote the edited copy).
+            this.writeStageArtifact(i, stage, result.artifact);
+          }
+
+          // Phase 2: extract structured fields from this stage's artifact and
+          // patch the manifest. Best-effort — extractor failures degrade to
+          // "field stays unset" rather than aborting the run.
+          try {
+            await this.extractAndUpdateManifest(stage, result.artifact);
+          } catch (err) {
+            console.warn(`[pipeline] manifest extraction at ${stage.name} failed:`, err);
+          }
+
+          // After build (plan-seeded runs only): capture what Build actually did
+          // vs what the plan claimed. Feeds plan-learner.
+          if (stage.name === 'build' && this.config.planSeed && !this.cancelled) {
+            try {
+              const { captureDeviation, updateLearnings } = await import('./plan-deviation.js');
+              const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
+              const repoLocalPaths: Record<string, string> = {};
+              for (const r of this.state.repoNames) repoLocalPaths[r] = this.repoPaths[r] ?? '';
+              const deviation = captureDeviation(this.config.planSeed.plan, {
+                featureDir,
+                repoLocalPaths,
+                baseBranch: this.config.baseBranch ?? 'main',
+                branch: `anvil/${this.state.featureSlug}`,
+              });
+              const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME
+                || (await import('node:os')).homedir() + '/.anvil';
+              updateLearnings(
+                anvilHome,
+                this.config.project,
+                deviation,
+                this.state.totalCost,
+                this.config.planSeed.plan.estimate.usd,
+              );
+              this.emit('artifact-written', {
+                stage: 'build',
+                file: `${featureDir}/plan-deviation.json`,
+                summary: `Plan match rate: ${(deviation.summary.matchRate * 100).toFixed(0)}%`,
+                content: JSON.stringify(deviation, null, 2),
+              });
+            } catch (err) {
+              console.warn('[pipeline] Plan deviation capture failed:', err);
+            }
+          }
 
           // After ship stage, optionally deploy to remote sandbox
           if (stage.name === 'ship' && this.config.deploy && !this.cancelled) {
@@ -695,6 +2011,8 @@ export class PipelineRunner extends EventEmitter {
               // Run engineer agent to fix the reported issues
               const fixResult = await this.runFixLoop(i, validateArtifact, fixAttempts);
               this.state.totalCost += fixResult.cost;
+              this.aggregateRunTokens(fixResult.tokens);
+              this.logCacheTelemetry(`${stage.name}:fix-${fixAttempts}`, fixResult.tokens);
 
               if (this.cancelled) break;
 
@@ -704,6 +2022,8 @@ export class PipelineRunner extends EventEmitter {
               this.state.stages[i].artifact = validateArtifact;
               this.state.stages[i].cost += revalidateResult.cost;
               this.state.totalCost += revalidateResult.cost;
+              this.aggregateRunTokens(revalidateResult.tokens);
+              this.logCacheTelemetry(`${stage.name}:revalidate-${fixAttempts}`, revalidateResult.tokens);
               this.broadcastState();
 
               // Write updated validate artifact
@@ -713,6 +2033,10 @@ export class PipelineRunner extends EventEmitter {
             if (this.hasValidationFailures(validateArtifact)) {
               console.warn(`[pipeline] Validation still failing after ${MAX_FIX_ATTEMPTS} fix attempts`);
               // Don't fail the pipeline — ship stage will do a final check
+            } else if (fixAttempts > 0) {
+              console.log(`[pipeline] Validation recovered after ${fixAttempts} fix attempt(s)`);
+            } else {
+              console.log(`[pipeline] Validation clean — proceeding to Ship`);
             }
 
             prevArtifact = validateArtifact;
@@ -731,6 +2055,11 @@ export class PipelineRunner extends EventEmitter {
             status: 'failed',
           });
           return this.state;
+        } finally {
+          // The reviewer note (if any) applied to THIS stage only. Drop it
+          // before advancing so the next stage starts fresh and can pick up
+          // a brand-new note set by its own after-stage pause resolution.
+          this.clearStageReviewNote();
         }
       }
 
@@ -830,194 +2159,87 @@ export class PipelineRunner extends EventEmitter {
    * Uses config.baseBranch, then tries main, then master as fallback.
    */
   private async pullLatestMain(): Promise<void> {
-    const base = this.getBaseBranch();
-    const repos = this.state.repoNames;
-
-    const pullBranch = (cwd: string, label: string): boolean => {
-      // If explicit baseBranch is set, only try that one
-      if (this.config.baseBranch) {
-        try {
-          execSync(`git fetch origin && git checkout "${base}" && git pull origin "${base}"`, { cwd, timeout: 30000, stdio: 'pipe' });
-          console.log(`[pipeline] ${label}: up to date with ${base}`);
-          return true;
-        } catch {
-          console.warn(`[pipeline] ${label}: could not pull ${base} — continuing with current state`);
-          return false;
-        }
-      }
-      // Auto-detect: try main, then master
-      try {
-        execSync('git fetch origin && git checkout main && git pull origin main', { cwd, timeout: 30000, stdio: 'pipe' });
-        console.log(`[pipeline] ${label}: up to date with main`);
-        return true;
-      } catch {
-        try {
-          execSync('git fetch origin && git checkout master && git pull origin master', { cwd, timeout: 30000, stdio: 'pipe' });
-          console.log(`[pipeline] ${label}: up to date with master`);
-          return true;
-        } catch {
-          console.warn(`[pipeline] ${label}: could not pull latest — continuing with current state`);
-          return false;
-        }
-      }
-    };
-
-    if (repos.length === 0) {
-      pullBranch(this.workspaceDir, 'workspace root');
-      return;
-    }
-
-    for (const repoName of repos) {
-      const repoPath = this.repoPaths[repoName];
-      if (!repoPath || !existsSync(repoPath)) continue;
-      pullBranch(repoPath, repoName);
-    }
+    await pullBaseBranchForRepos({
+      baseBranch: this.config.baseBranch,
+      repoPaths: this.repoPaths,
+      repoNames: this.state.repoNames,
+      workspaceDir: this.workspaceDir,
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
   }
 
   // ── Interactive Clarify (one question at a time) ─────────────────
 
-  /**
-   * Parse numbered questions from the clarifier agent's output.
-   * Matches patterns like:
-   *   1. **[Topic]**: Question text?
-   *   2. Question text?
-   *   1) Question text?
-   */
-  private parseQuestions(output: string): string[] {
-    const lines = output.split('\n');
-    const questions: string[] = [];
-    let current = '';
-
-    for (const line of lines) {
-      // Detect start of a new numbered question
-      const isNewQ = /^\s*\d+[\.\)]\s+/.test(line);
-      if (isNewQ) {
-        if (current.trim()) questions.push(current.trim());
-        current = line.replace(/^\s*\d+[\.\)]\s+/, '');
-      } else if (current) {
-        // Continuation of current question (non-empty, not a closing line)
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.toLowerCase().startsWith('please answer')) {
-          current += '\n' + line;
-        }
-      }
-    }
-    if (current.trim()) questions.push(current.trim());
-
-    // Deduplicate — agent may produce identical questions under different numbers
-    const seen = new Set<string>();
-    return questions.filter((q) => {
-      if (q.length <= 10) return false; // skip very short fragments
-      // Normalize: strip bold markers, whitespace, and leading topic labels for comparison
-      const normalized = q.replace(/\*\*/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
-      if (seen.has(normalized)) return false;
-      seen.add(normalized);
-      return true;
-    });
-  }
-
-  private async runClarifyStage(index: number): Promise<{ artifact: string; cost: number }> {
-    // Phase A: Agent explores codebase and generates questions
-    const explorePrompt = this.buildClarifyExplorePrompt();
-    const projectPrompt = this.buildProjectPrompt(STAGES[0]);
-
-    const agent = this.agentManager.spawn({
-      name: `clarifier-${this.config.project}`,
-      persona: 'clarifier',
+  private async runClarifyStage(index: number): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
+    const result = await this.runStageWithFallback('clarify', (model) => runClarifyForProject({
+      agentManager: this.agentManager,
       project: this.config.project,
-      stage: 'clarify',
-      prompt: explorePrompt,
-      model: this.resolveModelForStage('clarify'),
-      cwd: this.workspaceDir,
-      projectPrompt,
-      permissionMode: 'bypassPermissions',
-      disallowedTools: ['Write', 'Edit', 'NotebookEdit', 'Bash'],
-    });
-
-    this.state.stages[index].agentId = agent.id;
-    this.broadcastState();
-    this.emit('stage-start', index, agent.id);
-
-    // Wait for agent to finish generating questions
-    const exploreResult = await this.waitForAgent(agent.id);
-    let totalCost = exploreResult.cost;
-
-    // Phase B: Parse questions and ask them one by one
-    const questions = this.parseQuestions(exploreResult.artifact);
-    const qaPairs: Array<{ question: string; answer: string }> = [];
-
-    if (questions.length === 0) {
-      // Fallback: treat entire output as a single question block
-      questions.push(exploreResult.artifact);
-    }
-
-    for (let qi = 0; qi < questions.length; qi++) {
-      if (this.cancelled) break;
-
-      const question = questions[qi];
-
-      // Emit the question as a visible activity
-      this.emit('clarify-question', {
-        stageIndex: index,
-        questionIndex: qi,
-        totalQuestions: questions.length,
-        question,
-      });
-
-      // Wait for user's answer
-      this.state.stages[index].status = 'waiting';
-      this.state.status = 'waiting';
-      this.state.waitingForInput = true;
-      this.broadcastState();
-      this.emit('waiting-for-input', index, agent.id);
-
-      const answer = await new Promise<string>((resolve) => {
+      workspaceDir: this.workspaceDir,
+      model,
+      allowedTools: this.allowedToolsForCurrentStage('clarify'),
+      maxOutputTokens: maxOutputTokensForStage('clarify'),
+      explorePrompt: this.buildClarifyExplorePrompt(),
+      projectPrompt: this.buildProjectPrompt(STAGES[0]),
+      isCancelled: () => this.cancelled,
+      onAgentSpawned: (agentId) => {
+        this.state.stages[index].agentId = agentId;
+        this.broadcastState();
+        this.emit('stage-start', index, agentId);
+      },
+      onTruncation: (agentName, outputTokens) => {
+        this.handleOutputTruncation(agentName, outputTokens);
+      },
+      onClarifyQuestion: (questionIndex, totalQuestions, question) => {
+        this.emit('clarify-question', {
+          stageIndex: index,
+          questionIndex,
+          totalQuestions,
+          question,
+        });
+      },
+      onWaitingForInput: (agentId) => {
+        this.state.stages[index].status = 'waiting';
+        this.state.status = 'waiting';
+        this.state.waitingForInput = true;
+        this.broadcastState();
+        this.emit('waiting-for-input', index, agentId);
+      },
+      onAnswerReceived: (answer) => {
+        this.emit('user-input', { stageIndex: index, text: answer });
+        this.state.waitingForInput = false;
+        this.broadcastState();
+      },
+      onClarifyAck: (questionIndex, totalQuestions, hasMore) => {
+        this.emit('clarify-ack', {
+          stageIndex: index,
+          questionIndex,
+          totalQuestions,
+          hasMore,
+        });
+      },
+      onSynthesizeStart: () => {
+        this.state.stages[index].status = 'running';
+        this.state.status = 'running';
+        this.state.waitingForInput = false;
+        this.broadcastState();
+      },
+      inputResolver: () => new Promise<string>((resolve) => {
         this.inputResolve = resolve;
-      });
-
-      if (this.cancelled || !answer) break;
-
-      // Record the Q&A pair
-      qaPairs.push({ question, answer });
-
-      // Emit acknowledgment
-      this.emit('user-input', { stageIndex: index, text: answer });
-      this.emit('clarify-ack', {
-        stageIndex: index,
-        questionIndex: qi,
-        totalQuestions: questions.length,
-        hasMore: qi < questions.length - 1,
-      });
-
-      this.state.waitingForInput = false;
-      this.broadcastState();
-    }
-
-    if (this.cancelled || qaPairs.length === 0) {
-      return { artifact: exploreResult.artifact, cost: totalCost };
-    }
-
-    // Phase C: Resume agent with all Q&A pairs to synthesize clarification
-    this.state.stages[index].status = 'running';
-    this.state.status = 'running';
-    this.state.waitingForInput = false;
-    this.broadcastState();
-
-    const qaText = qaPairs.map((qa, i) =>
-      `**Q${i + 1}**: ${qa.question}\n**A${i + 1}**: ${qa.answer}`,
-    ).join('\n\n');
-
-    this.agentManager.sendInput(agent.id,
-      `Here are the clarifying questions and the user's answers:\n\n${qaText}\n\nNow synthesize a CLARIFICATION.md document that combines the questions, answers, and your codebase understanding into clear context for the next stages. Output ONLY the markdown content.`,
-    );
-
-    // Wait for the resumed agent to finish
-    const synthesizeResult = await this.waitForAgent(agent.id);
-    totalCost += synthesizeResult.cost;
+      }),
+    }));
 
     return {
-      artifact: synthesizeResult.artifact || exploreResult.artifact,
-      cost: totalCost,
+      artifact: result.artifact,
+      cost: result.cost,
+      tokens: {
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheWriteTokens: result.cacheWriteTokens,
+      },
     };
   }
 
@@ -1027,7 +2249,7 @@ export class PipelineRunner extends EventEmitter {
     index: number,
     stage: StageDefinition,
     prevArtifact: string,
-  ): Promise<{ artifact: string; cost: number }> {
+  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
     const repos = this.state.repoNames;
 
     if (repos.length === 0) {
@@ -1036,47 +2258,87 @@ export class PipelineRunner extends EventEmitter {
     }
 
     // Spawn agents for all repos in parallel
-    const promises: Promise<{ repoName: string; artifact: string; cost: number }>[] = [];
+    const promises: Promise<{
+      repoName: string;
+      artifact: string;
+      cost: number;
+      tokens: StageTokenStats;
+    }>[] = [];
 
     for (let r = 0; r < repos.length; r++) {
       const repoName = repos[r];
       const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
+      const repoIdx = r;
 
       // Mark repo as running
       if (this.state.stages[index].repos[r]) {
         this.state.stages[index].repos[r].status = 'running';
       }
 
-      const prompt = this.buildRepoStagePrompt(stage, repoName, prevArtifact);
       const projectPrompt = this.buildRepoProjectPrompt(stage, repoName);
 
-      // Non-engineer/tester personas cannot write files — only engineers and testers modify code
-      const noWriteTools = (stage.persona !== 'engineer' && stage.persona !== 'tester')
-        ? ['Write', 'Edit', 'NotebookEdit', 'Bash'] : undefined;
-
-      const agent = this.agentManager.spawn({
-        name: `${stage.persona}-${repoName}`,
-        persona: stage.persona,
-        project: this.config.project,
-        stage: `${stage.name}:${repoName}`,
-        prompt,
-        model: this.resolveModelForStage(stage.name),
-        cwd: repoPath,
-        projectPrompt,
-        permissionMode: 'bypassPermissions',
-        disallowedTools: noWriteTools,
-      });
-
-      if (this.state.stages[index].repos[r]) {
-        this.state.stages[index].repos[r].agentId = agent.id;
+      // ── Build stage: per-task spawning (P5) ──
+      // When the engineer's repo has parseable TASKS.md, spawn one engineer per task
+      // (in dependency-aware groups) instead of one engineer for the whole repo.
+      // Each per-task spawn shares the same stable system prompt, which lets the
+      // Claude CLI prompt cache hit across spawns.
+      if (stage.name === 'build' && stage.persona === 'engineer') {
+        promises.push(
+          this.runBuildForRepo(index, repoIdx, stage, repoName, repoPath, projectPrompt)
+            .then((res) => ({
+              repoName,
+              artifact: res.artifact,
+              cost: res.cost,
+              tokens: res.tokens,
+            }))
+            .catch((err) => {
+              const errorMsg = err instanceof Error ? err.message : String(err);
+              const repoState = this.state.stages[index].repos[repoIdx];
+              if (repoState) {
+                repoState.status = 'failed';
+                repoState.error = errorMsg;
+              }
+              this.broadcastState();
+              return {
+                repoName,
+                artifact: '',
+                cost: 0,
+                tokens: zeroTokenStats(),
+              };
+            }),
+        );
+        continue;
       }
-      this.broadcastState();
+
+      const prompt = this.buildRepoStagePrompt(stage, repoName, prevArtifact);
 
       promises.push(
-        this.waitForAgent(agent.id)
+        this.runStageWithFallback(stage.name, (model) => runPerRepoStageForRepo({
+          agentManager: this.agentManager,
+          project: this.config.project,
+          stageName: stage.name,
+          persona: stage.persona,
+          model,
+          allowedTools: this.allowedToolsForCurrentStage(stage.name),
+          maxOutputTokens: maxOutputTokensForStage(stage.name),
+          repoName,
+          repoPath,
+          projectPrompt,
+          prompt,
+          isCancelled: () => this.cancelled,
+          onSpawn: (agentId) => {
+            if (this.state.stages[index].repos[repoIdx]) {
+              this.state.stages[index].repos[repoIdx].agentId = agentId;
+            }
+            this.broadcastState();
+          },
+          onTruncation: (agentName, outputTokens) => {
+            this.handleOutputTruncation(agentName, outputTokens);
+          },
+        }))
           .then((result) => {
             // Mark repo as completed
-            const repoState = this.state.stages[index].repos[r];
+            const repoState = this.state.stages[index].repos[repoIdx];
             if (repoState) {
               repoState.status = 'completed';
               repoState.cost = result.cost;
@@ -1088,17 +2350,32 @@ export class PipelineRunner extends EventEmitter {
             // Write per-repo artifact
             this.writeRepoArtifact(stage, repoName, result.artifact);
 
-            return { repoName, artifact: result.artifact, cost: result.cost };
+            return {
+              repoName,
+              artifact: result.artifact,
+              cost: result.cost,
+              tokens: {
+                inputTokens: result.inputTokens,
+                outputTokens: result.outputTokens,
+                cacheReadTokens: result.cacheReadTokens,
+                cacheWriteTokens: result.cacheWriteTokens,
+              },
+            };
           })
           .catch((err) => {
             const errorMsg = err instanceof Error ? err.message : String(err);
-            const repoState = this.state.stages[index].repos[r];
+            const repoState = this.state.stages[index].repos[repoIdx];
             if (repoState) {
               repoState.status = 'failed';
               repoState.error = errorMsg;
             }
             this.broadcastState();
-            return { repoName, artifact: '', cost: 0 };
+            return {
+              repoName,
+              artifact: '',
+              cost: 0,
+              tokens: zeroTokenStats(),
+            };
           }),
       );
     }
@@ -1106,19 +2383,114 @@ export class PipelineRunner extends EventEmitter {
     // Wait for all repos to complete
     const results = await Promise.all(promises);
     const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
+    const tokens = sumTokenStats(results.map((r) => r.tokens));
     const successResults = results.filter((r) => r.artifact);
+    const failedRepos = results.filter((r) => !r.artifact).map((r) => r.repoName);
 
-    // Combine artifacts
-    const combined = successResults
-      .map((r) => `## ${r.repoName}\n\n${r.artifact}`)
-      .join('\n\n---\n\n');
+    // Combine artifacts (legacy "## <repo>\n\n<artifact>" separator format).
+    const combined = combinePerRepoArtifacts(successResults);
 
-    // If all repos failed, throw
-    if (successResults.length === 0 && repos.length > 0) {
-      throw new Error(`All repo agents failed for ${stage.name}`);
+    // Per-repo stages are atomic: every repo must produce an artifact
+    // before we advance. Previously this only threw when EVERY repo
+    // failed (legacy partial-success behavior); a single-repo failure
+    // would silently advance with the surviving repo's output, and the
+    // next stage would run with missing context. The user observed
+    // this directly — "frontend is not checked still moved to next
+    // step". Fail-fast here so the dashboard surfaces the failure on
+    // the failing repo's tile and the pipeline halts for retry.
+    if (failedRepos.length > 0) {
+      throw new Error(
+        `Per-repo stage "${stage.name}" failed on ${failedRepos.length} of ${repos.length} repo(s): ${failedRepos.join(', ')}. ` +
+        `Stage cannot advance — retry the run or rerun this stage after fixing the underlying error.`,
+      );
     }
 
-    return { artifact: combined, cost: totalCost };
+    return { artifact: combined, cost: totalCost, tokens };
+  }
+
+  // ── Build stage: per-task spawning ─────────────────────────────────
+
+  /**
+   * Run the build stage for one repo by spawning one engineer per task,
+   * grouped into parallel batches by `groupTasksForExecution`.
+   *
+   * Falls back to a single repo-wide spawn when TASKS.md isn't parseable.
+   * The fallback path keeps Read/Grep/Glob/Agent disabled (P1) so behaviour
+   * matches the prior bundle-per-repo flow.
+   */
+  private async runBuildForRepo(
+    stageIndex: number,
+    repoIdx: number,
+    stage: StageDefinition,
+    repoName: string,
+    repoPath: string,
+    projectPrompt: string,
+  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
+    const repoArtifacts = this.loadRepoArtifacts(repoName);
+
+    const result = await this.runStageWithFallback(stage.name, (model) => runBuildForOneRepo({
+      agentManager: this.agentManager,
+      project: this.config.project,
+      stageName: stage.name,
+      persona: stage.persona,
+      model,
+      allowedTools: this.allowedToolsForCurrentStage(stage.name),
+      maxOutputTokens: maxOutputTokensForStage(stage.name),
+      repoName,
+      repoPath,
+      projectPrompt,
+      tasksMarkdown: repoArtifacts.tasks,
+      buildPerTaskPrompt: (task) =>
+        this.buildPerTaskPrompt(stage, repoName, repoPath, task, repoArtifacts.specs),
+      buildFallbackPrompt: () => this.buildRepoStagePrompt(stage, repoName, ''),
+      isCancelled: () => this.cancelled,
+      onAgentSpawned: (agentId) => {
+        const repoState = this.state.stages[stageIndex].repos[repoIdx];
+        if (repoState) repoState.agentId = agentId;
+        this.broadcastState();
+      },
+      onTruncation: (agentName, outputTokens) => {
+        this.handleOutputTruncation(agentName, outputTokens);
+      },
+      onProjectEvent: (level, message) => {
+        this.emit('project-event', { source: 'pipeline', message, level });
+      },
+    }));
+
+    const repoStateDone = this.state.stages[stageIndex].repos[repoIdx];
+    if (repoStateDone) {
+      repoStateDone.status = 'completed';
+      repoStateDone.cost = result.cost;
+      repoStateDone.artifact = result.artifact;
+    }
+    this.broadcastState();
+    this.checkpoint();
+    this.writeRepoArtifact(stage, repoName, result.artifact);
+
+    return {
+      artifact: result.artifact,
+      cost: result.cost,
+      tokens: {
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheWriteTokens: result.cacheWriteTokens,
+      },
+    };
+  }
+
+  /**
+   * Build the user prompt for ONE task: the task's own markdown block, the
+   * spec sections it references, and the files it touches pre-bundled.
+   */
+  private buildPerTaskPrompt(
+    _stage: StageDefinition,
+    repoName: string,
+    repoPath: string,
+    task: ParsedTask,
+    specsMd: string,
+  ): string {
+    return buildPerTaskPromptHelper(this.getPromptContext(), repoName, repoPath, task, specsMd);
   }
 
   // ── Single-agent stage execution ───────────────────────────────────
@@ -1127,32 +2499,56 @@ export class PipelineRunner extends EventEmitter {
     index: number,
     stage: StageDefinition,
     prevArtifact: string,
-  ): Promise<{ artifact: string; cost: number }> {
+  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
     const prompt = this.buildStagePrompt(stage, prevArtifact);
     const projectPrompt = this.buildProjectPrompt(stage);
 
-    // Non-engineer/tester personas cannot write files
-    const noWriteTools = (stage.persona !== 'engineer' && stage.persona !== 'tester')
-      ? ['Write', 'Edit', 'NotebookEdit'] : undefined;
+    // Persona-driven tool gating (defined in per-repo-stage.step.ts):
+    //   - engineer / tester: full toolbelt (mutate code, run tests).
+    //   - analyst / architect / lead: KB-only (no Grep/Glob/Bash) so the
+    //     model uses the injected Knowledge Base instead of re-exploring.
+    //   - clarifier / others: read-only exploration allowed, no mutation.
+    const disallowedTools = disallowedToolsForPersona(stage.persona);
 
-    const agent = this.agentManager.spawn({
-      name: `${stage.persona}-${this.config.project}`,
-      persona: stage.persona,
-      project: this.config.project,
-      stage: stage.name,
-      prompt,
-      model: this.resolveModelForStage(stage.name),
-      cwd: this.workspaceDir,
-      projectPrompt,
-      permissionMode: 'bypassPermissions',
-      disallowedTools: noWriteTools,
-    });
-
-    this.state.stages[index].agentId = agent.id;
-    this.broadcastState();
-    this.emit('stage-start', index, agent.id);
-
-    return this.waitForAgent(agent.id);
+    const result = await this.runStageWithFallback(stage.name, (model) => spawnAndWait({
+      agentManager: this.agentManager,
+      spec: {
+        name: `${stage.persona}-${this.config.project}`,
+        persona: stage.persona,
+        project: this.config.project,
+        stage: stage.name,
+        prompt,
+        model,
+        cwd: this.workspaceDir,
+        projectPrompt,
+        permissionMode: 'bypassPermissions',
+        disallowedTools,
+        // Phase 11.5 — per-stage tool-permission overrides from
+        // factory.yaml. The bridge uses this to construct a properly-
+        // scoped BuiltinToolExecutor for non-Claude agentic paths.
+        allowedTools: this.allowedToolsForCurrentStage(stage.name),
+        maxOutputTokens: maxOutputTokensForStage(stage.name),
+      },
+      isCancelled: () => this.cancelled,
+      onSpawn: (agentId) => {
+        this.state.stages[index].agentId = agentId;
+        this.broadcastState();
+        this.emit('stage-start', index, agentId);
+      },
+      onTruncation: (agentName, outputTokens) => {
+        this.handleOutputTruncation(agentName, outputTokens);
+      },
+    }));
+    return {
+      artifact: result.artifact,
+      cost: result.cost,
+      tokens: {
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheWriteTokens: result.cacheWriteTokens,
+      },
+    };
   }
 
   // ── Auth helper ──────────────────────────────────────────────────────
@@ -1222,113 +2618,165 @@ export class PipelineRunner extends EventEmitter {
     });
   }
 
-  // ── Agent completion helper ────────────────────────────────────────
+  /**
+   * Phase 3 — Output-truncation telemetry hook. Called when an agent's
+   * stop_reason indicates the max-tokens ceiling was reached. Surfaces a
+   * warning so users can raise the per-stage limit in STAGE_OUTPUT_LIMITS
+   * if a stage repeatedly hits its cap. No-op when no stopReason is set.
+   */
+  private handleOutputTruncation(agentName: string, outputTokens: number): void {
+    const message = `[pipeline] Output truncated for ${agentName} at ${outputTokens} tokens (max_tokens reached). Consider raising STAGE_OUTPUT_LIMITS.`;
+    if (process.env.ANVIL_LOG_OUTPUT_TRUNCATIONS === '1') {
+      console.warn(message);
+    }
+    try {
+      this.emit('project-event', {
+        source: 'pipeline',
+        message,
+      });
+    } catch {
+      /* defensive — emit must never break the run */
+    }
+  }
 
-  private waitForAgent(agentId: string): Promise<{ artifact: string; cost: number }> {
-    return new Promise((resolve, reject) => {
-      const checkDone = () => {
-        if (this.cancelled) return reject(new Error('Pipeline cancelled'));
+  // ── Token / cache telemetry (Phase 1 of TOKEN-OPTIMIZATION-PLAN) ──────
 
-        const current = this.agentManager.getAgent(agentId);
-        if (!current) return reject(new Error('Agent disappeared'));
+  /**
+   * Roll a single stage's token totals into the run-level aggregate. The
+   * cache-hit ratio is computed against the BILLABLE side (input tokens
+   * sent fresh + cache reads) — output and cache writes are excluded since
+   * they don't represent prompt-cache opportunities.
+   */
+  private aggregateRunTokens(t: StageTokenStats): void {
+    const prev = this.state.tokens ?? {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cacheHitRatio: 0,
+    };
+    const inputTokens = prev.inputTokens + t.inputTokens;
+    const outputTokens = prev.outputTokens + t.outputTokens;
+    const cacheReadTokens = prev.cacheReadTokens + t.cacheReadTokens;
+    const cacheWriteTokens = prev.cacheWriteTokens + t.cacheWriteTokens;
+    const denom = inputTokens + cacheReadTokens;
+    this.state.tokens = {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      cacheHitRatio: denom > 0 ? cacheReadTokens / denom : 0,
+    };
+  }
 
-        if (current.status === 'done') {
-          resolve({
-            artifact: current.output,
-            cost: current.cost.totalUsd,
-          });
-        } else if (current.status === 'error' || current.status === 'killed') {
-          reject(new Error(current.error ?? 'Agent failed'));
-        } else {
-          setTimeout(checkDone, 500);
-        }
-      };
-      checkDone();
-    });
+  /**
+   * Log the cache-hit ratio for one stage. The denominator is the billable
+   * input side (input + cache reads); cache writes pay one full price the
+   * first call and amortise for `cacheTtlSeconds` after, so we surface
+   * them but don't include them in the ratio.
+   */
+  private logCacheTelemetry(stageName: string, t: StageTokenStats): void {
+    const denom = t.inputTokens + t.cacheReadTokens;
+    const ratio = denom > 0 ? t.cacheReadTokens / denom : 0;
+    const pct = (ratio * 100).toFixed(1);
+    console.log(
+      `[cache] stage=${stageName} hit=${t.cacheReadTokens}/${denom} (${pct}%)`
+      + ` write=${t.cacheWriteTokens} input=${t.inputTokens} output=${t.outputTokens}`,
+    );
+    try {
+      this.emit('project-event', {
+        source: 'cache',
+        message: `Stage "${stageName}" cache hit ${pct}% (${t.cacheReadTokens.toLocaleString()} of ${denom.toLocaleString()} input-side tokens served from cache)`,
+      });
+    } catch { /* defensive */ }
   }
 
   // ── Validate-fix helpers ────────────────────────────────────────────
 
   /** Check if validation artifact indicates failures */
   private hasValidationFailures(artifact: string): boolean {
-    if (!artifact) return false;
-    return /VERDICT:\s*FAIL/i.test(artifact) ||
-           /UNRESOLVED/i.test(artifact) ||
-           /(?:build|lint|test).*(?:fail|error)/i.test(artifact);
+    return hasValidationFailuresHelper(artifact);
+  }
+
+  /**
+   * Deterministic test-generation stage: fingerprint per repo → extract behaviors
+   * from plan → ground → emit test cases → write to repos → persist TestSpec +
+   * TestCase artifacts. No LLM calls in Phase 1; validate runs whatever lands.
+   */
+  private async runTestGenStage(stageIndex: number): Promise<string> {
+    const repoNames = this.state.repoNames.length
+      ? this.state.repoNames
+      : Object.keys(this.repoPaths);
+    const repoLocalPaths: Record<string, string> = {};
+    for (const r of repoNames) repoLocalPaths[r] = this.repoPaths[r] ?? join(this.workspaceDir, r);
+
+    return runTestGenForProject({
+      planSeed: this.config.planSeed ?? null,
+      project: this.config.project,
+      model: this.config.model,
+      workspaceDir: this.workspaceDir,
+      repoLocalPaths,
+      onConventionsDetected: (artifact) => {
+        this.state.stages[stageIndex].artifact = artifact;
+      },
+      onArtifactWritten: (event) => {
+        this.emit('artifact-written', event);
+      },
+    });
   }
 
   /** Run engineer agents to fix validation issues, then return */
+  /** Per-repo agent ids carried across fix-loop attempts so attempt 2+ resumes the prior session (P9). */
+  private fixLoopAgentByRepo: Map<string, string> = new Map();
+  private fixLoopAgentSingle: string | null = null;
+
   private async runFixLoop(
     _validateStageIndex: number,
     validateArtifact: string,
     attempt: number,
-  ): Promise<{ artifact: string; cost: number }> {
+  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
     const buildStage = STAGES.find((s) => s.name === 'build')!;
-    const repos = this.state.repoNames;
-    let totalCost = 0;
-
-    if (repos.length === 0) {
-      // Single-agent fix
-      const prompt = `The validation stage found issues that need to be fixed (attempt ${attempt}):\n\n${validateArtifact.slice(0, 6000)}\n\nFix ALL build errors, lint errors, and test failures. Run the build and tests again to verify. Do NOT make git commits.`;
-      const agent = this.agentManager.spawn({
-        name: `fixer-${this.config.project}-${attempt}`,
-        persona: 'engineer',
-        project: this.config.project,
-        stage: `fix-${attempt}`,
-        prompt,
-        model: this.resolveModelForStage('validate'),
-        cwd: this.workspaceDir,
-        projectPrompt: this.buildProjectPrompt(buildStage),
-        permissionMode: 'bypassPermissions',
-      });
-
-      const result = await this.waitForAgent(agent.id);
-      return result;
+    const repoPaths: Record<string, string> = {};
+    for (const repoName of this.state.repoNames) {
+      repoPaths[repoName] = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
     }
-
-    // Per-repo fix
-    const promises = repos.map(async (repoName) => {
-      const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
-
-      // Extract repo-specific issues from validate artifact
-      const repoSection = this.extractRepoSection(validateArtifact, repoName);
-      if (!repoSection || !this.hasValidationFailures(repoSection)) {
-        return { artifact: '', cost: 0 };  // this repo is fine
-      }
-
-      const prompt = `The validation stage found issues in "${repoName}" that need to be fixed (attempt ${attempt}):\n\n${repoSection.slice(0, 4000)}\n\nFix ALL build errors, lint errors, and test failures in this repo. Run the build and tests again to verify. Do NOT make git commits.`;
-      const agent = this.agentManager.spawn({
-        name: `fixer-${repoName}-${attempt}`,
-        persona: 'engineer',
-        project: this.config.project,
-        stage: `fix-${attempt}:${repoName}`,
-        prompt,
-        model: this.resolveModelForStage('validate'),
-        cwd: repoPath,
-        projectPrompt: this.buildRepoProjectPrompt(buildStage, repoName),
-        permissionMode: 'bypassPermissions',
-      });
-
-      return this.waitForAgent(agent.id);
-    });
-
-    const results = await Promise.all(promises);
-    const combinedArtifact = results.map((r) => r.artifact).filter(Boolean).join('\n\n');
-    totalCost = results.reduce((sum, r) => sum + r.cost, 0);
-
-    return { artifact: combinedArtifact, cost: totalCost };
-  }
-
-  /** Extract the section of a validate artifact related to a specific repo */
-  private extractRepoSection(artifact: string, repoName: string): string {
-    // Try to find a section headed with the repo name
-    const regex = new RegExp(`## ${repoName}[\\s\\S]*?(?=## \\w|$)`, 'i');
-    const match = artifact.match(regex);
-    if (match) return match[0];
-
-    // Fallback: check if repo name appears anywhere with error context
-    if (artifact.includes(repoName)) return artifact;
-    return '';
+    const result = await this.runStageWithFallback('fix-loop', (model) => runFixLoop({
+      agentManager: this.agentManager,
+      project: this.config.project,
+      // fix-loop has its own stage policy (free-tier: local→cheap)
+      // because it's a tight mechanical retry loop. Falls back to the
+      // validate stage's policy if 'fix-loop' isn't in the registry.
+      model,
+      allowedTools: this.allowedToolsForCurrentStage('fix-loop'),
+      maxOutputTokens: maxOutputTokensForStage('build'),
+      workspaceDir: this.workspaceDir,
+      repoNames: this.state.repoNames,
+      repoPaths,
+      validateArtifact,
+      attempt,
+      priorByRepo: this.fixLoopAgentByRepo,
+      priorSingleId: this.fixLoopAgentSingle,
+      buildProjectPromptForBuildStage: () => this.buildProjectPrompt(buildStage),
+      buildRepoProjectPromptForBuildStage: (repoName: string) =>
+        this.buildRepoProjectPrompt(buildStage, repoName),
+      isCancelled: () => this.cancelled,
+      onTruncation: (agentName, outputTokens) => {
+        this.handleOutputTruncation(agentName, outputTokens);
+      },
+    }));
+    if (result.newSingleId !== null) {
+      this.fixLoopAgentSingle = result.newSingleId;
+    }
+    return {
+      artifact: result.artifact,
+      cost: result.cost,
+      tokens: {
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadTokens: result.cacheReadTokens,
+        cacheWriteTokens: result.cacheWriteTokens,
+      },
+    };
   }
 
   // ── Artifact loading (for resume) ──────────────────────────────────
@@ -1455,67 +2903,18 @@ export class PipelineRunner extends EventEmitter {
    */
   private runPostBuildGuards(): void {
     console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
-
     const repos = this.state.repoNames.length > 0
       ? this.state.repoNames.map((r) => ({ name: r, path: this.repoPaths[r] || join(this.workspaceDir, r) }))
       : [{ name: this.config.project, path: this.workspaceDir }];
-
-    for (const repo of repos) {
-      try {
-        // Load commands from project config (factory.yaml)
-        const repoCommands = this.projectLoader.getRepoCommands(this.config.project, repo.name);
-        if (repoCommands?.format) {
-          this.runSilent(repoCommands.format, repo.path, repo.name);
-        }
-        if (repoCommands?.lint) {
-          this.runSilent(repoCommands.lint, repo.path, repo.name);
-        }
-
-        // Fallback to language-based detection if no config
-        if (!repoCommands?.format && !repoCommands?.lint) {
-          const hasGo = this.fileExists(repo.path, 'go.mod');
-          const hasTs = this.fileExists(repo.path, 'tsconfig.json');
-          const hasPackageJson = this.fileExists(repo.path, 'package.json');
-          const hasPython = this.fileExists(repo.path, 'pyproject.toml') || this.fileExists(repo.path, 'setup.py');
-
-          if (hasGo) {
-            this.runSilent('gofmt -w .', repo.path, repo.name);
-            this.runSilent('golangci-lint run --fix ./... 2>/dev/null', repo.path, repo.name);
-          }
-
-          if (hasTs || hasPackageJson) {
-            this.runSilent('npx prettier --write "**/*.{ts,tsx,js,jsx}" --ignore-unknown 2>/dev/null', repo.path, repo.name);
-            this.runSilent('npx eslint --fix "**/*.{ts,tsx,js,jsx}" 2>/dev/null', repo.path, repo.name);
-          }
-
-          if (hasPython) {
-            this.runSilent('black . 2>/dev/null', repo.path, repo.name);
-            this.runSilent('ruff check --fix . 2>/dev/null', repo.path, repo.name);
-          }
-        }
-      } catch (err) {
-        // Guards are best-effort — don't fail the pipeline
-        console.warn(`[pipeline] Post-build guard error in ${repo.name}:`, err);
-      }
-    }
-
+    runPostBuildGuards({
+      repos,
+      getRepoCommands: (repoName) => this.projectLoader.getRepoCommands(this.config.project, repoName),
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
     console.log('[pipeline] Post-build guards complete.');
-  }
-
-  private runSilent(cmd: string, cwd: string, _repoName: string): void {
-    try {
-      execSync(cmd, { cwd, stdio: 'pipe', timeout: 60_000 });
-    } catch {
-      // Silently ignore — formatters/linters may not be installed
-    }
-  }
-
-  private fileExists(dir: string, filename: string): boolean {
-    try {
-      return existsSync(join(dir, filename));
-    } catch {
-      return false;
-    }
   }
 
   // ── Remote sandbox deployment ──────────────────────────────────────
@@ -1529,55 +2928,18 @@ export class PipelineRunner extends EventEmitter {
    * Runs after ship stage. Non-blocking — pipeline completes even if deploy fails.
    */
   private deployToRemote(): void {
-    const project = this.config.project;
-    const mode = this.config.deploy;
-    if (!mode) return;
-
-    const isRemote = mode === 'remote';
-    const label = isRemote ? 'remote sandbox' : 'local environment';
-
-    // Resolve deploy command: factory.yaml > ANVIL_DEPLOY_CMD env > skip
-    const factoryConfig = this.projectLoader.getConfig(project);
-    const configDeployCmd = factoryConfig?.pipeline?.ship?.deploy;
-    const envDeployCmd = process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD;
-
-    let cmd: string;
-    if (configDeployCmd) {
-      cmd = configDeployCmd;
-      console.log(`[pipeline] Using deploy command from factory.yaml: ${cmd}`);
-    } else if (envDeployCmd) {
-      cmd = isRemote ? `${envDeployCmd} up ${project} --remote` : `${envDeployCmd} up ${project}`;
-      console.log(`[pipeline] Using deploy command from ANVIL_DEPLOY_CMD: ${cmd}`);
-    } else {
-      console.log(`[pipeline] No deploy command configured — skipping sandbox deployment`);
-      return;
-    }
-    console.log(`[pipeline] Deploying ${project} to ${label}...`);
-
-    try {
-      const result = execSync(cmd, {
-        cwd: this.workspaceDir,
-        timeout: 10 * 60 * 1000,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }).toString();
-
-      // Try to extract URL from output
-      const urlMatch = result.match(/https?:\/\/\S+/);
-      if (urlMatch) {
-        console.log(`[pipeline] Deployed: ${urlMatch[0]}`);
-        this.emit('artifact-written', {
-          stage: 'ship',
-          file: isRemote ? 'SANDBOX_URL' : 'LOCAL_URL',
-          summary: `${label} deployed: ${urlMatch[0]}`,
-          content: urlMatch[0],
-        });
-      } else {
-        console.log(`[pipeline] ${label} deployed for ${project}`);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[pipeline] Deploy to ${label} failed (non-fatal): ${msg}`);
-    }
+    deployProject({
+      project: this.config.project,
+      mode: this.config.deploy,
+      workspaceDir: this.workspaceDir,
+      configDeployCmd: this.projectLoader.getConfig(this.config.project)?.pipeline?.ship?.deploy,
+      envDeployCmd: process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD,
+      onArtifact: (artifact) => this.emit('artifact-written', artifact),
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
   }
 
   // ── Feature branch creation ────────────────────────────────────────
@@ -1589,40 +2951,16 @@ export class PipelineRunner extends EventEmitter {
   private createFeatureBranches(): void {
     const branchName = `anvil/${this.state.featureSlug}`;
     console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
-
-    for (const repoName of this.state.repoNames) {
-      const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
-      try {
-        // Check if branch already exists
-        try {
-          execSync(`git rev-parse --verify "${branchName}"`, { cwd: repoPath, stdio: 'pipe' });
-          // Branch exists — check it out
-          execSync(`git checkout "${branchName}"`, { cwd: repoPath, stdio: 'pipe' });
-          console.log(`[pipeline] Checked out existing branch "${branchName}" in ${repoName}`);
-        } catch {
-          // Branch doesn't exist — create it from current HEAD
-          execSync(`git checkout -b "${branchName}"`, { cwd: repoPath, stdio: 'pipe' });
-          console.log(`[pipeline] Created branch "${branchName}" in ${repoName}`);
-        }
-      } catch (err) {
-        console.warn(`[pipeline] Failed to create branch in ${repoName}:`, err);
-      }
-    }
-
-    // Also create branch in workspace root if no repos
-    if (this.state.repoNames.length === 0) {
-      try {
-        try {
-          execSync(`git rev-parse --verify "${branchName}"`, { cwd: this.workspaceDir, stdio: 'pipe' });
-          execSync(`git checkout "${branchName}"`, { cwd: this.workspaceDir, stdio: 'pipe' });
-        } catch {
-          execSync(`git checkout -b "${branchName}"`, { cwd: this.workspaceDir, stdio: 'pipe' });
-        }
-        console.log(`[pipeline] Created branch "${branchName}" in workspace root`);
-      } catch (err) {
-        console.warn(`[pipeline] Failed to create branch in workspace root:`, err);
-      }
-    }
+    createFeatureBranchesHelper({
+      featureSlug: this.state.featureSlug,
+      repoPaths: this.repoPaths,
+      repoNames: this.state.repoNames,
+      workspaceDir: this.workspaceDir,
+      onLog: (level, message) => {
+        if (level === 'info') console.log(`[pipeline] ${message}`);
+        else console.warn(`[pipeline] ${message}`);
+      },
+    });
   }
 
   // ── Artifact writing ───────────────────────────────────────────────
@@ -1683,329 +3021,19 @@ export class PipelineRunner extends EventEmitter {
   // ── Prompt building ─────────────────────────────────────────────────
 
   private buildProjectPrompt(stage: StageDefinition): string {
-    // Load the full persona prompt from the markdown file
-    const personaPrompt = loadPersonaPromptSync(stage.persona);
-
-    if (personaPrompt) {
-      // Inject template variables
-      const repoList = this.state.repoNames.length > 0
-        ? this.state.repoNames.join(', ')
-        : '(single-repo or monorepo)';
-
-      // Load persistent memory for this project
-      const projectMemory = this.memoryStore.formatForPrompt(this.config.project, 'memory');
-      const userProfile = this.memoryStore.formatForPrompt(this.config.project, 'user');
-      const memoryBlock = [projectMemory, userProfile].filter(Boolean).join('\n\n') || '(no prior memories)';
-
-      // Load knowledge graph — prefer compact index + query-matched context over full blob
-      let knowledgeGraph = '';
-      const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
-      if (indexPrompt) {
-        // Use index + pre-query for focused context
-        const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
-        knowledgeGraph = `${indexPrompt}\n\n---\n\n${queryContext}`;
-        console.log(`[pipeline] buildProjectPrompt("${stage.name}"): KB index (${indexPrompt.length} chars) + query context (${queryContext.length} chars) = ${knowledgeGraph.length} total`);
-      } else {
-        // Fallback: full KB blob (no index built yet)
-        knowledgeGraph = this.kbManager?.getAllGraphReports(this.config.project) || '';
-        console.log(`[pipeline] buildProjectPrompt("${stage.name}"): KB fallback full blob = ${knowledgeGraph ? `${knowledgeGraph.length} chars` : 'EMPTY'}`);
-      }
-
-      // Emit explicit integration events for the output panel
-      if (knowledgeGraph) {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `Knowledge Base loaded for "${this.config.project}" (${knowledgeGraph.length} chars, ${indexPrompt ? 'index + query-matched' : 'full blob'}) → injecting into ${stage.persona} agent`,
-        });
-      } else {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `No Knowledge Base available for "${this.config.project}" — ${stage.persona} agent will explore codebase manually`,
-          level: 'warn',
-        });
-      }
-      if (this.projectYaml && this.projectYaml.length > 10) {
-        this.emit('project-event', {
-          source: 'project-context',
-          message: `Project config loaded for "${this.config.project}" (${this.projectYaml.slice(0, 8000).length} chars) → injecting into ${stage.persona} agent`,
-        });
-      }
-
-      // Apply context budget to avoid exceeding provider token limits
-      const budgeted = budgetPromptContext({
-        featureDescription: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nRepositories: ${repoList}`,
-        stagePrompt: personaPrompt,
-        knowledgeBase: knowledgeGraph,
-        priorArtifacts: '', // Prior artifacts are in the user prompt, not project prompt
-        memory: memoryBlock,
-        projectYaml: this.projectYaml.slice(0, 8000) || '(not available)',
-        overrides: '', // Will be added after injection
-        modelId: this.config.model,
-      });
-
-      if (budgeted.warning) {
-        console.warn(`[pipeline] Context budget: ${budgeted.warning}`);
-        this.emit('project-event', {
-          source: 'context-budget',
-          message: budgeted.warning,
-          level: 'warn',
-        });
-      }
-
-      const tokenInfo = `[Context: ~${Math.round(budgeted.totalTokens / 1000)}K / ${Math.round(budgeted.limit / 1000)}K tokens]`;
-      console.log(`[pipeline] ${stage.name} prompt ${tokenInfo}`);
-
-      const injected = injectTemplateVars(personaPrompt, {
-        project_yaml: budgeted.projectYaml || '(not available)',
-        task: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nRepositories: ${repoList}`,
-        conventions: '(use existing project conventions found in the codebase)',
-        memories: budgeted.memory || '(no prior memories)',
-        knowledge_graph: budgeted.knowledgeBase || '(no knowledge base available — run "Refresh Knowledge Base" from the dashboard)',
-        repo_context: `Project: ${this.config.project}\nRepositories: ${repoList}\nWorkspace: ${this.workspaceDir}`,
-        existing_code: budgeted.knowledgeBase
-          ? '(see Knowledge Graph section for codebase structure — explore specific files as needed)'
-          : '(explore the codebase to discover relevant code)',
-      });
-
-      // Append pipeline-specific overrides
-      const overrides: string[] = [];
-
-      // Non-coding personas must NOT write files — output text only, pipeline persists artifacts
-      if (stage.persona !== 'engineer') {
-        overrides.push('CRITICAL — NO FILE WRITES: Do NOT use the Write tool, do NOT create files, do NOT run mkdir. Output your documents as plain text in your response. The pipeline will persist your output automatically. The workspace repos must contain ONLY source code changes, never markdown artifacts.');
-      }
-
-      if (knowledgeGraph) {
-        overrides.push(`CRITICAL — KNOWLEDGE BASE USAGE:
-A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Graph" section above. It contains:
-1. **Project-level synthesis** (if available): Cross-repo dependencies, shared concepts, and architecture overview for the entire "${this.config.project}" project.
-2. **Per-repo analysis**: AST-extracted modules, functions, imports, call graphs, and community clusters for each repository.
-
-**You MUST follow this traversal strategy:**
-- START by reading the Project Knowledge Base section (if present) to understand how repos relate to each other.
-- THEN read the per-repo sections relevant to your task for detailed module/function information.
-- ONLY read specific source files when you need exact implementation details (API signatures, data model fields) not covered by the KB.
-- When you use KB information, explicitly state it: e.g., "From the Knowledge Base, I can see that module X in repo Y handles Z..."
-- Do NOT broadly explore files when the KB already provides the architectural map.`);
-        if (stage.persona === 'analyst') {
-          overrides.push('IMPORTANT — ANALYST DIRECTIVE: The Knowledge Base provides sufficient architectural context for writing requirements. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Reference specific KB findings in your requirements (e.g., "Based on KB analysis of module X..."). Only read a specific file if you need to verify a concrete implementation detail.');
-        }
-      }
-      if (stage.persona === 'clarifier') {
-        overrides.push('IMPORTANT: Format each clarifying question as a separate numbered item (1. 2. 3. etc). Each question will be shown to the user one at a time in an interactive Q&A flow. Keep each question self-contained. Do NOT combine multiple questions into one item.');
-      }
-      if (stage.persona === 'engineer') {
-        overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
-      }
-      if (stage.persona === 'tester') {
-        overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
-        overrides.push('CRITICAL: You MUST fix ALL build errors, lint errors, and test failures before completing. Iterate until the codebase is clean. End your output with "VERDICT: PASS" or "VERDICT: FAIL" so the pipeline knows whether to proceed to shipping.');
-      }
-
-      return injected + (overrides.length > 0 ? '\n\n' + overrides.join('\n') : '');
-    }
-
-    // Fallback if prompt file not found
-    return `You are the ${stage.persona} agent in an Anvil pipeline for the "${this.config.project}" project.\n\nProject YAML:\n${this.projectYaml.slice(0, 4000)}`;
+    return buildProjectPromptHelper(this.getPromptContext(), stage);
   }
 
   private buildRepoProjectPrompt(stage: StageDefinition, repoName: string): string {
-    // Load the full persona prompt from the markdown file
-    const personaPrompt = loadPersonaPromptSync(stage.persona);
-
-    // Find repo info from project data
-    const repoInfo = this.projectInfo?.repos.find((r) => r.name === repoName);
-    const repoContext = repoInfo
-      ? `Repository: ${repoName}\n- GitHub: ${repoInfo.github}\n- Language: ${repoInfo.language}\n- Kind: ${repoInfo.repoKind}\n- Description: ${repoInfo.description}`
-      : `Repository: ${repoName}`;
-
-    if (personaPrompt) {
-      const projectMemory = this.memoryStore.formatForPrompt(this.config.project, 'memory');
-      const userProfile = this.memoryStore.formatForPrompt(this.config.project, 'user');
-      const memoryBlock = [projectMemory, userProfile].filter(Boolean).join('\n\n') || '(no prior memories)';
-
-      // Load KB — prefer index + query-matched context, with target repo prominently
-      let knowledgeGraph = '';
-      const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
-      if (indexPrompt) {
-        const repoKB = this.kbManager?.getGraphReport(this.config.project, repoName) || '';
-        const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
-        knowledgeGraph = `${indexPrompt}\n\n---\n\n## YOUR TARGET REPO: ${repoName}\n\n${repoKB || '(no repo-specific KB)'}\n\n---\n\n${queryContext}`;
-      } else {
-        // Fallback: full blob approach
-        const repoKB = this.kbManager?.getGraphReport(this.config.project, repoName) || '';
-        const fullKB = this.kbManager?.getAllGraphReports(this.config.project) || '';
-        if (repoKB) {
-          knowledgeGraph += `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}`;
-          const otherRepos = fullKB.split('\n\n---\n\n').filter((s) => !s.includes(`## ${repoName}\n`));
-          if (otherRepos.length > 0) {
-            knowledgeGraph += `\n\n---\n\n## OTHER REPOS (for cross-repo context)\n\n${otherRepos.join('\n\n---\n\n')}`;
-          }
-        } else {
-          knowledgeGraph = fullKB;
-        }
-      }
-
-      // Emit explicit integration events for per-repo prompt
-      if (knowledgeGraph) {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `Knowledge Base loaded for repo "${repoName}" (${knowledgeGraph.length} chars, ${indexPrompt ? 'index + query-matched' : 'full blob'}) → injecting into ${stage.persona} agent`,
-        });
-      } else {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `No Knowledge Base available for repo "${repoName}" — ${stage.persona} agent will explore codebase manually`,
-          level: 'warn',
-        });
-      }
-      if (this.projectYaml && this.projectYaml.length > 10) {
-        this.emit('project-event', {
-          source: 'project-context',
-          message: `Project config loaded for "${this.config.project}" → injecting into ${stage.persona}/${repoName} agent`,
-        });
-      }
-
-      const injected = injectTemplateVars(personaPrompt, {
-        project_yaml: this.projectYaml.slice(0, 4000) || '(not available)',
-        task: `Feature: "${this.config.feature}"\nProject: ${this.config.project}\nTarget repository: ${repoName}`,
-        conventions: '(use existing project conventions found in the codebase)',
-        memories: memoryBlock,
-        knowledge_graph: knowledgeGraph || '(no knowledge base available for this repo)',
-        repo_context: repoContext,
-        existing_code: knowledgeGraph
-          ? '(see Knowledge Graph section for codebase structure — explore specific files as needed)'
-          : '(explore the codebase to discover relevant code)',
-      });
-
-      // Append pipeline-specific overrides
-      const overrides: string[] = [
-        `You are working specifically on the "${repoName}" repository within the "${this.config.project}" project.`,
-      ];
-
-      // Non-coding personas must NOT write files — output text only, pipeline persists artifacts
-      if (stage.persona !== 'engineer') {
-        overrides.push('CRITICAL — NO FILE WRITES: Do NOT use the Write tool, do NOT create files, do NOT run mkdir. Output your documents as plain text in your response. The pipeline will persist your output automatically. The workspace repos must contain ONLY source code changes, never markdown artifacts.');
-      }
-
-      if (knowledgeGraph) {
-        overrides.push(`CRITICAL — KNOWLEDGE BASE USAGE:
-The Knowledge Base above contains your target repo "${repoName}" (labeled "YOUR TARGET REPO") as the primary section, plus the Project Knowledge Base and other repos for cross-repo context.
-
-**You MUST follow this traversal strategy:**
-- START with the Project Knowledge Base section (if present) to understand how "${repoName}" relates to other repos in "${this.config.project}".
-- THEN read the "${repoName}" section in depth — it has AST-extracted modules, functions, imports, call graphs, and community clusters.
-- USE the other repo sections to understand integration points, shared interfaces, and API contracts.
-- ONLY read specific source files when you need exact implementation details not covered by the KB.
-- When you use KB information, explicitly state it: e.g., "From the Knowledge Base, I can see that module X handles Z..."
-- Do NOT broadly explore files when the KB already provides the architectural map.`);
-        if (stage.persona === 'analyst') {
-          overrides.push(`IMPORTANT — ANALYST DIRECTIVE: The Knowledge Base for "${repoName}" provides sufficient architectural context. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Reference specific KB findings in your requirements. Refer to other repos' KB sections for API contracts and integration points. Only read a specific file if you need to verify a concrete implementation detail.`);
-        }
-      }
-      if (stage.persona === 'engineer' || stage.persona === 'tester') {
-        overrides.push('IMPORTANT: Do NOT make git commits. Commits happen in the ship stage on a feature branch.');
-      }
-
-      return injected + '\n\n' + overrides.join('\n');
-    }
-
-    // Fallback if prompt file not found
-    return `You are the ${stage.persona} agent working on "${repoName}" in the "${this.config.project}" project.\n\n${repoContext}\n\nProject YAML:\n${this.projectYaml.slice(0, 2000)}`;
+    return buildRepoProjectPromptHelper(this.getPromptContext(), stage, repoName);
   }
 
   private buildClarifyExplorePrompt(): string {
-    const repoList = this.state.repoNames.length > 0
-      ? this.state.repoNames.join(', ')
-      : '';
-
-    // Load knowledge graph — prefer index + query context
-    let kbReport = '';
-    const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
-    if (indexPrompt) {
-      const queryCtx = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
-      kbReport = `${indexPrompt}\n\n---\n\n${queryCtx}`;
-    } else {
-      kbReport = this.kbManager?.getAllGraphReports(this.config.project) || '';
-    }
-    const hasKB = kbReport.length > 100;
-    console.log(`[pipeline] Clarify KB for "${this.config.project}": ${hasKB ? `${kbReport.length} chars` : 'none'} (${indexPrompt ? 'index-based' : 'full blob'})`);
-
-    const questionFormat = `IMPORTANT: The user will answer each question one at a time in an interactive conversation. Format each question as a separate numbered item so they can be presented individually.
-
-Format your response EXACTLY like this — each question must start on its own line with a number:
-1. **[Question topic]**: Your specific question here?
-2. **[Question topic]**: Your specific question here?
-3. **[Question topic]**: Your specific question here?
-
-Keep each question self-contained and clear. Do not combine multiple questions into one numbered item. End with: "Please answer these questions so I can proceed with detailed requirements."`;
-
-    if (hasKB) {
-      return `Feature: "${this.config.feature}"
-Project: ${this.config.project}
-Repositories: ${repoList}
-
-## Codebase Knowledge Graph
-The following is a pre-computed architectural analysis of the codebase(s). It contains:
-- Module/file structure and key components
-- Function signatures, class definitions, and their relationships
-- Import dependencies and call graphs
-- Topological communities (clusters of related code)
-- Hub components (highly connected critical nodes)
-
-USE THIS AS YOUR PRIMARY SOURCE OF UNDERSTANDING. Do NOT re-explore the entire codebase.
-Only read specific files if you need to verify a detail or understand implementation specifics
-that the knowledge graph doesn't cover.
-
-### How to read the Knowledge Graph
-- **Graph Statistics**: Node count, edge count, density — gives scale of the codebase
-- **Communities**: Topologically clustered modules — each is a logical domain boundary
-- **Hub Components (God Nodes)**: Most-connected components — critical integration points
-- **Surprising Connections**: Unexpected dependencies that may indicate coupling risks
-
-${kbReport}
-
----
-
-Based on this architectural understanding, generate 3-5 specific, thoughtful clarifying questions about the feature request that will help produce better requirements.
-
-${questionFormat}`;
-    }
-
-    // Fallback: no KB available, use original exploration approach
-    return `Feature: "${this.config.feature}"${repoList ? `\n\nThis project contains these repositories: ${repoList}. Explore them to understand the architecture.` : ''}
-
-Explore the codebase thoroughly. Understand the architecture, key files, APIs, data flows, and patterns. Then generate 3-5 specific, thoughtful clarifying questions that will help produce better requirements.
-
-${questionFormat}`;
+    return buildClarifyExplorePromptHelper(this.getPromptContext());
   }
 
   private buildStagePrompt(stage: StageDefinition, prevArtifact: string): string {
-    const feature = `Feature: "${this.config.feature}"`;
-    const prev = prevArtifact ? `\n\n## Previous stage output:\n${prevArtifact.slice(0, 12000)}` : '';
-    const resumeCtx = this.config.failureContext
-      ? `\n\nIMPORTANT — This is a RETRY. The previous run failed:\n${this.config.failureContext}\nFix the issues and proceed. All prior stage artifacts are included above.`
-      : '';
-    const repoList = this.state.repoNames.length > 0
-      ? `\nRepositories: ${this.state.repoNames.join(', ')}`
-      : '';
-
-    switch (stage.name) {
-      case 'requirements':
-        return `${feature}${repoList}\n\nProduce high-level requirements for this feature across the entire project. Identify which repositories need changes and why. Include success criteria.${prev}${resumeCtx}`;
-      case 'ship': {
-        const prLabels = ['anvil'];
-        const at = this.config.actionType ?? 'feature';
-        if (at === 'bugfix' || at === 'fix') prLabels.push('bug');
-        else if (at === 'spike' || at === 'review') prLabels.push(at);
-        else prLabels.push('enhancement');
-        const labelFlags = prLabels.map((l) => `--label "${l}"`).join(' ');
-        const baseBranch = this.getBaseBranch();
-        return `${feature}${repoList}\n\nShip the changes for each repository. The code has been validated — build, lint, and tests all pass.\n\nThe code is already on a feature branch "anvil/${this.state.featureSlug}". For each repo with changes:\n1. Run a final quick check: build and lint to confirm everything is clean\n2. If ANY errors remain, fix them before proceeding\n3. Stage and commit all changes with a clear commit message: "[anvil] ${this.config.feature}"\n4. Push the feature branch to origin\n5. Create a PR from the feature branch to "${baseBranch}" using: gh pr create --base "${baseBranch}" --head "anvil/${this.state.featureSlug}" ${labelFlags}\n\nDo NOT merge to ${baseBranch}. Only create PRs. Do NOT create a PR if the code has unfixed errors.${prev}${resumeCtx}`;
-      }
-      default:
-        return `${feature}${repoList}${prev}${resumeCtx}`;
-    }
+    return buildStagePromptHelper(this.getPromptContext(), stage, prevArtifact);
   }
 
   /**
@@ -2033,130 +3061,7 @@ ${questionFormat}`;
   }
 
   private buildRepoStagePrompt(stage: StageDefinition, repoName: string, prevArtifact: string): string {
-    const feature = `Feature: "${this.config.feature}"`;
-    const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
-    const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
-
-    const resumeCtx = this.config.failureContext
-      ? `\n\nIMPORTANT — This is a RETRY. The previous run failed:\n${this.config.failureContext}\nFix the issues and proceed.`
-      : '';
-
-    // For early stages (repo-requirements, specs, tasks), use the combined prevArtifact
-    const prev = prevArtifact ? `\n\n## Prior stage output:\n${prevArtifact.slice(0, 12000)}` : '';
-
-    // High-level requirements (shared)
-    const hlReqs = this.loadHighLevelRequirements();
-    const hlReqsBlock = hlReqs ? `\n\n## High-Level Requirements\n${hlReqs.slice(0, 4000)}` : '';
-
-    // For build/validate, load THIS repo's specific artifacts
-    const repoArtifacts = this.loadRepoArtifacts(repoName);
-
-    switch (stage.name) {
-      case 'repo-requirements':
-        return `${feature}\n\nProduce requirements specific to the "${repoName}" repository. What changes does THIS repo need for this feature? Include success criteria.${hlReqsBlock}${prev}`;
-
-      case 'specs': {
-        // Use THIS repo's requirements if available, not the combined blob
-        const repoReqsBlock = repoArtifacts.requirements
-          ? `\n\n## Requirements for ${repoName}\n${repoArtifacts.requirements}`
-          : prev;
-        return `${feature}\n\nProduce a detailed technical specification for changes in "${repoName}". Include file paths, function signatures, API changes, data model changes, and how components interact.${hlReqsBlock}${repoReqsBlock}`;
-      }
-
-      case 'tasks': {
-        // Use THIS repo's spec, falling back to requirements
-        const specsBlock = repoArtifacts.specs
-          ? `\n\n## Technical Specification for ${repoName}\n${repoArtifacts.specs}`
-          : '';
-        const repoReqsFallback = !specsBlock && repoArtifacts.requirements
-          ? `\n\n## Requirements for ${repoName}\n${repoArtifacts.requirements}`
-          : '';
-        const context = specsBlock || repoReqsFallback || prev;
-        return `${feature}\n\nBreak down the spec into ordered implementation tasks for "${repoName}". Each task should include: file path, description, acceptance criteria. Order tasks so dependencies come first.${hlReqsBlock}${context}`;
-      }
-
-      case 'build': {
-        const sections: string[] = [feature];
-
-        sections.push(`\n## Context`);
-        sections.push(`- You are working in the "${repoName}" repository at: ${repoPath}`);
-        sections.push(`- Feature branch: anvil/${this.state.featureSlug}`);
-        sections.push(`- Planning artifacts are in: ${featureDir}/repos/${repoName}/`);
-        sections.push(`- Other repos in this project: ${this.state.repoNames.filter(r => r !== repoName).join(', ') || '(none)'}`);
-
-        // Inject all available repo-specific artifacts
-        if (repoArtifacts.requirements) {
-          sections.push(`\n## Requirements for ${repoName}\n${repoArtifacts.requirements}`);
-        }
-        if (repoArtifacts.specs) {
-          sections.push(`\n## Technical Specification for ${repoName}\n${repoArtifacts.specs}`);
-        }
-        if (repoArtifacts.tasks) {
-          sections.push(`\n## Implementation Tasks for ${repoName}\n${repoArtifacts.tasks}`);
-        }
-
-        // Always include high-level requirements as additional context
-        if (hlReqs && !repoArtifacts.requirements) {
-          sections.push(`\n## High-Level Feature Requirements\n${hlReqs.slice(0, 6000)}`);
-        }
-
-        // If no repo-specific artifacts at all, fall back to prevArtifact
-        if (!repoArtifacts.tasks && !repoArtifacts.specs && !repoArtifacts.requirements && prevArtifact) {
-          sections.push(`\n## Prior stage output\n${prevArtifact.slice(0, 12000)}`);
-        }
-
-        sections.push(`\n## Instructions`);
-        sections.push(`Implement the feature for the "${repoName}" repository based on the requirements, specs, and tasks above.`);
-        sections.push(`- Explore the existing codebase FIRST to understand current patterns and conventions.`);
-        sections.push(`- Write real, production-quality code. Do NOT output pseudocode or placeholders.`);
-        sections.push(`- If a task list is provided above, implement each task in order.`);
-        sections.push(`- If no explicit task list is available, derive the implementation steps from the requirements and specs, then implement them.`);
-        sections.push(`- Run the build/compile step to verify your changes work.`);
-        sections.push(`- Do NOT make git commits — that happens in the ship stage.`);
-        sections.push(`- Do NOT ask for clarification or say you are missing information. Use the context above and the codebase to make informed decisions and proceed.`);
-
-        if (resumeCtx) sections.push(resumeCtx);
-        return sections.join('\n');
-      }
-
-      case 'validate': {
-        const sections: string[] = [feature];
-
-        sections.push(`\n## Context`);
-        sections.push(`- You are validating the "${repoName}" repository at: ${repoPath}`);
-        sections.push(`- Feature branch: anvil/${this.state.featureSlug}`);
-
-        if (repoArtifacts.tasks) {
-          sections.push(`\n## Expected Changes (Tasks)\n${repoArtifacts.tasks}`);
-        }
-        if (repoArtifacts.specs) {
-          sections.push(`\n## Technical Specification\n${repoArtifacts.specs.slice(0, 4000)}`);
-        }
-        if (!repoArtifacts.tasks && !repoArtifacts.specs && prevArtifact) {
-          sections.push(`\n## Prior stage output\n${prevArtifact.slice(0, 8000)}`);
-        }
-
-        sections.push(`\n## Validation Steps`);
-        sections.push(`You MUST ensure the code is fully clean before this stage completes:`);
-        sections.push(`1. Run the build (compile/type-check). Fix ALL errors.`);
-        sections.push(`2. Run the linter. Fix ALL lint warnings and errors.`);
-        sections.push(`3. Run the test suite. Fix ALL failing tests.`);
-        sections.push(`4. Repeat steps 1-3 until everything passes with zero errors.`);
-        sections.push(`5. Do NOT move on until build, lint, AND tests all pass.`);
-        sections.push(`\nIf you cannot fix an issue after 5 attempts, document it clearly as UNRESOLVED.`);
-        sections.push(`\nAt the end, output a clear verdict:`);
-        sections.push(`- VERDICT: PASS — if build, lint, and tests all pass`);
-        sections.push(`- VERDICT: FAIL — if any issues remain unresolved`);
-        sections.push(`\nDo NOT make git commits.`);
-        sections.push(`Do NOT ask for missing information. Use the codebase and context above to validate.`);
-
-        if (resumeCtx) sections.push(resumeCtx);
-        return sections.join('\n');
-      }
-
-      default:
-        return `${feature}\n\nWork on "${repoName}".${prev}${resumeCtx}`;
-    }
+    return buildRepoStagePromptHelper(this.getPromptContext(), stage, repoName, prevArtifact);
   }
 
   private broadcastState(): void {

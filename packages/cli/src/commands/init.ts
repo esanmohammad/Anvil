@@ -283,7 +283,38 @@ export async function runInit(force: boolean = false): Promise<void> {
     info(`Skipped ${personaResult.skipped.length} existing persona prompts`);
   }
 
-  if (created > 0 || personaResult.installed.length > 0) {
+  // Bootstrap ~/.anvil/models.yaml from the bundled default template, then
+  // attempt to pull missing Ollama models. Ollama pulls are best-effort —
+  // a missing `ollama` binary or a network failure leaves the template in
+  // place and surfaces a soft hint instead of failing init.
+  let modelsBootstrapped = false;
+  try {
+    const { bootstrapModels, BootstrapError } = await import('./bootstrap-models.js');
+    const result = await bootstrapModels({
+      log: (msg) => {
+        // Suppress the per-step chatter; surface the high-level outcomes below.
+        if (msg.startsWith('Wrote ')) success(msg);
+      },
+    });
+    modelsBootstrapped = result.createdFromTemplate;
+    if (result.pulled.length > 0) {
+      success(`Pulled ${result.pulled.length} Ollama model(s): ${result.pulled.join(', ')}`);
+    }
+    if (result.failed.length > 0) {
+      warn(`Failed to pull ${result.failed.length} Ollama model(s): ${result.failed.map((f) => f.id).join(', ')}`);
+    }
+    // Pre-existing models.yaml + no work to do is silent — no log spam.
+    void BootstrapError;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('Ollama') || message.includes('ollama')) {
+      info(`Skipping Ollama model pulls: ${message}`);
+    } else {
+      warn(`Models bootstrap skipped: ${message}`);
+    }
+  }
+
+  if (created > 0 || personaResult.installed.length > 0 || modelsBootstrapped) {
     success(`Initialized Anvil at ${home}`);
   } else {
     info(`Anvil already initialized at ${home}`);

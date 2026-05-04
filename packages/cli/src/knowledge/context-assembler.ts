@@ -8,13 +8,17 @@
  *   L3 — Deep Search (on-demand, future)
  */
 
-import type { CodeChunk, RetrievalResult, ScoredChunk } from './types.js';
-import { loadProjectGraph, formatProjectGraphForPrompt } from './project-graph-builder.js';
+import type { CodeChunk, RetrievalResult, ScoredChunk } from '@anvil/knowledge-core';
+import { loadProjectGraph, formatProjectGraphForPrompt } from '@anvil/knowledge-core';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Heuristic-only estimator: this module runs during KB indexing (no adapter
+// in scope). Mirrors `heuristicTokenCount` in
+// `packages/dashboard/server/token-util.ts`. If an adapter ever becomes
+// available here, prefer routing through `BaseAdapter.countTokens`.
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
@@ -87,7 +91,7 @@ export function getContextLayerForStage(stageIndex: number): ContextLayer {
   switch (stageIndex) {
     case 0: return 'minimal';     // clarify
     case 1: return 'moderate';    // requirements
-    case 2: return 'moderate';    // project-requirements
+    case 2: return 'moderate';    // repo-requirements
     case 3: return 'moderate';    // specs
     case 4: return 'moderate';    // tasks
     case 5: return 'full';        // build

@@ -36,13 +36,11 @@ packages/code-search-mcp/src/**/*.d.ts.map
 # Claude Code project memory
 .claude/
 
-# Internal planning and architecture docs (not for public release)
+# Internal planning artifacts (not for public release)
 tasks/
-docs/
-PLAN.md
-DASHBOARD-PLAN.md
-ANALYSIS.md
-DEV-TESTING.md
-TESTING.md
-TECHNICAL_ARCHITECTURE.md
-FLOW_DIAGRAM.md
+
+# Exclude all markdown files except READMEs and the public docs/ folder
+*.md
+!README.md
+!**/README.md
+!docs/**/*.md

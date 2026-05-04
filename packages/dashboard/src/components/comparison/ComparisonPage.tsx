@@ -326,7 +326,7 @@ function RagResultsView({ data, expertAnswer, activeTab, onTabChange }: {
                     <td key={m} style={{
                       ...tdStyle, textAlign: 'center', fontFamily: 'var(--font-mono)', fontWeight: 600,
                       fontSize: 14,
-                      color: vals[i] === maxVal && maxVal > 0 ? '#10b981' : 'var(--text-primary)',
+                      color: vals[i] === maxVal && maxVal > 0 ? 'var(--color-success)' : 'var(--text-primary)',
                       background: vals[i] === maxVal && maxVal > 0 ? 'rgba(16,185,129,0.06)' : undefined,
                     }}>
                       {vals[i] || '—'}
@@ -340,7 +340,7 @@ function RagResultsView({ data, expertAnswer, activeTab, onTabChange }: {
               {ALL_MODES.map((m) => (
                 <td key={m} style={{
                   ...tdStyle, textAlign: 'center', fontFamily: 'var(--font-mono)', fontWeight: 700, fontSize: 16,
-                  color: m === bestMode ? '#10b981' : 'var(--text-primary)',
+                  color: m === bestMode ? 'var(--color-success)' : 'var(--text-primary)',
                 }}>
                   {modes[m]?.judge.overall ?? '—'}
                 </td>
@@ -421,8 +421,8 @@ function RagResultsView({ data, expertAnswer, activeTab, onTabChange }: {
                 return (
                   <span key={dim} style={{
                     padding: '4px 10px', fontSize: 11, borderRadius: 'var(--radius-full)',
-                    background: val >= 8 ? 'rgba(16,185,129,0.12)' : val >= 5 ? 'rgba(245,158,11,0.12)' : 'rgba(239,68,68,0.12)',
-                    color: val >= 8 ? '#10b981' : val >= 5 ? '#f59e0b' : '#ef4444',
+                    background: val >= 8 ? 'rgba(111,175,138,0.12)' : val >= 5 ? 'rgba(212,162,74,0.12)' : 'rgba(201,115,115,0.12)',
+                    color: val >= 8 ? 'var(--color-success)' : val >= 5 ? 'var(--color-warning)' : 'var(--color-error)',
                     fontWeight: 600, textTransform: 'capitalize',
                   }}>
                     {dim}: {val}/10
@@ -515,7 +515,7 @@ function RetrievalResultsView({ modes, activeTab, onTabChange, queryTerms }: {
               <tr key={row.label} style={{ borderBottom: '1px solid var(--separator)' }}>
                 <td style={tdStyle}>{row.label}</td>
                 {ALL_MODES.map((m, i) => (
-                  <td key={m} style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--font-mono)', fontWeight: 500, color: row.best === m ? '#10b981' : 'var(--text-primary)', background: row.best === m ? 'rgba(16,185,129,0.06)' : undefined }}>
+                  <td key={m} style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--font-mono)', fontWeight: 500, color: row.best === m ? 'var(--color-success)' : 'var(--text-primary)', background: row.best === m ? 'rgba(111,175,138,0.06)' : undefined }}>
                     {row.vals[i]}
                   </td>
                 ))}
@@ -547,7 +547,7 @@ function RetrievalResultsView({ modes, activeTab, onTabChange, queryTerms }: {
                   {foundIn.map((m) => <span key={m} style={{ fontSize: 9, padding: '1px 5px', borderRadius: 'var(--radius-full)', background: MODE_META[m].color + '18', color: MODE_META[m].color, fontWeight: 500 }}>{MODE_META[m].short}</span>)}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-                  <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', padding: '2px 6px', borderRadius: 'var(--radius-xs)', background: kwHit >= 0.5 ? 'rgba(16,185,129,0.12)' : kwHit > 0 ? 'rgba(245,158,11,0.12)' : 'transparent', color: kwHit >= 0.5 ? '#10b981' : kwHit > 0 ? '#f59e0b' : 'var(--text-tertiary)' }}>kw {(kwHit * 100).toFixed(0)}%</span>
+                  <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', padding: '2px 6px', borderRadius: 'var(--radius-xs)', background: kwHit >= 0.5 ? 'rgba(111,175,138,0.12)' : kwHit > 0 ? 'rgba(212,162,74,0.12)' : 'transparent', color: kwHit >= 0.5 ? 'var(--color-success)' : kwHit > 0 ? 'var(--color-warning)' : 'var(--text-tertiary)' }}>kw {(kwHit * 100).toFixed(0)}%</span>
                   <span style={{ fontSize: 10, color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>{result.tokens} tok</span>
                 </div>
               </div>

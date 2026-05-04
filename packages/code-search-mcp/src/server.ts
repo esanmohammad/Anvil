@@ -19,8 +19,8 @@ import { registerGraphTools, handleGraphTool } from './tools/graph.js';
 import { registerProfileTools, handleProfileTool } from './tools/profile.js';
 import { registerIndexTools, handleIndexTool } from './tools/index-tools';
 import { registerResources, handleResource } from './resources/resources';
-import { getKnowledgeBasePath } from './core/config.js';
-import { indexFromPath } from './core/indexer.js';
+import { getKnowledgeBasePath } from '@anvil/knowledge-core';
+import { indexFromPath } from '@anvil/knowledge-core';
 import { loadServerConfig, type ServerConfig } from './core/env-config.js';
 import { startHttpTransport } from './transports/http-transport.js';
 

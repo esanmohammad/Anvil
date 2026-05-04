@@ -207,10 +207,33 @@ export function queryKnowledgeBase(project: string, query: string, maxChars = 15
 
 /**
  * Load knowledge graph for prompt injection.
- * Prefers index + query-matched context when available, falls back to full blob.
+ *
+ * Resolution order:
+ *   1. HybridRetriever (vector ⫽ BM25 → RRF → AST expansion → rerank) when a
+ *      `featureQuery` is provided and the LanceDB index is populated.
+ *   2. Compact `project_index.json` + keyword scoring on community summaries.
+ *   3. Full GRAPH_REPORT.md blob.
+ *
+ * The retriever path is preferred because it gives focused, query-matched
+ * code chunks (cheap LLM input) instead of community-summary blobs.
  */
 export async function loadKnowledgeGraph(project: string, featureQuery?: string): Promise<string> {
-  // Prefer compact index + query if available
+  // 1. Hybrid-search path (only when a query is supplied + index is reachable)
+  if (featureQuery) {
+    try {
+      const { getRetriever } = await import('@anvil/knowledge-core');
+      const { assembleKnowledgeContext } = await import('../knowledge/context-assembler.js');
+      const retriever = await getRetriever(project);
+      const result = await retriever.retrieve(featureQuery, { maxTokens: 12000 });
+      if (result.chunks.length > 0) {
+        return assembleKnowledgeContext(result, featureQuery, 12000);
+      }
+    } catch {
+      // KB not indexed / vector store missing — fall through to legacy paths.
+    }
+  }
+
+  // 2. Compact index + query if available
   const index = loadProjectIndex(project);
   if (index) {
     const indexStr = formatIndexForPrompt(index);

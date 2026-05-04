@@ -3,12 +3,19 @@
 // knowledge base, conventions, and invariants.
 
 import { Command } from 'commander';
-import { execSync, spawn } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import pc from 'picocolors';
 import { info, success, error, warn } from '../logger.js';
+import {
+  BlobStore,
+  CheckpointStore,
+  runWithAgent,
+  runWithCheckpoint,
+  type CheckpointInputs,
+} from '@anvil/agent-core';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -297,70 +304,22 @@ function formatSummary(findings: Finding[]): string {
 
 // ── Agent Interaction ─────────────────────────────────────────────────────
 
-function runAgent(projectPrompt: string, userPrompt: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const bin = getAgentBinary();
-    const args = ['-p', userPrompt, '--output-format', 'stream-json', '--verbose'];
-
-    const proc = spawn(bin, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
-
-    let output = '';
-    let buffer = '';
-
-    proc.stdout.on('data', (data: Buffer) => {
-      const chunk = data.toString();
-      buffer += chunk;
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const msg = JSON.parse(trimmed);
-          if (msg.type === 'assistant' && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === 'text' && block.text) {
-                output += block.text;
-              }
-            }
-          } else if (msg.type === 'result') {
-            if (msg.result) output = msg.result;
-          }
-        } catch { /* skip non-JSON lines */ }
-      }
-    });
-
-    proc.stderr.on('data', () => {
-      // Discard stderr noise from the agent
-    });
-
-    proc.on('close', (code) => {
-      // Process any remaining buffer
-      if (buffer.trim()) {
-        try {
-          const msg = JSON.parse(buffer.trim());
-          if (msg.type === 'result' && msg.result) output = msg.result;
-        } catch { /* ignore */ }
-      }
-      if (code !== 0 && !output) {
-        reject(new Error(`Agent exited with code ${code}`));
-      } else {
-        resolve(output);
-      }
-    });
-
-    proc.on('error', (err) => {
-      reject(new Error(`Failed to spawn agent: ${err.message}`));
-    });
-
-    // Write project prompt via stdin, then close
-    proc.stdin.write(projectPrompt);
-    proc.stdin.end();
+async function runAgent(
+  projectPrompt: string,
+  userPrompt: string,
+  project: string | undefined,
+): Promise<string> {
+  const result = await runWithAgent({
+    name: 'diff-review',
+    persona: 'cli',
+    project: project ?? 'unknown',
+    stage: 'review',
+    prompt: userPrompt,
+    projectPrompt,
+    model: 'claude-3-5-sonnet',
+    cwd: process.cwd(),
   });
+  return result.output;
 }
 
 // ── Command Definition ────────────────────────────────────────────────────
@@ -543,7 +502,32 @@ export const diffCommand = new Command('diff')
     info('Running review agent...');
     let agentOutput: string;
     try {
-      agentOutput = await runAgent(projectPrompt, userPrompt);
+      // Phase 5 of the agent-manager consolidation: cli now consumes
+      // agent-core's per-call checkpoint cache. Identical re-runs of
+      // `anvil diff` against the same git state hit the cache and skip
+      // the agent invocation. Cache key derives from the full prompt;
+      // any diff change invalidates.
+      const blobStore = new BlobStore(ANVIL_HOME);
+      const checkpointStore = new CheckpointStore({
+        anvilHome: ANVIL_HOME,
+        blobStore,
+      });
+      const checkpointInputs: CheckpointInputs & { inputs: unknown } = {
+        stage: 'review',
+        taskId: `diff:${project ?? 'unknown'}`,
+        promptVersion: 'diff-v1',
+        model: 'agent-default',
+        inputs: { projectPrompt, userPrompt },
+      };
+      agentOutput = await runWithCheckpoint(checkpointStore, blobStore, {
+        project: project ?? 'unknown',
+        runFamily: `diff-${Date.now().toString(36)}`,
+        inputs: checkpointInputs,
+        run: () => runAgent(projectPrompt, userPrompt, project),
+        serialize: (s) => s,
+        deserialize: (b) => b.toString('utf-8'),
+        onHit: () => info('Cache hit — skipped agent invocation.'),
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       error(`Agent failed: ${msg}`);
