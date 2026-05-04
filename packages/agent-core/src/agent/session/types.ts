@@ -41,7 +41,7 @@ export type AgentStatus =
  */
 export interface AgentActivity {
   id: string;
-  kind: 'tool_use' | 'thinking' | 'text';
+  kind: 'tool_use' | 'thinking' | 'text' | 'tool_result';
   tool?: string;
   summary: string;
   content?: string;

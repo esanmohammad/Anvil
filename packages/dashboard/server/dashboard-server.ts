@@ -1011,8 +1011,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         reviewers: (data.reviewRequests ?? []).map((r: any) => r.login ?? r.name ?? '').filter(Boolean),
         labels: (data.labels ?? []).map((l: any) => l.name ?? '').filter(Boolean),
       };
-    } catch (err) {
-      console.warn(`[dashboard] Failed to fetch PR details for ${prUrl}:`, err instanceof Error ? err.message : err);
+    } catch {
+      // Silently ignore — `gh pr view` failures (auth, network, ETIMEDOUT
+      // on cancellation cleanup) shouldn't spam the terminal. The PR
+      // surfaces from the activity-log scanner if it ever appears in
+      // agent output; missing it here just means no enriched metadata.
       return null;
     }
   }
@@ -1126,13 +1129,12 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       }
 
       if (prUrls.size > 0) {
-        console.log(`[dashboard] Found ${prUrls.size} PR URLs in feature store, tracking...`);
         for (const url of prUrls) {
           await trackPR(url);
         }
       }
-    } catch (err) {
-      console.warn('[dashboard] Failed to load PRs from feature store:', err);
+    } catch {
+      // Silently ignore — feature-store PR backfill is best-effort.
     }
   }
 
@@ -5541,11 +5543,16 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     });
 
     // Show integration events (KB injection, project context) in the output panel
-    runner.on('project-event', (data: { source: string; message: string; level?: string }) => {
+    runner.on('project-event', (data: { source: string; message: string; level?: string; stage?: string }) => {
       const prefix = data.source === 'knowledge-base' ? '📚' : data.source === 'project-context' ? '🔌' : 'ℹ️';
+      // Tag with the originating pipeline stage when the emitter knows it
+      // (KB / project-context events fire during prompt-building for a
+      // specific stage). Falls back to 'pipeline' for run-level events
+      // (warmup, routing, cost-budget) so they don't get filtered out
+      // entirely when no stage is selected.
       const entry = {
         timestamp: Date.now(),
-        stage: 'pipeline',
+        stage: data.stage ?? 'pipeline',
         type: (data.level === 'warn' ? 'stderr' : 'stdout') as 'stderr' | 'stdout',
         content: `${prefix} [${data.source}] ${data.message}`,
         kind: 'project',

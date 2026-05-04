@@ -543,6 +543,12 @@ export class PipelineRunner extends EventEmitter {
    */
   private runtimeBurnedModels = new Set<string>();
   /**
+   * Per-stage de-dupe so the proactive liveness fallback nudge fires
+   * once per (stage, original→fallback) pair instead of on every
+   * `resolveModelForStage` call.
+   */
+  private livenessFallbackNotified = new Set<string>();
+  /**
    * Walker tunables loaded from `~/.anvil/models.yaml`'s top-level
    * `walker:` block (with compiled-in defaults for missing keys). Cached
    * once at run start by `prefetchProviderLiveness` so chain-walking +
@@ -1281,6 +1287,15 @@ export class PipelineRunner extends EventEmitter {
         console.warn(
           `[pipeline] ${stageName}: ${picked.fellBackFrom} skipped; falling back to ${picked.model}`,
         );
+        const key = `${stageName}|${picked.fellBackFrom}->${picked.model}`;
+        if (!this.livenessFallbackNotified.has(key)) {
+          this.livenessFallbackNotified.add(key);
+          this.emit('project-event', {
+            source: 'routing',
+            message: `${picked.fellBackFrom} unavailable for ${stageName} (provider auth/liveness); falling back to ${picked.model}`,
+            level: 'warn',
+          });
+        }
       }
       return picked.model;
     } catch (err) {

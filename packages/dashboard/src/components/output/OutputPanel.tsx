@@ -19,6 +19,7 @@ export interface ChangeEntry {
   timestamp: number;
   diff?: string;
   repo?: string;
+  stage?: string;
 }
 
 export interface OutputPanelAgent {

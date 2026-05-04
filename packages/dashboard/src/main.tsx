@@ -688,6 +688,7 @@ function App() {
               timestamp: activity.timestamp,
               diff,
               repo: activity.repo,
+              stage: activity.stage,
             });
           }
           if (newChanges.length > 0) setChanges((prev) => [...prev, ...newChanges]);
@@ -705,6 +706,8 @@ function App() {
             tool: 'Write' as const,
             summary: a.summary || 'Artifact',
             timestamp: a.timestamp || Date.now(),
+            repo: a.repo,
+            stage: a.stage,
           }]);
         }
         break;

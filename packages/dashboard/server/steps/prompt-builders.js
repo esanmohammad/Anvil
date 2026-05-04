@@ -84,6 +84,13 @@ export function injectTemplateVars(prompt, vars) {
     for (const [key, value] of Object.entries(vars)) {
         result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
     }
+    // Sweep any remaining `{{...}}` placeholders. Persona prompts evolve
+    // independently of the injection map; leftover braces are bad for every
+    // provider — Claude / OpenRouter / OpenCode / Ollama silently feed the
+    // literal text to the LLM (poor output), Gemini-via-ADK parses it as a
+    // context variable and 500s. Empty-string substitution is safer than
+    // either failure mode and produces consistent prompts across providers.
+    result = result.replace(/\{\{[A-Za-z_][A-Za-z0-9_]*\}\}/g, '');
     return result;
 }
 // ── warnIfSystemPromptOversized ────────────────────────────────────────
@@ -132,6 +139,7 @@ export function buildProjectPrompt(ctx, stage) {
             ctx.emit('project-event', {
                 source: 'knowledge-base',
                 message: `Knowledge Base loaded for "${ctx.project}" (${knowledgeGraph.length} chars, source=${kb.sourceLabel}) → injecting into ${stage.persona} agent`,
+                stage: stage.name,
             });
         }
         else if (tier === 'none') {
@@ -142,6 +150,7 @@ export function buildProjectPrompt(ctx, stage) {
             ctx.emit('project-event', {
                 source: 'knowledge-base',
                 message: `Knowledge Base intentionally skipped for "${stage.name}" stage (policy: tier=none). KB is available but not needed for this stage.`,
+                stage: stage.name,
             });
         }
         else {
@@ -149,6 +158,7 @@ export function buildProjectPrompt(ctx, stage) {
                 source: 'knowledge-base',
                 message: `No Knowledge Base available for "${ctx.project}" — ${stage.persona} agent will explore codebase manually`,
                 level: 'warn',
+                stage: stage.name,
             });
         }
         const projectYamlSlice = ctx.getStableProjectYamlSlice(8000);
@@ -156,6 +166,7 @@ export function buildProjectPrompt(ctx, stage) {
             ctx.emit('project-event', {
                 source: 'project-context',
                 message: `Project config loaded for "${ctx.project}" (${projectYamlSlice.length} chars) → injecting into ${stage.persona} agent`,
+                stage: stage.name,
             });
         }
         const budgeted = budgetPromptContext({
@@ -180,6 +191,14 @@ export function buildProjectPrompt(ctx, stage) {
         console.log(`[pipeline] ${stage.name} prompt ${tokenInfo}`);
         const injected = injectTemplateVars(personaPrompt, {
             project_yaml: budgeted.projectYaml,
+            // Persona prompts (analyst.md, architect.md, clarifier.md, ...) use
+            // `{{system_yaml}}`. Alias to project_yaml so the placeholder is
+            // substituted for every provider — the leftover-brace sweep below
+            // catches anything else, but explicit aliasing keeps the content
+            // (project YAML) flowing where the persona expects it.
+            system_yaml: budgeted.projectYaml,
+            feature_request: `Feature: "${ctx.feature}"\nProject: ${ctx.project}\nRepositories: ${repoList}`,
+            existing_clarifications: '',
             task: `Feature: "${ctx.feature}"\nProject: ${ctx.project}\nRepositories: ${repoList}`,
             conventions: ctx.getStableConventionsBlock(),
             memories: budgeted.memory,
@@ -203,8 +222,11 @@ A pre-computed Knowledge Base has been injected into the "Codebase Knowledge Gra
 - ONLY read specific source files when you need exact implementation details (API signatures, data model fields) not covered by the KB.
 - When you use KB information, explicitly state it: e.g., "From the Knowledge Base, I can see that module X in repo Y handles Z..."
 - Do NOT broadly explore files when the KB already provides the architectural map.`);
-            if (stage.persona === 'analyst') {
-                overrides.push('IMPORTANT — ANALYST DIRECTIVE: The Knowledge Base provides sufficient architectural context for writing requirements. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Reference specific KB findings in your requirements (e.g., "Based on KB analysis of module X..."). Only read a specific file if you need to verify a concrete implementation detail.');
+            if (stage.persona === 'analyst' || stage.persona === 'architect' || stage.persona === 'lead') {
+                const role = stage.persona === 'analyst' ? 'requirements'
+                    : stage.persona === 'architect' ? 'specs'
+                        : 'task breakdowns';
+                overrides.push(`IMPORTANT — KB-FIRST DIRECTIVE: The Knowledge Base provides sufficient architectural context for writing ${role}. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Do NOT read more than 2-3 files. Reference specific KB findings explicitly (e.g., "Based on KB analysis of module X..."). Only read a specific file if you need to verify a concrete implementation detail not covered by the KB.`);
             }
         }
         if (stage.persona === 'clarifier') {
@@ -245,6 +267,7 @@ export function buildRepoProjectPrompt(ctx, stage, repoName) {
             ctx.emit('project-event', {
                 source: 'knowledge-base',
                 message: `Knowledge Base loaded for repo "${repoName}" (${knowledgeGraph.length} chars, tier=${kbSourceLabel}) → injecting into ${stage.persona} agent`,
+                stage: `${stage.name}:${repoName}`,
             });
         }
         else if (tier !== 'none') {
@@ -252,16 +275,22 @@ export function buildRepoProjectPrompt(ctx, stage, repoName) {
                 source: 'knowledge-base',
                 message: `No Knowledge Base available for repo "${repoName}" — ${stage.persona} agent will explore codebase manually`,
                 level: 'warn',
+                stage: `${stage.name}:${repoName}`,
             });
         }
         if (ctx.projectYaml && ctx.projectYaml.length > 10) {
             ctx.emit('project-event', {
                 source: 'project-context',
                 message: `Project config loaded for "${ctx.project}" → injecting into ${stage.persona}/${repoName} agent`,
+                stage: `${stage.name}:${repoName}`,
             });
         }
         const injected = injectTemplateVars(personaPrompt, {
             project_yaml: ctx.getStableProjectYamlSlice(4000),
+            // Mirror the per-project builder — provider-agnostic alias.
+            system_yaml: ctx.getStableProjectYamlSlice(4000),
+            feature_request: `Feature: "${ctx.feature}"\nProject: ${ctx.project}\nTarget repository: ${repoName}`,
+            existing_clarifications: '',
             task: `Feature: "${ctx.feature}"\nProject: ${ctx.project}\nTarget repository: ${repoName}`,
             conventions: ctx.getStableConventionsBlock(),
             memories: memoryBlock,
@@ -288,8 +317,11 @@ The Knowledge Base above contains your target repo "${repoName}" (labeled "YOUR 
 - ONLY read specific source files when you need exact implementation details not covered by the KB.
 - When you use KB information, explicitly state it: e.g., "From the Knowledge Base, I can see that module X handles Z..."
 - Do NOT broadly explore files when the KB already provides the architectural map.`);
-            if (stage.persona === 'analyst') {
-                overrides.push(`IMPORTANT — ANALYST DIRECTIVE: The Knowledge Base for "${repoName}" provides sufficient architectural context. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Reference specific KB findings in your requirements. Refer to other repos' KB sections for API contracts and integration points. Only read a specific file if you need to verify a concrete implementation detail.`);
+            if (stage.persona === 'analyst' || stage.persona === 'architect' || stage.persona === 'lead') {
+                const role = stage.persona === 'analyst' ? 'requirements'
+                    : stage.persona === 'architect' ? 'specs'
+                        : 'task breakdowns';
+                overrides.push(`IMPORTANT — KB-FIRST DIRECTIVE: The Knowledge Base for "${repoName}" provides sufficient architectural context for writing ${role}. Do NOT spawn sub-agents to explore the codebase. Do NOT run find/ls/tree commands. Do NOT read more than 2-3 files. Reference specific KB findings explicitly. Refer to other repos' KB sections for API contracts and integration points. Only read a specific file if you need to verify a concrete implementation detail not covered by the KB.`);
             }
         }
         if (stage.persona === 'engineer' || stage.persona === 'tester') {

@@ -207,6 +207,16 @@ export function PipelineContainer({
       .filter((t) => t.length > 0)
       .join('\n\n');
     filteredChanges = changes.filter((c) => {
+      // Prefer the explicit stage tag the server stamps on artifact /
+      // tool_use change broadcasts — survives async ordering issues that
+      // a [first-activity, last-activity] timestamp window can't, and
+      // surfaces every per-repo artifact under the parent stage.
+      if (c.stage) {
+        return c.stage === selectedStageRaw
+          || c.stage.startsWith(selectedStageRaw + ':');
+      }
+      // Legacy entries without a stage tag — fall back to the timestamp
+      // window so older runs / non-broadcasted writes still render.
       if (filteredActivities.length === 0) return false;
       const minTs = filteredActivities[0].timestamp;
       const maxTs = filteredActivities[filteredActivities.length - 1].timestamp;
@@ -420,7 +430,12 @@ export function PipelineContainer({
           activities={filteredActivities}
           rawOutput={filteredRaw}
           changes={filteredChanges}
-          isRunning={isRunning}
+          isRunning={isRunning && (
+            selectedStage == null
+              ? true
+              : pipelineData?.stages?.[selectedStage]?.status === 'running'
+                || pipelineData?.stages?.[selectedStage]?.status === 'waiting'
+          )}
           onSendInput={onSendInput}
           inputPlaceholder={inputPlaceholder}
         />

@@ -49,6 +49,35 @@ import { UpstreamError, bodyLooksRetryable } from './upstream-error.js';
 
 const PREFIX = 'adk:';
 
+/**
+ * Defuse ADK's prompt template engine for source code we inject.
+ *
+ * ADK (`@google/adk`'s `instructions.js`) scans the prompt with
+ * `/\{+[^{}]*\}+/g`, strips ALL leading `{` and trailing `}`, trims,
+ * then if the residue matches `^[a-zA-Z_][a-zA-Z0-9_]*$` (a valid
+ * identifier) it tries to resolve it against the session state — and
+ * throws `Context variable not found: \`<name>\`` if it isn't there.
+ *
+ * Doubling braces does NOT help — `{{modalOpen}}` → strip `{+` / `}+`
+ * → `modalOpen` → still throws. Anvil doesn't use ADK's templating;
+ * we substitute our own `{{...}}` in `prompt-builders.ts:injectTemplateVars`
+ * before this call. By the time content lands here, every remaining
+ * `{name}` comes from KB-injected source code (TypeScript template
+ * literals, JSX expressions, Go struct literals).
+ *
+ * Insert a zero-width space (U+200B) right after every `{`. ADK still
+ * matches the regex but the resulting key starts with ZWSP, which
+ * fails the identifier check, so ADK returns `match[0]` unchanged
+ * instead of looking up state. ZWSP is invisible to the model — the
+ * source code reads identically.
+ *
+ * Provider-local: only ADK has this templating layer. Other adapters
+ * receive the raw prompt unchanged.
+ */
+function escapeAdkBraces(text: string): string {
+  return text.replace(/\{/g, '{\u200B');
+}
+
 const ADK_PRICING: Record<string, [number, number]> = {
   // Claude (Anthropic API)
   'claude-haiku-4-5':  [1.0, 5.0],
@@ -155,7 +184,16 @@ export class AdkAdapter implements ModelAdapter {
         name: 'anvil_adk_agent',
         description: `Anvil agent (${config.persona ?? 'engineer'} stage=${config.stage ?? 'unknown'})`,
         model: upstreamModel,
-        instruction: config.projectPrompt ?? '',
+        // ADK's prompt template engine treats `{varname}` as a context
+        // variable lookup and 500s on unresolved vars. Real source code
+        // injected via the KB / file reads naturally contains `{...}`
+        // (TypeScript template literals like `${adoptionId}`, JSON object
+        // literals, JSX expressions). We don't use ADK's templating —
+        // our own `injectTemplateVars` already substitutes `{{...}}`
+        // before this call. So escape every brace by doubling it; ADK
+        // unescapes `{{` → `{` and `}}` → `}` when rendering. Provider-
+        // local because no other adapter parses braces this way.
+        instruction: escapeAdkBraces(config.projectPrompt ?? ''),
         tools,
       });
 
@@ -169,7 +207,7 @@ export class AdkAdapter implements ModelAdapter {
       const userId = config.sessionId ?? `anvil-${randomUUID()}`;
       const events = runner.runEphemeral({
         userId,
-        newMessage: { role: 'user', parts: [{ text: config.userPrompt }] },
+        newMessage: { role: 'user', parts: [{ text: escapeAdkBraces(config.userPrompt) }] },
       });
 
       // Wrap the iteration so plain Errors thrown by the underlying
@@ -342,6 +380,25 @@ async function loadAdk(): Promise<AdkExports> {
   // erased; this dynamic import resolves at runtime).
   const pkg = '@google/adk';
   const mod = (await import(pkg)) as AdkExports;
+  // Silence ADK's default INFO-level logger — it dumps every Runner
+  // event (including the full request prompt) to stderr, which floods
+  // the dashboard's terminal once ADK is in the chain. Drop to ERROR
+  // so genuine failures still surface. Set `ANVIL_ADK_LOG=info|debug`
+  // to opt back in when debugging the adapter itself.
+  try {
+    const m = mod as unknown as {
+      setLogLevel?: (n: number) => void;
+      LogLevel?: { DEBUG?: number; INFO?: number; WARN?: number; ERROR?: number };
+    };
+    const wantedRaw = (process.env.ANVIL_ADK_LOG ?? 'error').toLowerCase();
+    const wanted = wantedRaw === 'debug' ? m.LogLevel?.DEBUG
+      : wantedRaw === 'info' ? m.LogLevel?.INFO
+      : wantedRaw === 'warn' ? m.LogLevel?.WARN
+      : m.LogLevel?.ERROR;
+    if (typeof wanted === 'number' && typeof m.setLogLevel === 'function') {
+      m.setLogLevel(wanted);
+    }
+  } catch { /* non-fatal — just keeps ADK noisy */ }
   cachedAdk = mod;
   return mod;
 }

@@ -383,9 +383,14 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
       // PRs never surface in stats. Cap content at 4KB so a stray
       // `bash: cat huge_file` doesn't blow the activity stream.
       if (rawContent) {
+        // `tool_result` kind so the dashboard renders it collapsed/hidden
+        // by default — without this, the activity panel dumps the full
+        // file body (line-by-line) for every Read / Bash / Grep call.
+        // PR URL extraction scans every activity regardless of kind, so
+        // `gh pr create` URLs still surface.
         this.emit('activity', {
           id: this.nextActivityId(),
-          kind: 'text',
+          kind: 'tool_result',
           summary: rawContent.slice(0, 200),
           content: rawContent.slice(0, 4096),
           timestamp: Date.now(),
