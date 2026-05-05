@@ -605,68 +605,6 @@ RAG-eval · additional MCP tools.
 
 ---
 
-## Releasing (maintainers)
-
-Anvil ships as **six public npm packages** under the `@esankhan3` scope.
-The CLI is the front door; the five `anvil-*` cores are real registry
-deps, not bundled. End users only ever `npm install` the CLI — npm
-resolves the rest.
-
-### Publish order matters
-
-Cross-deps form a graph; later packages depend on earlier ones, so
-publish in this order. If a step fails, fix it and re-run from that
-step — earlier successful publishes are immutable on npm.
-
-```sh
-# 0. confirm auth + clean build
-npm whoami                                    # should print: esankhan3
-npm install                                   # relink workspaces
-npm run build                                 # builds every package
-
-# 1. publish in dependency order
-npm publish -w @esankhan3/anvil-agent-core      --access public
-npm publish -w @esankhan3/anvil-knowledge-core  --access public
-npm publish -w @esankhan3/anvil-memory-core     --access public
-npm publish -w @esankhan3/anvil-convention-core --access public
-npm publish -w @esankhan3/anvil-core-pipeline   --access public
-npm publish -w @esankhan3/anvil-cli             --access public
-
-# 2. tag the release (triggers .github/workflows/release.yml → GitHub Release)
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-### Bumping versions
-
-Every package shares one version line — bump all six together. Update
-the `version` field in each `packages/*/package.json` and any
-cross-dep range in `dependencies` that needs to widen, then re-run
-the publish chain above.
-
-### Verify the published install
-
-```sh
-TMP=$(mktemp -d) && cd "$TMP" && npm init -y >/dev/null
-npm install @esankhan3/anvil-cli@latest
-node node_modules/.bin/anvil --version        # should print the new version
-```
-
-This installs the CLI from the registry plus all five core deps —
-exactly what an end user gets.
-
-### Why six packages, not one bundle?
-
-Workspace symlinks make `anvil-loc` (the local dev binary) work
-without any of these being on npm. End-user installs don't have
-symlinks — npm has to resolve every dep against the registry. So
-each `@esankhan3/anvil-*` core has to exist as a real published
-package. The dashboard (`@anvil-dev/dashboard`) is the one
-exception: it stays private and is **bundled** into the CLI tarball
-via `packages/cli/scripts/bundle-dashboard.mjs`.
-
----
-
 <div align="center">
 
 ## License
@@ -681,5 +619,9 @@ Your code, your keys, your budget. That's the deal.</b></sub>
 <br /><br />
 
 <sub>Built for engineers who want their AI tools to <b>respect their stack and their wallet</b>.</sub>
+
+<br /><br />
+
+<sub>Crafted by <a href="https://github.com/esanmohammad"><b>Esan Mohammad</b></a></sub>
 
 </div>
