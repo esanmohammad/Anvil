@@ -195,6 +195,45 @@ Two layers of detection: a **proactive** liveness probe at run start
 duck-typed `UpstreamError` check on every adapter call. Configurable
 per-run cap on retry attempts in `models.yaml` (`walker.max_attempts`).
 
+### One GPU, many models — exclusive slot serialization
+
+Big local models can't all share a single GPU at the same time.
+If your `clarify` and `build` stages both want a heavy Ollama
+model, naive concurrency ends in an OOM. Anvil's
+`exclusive_slot: true` flag puts those models behind a
+**process-local FIFO queue** so only one exclusive model is ever
+GPU-resident at a time.
+
+The queue does the dance for you:
+
+- **Hard eviction on switch.** Going from model A → model B
+  explicitly tells Ollama to release A's weights, then polls until
+  the GPU has actually freed them before letting B load. No GPU
+  briefly holding both.
+- **Intruder detection.** An out-of-band Ollama session on the host
+  (e.g. you ran `ollama run` in another terminal) gets evicted
+  before the next exclusive load — so two big models can't sneak
+  in side by side.
+- **Embeddings + rerankers bypass.** They're small enough to
+  co-reside, so they never touch the queue.
+- **Same-model calls are free.** Consecutive calls to the same id
+  skip the eviction step entirely. A stage fanning out across repos
+  pays the model-load cost once.
+
+Mark a model exclusive in `~/.anvil/models.yaml`:
+
+```yaml
+- id: ollama/qwen2.5-coder:14b
+  provider: ollama
+  tier: local
+  vram_gb: 9
+  exclusive_slot: true        # mandatory for any VRAM-heavy local
+```
+
+Lets you mix multiple big local models on the same machine without
+manual sequencing or OOM kills, regardless of how much VRAM you
+actually have.
+
 ### Cost ledger, live
 
 Every adapter call attaches a real `gen_ai.usage.cost` attribute
@@ -473,12 +512,12 @@ Three different fronts ride on the same engine:
 | Package | What it owns |
 |:---|:---|
 | [`@esankhan3/anvil-cli`](packages/cli/) | CLI entry point + bundled dashboard |
-| [`@anvil-dev/dashboard`](packages/dashboard/) | React UI + WebSocket pipeline orchestrator |
-| [`@anvil/agent-core`](packages/agent-core/) | 8 LLM adapters, router, cost, OTel |
-| [`@anvil/core-pipeline`](packages/core-pipeline/) | Typed `Step<I,O>` graph + EventBus + hooks |
-| [`@anvil/knowledge-core`](packages/knowledge-core/) | AST chunks, graph, hybrid retrieval |
-| [`@anvil/memory-core`](packages/memory-core/) | Five-type memory, bi-temporal, drift detection |
-| [`@anvil/convention-core`](packages/convention-core/) | Convention extractor + promotion ledger |
+| [`@anvil-dev/dashboard`](packages/dashboard/) | React UI + WebSocket pipeline orchestrator (private — bundled into the CLI tarball) |
+| [`@esankhan3/anvil-agent-core`](packages/agent-core/) | 8 LLM adapters, router, cost, OTel |
+| [`@esankhan3/anvil-core-pipeline`](packages/core-pipeline/) | Typed `Step<I,O>` graph + EventBus + hooks |
+| [`@esankhan3/anvil-knowledge-core`](packages/knowledge-core/) | AST chunks, graph, hybrid retrieval |
+| [`@esankhan3/anvil-memory-core`](packages/memory-core/) | Five-type memory, bi-temporal, drift detection |
+| [`@esankhan3/anvil-convention-core`](packages/convention-core/) | Convention extractor + promotion ledger |
 | [`@esankhan3/code-search-mcp`](packages/code-search-mcp/) | MCP server wrapping `knowledge-core` |
 
 ---
@@ -563,6 +602,68 @@ PR review · OpenTelemetry · dashboard UI.
 
 **In flight:** durable execution · richer plan validators · deeper
 RAG-eval · additional MCP tools.
+
+---
+
+## Releasing (maintainers)
+
+Anvil ships as **six public npm packages** under the `@esankhan3` scope.
+The CLI is the front door; the five `anvil-*` cores are real registry
+deps, not bundled. End users only ever `npm install` the CLI — npm
+resolves the rest.
+
+### Publish order matters
+
+Cross-deps form a graph; later packages depend on earlier ones, so
+publish in this order. If a step fails, fix it and re-run from that
+step — earlier successful publishes are immutable on npm.
+
+```sh
+# 0. confirm auth + clean build
+npm whoami                                    # should print: esankhan3
+npm install                                   # relink workspaces
+npm run build                                 # builds every package
+
+# 1. publish in dependency order
+npm publish -w @esankhan3/anvil-agent-core      --access public
+npm publish -w @esankhan3/anvil-knowledge-core  --access public
+npm publish -w @esankhan3/anvil-memory-core     --access public
+npm publish -w @esankhan3/anvil-convention-core --access public
+npm publish -w @esankhan3/anvil-core-pipeline   --access public
+npm publish -w @esankhan3/anvil-cli             --access public
+
+# 2. tag the release (triggers .github/workflows/release.yml → GitHub Release)
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+### Bumping versions
+
+Every package shares one version line — bump all six together. Update
+the `version` field in each `packages/*/package.json` and any
+cross-dep range in `dependencies` that needs to widen, then re-run
+the publish chain above.
+
+### Verify the published install
+
+```sh
+TMP=$(mktemp -d) && cd "$TMP" && npm init -y >/dev/null
+npm install @esankhan3/anvil-cli@latest
+node node_modules/.bin/anvil --version        # should print the new version
+```
+
+This installs the CLI from the registry plus all five core deps —
+exactly what an end user gets.
+
+### Why six packages, not one bundle?
+
+Workspace symlinks make `anvil-loc` (the local dev binary) work
+without any of these being on npm. End-user installs don't have
+symlinks — npm has to resolve every dep against the registry. So
+each `@esankhan3/anvil-*` core has to exist as a real published
+package. The dashboard (`@anvil-dev/dashboard`) is the one
+exception: it stays private and is **bundled** into the CLI tarball
+via `packages/cli/scripts/bundle-dashboard.mjs`.
 
 ---
 
