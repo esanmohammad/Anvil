@@ -17,105 +17,42 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { FeatureStore } from './feature-store.js';
 
-export const FEATURE_MANIFEST_VERSION = 1;
+// Phase F11 — types + the FEATURE_MANIFEST_VERSION constant + the
+// pure `emptyManifest` factory live in @esankhan3/anvil-core-pipeline.
+// The `FeatureManifestStore` CLASS (FS-backed `~/.anvil/features/...
+// /manifest.json` storage) and `renderManifestForPrompt` (depends on
+// nothing FS but only the dashboard wires it into prompts) stay here.
+import {
+  FEATURE_MANIFEST_VERSION,
+  emptyManifest,
+  type FieldStatus,
+  type ManifestField,
+  type ApiEndpoint,
+  type TableMutation,
+  type PlannedFile,
+  type TestBehavior,
+  type FeatureManifest,
+  type ManifestFieldKey,
+  type ManifestFieldValue,
+} from '@esankhan3/anvil-core-pipeline';
+
+export {
+  FEATURE_MANIFEST_VERSION,
+  emptyManifest,
+};
+export type {
+  FieldStatus,
+  ManifestField,
+  ApiEndpoint,
+  TableMutation,
+  PlannedFile,
+  TestBehavior,
+  FeatureManifest,
+  ManifestFieldKey,
+  ManifestFieldValue,
+};
+
 const MANIFEST_FILENAME = 'manifest.json';
-
-// ── Types ────────────────────────────────────────────────────────────────
-
-export type FieldStatus = 'unset' | 'partial' | 'final';
-
-export interface ManifestField<T> {
-  status: FieldStatus;
-  value: T | null;
-  /** Stage that last wrote this field. */
-  writtenBy?: string;
-  /** ISO timestamp of last write. */
-  writtenAt?: string;
-}
-
-export interface ApiEndpoint {
-  repo: string;
-  method: string;
-  path: string;
-  purpose: string;
-}
-
-export interface TableMutation {
-  repo: string;
-  table: string;
-  mutationKind: 'add' | 'alter' | 'drop' | 'read-only';
-}
-
-export interface PlannedFile {
-  repo: string;
-  path: string;
-  kind: 'create' | 'modify' | 'delete';
-}
-
-export interface TestBehavior {
-  description: string;
-  gherkin?: string;
-}
-
-export interface FeatureManifest {
-  version: number;
-  feature: string;
-  featureSlug: string;
-  project: string;
-  createdAt: string;
-  updatedAt: string;
-
-  // Populated through the pipeline:
-  acceptanceCriteria: ManifestField<string[]>;
-  affectedRepos: ManifestField<string[]>;
-  apiEndpoints: ManifestField<ApiEndpoint[]>;
-  tablesTouched: ManifestField<TableMutation[]>;
-  filesPlanned: ManifestField<PlannedFile[]>;
-  testBehaviors: ManifestField<TestBehavior[]>;
-  changeBrief: ManifestField<string>;
-  openQuestions: ManifestField<string[]>;
-}
-
-/** Keys of FeatureManifest that hold a ManifestField (i.e. patchable). */
-export type ManifestFieldKey =
-  | 'acceptanceCriteria'
-  | 'affectedRepos'
-  | 'apiEndpoints'
-  | 'tablesTouched'
-  | 'filesPlanned'
-  | 'testBehaviors'
-  | 'changeBrief'
-  | 'openQuestions';
-
-/** Extract the inner value type T for a ManifestField<T> living at key K. */
-export type ManifestFieldValue<K extends ManifestFieldKey> =
-  FeatureManifest[K] extends ManifestField<infer T> ? T : never;
-
-// ── Factories ────────────────────────────────────────────────────────────
-
-function unsetField<T>(): ManifestField<T> {
-  return { status: 'unset', value: null };
-}
-
-export function emptyManifest(project: string, slug: string, feature: string): FeatureManifest {
-  const now = new Date().toISOString();
-  return {
-    version: FEATURE_MANIFEST_VERSION,
-    feature,
-    featureSlug: slug,
-    project,
-    createdAt: now,
-    updatedAt: now,
-    acceptanceCriteria: unsetField<string[]>(),
-    affectedRepos: unsetField<string[]>(),
-    apiEndpoints: unsetField<ApiEndpoint[]>(),
-    tablesTouched: unsetField<TableMutation[]>(),
-    filesPlanned: unsetField<PlannedFile[]>(),
-    testBehaviors: unsetField<TestBehavior[]>(),
-    changeBrief: unsetField<string>(),
-    openQuestions: unsetField<string[]>(),
-  };
-}
 
 // ── Store ────────────────────────────────────────────────────────────────
 

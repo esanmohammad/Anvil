@@ -100,3 +100,18 @@ export {
 export type {
   ScorePlanOpts,
 } from './plan-risk-scorer.js';
+export {
+  FEATURE_MANIFEST_VERSION,
+  emptyManifest,
+} from './feature-manifest-types.js';
+export type {
+  FieldStatus,
+  ManifestField,
+  ApiEndpoint,
+  TableMutation,
+  PlannedFile,
+  TestBehavior,
+  FeatureManifest,
+  ManifestFieldKey,
+  ManifestFieldValue,
+} from './feature-manifest-types.js';

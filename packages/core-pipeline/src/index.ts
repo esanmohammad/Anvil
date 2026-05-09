@@ -71,6 +71,8 @@ export {
   SENSITIVE_PATH_PATTERNS,
   scorePlan,
   computeRiskTier,
+  FEATURE_MANIFEST_VERSION,
+  emptyManifest,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
@@ -109,6 +111,15 @@ export type {
   RiskFactor,
   RiskScore,
   ScorePlanOpts,
+  FieldStatus,
+  ManifestField,
+  ApiEndpoint,
+  TableMutation,
+  PlannedFile,
+  TestBehavior,
+  FeatureManifest,
+  ManifestFieldKey,
+  ManifestFieldValue,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {
