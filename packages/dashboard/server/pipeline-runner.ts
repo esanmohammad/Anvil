@@ -25,13 +25,57 @@ import type { ProjectInfo } from './project-loader.js';
 import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
-import { resolveModelByTier, type ResolverTier } from '@esankhan3/anvil-agent-core';
-/**
- * Dashboard's local alias — preserves the public `ModelTier` re-export
- * surface for in-tree consumers (dashboard-server.ts, runs UI). Backed by
- * agent-core's `ResolverTier` since F2.
- */
-export type ModelTier = ResolverTier;
+import { resolveModelByTier } from '@esankhan3/anvil-agent-core';
+// Type declarations + module-level constants live in a sibling file
+// so this orchestrator stays focused on logic. Re-exported below for
+// back-compat with consumers that import these from `./pipeline-runner.js`.
+import type {
+  ModelTier,
+  StageDefinition,
+  RepoAgentState,
+  StageTokenStats,
+  PipelineStageState,
+  PipelineRunState,
+  PipelineRunnerEvents,
+  PipelineConfig,
+  PipelineCheckpoint,
+  AfterStageHook,
+} from './pipeline-runner-types.js';
+import {
+  STAGES,
+  PLAN_DERIVED_STAGES,
+  STAGE_OUTPUT_LIMITS,
+  STAGE_OUTPUT_LIMIT_FALLBACK,
+  maxOutputTokensForStage,
+  listStageNames,
+  LOCAL_TIER_STAGES,
+  providerOfModelId,
+  zeroTokenStats,
+  sumTokenStats,
+  readCheckpoint,
+  findInterruptedPipelines,
+} from './pipeline-runner-types.js';
+export type {
+  ModelTier,
+  StageDefinition,
+  RepoAgentState,
+  StageTokenStats,
+  PipelineStageState,
+  PipelineRunState,
+  PipelineRunnerEvents,
+  PipelineConfig,
+  PipelineCheckpoint,
+  AfterStageHook,
+};
+export {
+  STAGES,
+  STAGE_OUTPUT_LIMITS,
+  STAGE_OUTPUT_LIMIT_FALLBACK,
+  maxOutputTokensForStage,
+  listStageNames,
+  readCheckpoint,
+  findInterruptedPipelines,
+};
 import {
   resolveModelForStage as registryResolveStage,
   ModelResolutionError,
@@ -182,334 +226,11 @@ function refreshClaudeAuth(timeoutMs = 120_000): Promise<boolean> {
 // `./steps/prompt-builders.ts` so the lifted prompt-builder functions can
 // share them. Kept as a re-export below for legacy callsites until 4f.8+.
 
-// ── Stage definitions ─────────────────────────────────────────────────
-
-interface StageDefinition {
-  index: number;
-  name: string;
-  label: string;         // human-friendly label for UI
-  persona: string;
-  perRepo: boolean;       // whether this stage runs per-repo
-}
-
-const STAGES: StageDefinition[] = [
-  { index: 0, name: 'clarify',           label: 'Understanding',        persona: 'clarifier',   perRepo: false },
-  { index: 1, name: 'requirements',      label: 'Planning requirements', persona: 'analyst',    perRepo: false },
-  { index: 2, name: 'repo-requirements', label: 'Repo requirements',    persona: 'analyst',     perRepo: true },
-  { index: 3, name: 'specs',             label: 'Writing specs',        persona: 'architect',   perRepo: true },
-  { index: 4, name: 'tasks',             label: 'Creating tasks',       persona: 'lead',        perRepo: true },
-  { index: 5, name: 'build',             label: 'Writing code',         persona: 'engineer',    perRepo: true },
-  { index: 6, name: 'test',              label: 'Generating tests',     persona: 'test-author', perRepo: true },
-  { index: 7, name: 'validate',          label: 'Testing',              persona: 'tester',      perRepo: true },
-  { index: 8, name: 'ship',              label: 'Shipping',             persona: 'engineer',    perRepo: false },
-];
-
-/** Stages whose artifacts can be fully derived from a Plan — skipped when planSeed is provided. */
-const PLAN_DERIVED_STAGES: string[] = ['requirements', 'repo-requirements', 'specs', 'tasks'];
-
-/**
- * Per-stage output-token ceilings (Phase 3 — TOKEN-OPTIMIZATION-PLAN).
- *
- * Caps how many tokens each stage's agent is allowed to emit so that artifact
- * bloat (50KB BUILD.md narratives, recap dumps in REQUIREMENTS.md) stops
- * costing output tokens. The numbers below are conservative starting points
- * tuned to typical artifact sizes in this repo:
- *
- *   - clarify / ship — short Q-and-A or git ops, ≤ 2K
- *   - requirements / repo-requirements / validate — bullet lists, ≤ 4K
- *   - specs — APIs + schema + behaviors, ≤ 6K
- *   - tasks — task breakdown, ≤ 8K
- *   - test — generated tests across files, ≤ 12K
- *   - build — real codegen, ≤ 16K (highest because the engineer writes diffs)
- *
- * Adapter behavior:
- *   - api-adapter: passes `max_tokens` in the request body.
- *   - claude-adapter / gemini-cli-adapter: capabilities.maxOutputTokens=false
- *     today (CLIs don't expose a flag) — the call is a no-op.
- *
- * STAGE_OUTPUT_LIMIT_FALLBACK is used for any stage not present in the table.
- */
-export const STAGE_OUTPUT_LIMITS: Record<string, number> = {
-  clarify: 2000,
-  requirements: 4000,
-  'repo-requirements': 4000,
-  specs: 6000,
-  tasks: 8000,
-  build: 16000,
-  test: 12000,
-  validate: 4000,
-  ship: 2000,
-};
-export const STAGE_OUTPUT_LIMIT_FALLBACK = 8000;
-
-export function maxOutputTokensForStage(stageName: string): number {
-  return STAGE_OUTPUT_LIMITS[stageName] ?? STAGE_OUTPUT_LIMIT_FALLBACK;
-}
-
-/** Exposed for tests — read-only snapshot of pipeline stage names. */
-export function listStageNames(): string[] {
-  return STAGES.map((s) => s.name);
-}
-
-// ── Per-repo agent tracking ───────────────────────────────────────────
-
-export interface RepoAgentState {
-  repoName: string;
-  agentId: string | null;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  cost: number;
-  artifact: string;
-  error: string | null;
-}
-
-// ── Pipeline state ────────────────────────────────────────────────────
-
-/**
- * Per-stage token + cache breakdown. Surfaced so the dashboard can render
- * the cache-hit rate (Phase 1 of TOKEN-OPTIMIZATION-PLAN). All counts are
- * aggregates across every spawn the stage produced (single agent for
- * project-wide stages, all repos × tasks for per-repo stages).
- */
-export interface StageTokenStats {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-}
-
-export interface PipelineStageState {
-  name: string;
-  label: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'waiting';
-  agentId: string | null;
-  cost: number;
-  startedAt: string | null;
-  completedAt: string | null;
-  artifact: string;
-  error: string | null;
-  perRepo: boolean;
-  repos: RepoAgentState[];
-  /** Token breakdown for this stage; absent for skipped/pending stages. */
-  tokens?: StageTokenStats;
-  /**
-   * Model id resolved for this stage by the registry-driven resolver.
-   * Surfaced so the UI can show "build → qwen3:14b" badges and so users
-   * can SEE local models firing rather than just inferring from cost.
-   */
-  resolvedModel?: string;
-  /**
-   * Tool-permission classes the stage is running under.
-   * 'read' / 'write' / 'exec'. Surfaced so the UI can show 🔒 / 📝 / ⚡
-   * badges next to each stage.
-   */
-  permissionClasses?: ('read' | 'write' | 'exec')[];
-}
-
-export interface PipelineRunState {
-  runId: string;
-  project: string;
-  feature: string;
-  featureSlug: string;
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'waiting';
-  currentStage: number;
-  stages: PipelineStageState[];
-  startedAt: string;
-  totalCost: number;
-  model: string;
-  repoNames: string[];
-  waitingForInput: boolean;
-  /** Run-level token aggregate. cacheHitRatio = cacheReadTokens / (inputTokens + cacheReadTokens). */
-  tokens?: StageTokenStats & { cacheHitRatio: number };
-}
-
-export interface PipelineRunnerEvents {
-  'state-change': (state: PipelineRunState) => void;
-  'stage-start': (stageIndex: number, agentId: string) => void;
-  'stage-complete': (stageIndex: number, artifact: string, cost: number) => void;
-  'stage-fail': (stageIndex: number, error: string) => void;
-  'pipeline-complete': (state: PipelineRunState) => void;
-  'pipeline-fail': (state: PipelineRunState) => void;
-  'waiting-for-input': (stageIndex: number, agentId: string) => void;
-}
-
-// ── Local-tier stage list (Phase 5 — Ollama) ──────────────────────────
-
-/**
- * Stages eligible to be routed to a local Ollama model when
- * `process.env.ANVIL_LOCAL_MODEL` is set. The list is conservative —
- * stages whose output feeds engineer/architect/tester are excluded so a
- * weaker local model can't poison the rest of the pipeline. Manifest
- * extraction is heuristic (no LLM call today) so it's not in the list;
- * if/when Phase 4b grows an LLM extractor, append it here.
- */
-const LOCAL_TIER_STAGES = new Set<string>(['clarify', 'ship']);
-
-/**
- * Map a model id to its provider for the liveness chain walker.
- * Mirrors the heuristic in agent-core's `default-adapter-factory.
- * resolveProvider` — kept inline to avoid pulling that whole module
- * into the sync resolver path.
- */
-function providerOfModelId(modelId: string): ProviderName {
-  const id = modelId.toLowerCase();
-  if (id.startsWith('ollama:')) return 'ollama';
-  if (id.startsWith('gemini-')) return 'gemini';
-  if (id.startsWith('gpt-') || id.startsWith('o1') || id.startsWith('o3') || id.startsWith('o4') || id.startsWith('chatgpt-')) return 'openai';
-  if (id.includes('/')) return 'openrouter';
-  if (/^[a-z0-9_.-]+:[a-z0-9_.-]+$/.test(id) && id !== 'claude' && !id.startsWith('claude-')) return 'ollama';
-  return 'claude';
-}
-
-// ── Token-stats helpers ───────────────────────────────────────────────
-
-function zeroTokenStats(): StageTokenStats {
-  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-}
-
-function sumTokenStats(parts: ReadonlyArray<StageTokenStats>): StageTokenStats {
-  const total = zeroTokenStats();
-  for (const p of parts) {
-    total.inputTokens += p.inputTokens;
-    total.outputTokens += p.outputTokens;
-    total.cacheReadTokens += p.cacheReadTokens;
-    total.cacheWriteTokens += p.cacheWriteTokens;
-  }
-  return total;
-}
-
-// ── Config ────────────────────────────────────────────────────────────
-
-export interface PipelineConfig {
-  project: string;
-  feature: string;
-  model: string;
-  modelTier?: ModelTier;     // cost-aware tier — overrides single model with per-stage routing
-  baseBranch?: string;       // base branch to checkout/PR against (default: auto-detect main/master)
-  skipClarify?: boolean;
-  /** When set and skipClarify=true, this replaces the Clarify artifact fed to the next stage. Used by the Plan flow. */
-  clarifySeedArtifact?: string;
-  /**
-   * When set, stages 1–4 (requirements, repo-requirements, specs, tasks) are
-   * derived deterministically from this Plan instead of running agents.
-   * The Plan flow uses this to skip straight to Build.
-   */
-  planSeed?: {
-    project: string;
-    slug: string;
-    version: number;
-    /** Snapshot of the plan JSON (so changes after execute don't affect the run). */
-    plan: import('@esankhan3/anvil-core-pipeline').Plan;
-  };
-  skipShip?: boolean;
-  deploy?: 'local' | 'remote' | false;  // deploy after shipping
-  repos?: string[];          // explicit repo list (overrides auto-detection)
-  // Resume support
-  resumeFromStage?: number;  // stage index to resume from (skip completed stages before this)
-  featureSlug?: string;      // existing feature slug (to load prior artifacts)
-  failureContext?: string;   // what went wrong in the previous run
-  actionType?: 'feature' | 'bugfix' | 'fix' | 'spike' | 'review';
-}
-
-// ── Checkpoint — persisted pipeline state for crash recovery ──────────
-
-export interface PipelineCheckpoint {
-  version: 1;
-  runId: string;
-  project: string;
-  feature: string;
-  featureSlug: string;
-  config: {
-    model: string;
-    modelTier?: ModelTier;
-    baseBranch?: string;
-    skipClarify?: boolean;
-    skipShip?: boolean;
-    actionType?: string;
-  };
-  status: PipelineRunState['status'];
-  currentStage: number;
-  stages: Array<{
-    name: string;
-    label: string;
-    status: string;
-    cost: number;
-    error: string | null;
-    repos: Array<{
-      repoName: string;
-      status: string;
-      cost: number;
-      error: string | null;
-    }>;
-  }>;
-  repoNames: string[];
-  totalCost: number;
-  startedAt: string;
-  updatedAt: string;
-}
-
-/** Read a checkpoint file from disk */
-export function readCheckpoint(featureDir: string): PipelineCheckpoint | null {
-  const path = join(featureDir, 'pipeline-state.json');
-  try {
-    if (!existsSync(path)) return null;
-    const raw = readFileSync(path, 'utf-8');
-    const cp = JSON.parse(raw) as PipelineCheckpoint;
-    if (cp.version !== 1) return null;
-    return cp;
-  } catch {
-    return null;
-  }
-}
-
-/** Find all incomplete pipelines across all projects (interrupted, failed, or waiting) */
-export function findInterruptedPipelines(anvilHome: string): PipelineCheckpoint[] {
-  const featuresDir = join(anvilHome, 'features');
-  if (!existsSync(featuresDir)) return [];
-
-  const incomplete: PipelineCheckpoint[] = [];
-  try {
-    for (const project of readdirSync(featuresDir)) {
-      const projectDir = join(featuresDir, project);
-      if (!existsSync(projectDir)) continue;
-      try {
-        for (const slug of readdirSync(projectDir)) {
-          const cp = readCheckpoint(join(projectDir, slug));
-          if (!cp) continue;
-          if (cp.status === 'running' || cp.status === 'waiting') {
-            // Was in-progress when dashboard died — mark as interrupted
-            incomplete.push({ ...cp, status: 'failed' as any });
-          } else if (cp.status === 'failed' || cp.status === 'cancelled') {
-            // Previously failed/cancelled — still resumable
-            incomplete.push(cp);
-          }
-        }
-      } catch { /* skip unreadable dirs */ }
-    }
-  } catch { /* skip */ }
-  return incomplete;
-}
+// Stage definitions, type declarations, token-stat helpers, checkpoint
+// reader, and after-stage hook contract live in `./pipeline-runner-types.js`.
+// Re-exported above for back-compat.
 
 // ── Pipeline Runner ───────────────────────────────────────────────────
-
-/**
- * Hook fired after each stage completes. Returning a rejected promise cancels
- * the pipeline; resolving with `{ pause: true }` suspends execution until
- * `resume()` is called.
- */
-export interface AfterStageHook {
-  (info: {
-    runId: string;
-    project: string;
-    stageIndex: number;
-    stageName: string;
-    artifact: string;
-    cost: number;
-    totalCost: number;
-    touchedFiles?: string[];
-    riskTier?: 'low' | 'med' | 'high';
-    confidence?: number;
-  }): Promise<void>;
-}
 
 export class PipelineRunner extends EventEmitter {
   private agentManager: AgentManager;
