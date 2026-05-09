@@ -46,6 +46,14 @@ export {
 export type {
   FeatureManifestStepOptions,
 } from './steps/feature-manifest.step.js';
+export {
+  createTaskBundlerStep,
+  TASK_BUNDLES_ARTIFACT_ID,
+} from './steps/task-bundler.step.js';
+export type {
+  TaskBundleOutput,
+  TaskBundlerStepOptions,
+} from './steps/task-bundler.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
