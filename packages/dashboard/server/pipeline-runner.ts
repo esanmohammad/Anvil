@@ -30,6 +30,7 @@ import {
   writePipelineCheckpoint,
   clearPipelineCheckpoint,
 } from './pipeline-checkpoint.js';
+import { ReviewerControl } from './reviewer-control.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -275,14 +276,6 @@ export class PipelineRunner extends EventEmitter {
   private kbManager: KnowledgeBaseManager | null;
   private afterStageHook: AfterStageHook | null = null;
   /**
-   * Review-time feedback from the most recent pause resume. Set by the
-   * dashboard's after-stage hook when the user resumes with
-   * `approve-with-note` (or any action carrying a `note`). Read once by
-   * the next stage's prompt builders, then cleared so the note doesn't
-   * leak into stages it wasn't intended for.
-   */
-  private pendingReviewNote: string | null = null;
-  /**
    * Phase 2: feature manifest is rendered into the projectPrompt of every
    * stage so downstream agents stop re-deriving fields earlier stages already
    * produced. Memoised per-snapshot — invalidated whenever a stage patches
@@ -292,48 +285,15 @@ export class PipelineRunner extends EventEmitter {
 
   setAfterStageHook(hook: AfterStageHook | null): void { this.afterStageHook = hook; }
 
-  /**
-   * Stash a reviewer's feedback note so the next stage's user prompt
-   * gets a "User note from review:" block prepended. Called by the
-   * dashboard-server after-stage hook the moment a pause resolves.
-   *
-   * Set in two phases so per-repo fanout (which calls getPromptContext
-   * multiple times within a single stage) all sees the same note:
-   *   1. After-stage hook calls `setReviewNote(note)` → pendingReviewNote
-   *   2. Pipeline loop calls `armReviewNoteForCurrentStage()` once at
-   *      stage entry → currentStageReviewNote (read by every prompt build)
-   *   3. Pipeline loop calls `clearStageReviewNote()` once at stage exit
-   */
+  // Reviewer-control state (note slot, artifact override, rerun-from /
+  // iterate-with-note) lives in a sibling helper. The runner owns the
+  // FS / state-mutation side effects of those actions; this helper owns
+  // the pure state machine.
+  private reviewer = new ReviewerControl();
+
   setReviewNote(note: string | null): void {
-    const trimmed = note?.trim() ?? '';
-    this.pendingReviewNote = trimmed.length > 0 ? trimmed : null;
+    this.reviewer.setReviewNote(note);
   }
-  private currentStageReviewNote: string | null = null;
-  /** Move the most recent pause note onto the current stage. No-op when none. */
-  private armReviewNoteForCurrentStage(): void {
-    if (this.pendingReviewNote) {
-      this.currentStageReviewNote = this.pendingReviewNote;
-      this.pendingReviewNote = null;
-    }
-  }
-  /** Clear the per-stage review note so it doesn't bleed into the next stage. */
-  private clearStageReviewNote(): void {
-    this.currentStageReviewNote = null;
-  }
-  /** Read the active review note (for prompt builders). Does NOT clear. */
-  private peekReviewNote(): string | null {
-    return this.currentStageReviewNote;
-  }
-
-  // ── Artifact override (Phase B — modify-artifact) ────────────────────
-
-  /**
-   * Set when the dashboard's after-stage hook resolves a pause with
-   * `modify-artifact`. The pipeline loop reads this AFTER the hook
-   * returns and uses it as the `prevArtifact` for the next stage,
-   * superseding the agent's output. Cleared once consumed.
-   */
-  private prevArtifactOverride: string | null = null;
 
   /**
    * Replace the just-completed stage's artifact with reviewer-edited
@@ -352,85 +312,17 @@ export class PipelineRunner extends EventEmitter {
     } catch (err) {
       console.warn(`[pipeline] applyArtifactEdit: writeStageArtifact failed: ${err instanceof Error ? err.message : err}`);
     }
-    this.prevArtifactOverride = editedArtifact;
+    this.reviewer.setArtifactOverride(editedArtifact);
     this.broadcastState();
     this.checkpoint();
   }
 
-  /** Read-and-clear the artifact override. Returns null when unset. */
-  private consumeArtifactOverride(): string | null {
-    const v = this.prevArtifactOverride;
-    this.prevArtifactOverride = null;
-    return v;
-  }
-
-  // ── Rerun-from + Iterate-with-note (Phases C & F) ─────────────────────
-  //
-  // Both actions reset stage state and bounce the loop counter back; the
-  // difference is *what* gets reset and how the note is framed:
-  //
-  //   rerun-from:
-  //     - Resets stages [target..current] (could rewind multiple stages)
-  //     - Clears manifest fields written by those stages
-  //     - Note → failureContext ("RETRY. The previous run failed: …")
-  //
-  //   iterate-with-note:
-  //     - Resets ONLY the current stage
-  //     - Manifest fields untouched
-  //     - Note → reviewNote ("User note from review (apply throughout)")
-  //
-  // Both share the same pending slot; `pendingRerunMode` decides which
-  // semantics the loop applies on consume.
-
-  private pendingRerunFromStage: number | null = null;
-  private rerunFromNote: string | null = null;
-  private pendingRerunMode: 'rerun-from' | 'iterate' | null = null;
-
-  /**
-   * Reviewer asked to roll the pipeline back to `targetIndex` and replay
-   * with `note` as failure context.
-   */
   requestRerunFromStage(targetIndex: number, note: string | null): void {
-    if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= STAGES.length) {
-      return;
-    }
-    this.pendingRerunFromStage = targetIndex;
-    this.pendingRerunMode = 'rerun-from';
-    const trimmed = note?.trim() ?? '';
-    this.rerunFromNote = trimmed.length > 0 ? trimmed : null;
+    this.reviewer.requestRerunFromStage(targetIndex, STAGES.length, note);
   }
 
-  /**
-   * Reviewer wants to refine the just-paused stage's output with feedback
-   * — keep working-tree state, keep manifest, frame the note as
-   * reviewer-feedback (not retry). The loop will reset just THIS stage
-   * and re-spawn with `reviewNote` set.
-   */
   iterateCurrentStageWithNote(currentStageIndex: number, note: string | null): void {
-    if (!Number.isInteger(currentStageIndex) || currentStageIndex < 0 || currentStageIndex >= STAGES.length) {
-      return;
-    }
-    this.pendingRerunFromStage = currentStageIndex;
-    this.pendingRerunMode = 'iterate';
-    const trimmed = note?.trim() ?? '';
-    this.rerunFromNote = trimmed.length > 0 ? trimmed : null;
-  }
-
-  private consumeRerunRequest(): {
-    targetIndex: number;
-    note: string | null;
-    mode: 'rerun-from' | 'iterate';
-  } | null {
-    if (this.pendingRerunFromStage === null || this.pendingRerunMode === null) return null;
-    const v = {
-      targetIndex: this.pendingRerunFromStage,
-      note: this.rerunFromNote,
-      mode: this.pendingRerunMode,
-    };
-    this.pendingRerunFromStage = null;
-    this.rerunFromNote = null;
-    this.pendingRerunMode = null;
-    return v;
+    this.reviewer.iterateCurrentStageWithNote(currentStageIndex, STAGES.length, note);
   }
 
   /**
@@ -1214,7 +1106,7 @@ export class PipelineRunner extends EventEmitter {
       // Surfaced for the immediate next stage only — pipeline loop arms
       // it on stage entry and clears it on stage exit, so per-repo fanout
       // sees the same note across calls.
-      reviewNote: this.peekReviewNote() ?? undefined,
+      reviewNote: this.reviewer.peekReviewNote() ?? undefined,
       actionType: this.config.actionType,
       repoNames: this.state.repoNames,
       featureSlug: this.state.featureSlug,
@@ -1819,7 +1711,7 @@ export class PipelineRunner extends EventEmitter {
 
       console.log(`[pipeline] Entering stage "${stage.name}" (${i + 1}/${STAGES.length})`);
 
-      this.armReviewNoteForCurrentStage();
+      this.reviewer.armForCurrentStage();
       await this.ensureAuth(stage.name);
 
       if (stage.name === 'build') {
@@ -1909,7 +1801,7 @@ export class PipelineRunner extends EventEmitter {
         }
 
         // Reviewer rerun-from / iterate handling.
-        const rerun = this.consumeRerunRequest();
+        const rerun = this.reviewer.consumeRerunRequest();
         if (rerun !== null) {
           const target = rerun.targetIndex;
           if (rerun.mode === 'iterate') {
@@ -1933,7 +1825,7 @@ export class PipelineRunner extends EventEmitter {
           return { control: 'rewind', rewindTo: target, prevArtifact };
         }
 
-        const edited = this.consumeArtifactOverride();
+        const edited = this.reviewer.consumeArtifactOverride();
         if (edited !== null) {
           prevArtifact = edited;
         } else {
@@ -2053,7 +1945,7 @@ export class PipelineRunner extends EventEmitter {
         return { control: 'fail-early-return', prevArtifact };
       }
     } finally {
-      this.clearStageReviewNote();
+      this.reviewer.clearForCurrentStage();
     }
   }
 
