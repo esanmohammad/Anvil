@@ -45,7 +45,7 @@ import {
   extractTablesTouched,
   extractTestBehaviors,
   type ManifestExtractor,
-} from '../feature-manifest-extractors.js';
+} from '@esankhan3/anvil-core-pipeline';
 
 const STAGE_EXTRACTORS: Record<string, readonly ManifestExtractor[]> = {
   requirements: [extractAcceptanceCriteria, extractAffectedRepos],

@@ -115,3 +115,17 @@ export type {
   ManifestFieldKey,
   ManifestFieldValue,
 } from './feature-manifest-types.js';
+export {
+  extractAcceptanceCriteria,
+  extractAffectedRepos,
+  extractApiEndpoints,
+  extractTablesTouched,
+  extractFilesPlanned,
+  extractTestBehaviors,
+  extractChangeBrief,
+  extractOpenQuestions,
+} from './feature-manifest-extractors.js';
+export type {
+  ExtractorResult,
+  ManifestExtractor,
+} from './feature-manifest-extractors.js';

@@ -31,7 +31,7 @@
  *   build        → extractChangeBrief
  *   validate     → extractOpenQuestions
  */
-import { extractAcceptanceCriteria, extractAffectedRepos, extractApiEndpoints, extractChangeBrief, extractFilesPlanned, extractOpenQuestions, extractTablesTouched, extractTestBehaviors, } from '../feature-manifest-extractors.js';
+import { extractAcceptanceCriteria, extractAffectedRepos, extractApiEndpoints, extractChangeBrief, extractFilesPlanned, extractOpenQuestions, extractTablesTouched, extractTestBehaviors, } from '@esankhan3/anvil-core-pipeline';
 const STAGE_EXTRACTORS = {
     requirements: [extractAcceptanceCriteria, extractAffectedRepos],
     specs: [extractApiEndpoints, extractTablesTouched, extractTestBehaviors],

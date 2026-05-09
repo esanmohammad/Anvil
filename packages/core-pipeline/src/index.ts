@@ -73,6 +73,14 @@ export {
   computeRiskTier,
   FEATURE_MANIFEST_VERSION,
   emptyManifest,
+  extractAcceptanceCriteria,
+  extractAffectedRepos,
+  extractApiEndpoints,
+  extractTablesTouched,
+  extractFilesPlanned,
+  extractTestBehaviors,
+  extractChangeBrief,
+  extractOpenQuestions,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
@@ -120,6 +128,8 @@ export type {
   FeatureManifest,
   ManifestFieldKey,
   ManifestFieldValue,
+  ExtractorResult,
+  ManifestExtractor,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {

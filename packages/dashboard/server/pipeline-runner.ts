@@ -110,7 +110,7 @@ import {
   extractTablesTouched,
   extractTestBehaviors,
   type ManifestExtractor,
-} from './feature-manifest-extractors.js';
+} from '@esankhan3/anvil-core-pipeline';
 
 // ── Claude CLI binary ────────────────────────────────────────────────
 

@@ -33,7 +33,7 @@
  */
 import type { Step } from '@esankhan3/anvil-core-pipeline';
 import type { FeatureManifestStore } from '../feature-manifest.js';
-import { type ManifestExtractor } from '../feature-manifest-extractors.js';
+import { type ManifestExtractor } from '@esankhan3/anvil-core-pipeline';
 /**
  * Stage names with at least one configured extractor. A registry that
  * registers a manifest Step for an unknown stage is harmless (it would
