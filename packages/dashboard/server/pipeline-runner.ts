@@ -44,6 +44,10 @@ import {
   InMemoryEventBus,
   attachAuditLogHook,
   attachCostTrackerHook,
+  attachStreamHook,
+  attachCheckpointHook,
+  createFileCheckpointStore,
+  attachLivenessPrefetchHook,
 } from '@esankhan3/anvil-core-pipeline';
 import { pickAliveModelFromChainSync, prefetchLiveness, setLivenessTtlMs } from './provider-liveness.js';
 import { loadModelRegistry, DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
@@ -1562,10 +1566,12 @@ export class PipelineRunner extends EventEmitter {
       await this.setupWorkspace();
 
       // Pre-warm provider liveness so the sync resolver chain walker
-      // (called per stage) reads fresh data. Non-blocking failure mode:
-      // if any probe fails, the cache stays cold for that provider and
-      // the walker treats it as alive (status quo).
-      await this.prefetchProviderLiveness().catch(() => undefined);
+      // (called per stage) reads fresh data. Wired via
+      // `attachLivenessPrefetchHook` further down — it fires the
+      // caller-supplied probe on `pipeline:started`, with `await: true`
+      // blocking stage 0 until the probe completes. Non-blocking
+      // failure mode preserved: probe errors are caught by the hook
+      // and surfaced via onError, never fail the run.
 
       // Pre-warm conventions block — extracts on first run if missing,
       // then loads the markdown into the run-scoped cache so every
@@ -1655,7 +1661,6 @@ export class PipelineRunner extends EventEmitter {
       //                                      Pipeline.run with
       //                                      completedSteps trimmed.
       const stageState = { prevArtifact, isResume: !!isResume, resumeStage };
-      let pipelineRewindTarget: number | undefined;
       let pipelineEarlyReturn = false;
 
       // Attach the canonical lifecycle hooks from core-pipeline. They
@@ -1672,13 +1677,71 @@ export class PipelineRunner extends EventEmitter {
       );
       const auditLogHandle = attachAuditLogHook(this.pipelineBus, { path: auditLogPath });
       const costTrackerHandle = attachCostTrackerHook(this.pipelineBus);
+      // Phase C1 — debounced WS broadcast driven by step:* lifecycle
+      // events. Coalesces the burst of mutations inside a stage into a
+      // single broadcast per ~100ms window. Existing inline
+      // broadcastState() calls remain for now (events the bus doesn't
+      // carry today: reviewer edits, mid-stage progress, repo discovery,
+      // etc.); subsequent C-tasks migrate those one by one.
+      const streamHandle = attachStreamHook(this.pipelineBus, {
+        onSnapshot: () => this.broadcastState(),
+        debounceMs: 100,
+      });
+      // Phase C2 — bus-driven forensic checkpoint at
+      // ~/.anvil/runs/<runId>/checkpoint.json. Lives alongside the
+      // dashboard's pipeline-state.json (which has a richer shape and
+      // is read by resume-from-stage). Once reviewer rewind moves to
+      // Pipeline.run({ rewindTo }) (Phase C5), the existing
+      // checkpoint()/clearCheckpoint() pair retires in favor of this.
+      const checkpointHandle = attachCheckpointHook(this.pipelineBus, {
+        store: createFileCheckpointStore(),
+        runId: this.state.runId,
+        keepOnSuccess: true,
+        getShared: () => ({
+          project: this.state.project,
+          feature: this.state.feature,
+          featureSlug: this.state.featureSlug,
+          totalCost: this.state.totalCost,
+          repoNames: this.state.repoNames,
+        }),
+      });
+      // Phase C4 — provider liveness probe wired via the bus. Runs
+      // once on `pipeline:started`, BEFORE stage 0 spawns (await:true).
+      // Replaces the inline `await this.prefetchProviderLiveness()`
+      // call; same fire-and-tolerant semantics — probe failures are
+      // caught and never fail the pipeline.
+      const livenessHandle = attachLivenessPrefetchHook(this.pipelineBus, {
+        probe: () => this.prefetchProviderLiveness(),
+        await: true,
+      });
 
-      // Outer loop handles rewind: inner pipeline.run walks forward.
-      // On rewind we trim completedSteps and re-run from the target.
-      const completedStepIds = new Set<string>();
+      // Outer loop handles rewind. The walker drives forward; on
+      // reviewer rewind we set `rewindToStep` and Pipeline.run handles
+      // the prefix-skip + suffix-rerun automatically (Phase A2 +
+      // Phase C5 — replaces the manual `completedStepIds` trim that
+      // never actually populated, since no `step:completed` listener
+      // was wired). The runOneStage internal short-circuit on
+      // `state.stages[i].status === 'completed'` keeps the rewind
+      // economical even when the walker re-fires every prior step.
+      let rewindToStep: string | undefined;
       while (true) {
         if (this.cancelled) break;
         const stagePipelineRegistry = buildStandardStepRegistry({
+          // Phase C6 — the `skipIfByStage` plumbing is wired but
+          // intentionally empty for now. The dashboard's existing
+          // skip flows (`skipClarify`, `PLAN_DERIVED_STAGES` when a
+          // planSeed is present) are NOT pure skips — they
+          // deterministically render artifacts from the plan, write
+          // them via `featureStore.writeArtifact`, mutate
+          // `this.state.stages[i]`, and broadcast. Phase A1's
+          // `skipIf` predicate is contractually side-effect-free
+          // (no bus, no emit, no signal), so migrating those
+          // branches needs a step:skipped listener pattern for the
+          // rendering — structural scope creep beyond Phase C.
+          //
+          // Future pure-skip use cases (e.g., feature flags, cached
+          // artifacts) plug in here without further plumbing.
+          skipIfByStage: {},
           runStage: async (stageName, _prevForStep) => {
             // Map name → index. STAGES is the canonical ordering.
             const idx = STAGES.findIndex((s) => s.name === stageName);
@@ -1718,7 +1781,7 @@ export class PipelineRunner extends EventEmitter {
             workspaceDir: this.workspaceDir,
             initialInput: stageState.prevArtifact,
             repoPaths: this.repoPaths,
-            completedSteps: [...completedStepIds],
+            ...(rewindToStep ? { rewindTo: rewindToStep } : {}),
           });
           await pipeline.run();
           // No exceptions → walker ran cleanly to the end.
@@ -1739,16 +1802,15 @@ export class PipelineRunner extends EventEmitter {
             break;
           }
           if (e.__anvilRewind !== undefined || msg.includes('rewind')) {
-            // Trim completedStepIds back so Pipeline.run re-runs from
-            // the rewind target on the next iteration.
+            // Phase C5 — translate the runOneStage rewind sentinel into
+            // a Pipeline.run({ rewindTo }) for the next iteration. The
+            // walker auto-handles the prefix skip + suffix re-run so
+            // we don't need to maintain a parallel completedStepIds set.
             const target = e.__anvilRewind ?? -1;
             if (target < 0) break;
-            // Drop everything ≥ target so the next pipeline.run re-runs them.
-            for (let k = target; k < STAGES.length; k++) {
-              completedStepIds.delete(STAGES[k].name);
-            }
-            pipelineRewindTarget = target;
-            void pipelineRewindTarget;
+            const targetName = STAGES[target]?.name;
+            if (!targetName) break;
+            rewindToStep = targetName;
             continue;
           }
           // Unexpected — re-throw so the outer try/catch handles it.
@@ -1764,6 +1826,10 @@ export class PipelineRunner extends EventEmitter {
       void auditEntries; void costTotals;
       auditLogHandle.unsubscribe();
       costTrackerHandle.unsubscribe();
+      streamHandle.flush();
+      streamHandle.unsubscribe();
+      checkpointHandle.unsubscribe();
+      livenessHandle.unsubscribe();
       if (pipelineEarlyReturn) return this.state;
 
       if (!this.cancelled) {

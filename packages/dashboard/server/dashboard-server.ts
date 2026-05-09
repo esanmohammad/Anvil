@@ -140,6 +140,7 @@ import {
   ModelResolutionError,
   UnknownStageError,
   allowedToolsForStage,
+  PR_URL_REGEX,
 } from '@esankhan3/anvil-core-pipeline';
 import {
   attachPipelineBusSubscriber,
@@ -968,9 +969,19 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
   const trackedPRs = new Map<string, TrackedPR>();
 
-  /** Extract PR URLs from text (GitHub PR URLs) */
+  /**
+   * Extract PR URLs from text (GitHub PR URLs).
+   *
+   * Phase C3 — regex moved into core-pipeline as `PR_URL_REGEX` so the
+   * dashboard, cli, and any future tooling share one canonical pattern.
+   * The fuller migration to `attachPrUrlHook` (with the hook owning the
+   * dedupe) is deferred until the per-run `prUrls: Set<string>` state on
+   * `activeRuns` lifts into the hook handle — that crosses dashboard-server
+   * boundaries and earns its own phase.
+   */
   function extractPRUrls(text: string): string[] {
-    const matches = text.match(/https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/g);
+    PR_URL_REGEX.lastIndex = 0;
+    const matches = text.match(PR_URL_REGEX);
     return matches ? [...new Set(matches)] : [];
   }
 
