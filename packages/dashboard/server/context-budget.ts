@@ -8,7 +8,7 @@
  * env-var escape hatch), so new model versions work without code changes.
  */
 
-import { getContextWindow, getMaxOutput } from './model-catalog.js';
+import { getContextWindow, getMaxOutput } from '@esankhan3/anvil-agent-core';
 import { heuristicTokenCount } from './token-util.js';
 import { structurallyTruncate, looksLikeCode } from './structural-truncator.js';
 

@@ -45,4 +45,11 @@ export {
   prefetchLiveness,
   _resetLivenessCache,
 } from './provider-liveness.js';
+export {
+  DEFAULT_SPEC,
+  getModelSpec,
+  getContextWindow,
+  getMaxOutput,
+} from './model-catalog.js';
+export type { ModelSpec } from './model-catalog.js';
 export { VERSION } from './version.js';
