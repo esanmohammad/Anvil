@@ -59,3 +59,18 @@ export type {
   RunTasksOptions,
   RunTasksHooks,
 } from './engineer-task-bundler.js';
+export type {
+  RiskSeverity,
+  ContractKind,
+  PlanRepoImpact,
+  PlanContract,
+  PlanRisk,
+  PlanRollout,
+  PlanTests,
+  PlanEstimate,
+  Plan,
+  PlanPointer,
+  PlanSection,
+  PlanComment,
+  PlanApproval,
+} from './plan-types.js';

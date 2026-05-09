@@ -407,7 +407,7 @@ export interface PipelineConfig {
     slug: string;
     version: number;
     /** Snapshot of the plan JSON (so changes after execute don't affect the run). */
-    plan: import('./plan-store.js').Plan;
+    plan: import('@esankhan3/anvil-core-pipeline').Plan;
   };
   skipShip?: boolean;
   deploy?: 'local' | 'remote' | false;  // deploy after shipping
@@ -1061,7 +1061,7 @@ export class PipelineRunner extends EventEmitter {
    * and test behaviors as `final` and don't re-derive them. Plans don't
    * always have explicit API/table sections, so those are left `unset`.
    */
-  private populateManifestFromPlan(plan: import('./plan-store.js').Plan): void {
+  private populateManifestFromPlan(plan: import('@esankhan3/anvil-core-pipeline').Plan): void {
     const project = this.config.project;
     const slug = this.state.featureSlug;
     this.manifestStore.ensure(project, slug, this.config.feature);

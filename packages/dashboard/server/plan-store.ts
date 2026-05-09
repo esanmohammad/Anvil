@@ -26,97 +26,45 @@ import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 
 // ── Types ────────────────────────────────────────────────────────────────
+//
+// Phase F7 — the Plan vocabulary lifted into
+// `@esankhan3/anvil-core-pipeline` so cli + dashboard +
+// pipeline-stage code share one canonical shape. The PlanStore CLASS
+// stays here (FS-backed `~/.anvil/plans/<project>/<slug>/` storage is
+// dashboard-owned). Types are re-exported below for back-compat with
+// existing dashboard consumers.
 
-export type RiskSeverity = 'low' | 'med' | 'high';
-export type ContractKind = 'http' | 'grpc' | 'kafka' | 'db' | 'other';
+import type {
+  Plan,
+  PlanPointer,
+  PlanComment,
+  PlanApproval,
+  PlanSection,
+  PlanRepoImpact,
+  PlanContract,
+  PlanRisk,
+  PlanRollout,
+  PlanTests,
+  PlanEstimate,
+  RiskSeverity,
+  ContractKind,
+} from '@esankhan3/anvil-core-pipeline';
 
-export interface PlanRepoImpact {
-  name: string;
-  changes: string;
-  files: string[];
-  symbols: string[];
-}
-
-export interface PlanContract {
-  kind: ContractKind;
-  name: string;
-  producer: string;
-  consumers: string[];
-  description: string;
-}
-
-export interface PlanRisk {
-  title: string;
-  mitigation: string;
-  severity: RiskSeverity;
-}
-
-export interface PlanRollout {
-  strategy: string;
-  flags: string[];
-  order: string[];
-  rollback: string;
-}
-
-export interface PlanTests {
-  unit: string[];
-  integration: string[];
-  manual: string[];
-}
-
-export interface PlanEstimate {
-  usd: number;
-  minutes: number;
-  prs: number;
-}
-
-export interface Plan {
-  version: number;
-  slug: string;
-  project: string;
-  title: string;
-  problem: string;
-  scope: { inScope: string[]; outOfScope: string[] };
-  repos: PlanRepoImpact[];
-  contracts: PlanContract[];
-  architecture: { mermaid: string; notes: string };
-  risks: PlanRisk[];
-  rollout: PlanRollout;
-  tests: PlanTests;
-  estimate: PlanEstimate;
-  model: string;
-  feature: string;             // original feature description
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface PlanPointer {
-  slug: string;
-  title: string;
-  currentVersion: number;
-  updatedAt: string;
-}
-
-export type PlanSection =
-  | 'problem' | 'scope' | 'repos' | 'contracts' | 'architecture'
-  | 'risks' | 'rollout' | 'tests' | 'estimate';
-
-export interface PlanComment {
-  id: string;              // `c-${Date.now().toString(36)}-${randHex}`
-  sectionPath: string;     // e.g. "problem", "repos[2].files", "risks[0]"
-  author: string;          // from ANVIL_USER_NAME env or 'anonymous'
-  body: string;
-  createdAt: string;       // ISO
-  resolved: boolean;
-}
-
-export interface PlanApproval {
-  id: string;
-  user: string;
-  approvedVersion: number;
-  approvedAt: string;
-  note?: string;
-}
+export type {
+  Plan,
+  PlanPointer,
+  PlanComment,
+  PlanApproval,
+  PlanSection,
+  PlanRepoImpact,
+  PlanContract,
+  PlanRisk,
+  PlanRollout,
+  PlanTests,
+  PlanEstimate,
+  RiskSeverity,
+  ContractKind,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 

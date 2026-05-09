@@ -80,6 +80,19 @@ export type {
   BundleResult,
   RunTasksOptions,
   RunTasksHooks,
+  RiskSeverity,
+  ContractKind,
+  PlanRepoImpact,
+  PlanContract,
+  PlanRisk,
+  PlanRollout,
+  PlanTests,
+  PlanEstimate,
+  Plan,
+  PlanPointer,
+  PlanSection,
+  PlanComment,
+  PlanApproval,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {
