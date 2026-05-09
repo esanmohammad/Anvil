@@ -10,7 +10,7 @@
  * `waitForAgent`.
  */
 import { spawnAndWait, waitForAgent } from '../steps/agent-spawner.js';
-import { disallowedToolsForPersona } from '../steps/per-repo-stage.step.js';
+import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 export class AgentManagerSession {
     opts;
     constructor(opts) {

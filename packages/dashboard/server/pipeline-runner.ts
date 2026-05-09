@@ -2642,7 +2642,7 @@ export class PipelineRunner extends EventEmitter {
     // empty-throw retry, and on-spawn telemetry are baked in.
     const runner = this.makeAgentRunner(stage.name);
     const result = await runBuildForOneRepo({
-      agentRunner: runner,
+      runner,
       project: this.config.project,
       stageName: stage.name,
       persona: stage.persona,
@@ -2656,9 +2656,6 @@ export class PipelineRunner extends EventEmitter {
         this.buildPerTaskPrompt(stage, repoName, repoPath, task, repoArtifacts.specs),
       buildFallbackPrompt: () => this.buildRepoStagePrompt(stage, repoName, ''),
       isCancelled: () => this.cancelled,
-      onTruncation: (agentName, outputTokens) => {
-        this.handleOutputTruncation(agentName, outputTokens);
-      },
       onProjectEvent: (level, message) => {
         this.emit('project-event', { source: 'pipeline', message, level });
       },
@@ -3069,9 +3066,6 @@ export class PipelineRunner extends EventEmitter {
         buildRepoProjectPromptForBuildStage: (repoName: string) =>
           this.buildRepoProjectPrompt(buildStage, repoName),
         isCancelled: () => this.cancelled,
-        onTruncation: (agentName, outputTokens) => {
-          this.handleOutputTruncation(agentName, outputTokens);
-        },
       }),
     );
     if (result.newSingleId !== null) {
