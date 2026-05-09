@@ -25,7 +25,13 @@ import type { ProjectInfo } from './project-loader.js';
 import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
-import { resolveModelByTier } from './model-tier-resolver.js';
+import { resolveModelByTier, type ResolverTier } from '@esankhan3/anvil-agent-core';
+/**
+ * Dashboard's local alias — preserves the public `ModelTier` re-export
+ * surface for in-tree consumers (dashboard-server.ts, runs UI). Backed by
+ * agent-core's `ResolverTier` since F2.
+ */
+export type ModelTier = ResolverTier;
 import {
   resolveModelForStage as registryResolveStage,
   ModelResolutionError,
@@ -383,8 +389,6 @@ function sumTokenStats(parts: ReadonlyArray<StageTokenStats>): StageTokenStats {
 }
 
 // ── Config ────────────────────────────────────────────────────────────
-
-export type ModelTier = 'fast' | 'balanced' | 'thorough';
 
 export interface PipelineConfig {
   project: string;

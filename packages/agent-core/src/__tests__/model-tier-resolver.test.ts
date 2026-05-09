@@ -1,5 +1,12 @@
 /**
- * Phase 5 — local-tier routing on the model-tier-resolver.
+ * Phase F2 — model-tier-resolver tests.
+ *
+ * Moved verbatim from packages/dashboard/server/__tests__/model-tier-resolver.test.ts
+ * when the resolver was promoted into agent-core. Imports now use
+ * agent-core's structural input types (ResolverDiscoveryResult /
+ * ResolverModel) instead of the dashboard's full discovery shapes —
+ * the dashboard's DiscoveryResult / ModelInfo satisfy these
+ * structurally so the assertions still cover the original contract.
  *
  * Verifies the resolver:
  *   • escalates fast-tier clarify/ship to the local weight class when the
@@ -16,37 +23,31 @@ import {
   resolveModelByTier,
   setDiscoveryResult,
   invalidateResolverCache,
+  type ResolverDiscoveryResult,
+  type ResolverModel,
 } from '../model-tier-resolver.js';
-import type { DiscoveryResult, ModelInfo } from '../provider-registry.js';
 
 // ── Fixture builder ────────────────────────────────────────────────────
 
-function makeDiscovery(opts: { withLocal: boolean }): DiscoveryResult {
-  const models: ModelInfo[] = [
-    { id: 'claude-haiku-4-5', displayName: 'Haiku', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'fast' },
-    { id: 'claude-sonnet-4-6', displayName: 'Sonnet', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'balanced' },
-    { id: 'claude-opus-4-7', displayName: 'Opus', provider: 'claude', capabilities: ['agentic', 'chat'], tier: 'powerful' },
+function makeDiscovery(opts: { withLocal: boolean }): ResolverDiscoveryResult {
+  const models: ResolverModel[] = [
+    { id: 'claude-haiku-4-5', capabilities: ['agentic', 'chat'], tier: 'fast' },
+    { id: 'claude-sonnet-4-6', capabilities: ['agentic', 'chat'], tier: 'balanced' },
+    { id: 'claude-opus-4-7', capabilities: ['agentic', 'chat'], tier: 'powerful' },
   ];
   if (opts.withLocal) {
     models.push({
       id: 'qwen2.5-coder:7b',
-      displayName: 'qwen2.5-coder:7b',
-      provider: 'ollama',
       capabilities: ['chat'],
       tier: 'local',
     });
   }
-  return {
-    providers: [],
-    defaultModel: models[0].id,
-    defaultProvider: models[0].provider,
-    models,
-  };
+  return { models };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-describe('resolveModelByTier — local tier (Phase 5)', () => {
+describe('resolveModelByTier — local tier (Phase 5 / F2)', () => {
   const origFlag = process.env.ANVIL_LOCAL_TIER_ENABLED;
 
   beforeEach(() => {

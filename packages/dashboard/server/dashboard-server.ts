@@ -127,7 +127,7 @@ import {
   recordResolution, recordReviewCreated, formatLearningsForPrompt,
 } from './review-learner.js';
 import { discoverProviders, invalidateProviderCache } from './provider-registry.js';
-import { setDiscoveryResult } from './model-tier-resolver.js';
+import { setDiscoveryResult } from '@esankhan3/anvil-agent-core';
 import { autoLearn } from './pipeline-learner.js';
 import { extractConventions, loadRules } from '@esankhan3/anvil-convention-core';
 import {
