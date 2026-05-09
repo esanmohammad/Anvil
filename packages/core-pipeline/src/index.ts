@@ -39,6 +39,13 @@ export type {
   RunFixOptions,
   RunFixResult,
 } from './steps/fix.step.js';
+export {
+  createFeatureManifestStep,
+  FEATURE_MANIFEST_STAGES,
+} from './steps/feature-manifest.step.js';
+export type {
+  FeatureManifestStepOptions,
+} from './steps/feature-manifest.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
