@@ -371,6 +371,87 @@ export interface ProjectLoaderLike {
 
 ---
 
+## Status at completion (Phase L)
+
+All phases A → L shipped on `feat/harness-improvment`. Final commit log
+(28 commits since session start):
+
+| Phase | Commit  | Highlight |
+|---|---|---|
+| E.1 | `c004a48` | ADR §4 amendment for dashboard-domain bus events |
+| E.2 | `2afad8c` | bus events + `attachDashboardStateRollupHook` |
+| F1  | `a77e579` | model-catalog → agent-core |
+| F2  | `2faa32a` | model-tier-resolver → agent-core |
+| F3  | `252b607` | engineer-spec-slicer → core-pipeline/utils |
+| F4  | `5989d1e` | prompt-budget → core-pipeline/utils |
+| F5  | `c6fa728` | context-budget → core-pipeline/utils |
+| F6  | `076e778` | engineer-task-bundler → core-pipeline/utils |
+| F7  | `dd4b6c2` | Plan vocabulary types → core-pipeline/utils |
+| F8  | `1d63b84` | plan-to-artifacts → core-pipeline/utils |
+| F9  | `c760e97` | plan-risk-types → core-pipeline/utils |
+| F10 | `227da19` | plan-risk-scorer → core-pipeline/utils |
+| F11 | `09339a1` | FeatureManifest types → core-pipeline/utils |
+| F12 | `3272fa8` | feature-manifest-extractors → core-pipeline/utils |
+| G   | `7a70a81` | `*Like` interfaces (FeatureStoreLike, FeatureManifestStoreLike, KbManagerLike, ProjectLoaderLike) |
+| H1  | `1fd7580` | clarify.step → core-pipeline/steps |
+| H2  | `b953e55` | validate.step (AgentRunner) |
+| H3  | `2af5076` | fix.step (AgentRunner) |
+| H4  | `261f014` | feature-manifest.step (FeatureManifestStoreLike) |
+| H5  | `9292a8a` | task-bundler.step (pure) |
+| H6  | `38c18e6` | plan-risk.step (pure) |
+| H7  | `06037e0` | clarify-stage.step (AgentSession) |
+| H8  | `adf8214` | fix-loop.step canonical (AgentSession) |
+| H9  | `70e3145` | per-repo-stage.step + disallowedToolsForPersona |
+| H10 | `ea627ff` | per-repo-build.step (AgentRunner) |
+| H11 | `f69f688` | test-gen-stage.step (TestGenDeps injection) |
+| H13 | `7680f72` | prompt-builders (KbManagerLike + structural ProjectInfo) |
+| I   | `27c6f94` | Collapse legacy step factories (delete 3 legacy test files) |
+| J   | `ed06b20` | migrateLegacyCheckpoint utility |
+| K   | `069fa82` | Remove 19 back-compat shims |
+| L   | (this) | Final parity + docs |
+
+**Tests at completion:**
+- core-pipeline: 340/340
+- dashboard: 511/518 (7 pre-existing failures, all baseline)
+- cli + bundled dashboard: builds clean
+
+**Pipeline-runner.ts current size:** ~3360 LOC (down from 3380 at session
+start). The plan's "400-600 LOC target" was not achieved in this pass —
+the runOneStage switch + per-stage methods + reviewer-rewind + checkpoint
+machinery still live there. Phase I delivered the legacy STEP-FACTORY
+removal (~3458 LOC deleted across the dashboard `steps/`, `__tests__/`,
+and 19 shims) but stopped short of refactoring runOneStage itself.
+runOneStage's full collapse is tracked as follow-up work — its
+behavior is now covered by canonical step factories in core-pipeline,
+so the collapse becomes a registry-replace rather than a logic rewrite.
+
+**What was promoted to canonical core-pipeline:**
+- 12 helper modules (F1-F12)
+- 12 step factories (H1-H11, H13; H12 = agent-spawner stays in dashboard
+  as planned)
+- 4 storage `*Like` interfaces (Phase G)
+- 4 dashboard-domain bus event types + `attachDashboardStateRollupHook`
+  (Phase E)
+- Legacy checkpoint migration helper (Phase J)
+
+**What stays in dashboard:**
+- pipeline-runner.ts (the orchestrator; runOneStage collapse follow-up)
+- fix-flow.ts (the dashboard's interactive Fix UI flow)
+- 5 step adapter files (validate, fix, fix-loop, clarify-stage,
+  test-gen-stage) bridging legacy `agentManager` → canonical
+  AgentRunner/AgentSession
+- agent-spawner.ts (wraps AgentManager.spawn — H12 by design)
+- All FS-backed storage classes (FeatureStore, FeatureManifestStore,
+  KnowledgeBaseManager, ProjectLoader, MemoryStore, PlanStore) —
+  their `*Like` interfaces lifted to core-pipeline; classes stay
+- workspace-ops.ts, build-registry.ts, cost-budget.hook.ts (dashboard-
+  specific lifecycle)
+- All test-gen-stage helpers (convention-fingerprinter, behavior-
+  extractor, test-grounder, test-code-emitter, TestSpecStore,
+  TestCaseStore) — injected into the canonical step via TestGenDeps
+
+---
+
 ## Execution discipline (durable for next session after compact)
 
 1. Read this file before every session start.
