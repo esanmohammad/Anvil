@@ -54,6 +54,13 @@ export type {
   TaskBundleOutput,
   TaskBundlerStepOptions,
 } from './steps/task-bundler.step.js';
+export {
+  createPlanRiskStep,
+  PLAN_RISK_ARTIFACT_ID,
+} from './steps/plan-risk.step.js';
+export type {
+  PlanRiskStepOptions,
+} from './steps/plan-risk.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
