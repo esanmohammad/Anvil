@@ -101,6 +101,23 @@ export type {
   RunBuildForRepoResult,
   PerRepoBuildStepOptions,
 } from './steps/per-repo-build.step.js';
+export {
+  pickRepoForBehavior,
+  runTestGenForProject,
+  createTestGenStageStep,
+} from './steps/test-gen-stage.step.js';
+export type {
+  TestGenConventions,
+  TestGenBehavior,
+  TestGenSpec,
+  TestGenCase,
+  TestSpecStoreLike,
+  TestCaseStoreLike,
+  TestGenDeps,
+  TestGenArtifactEvent,
+  RunTestGenForProjectOptions,
+  TestGenStageStepOptions,
+} from './steps/test-gen-stage.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
