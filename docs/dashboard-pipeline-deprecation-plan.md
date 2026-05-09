@@ -74,7 +74,7 @@ type StepHookPoint =
   | 'reviewer:note'          // payload: { stageId, note }
 ```
 
-**This requires updating the canonical hook-point table at `packages/core-pipeline/ARCHITECTURE.md §2.3`** (the `StepHookPoint` table) plus its mirror in `packages/core-pipeline/CLAUDE.md`. There is no separate `EXTRACT-ADR.md` file in the repo today — the architecture doc is the authoritative record. Not deferred — it's a phase below.
+**This requires an ADR amendment to `CORE-PIPELINE-EXTRACT-ADR.md §4`.** Not deferred — it's a phase below.
 
 ### 4. How does resume work after `pipeline-state.json` retires?
 
@@ -126,15 +126,15 @@ Promoted from dashboard to core-pipeline. Walks `STAGES`, supports `skipIfByStag
 **Goal:** Four new `StepHookPoint` values so dashboard-domain state changes flow through the bus.
 
 **Steps:**
-1. Add `'stage:repo-progress' | 'stage:cost-update' | 'stage:fix-attempt' | 'reviewer:note'` to `StepHookPoint` in `core-pipeline/src/types.ts`. Document each payload shape inline as JSDoc.
-2. Update `packages/core-pipeline/ARCHITECTURE.md §2.3` (the `StepHookPoint` table) AND the corresponding bullets in `packages/core-pipeline/CLAUDE.md` to list the new events with their semantics.
-3. Add tests in `core-pipeline/src/__tests__/event-bus.test.ts` covering subscription/dispatch for each new type (event flows through `on`/`emit` with the documented payload shape).
+1. Amend `CORE-PIPELINE-EXTRACT-ADR.md §4` with the four new event types and their payload shapes.
+2. Add `'stage:repo-progress' | 'stage:cost-update' | 'stage:fix-attempt' | 'reviewer:note'` to `StepHookPoint` in `core-pipeline/src/types.ts`.
+3. Add tests in `core-pipeline/src/__tests__/event-bus.test.ts` covering subscription/dispatch for each new type.
 4. Add a `attachDashboardStateRollupHook(bus, { state, broadcast })` hook in core-pipeline that updates a passed-in mutable `state` object on the new events. This is the **named replacement** for ~30 inline `this.broadcastState()` / `this.checkpoint()` calls.
-5. Document each hook's priority interactions with the existing audit/cost/checkpoint/stream hooks (priority slot for the rollup hook + ordering rationale, in the same place as the other hook priority docs).
+5. Document each hook's priority interactions with the existing audit/cost/checkpoint/stream hooks.
 
 **Acceptance:** new test suite passes; hook publishes a rollup state matching today's `this.state` shape on a synthetic event sequence.
 
-**Deliverables:** 1 commit (code + tests + doc updates together — they describe one logical change).
+**Deliverables:** 1 ADR commit, 1 code+tests commit.
 
 ### Phase F — helper migration (NEW — replaces deferred D3 rest)
 
