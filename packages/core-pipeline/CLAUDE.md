@@ -31,11 +31,17 @@ drive the same pipeline shape.
   `run()`, applies `retryPolicy` to each Step. Accepts
   `{ resumeFromStep?, completedSteps? }` so resume-from-stage
   works (see `step:skipped` event).
-- **Lifecycle hooks** (`src/hooks/`) — eight in-tree hooks:
+- **Lifecycle hooks** (`src/hooks/`) — in-tree hooks:
     - `attachAuditLogHook` — JSONL audit at
       `~/.anvil/runs/<runId>/audit.jsonl`.
     - `attachDashboardStateHook` — debounced JSON snapshot at
       `~/.anvil/state.json`.
+    - `attachDashboardStateRollupHook` — mutates a caller-supplied
+      `state` object on `pipeline:*` / `step:*` / `stage:repo-progress`
+      / `stage:cost-update` / `stage:fix-attempt` / `reviewer:note` and
+      fires a debounced `broadcast()` callback. Replaces the
+      dashboard's ~30 inline `this.broadcastState()` calls. See ADR
+      §4.5.
     - `attachCostTrackerHook` — running USD spend; `.totals()`.
     - `attachLearnersHook` — invokes memory-core write-back on
       `step:completed`. Wires the previously-dead `autoLearnHook`.

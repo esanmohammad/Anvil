@@ -23,6 +23,11 @@ export type {
   BusRequest,
   BusRequestListener,
   BusRequestOptions,
+  // Dashboard-domain event payload shapes (ADR §4.5)
+  StageRepoProgressPayload,
+  StageCostUpdatePayload,
+  StageFixAttemptPayload,
+  ReviewerNotePayload,
 } from './types.js';
 export { InMemoryEventBus } from './event-bus.js';
 export {
@@ -52,6 +57,7 @@ export {
   attachAuditLogHook,
   AUDIT_LOG_HOOKS,
   attachDashboardStateHook,
+  attachDashboardStateRollupHook,
   attachCostTrackerHook,
   attachLearnersHook,
   attachRunStoreHook,
@@ -71,6 +77,11 @@ export type {
   DashboardStateHookOptions,
   DashboardStateHookHandle,
   DashboardStateSnapshot,
+  DashboardRollupState,
+  DashboardRollupStageState,
+  DashboardRollupRepoState,
+  DashboardStateRollupHookOptions,
+  DashboardStateRollupHookHandle,
   CostTrackerHookOptions,
   CostTrackerHookHandle,
   LearnersHookOptions,

@@ -12,6 +12,16 @@ export type {
   DashboardStateSnapshot,
 } from './dashboard-state.hook.js';
 export {
+  attachDashboardStateRollupHook,
+} from './dashboard-state-rollup.hook.js';
+export type {
+  DashboardRollupState,
+  DashboardRollupStageState,
+  DashboardRollupRepoState,
+  DashboardStateRollupHookOptions,
+  DashboardStateRollupHookHandle,
+} from './dashboard-state-rollup.hook.js';
+export {
   attachCostTrackerHook,
 } from './cost-tracker.hook.js';
 export type { CostTrackerHookOptions, CostTrackerHookHandle } from './cost-tracker.hook.js';

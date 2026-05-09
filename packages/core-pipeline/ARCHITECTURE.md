@@ -37,10 +37,14 @@ only what compiles today.
         │  audit-log         ─ priority 100                          │
         │  learners          ─ priority 50                           │
         │  cost-tracker      ─ priority 20                           │
+        │  checkpoint        ─ priority 15                           │
         │  dashboard-state   ─ priority 10                           │
+        │  dashboard-rollup  ─ priority 10  (FIFO after dashboard-st)│
+        │  stream            ─ priority  5                           │
         │  run-store         (caller-injected RunStore shape)        │
         │  feature-store     (writes ~/.anvil/features/.../*.md)     │
         │  approval-gate     (responds to bus.request('approval'))   │
+        │  pr-url / liveness-prefetch                                │
         └────────────────────────────────────────────────────────────┘
                        │
                        ▼
@@ -117,6 +121,17 @@ every downstream input.
 | `request:<channel>`   | per `bus.request(...)` call                  |
 | `response:<channel>`  | per `bus.respond(...)` call                  |
 
+**Dashboard-domain events** (ADR §4.5 — emitted by callers via
+`bus.emit(...)`, not by the walker; consumed by
+`attachDashboardStateRollupHook`):
+
+| Event                  | Fires                                                          | Payload type                |
+|------------------------|----------------------------------------------------------------|------------------------------|
+| `stage:repo-progress`  | per per-repo status transition inside a `'per-repo'` stage    | `StageRepoProgressPayload`   |
+| `stage:cost-update`    | per cumulative-USD-ledger increment                            | `StageCostUpdatePayload`     |
+| `stage:fix-attempt`    | per validate→fix loop iteration (`fix` then `revalidate`)      | `StageFixAttemptPayload`     |
+| `reviewer:note`        | per reviewer-supplied note armed for a stage                   | `ReviewerNotePayload`        |
+
 Listener registration order is preserved at equal priorities
 (FIFO tie-break).
 
@@ -184,15 +199,16 @@ pipeline shape. Mirrors Hapi.js plugin lifecycle.
 
 ## 6. Hooks (`src/hooks/`)
 
-| Hook file                  | Listens for                                     | Action |
-|----------------------------|-------------------------------------------------|--------|
-| `audit-log.hook.ts`        | every event                                     | append JSONL row to `~/.anvil/runs/<runId>/audit.jsonl` |
-| `dashboard-state.hook.ts`  | `step:started/completed/failed/skipped`, `artifact:emitted` | debounced JSON snapshot at `~/.anvil/state.json` |
-| `cost-tracker.hook.ts`     | `artifact:emitted` (cost-shaped artifacts)      | running USD spend; `.totals()` for caller |
-| `learners.hook.ts`         | `step:completed`                                | invokes caller-injected `onLearnEvent` (memory-core write-back) |
-| `run-store.hook.ts`        | `pipeline:*`, `step:*`                          | updates injected `RunStore` (structural type `{ updateRun(rec): Promise<void> }`) |
-| `feature-store.hook.ts`    | `artifact:emitted` with known artifact ids      | writes `~/.anvil/features/<project>/<slug>/<id>.md` |
-| `approval-gate.hook.ts`    | `request:approval:gate`                         | calls injected `getApprovalDecision(stageIndex)` and `bus.respond(...)` |
+| Hook file                          | Listens for                                                 | Action |
+|------------------------------------|-------------------------------------------------------------|--------|
+| `audit-log.hook.ts`                | every event                                                 | append JSONL row to `~/.anvil/runs/<runId>/audit.jsonl` |
+| `dashboard-state.hook.ts`          | `step:started/completed/failed/skipped`, `artifact:emitted` | debounced JSON snapshot at `~/.anvil/state.json` |
+| `dashboard-state-rollup.hook.ts`   | `pipeline:*`, `step:*`, `stage:*`, `reviewer:note`           | mutates caller-supplied `state` and fires debounced `broadcast()` (ADR §4.5) |
+| `cost-tracker.hook.ts`             | `artifact:emitted` (cost-shaped artifacts)                  | running USD spend; `.totals()` for caller |
+| `learners.hook.ts`                 | `step:completed`                                            | invokes caller-injected `onLearnEvent` (memory-core write-back) |
+| `run-store.hook.ts`                | `pipeline:*`, `step:*`                                      | updates injected `RunStore` (structural type `{ updateRun(rec): Promise<void> }`) |
+| `feature-store.hook.ts`            | `artifact:emitted` with known artifact ids                  | writes `~/.anvil/features/<project>/<slug>/<id>.md` |
+| `approval-gate.hook.ts`            | `request:approval:gate`                                     | calls injected `getApprovalDecision(stageIndex)` and `bus.respond(...)` |
 
 All hooks expose test seams (deterministic clocks, fake fs writers,
 synchronous timers).
