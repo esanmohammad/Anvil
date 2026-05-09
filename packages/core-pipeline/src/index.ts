@@ -48,12 +48,18 @@ export {
   parseSections,
   findSection,
   sliceSpecForRefs,
+  enforceBudget,
+  estimateBudgetTokens,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
   SpecSection,
   SliceOptions,
   SliceResult,
+  PromptSection,
+  BudgetOptions,
+  BudgetDecision,
+  BudgetResult,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {

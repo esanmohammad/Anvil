@@ -21,3 +21,13 @@ export type {
   SliceOptions,
   SliceResult,
 } from './engineer-spec-slicer.js';
+export {
+  enforceBudget,
+  estimateBudgetTokens,
+} from './prompt-budget.js';
+export type {
+  PromptSection,
+  BudgetOptions,
+  BudgetDecision,
+  BudgetResult,
+} from './prompt-budget.js';

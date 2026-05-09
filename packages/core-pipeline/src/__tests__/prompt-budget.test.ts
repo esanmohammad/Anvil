@@ -1,7 +1,9 @@
 /**
  * Tests for prompt-budget: enforceBudget + estimateBudgetTokens.
  *
- * node:test + node:assert/strict, no third-party deps.
+ * Phase F4 — moved from packages/dashboard/server/__tests__/ when the
+ * budget enforcer was promoted into core-pipeline/utils. node:test +
+ * node:assert/strict, no third-party deps.
  */
 
 import { describe, it } from 'node:test';
@@ -11,7 +13,7 @@ import {
   enforceBudget,
   estimateBudgetTokens,
   type PromptSection,
-} from '../prompt-budget.js';
+} from '../utils/prompt-budget.js';
 
 describe('enforceBudget — under budget', () => {
   it('returns all sections in input order with trimmed=false', () => {

@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { budgetPromptContext } from '../context-budget.js';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { bundleFiles, parseTasks } from '../engineer-task-bundler.js';
-import { enforceBudget } from '../prompt-budget.js';
+import { enforceBudget } from '@esankhan3/anvil-core-pipeline';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = join(__filename, '..');
 // ── Persona-prompt loader ───────────────────────────────────────────────
