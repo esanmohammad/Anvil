@@ -60,7 +60,7 @@ import { loadModelRegistry, DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent
 import type { ModelRegistry, ProviderName, WalkerConfig } from '@esankhan3/anvil-agent-core';
 import { parseTasks, bundleFiles } from './engineer-task-bundler.js';
 import type { ParsedTask } from './engineer-task-bundler.js';
-import { sliceSpecForRefs } from './engineer-spec-slicer.js';
+import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { enforceBudget } from './prompt-budget.js';
 import type { PromptSection } from './prompt-budget.js';
 import { scorePlan, computeRiskTier } from './plan-risk-scorer.js';

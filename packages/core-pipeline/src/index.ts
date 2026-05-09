@@ -45,8 +45,16 @@ export {
   countTokens,
   structurallyTruncate,
   looksLikeCode,
+  parseSections,
+  findSection,
+  sliceSpecForRefs,
 } from './utils/index.js';
-export type { StructuralTruncateOptions } from './utils/index.js';
+export type {
+  StructuralTruncateOptions,
+  SpecSection,
+  SliceOptions,
+  SliceResult,
+} from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {
   RunStageResult,

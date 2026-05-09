@@ -1,10 +1,9 @@
 /**
  * Tests for engineer-spec-slicer.
  *
- * Uses node:test + node:assert (built-in runner), matching the style of the
- * other tests in this directory. Run via:
- *   node --test packages/dashboard/server/__tests__/engineer-spec-slicer.test.ts
- * (after tsc compile, or via a ts loader).
+ * Phase F3 — moved from packages/dashboard/server/__tests__/ when the
+ * slicer was promoted into core-pipeline/utils. Uses node:test + node:assert
+ * (built-in runner), matching the style of the other tests in this directory.
  */
 
 import { describe, it } from 'node:test';
@@ -14,7 +13,7 @@ import {
   parseSections,
   findSection,
   sliceSpecForRefs,
-} from '../engineer-spec-slicer.js';
+} from '../utils/engineer-spec-slicer.js';
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
 

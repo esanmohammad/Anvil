@@ -31,7 +31,7 @@ import { buildShipUserPrompt } from '@esankhan3/anvil-core-pipeline';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { budgetPromptContext } from '../context-budget.js';
-import { sliceSpecForRefs } from '../engineer-spec-slicer.js';
+import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { bundleFiles, parseTasks } from '../engineer-task-bundler.js';
 import { enforceBudget } from '../prompt-budget.js';
 const __filename = fileURLToPath(import.meta.url);
