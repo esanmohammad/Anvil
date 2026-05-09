@@ -76,7 +76,12 @@ function ensureDir(dir: string): void {
 
 // ── FeatureStore ─────────────────────────────────────────────────────────
 
-export class FeatureStore {
+// Phase G — `implements FeatureStoreLike` pins the shape this class
+// owes to step modules in core-pipeline. Type-only import, no runtime
+// dep flip.
+import type { FeatureStoreLike } from '@esankhan3/anvil-core-pipeline';
+
+export class FeatureStore implements FeatureStoreLike {
   private baseDir: string;
 
   constructor(anvilHome?: string) {

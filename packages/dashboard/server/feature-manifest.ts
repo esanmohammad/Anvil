@@ -56,7 +56,11 @@ const MANIFEST_FILENAME = 'manifest.json';
 
 // ── Store ────────────────────────────────────────────────────────────────
 
-export class FeatureManifestStore {
+// Phase G — `implements FeatureManifestStoreLike` pins the shape
+// step modules consume from core-pipeline.
+import type { FeatureManifestStoreLike } from '@esankhan3/anvil-core-pipeline';
+
+export class FeatureManifestStore implements FeatureManifestStoreLike {
   constructor(private featureStore: FeatureStore) {}
 
   private manifestPath(project: string, slug: string): string {

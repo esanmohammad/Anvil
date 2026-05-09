@@ -5,6 +5,14 @@
  * lifecycle hooks. See CORE-PIPELINE-EXTRACT-PLAN.md for the phased rollout.
  */
 
+// Phase G — *Like interfaces for FS-backed dashboard storage layers
+export type {
+  FeatureStoreLike,
+  FeatureManifestStoreLike,
+  KbManagerLike,
+  ProjectLoaderLike,
+} from './storage-like.js';
+
 export type {
   Step,
   StepContext,
