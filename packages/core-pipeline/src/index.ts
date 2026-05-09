@@ -50,6 +50,10 @@ export {
   sliceSpecForRefs,
   enforceBudget,
   estimateBudgetTokens,
+  getModelTokenLimit,
+  estimateTokens,
+  applyBudget,
+  budgetPromptContext,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
@@ -60,6 +64,10 @@ export type {
   BudgetOptions,
   BudgetDecision,
   BudgetResult,
+  ContextComponent,
+  ContextBudgetResult,
+  PromptBudgetInput,
+  PromptBudgetOutput,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {

@@ -32,7 +32,7 @@ import { buildShipUserPrompt } from '@esankhan3/anvil-core-pipeline';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { budgetPromptContext } from '../context-budget.js';
+import { budgetPromptContext } from '@esankhan3/anvil-core-pipeline';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { bundleFiles, parseTasks } from '../engineer-task-bundler.js';
 import type { ParsedTask } from '../engineer-task-bundler.js';

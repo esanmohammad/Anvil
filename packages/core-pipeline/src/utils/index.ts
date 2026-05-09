@@ -31,3 +31,15 @@ export type {
   BudgetDecision,
   BudgetResult,
 } from './prompt-budget.js';
+export {
+  getModelTokenLimit,
+  estimateTokens,
+  applyBudget,
+  budgetPromptContext,
+} from './context-budget.js';
+export type {
+  ContextComponent,
+  ContextBudgetResult,
+  PromptBudgetInput,
+  PromptBudgetOutput,
+} from './context-budget.js';
