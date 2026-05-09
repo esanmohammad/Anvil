@@ -434,8 +434,29 @@ so the collapse becomes a registry-replace rather than a logic rewrite.
   (Phase E)
 - Legacy checkpoint migration helper (Phase J)
 
+**Pipeline-runner slimming follow-up (post-Phase L):**
+
+Six commits after Phase L further sliced the runner:
+
+| Commit | Change | Runner LOC |
+|---|---|---|
+| `78721e3` | Split types + stage table to `pipeline-runner-types.ts` | 3380 → 3086 |
+| `7b90998` | Wired `attachDashboardStateRollupHook` (no-op net; ready for future emits) | 3086 → 3062 |
+| `5938256` | Extracted `checkpoint()` / `clearCheckpoint()` to `pipeline-checkpoint.ts` | 3062 → 3062 |
+| `b820d57` | Inlined 9 thin wrapper methods into call sites | 3062 → 2993 |
+| `b4834cb` | Extracted `ReviewerControl` (review note slot, artifact override, rerun-from / iterate) | 2993 → 2885 |
+| `58a515f` | Extracted `PromptContextCache` (memory + conventions + KB tier + manifest memoization) | 2885 → 2647 |
+
+**Net runner reduction: 3380 → 2647 LOC (-733, 22% slimmer).**
+
+To hit the plan's original 400-600 LOC target requires:
+- **Replacing 39 inline `this.state.stages[i].x = …` mutations with `bus.emit('stage:repo-progress', …)` calls** — the rollup hook is wired and ready (`7b90998`). Each replacement is mechanical but per-site, with regression risk against the WS event vocabulary.
+- **Collapsing `runOneStage` (~310 LOC switch) + 4 per-stage methods (~600 LOC) into registry-replace factory wiring** — the canonical step factories all exist in core-pipeline since H1-H13. The rewrite is a structural pattern shift to `registry.replace('clarify', createClarifyStageStep({...}))` × 8 stages, with all dashboard state mutations driven by hooks.
+
+Both are coherent multi-commit follow-ups; this session ran out of headroom for the WS-event-vocabulary parity verification each rewrite needs.
+
 **What stays in dashboard:**
-- pipeline-runner.ts (the orchestrator; runOneStage collapse follow-up)
+- pipeline-runner.ts (the orchestrator at 2647 LOC; runOneStage collapse remains follow-up)
 - fix-flow.ts (the dashboard's interactive Fix UI flow)
 - 5 step adapter files (validate, fix, fix-loop, clarify-stage,
   test-gen-stage) bridging legacy `agentManager` → canonical
