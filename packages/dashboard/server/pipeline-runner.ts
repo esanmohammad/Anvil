@@ -26,6 +26,10 @@ import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
 import { resolveModelByTier } from '@esankhan3/anvil-agent-core';
+import {
+  writePipelineCheckpoint,
+  clearPipelineCheckpoint,
+} from './pipeline-checkpoint.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -1230,70 +1234,22 @@ export class PipelineRunner extends EventEmitter {
     };
   }
 
-  /** Persist pipeline state to disk for crash recovery */
+  /** Persist pipeline state to disk for crash recovery. */
   checkpoint(): void {
-    try {
-      const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
-      if (!existsSync(featureDir)) mkdirSync(featureDir, { recursive: true });
-
-      const cp: PipelineCheckpoint = {
-        version: 1,
-        runId: this.state.runId,
-        project: this.state.project,
-        feature: this.state.feature,
-        featureSlug: this.state.featureSlug,
-        config: {
-          model: this.config.model,
-          modelTier: this.config.modelTier,
-          baseBranch: this.config.baseBranch,
-          skipClarify: this.config.skipClarify,
-          skipShip: this.config.skipShip,
-          actionType: this.config.actionType,
-        },
-        status: this.state.status,
-        currentStage: this.state.currentStage,
-        stages: this.state.stages.map((s) => ({
-          name: s.name,
-          label: s.label,
-          status: s.status,
-          cost: s.cost,
-          error: s.error,
-          repos: s.repos.map((r) => ({
-            repoName: r.repoName,
-            status: r.status,
-            cost: r.cost,
-            error: r.error,
-          })),
-        })),
-        repoNames: this.state.repoNames,
-        totalCost: this.state.totalCost,
-        startedAt: this.state.startedAt,
-        updatedAt: new Date().toISOString(),
-      };
-
-      // Atomic write
-      const path = join(featureDir, 'pipeline-state.json');
-      const tmp = path + '.tmp';
-      writeFileSync(tmp, JSON.stringify(cp, null, 2), 'utf-8');
-      renameSync(tmp, path);
-    } catch (err) {
-      console.warn('[pipeline] Checkpoint write failed:', err);
-    }
+    writePipelineCheckpoint({
+      state: this.state,
+      config: this.config,
+      featureStore: this.featureStore,
+    });
   }
 
-  /** Clear checkpoint (called when pipeline completes successfully) */
+  /** Clear checkpoint (called when pipeline completes successfully). */
   private clearCheckpoint(): void {
-    try {
-      const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
-      const path = join(featureDir, 'pipeline-state.json');
-      if (existsSync(path)) {
-        // Don't delete — update status so it's not detected as interrupted
-        const cp = JSON.parse(readFileSync(path, 'utf-8'));
-        cp.status = this.state.status;
-        cp.updatedAt = new Date().toISOString();
-        writeFileSync(path, JSON.stringify(cp, null, 2), 'utf-8');
-      }
-    } catch { /* non-critical */ }
+    clearPipelineCheckpoint({
+      state: this.state,
+      config: this.config,
+      featureStore: this.featureStore,
+    });
   }
 
   /** Get the agentId for a specific stage (for sendInput) */
