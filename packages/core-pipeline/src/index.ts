@@ -34,6 +34,14 @@ export { InMemoryStepRegistry } from './step-registry.js';
 export { InMemoryArtifactStore } from './artifacts.js';
 export { Pipeline, makePipelineEvent } from './pipeline.js';
 export type { PipelineDeps } from './pipeline.js';
+export {
+  heuristicTokenCount,
+  heuristicTokenCountFromBytes,
+  countTokens,
+  structurallyTruncate,
+  looksLikeCode,
+} from './utils/index.js';
+export type { StructuralTruncateOptions } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {
   RunStageResult,

@@ -1118,6 +1118,74 @@ export class PipelineRunner extends EventEmitter {
   }
 
   /**
+   * Render plan-derived artifacts for stages that the walker skipped via
+   * `skipIfByStage`. Mutates `this.state.stages[i]` and writes the
+   * artifact through `featureStore` — same side effects the legacy
+   * runOneStage branch did, just driven by the bus listener instead
+   * of the inline `if (planSeed && PLAN_DERIVED_STAGES.includes(...))`.
+   *
+   * Phase D1. Idempotent — calling for a stage already populated does
+   * the same writes again, which the featureStore tolerates.
+   */
+  private async renderPlanDerivedArtifact(stageName: string, stageIndex: number): Promise<void> {
+    const seed = this.config.planSeed;
+    if (!seed) return;
+    const { plan } = seed;
+    const { renderRequirements, renderRepoRequirements, renderRepoSpecs, renderRepoTasks }
+      = await import('./plan-to-artifacts.js');
+
+    const project = this.config.project;
+    const slug = this.state.featureSlug;
+    const i = stageIndex;
+    if (i < 0 || !this.state.stages[i]) return;
+
+    if (stageName === 'requirements') {
+      const artifact = renderRequirements(plan);
+      this.state.stages[i].status = 'skipped';
+      this.state.stages[i].artifact = artifact;
+      try { this.featureStore.writeArtifact(project, slug, 'REQUIREMENTS.md', artifact); } catch { /* non-fatal */ }
+    } else {
+      const filenameByStage: Record<string, string> = {
+        'repo-requirements': 'REQUIREMENTS.md',
+        specs: 'SPECS.md',
+        tasks: 'TASKS.md',
+      };
+      const rendererByStage: Record<string, (p: typeof plan, r: string) => string> = {
+        'repo-requirements': renderRepoRequirements,
+        specs: renderRepoSpecs,
+        tasks: renderRepoTasks,
+      };
+      const filename = filenameByStage[stageName];
+      const renderer = rendererByStage[stageName];
+      if (!filename || !renderer) return;
+
+      const combined: string[] = [];
+      this.state.stages[i].repos = this.state.repoNames.map((repoName) => {
+        const artifact = renderer(plan, repoName);
+        try {
+          this.featureStore.writeArtifact(project, slug, `repos/${repoName}/${filename}`, artifact);
+        } catch { /* non-fatal */ }
+        combined.push(`## ${repoName}\n${artifact}`);
+        return {
+          repoName,
+          agentId: null,
+          status: 'completed' as const,
+          cost: 0,
+          artifact,
+          error: null,
+        };
+      });
+
+      this.state.stages[i].status = 'skipped';
+      this.state.stages[i].artifact = combined.join('\n\n');
+    }
+
+    this.state.stages[i].completedAt = new Date().toISOString();
+    this.broadcastState();
+    this.checkpoint();
+  }
+
+  /**
    * After a stage's artifact lands, extract structured fields and patch the
    * manifest. Uses a heuristic deterministic parser today — the cheap-model
    * extraction call is wired through later phases so we avoid an extra spawn
@@ -1714,6 +1782,21 @@ export class PipelineRunner extends EventEmitter {
         probe: () => this.prefetchProviderLiveness(),
         await: true,
       });
+      // Phase D1 — when the walker skips a plan-derived stage via
+      // skipIfByStage, render the artifact + mutate state here.
+      // Listener is awaited inside bus.emit so the next step's
+      // input threading sees the rendered artifact.
+      const planSkipUnsub = this.pipelineBus.on('step:skipped', async (event) => {
+        if (event.payload && (event.payload as { reason?: string }).reason !== 'skipIf') return;
+        if (!event.stepId || !PLAN_DERIVED_STAGES.includes(event.stepId)) return;
+        const stageIdx = STAGES.findIndex((s) => s.name === event.stepId);
+        if (stageIdx < 0) return;
+        await this.renderPlanDerivedArtifact(event.stepId, stageIdx);
+        // Thread the rendered artifact into stageState so subsequent
+        // non-skipped stages see it as their prevArtifact.
+        const rendered = this.state.stages[stageIdx]?.artifact;
+        if (rendered) stageState.prevArtifact = rendered;
+      });
 
       // Outer loop handles rewind. The walker drives forward; on
       // reviewer rewind we set `rewindToStep` and Pipeline.run handles
@@ -1727,21 +1810,16 @@ export class PipelineRunner extends EventEmitter {
       while (true) {
         if (this.cancelled) break;
         const stagePipelineRegistry = buildStandardStepRegistry({
-          // Phase C6 — the `skipIfByStage` plumbing is wired but
-          // intentionally empty for now. The dashboard's existing
-          // skip flows (`skipClarify`, `PLAN_DERIVED_STAGES` when a
-          // planSeed is present) are NOT pure skips — they
-          // deterministically render artifacts from the plan, write
-          // them via `featureStore.writeArtifact`, mutate
-          // `this.state.stages[i]`, and broadcast. Phase A1's
-          // `skipIf` predicate is contractually side-effect-free
-          // (no bus, no emit, no signal), so migrating those
-          // branches needs a step:skipped listener pattern for the
-          // rendering — structural scope creep beyond Phase C.
-          //
-          // Future pure-skip use cases (e.g., feature flags, cached
-          // artifacts) plug in here without further plumbing.
-          skipIfByStage: {},
+          // Phase D1 — plan-derived stages skip when a planSeed is
+          // present. The skipIf predicate is pure (just a config
+          // read); the rendering side effects live in the
+          // `step:skipped` listener attached above.
+          skipIfByStage: {
+            requirements: () => this.config.planSeed != null,
+            'repo-requirements': () => this.config.planSeed != null,
+            specs: () => this.config.planSeed != null,
+            tasks: () => this.config.planSeed != null,
+          },
           runStage: async (stageName, _prevForStep) => {
             // Map name → index. STAGES is the canonical ordering.
             const idx = STAGES.findIndex((s) => s.name === stageName);
@@ -1830,6 +1908,7 @@ export class PipelineRunner extends EventEmitter {
       streamHandle.unsubscribe();
       checkpointHandle.unsubscribe();
       livenessHandle.unsubscribe();
+      planSkipUnsub();
       if (pipelineEarlyReturn) return this.state;
 
       if (!this.cancelled) {
@@ -2000,60 +2079,20 @@ export class PipelineRunner extends EventEmitter {
         return { control: 'continue', prevArtifact };
       }
 
-      // Plan-seed skip: stages 1–4 derive deterministically from the plan.
+      // Plan-seed skip: stages 1–4 derive deterministically from the
+      // plan. Phase D1 — the rendering side-effects (artifact write,
+      // state mutation, broadcast, checkpoint) live in a step:skipped
+      // listener wired in `run()`. The skipIfByStage map activates
+      // the walker-driven skip so this branch is unreachable when a
+      // planSeed is present; we keep a guard log here as a tripwire.
       if (this.config.planSeed && PLAN_DERIVED_STAGES.includes(stage.name)) {
-        const { plan } = this.config.planSeed;
-        const { renderRequirements, renderRepoRequirements, renderRepoSpecs, renderRepoTasks }
-          = await import('./plan-to-artifacts.js');
-
-        const project = this.config.project;
-        const slug = this.state.featureSlug;
-
-        if (stage.name === 'requirements') {
-          const artifact = renderRequirements(plan);
-          this.state.stages[i].status = 'skipped';
-          this.state.stages[i].artifact = artifact;
-          prevArtifact = artifact;
-          try { this.featureStore.writeArtifact(project, slug, 'REQUIREMENTS.md', artifact); } catch { /* non-fatal */ }
-        } else {
-          const filenameByStage: Record<string, string> = {
-            'repo-requirements': 'REQUIREMENTS.md',
-            specs: 'SPECS.md',
-            tasks: 'TASKS.md',
-          };
-          const rendererByStage: Record<string, (p: typeof plan, r: string) => string> = {
-            'repo-requirements': renderRepoRequirements,
-            specs: renderRepoSpecs,
-            tasks: renderRepoTasks,
-          };
-          const filename = filenameByStage[stage.name];
-          const renderer = rendererByStage[stage.name];
-
-          const combined: string[] = [];
-          this.state.stages[i].repos = this.state.repoNames.map((repoName) => {
-            const artifact = renderer(plan, repoName);
-            try {
-              this.featureStore.writeArtifact(project, slug, `repos/${repoName}/${filename}`, artifact);
-            } catch { /* non-fatal */ }
-            combined.push(`## ${repoName}\n${artifact}`);
-            return {
-              repoName,
-              agentId: null,
-              status: 'completed' as const,
-              cost: 0,
-              artifact,
-              error: null,
-            };
-          });
-
-          this.state.stages[i].status = 'skipped';
-          this.state.stages[i].artifact = combined.join('\n\n');
-          prevArtifact = this.state.stages[i].artifact;
-        }
-
-        this.state.stages[i].completedAt = new Date().toISOString();
-        this.broadcastState();
-        this.checkpoint();
+        console.warn(
+          `[pipeline] runOneStage(${stage.name}) reached with planSeed — `
+            + `skipIf path should have fired earlier. Falling through to `
+            + `legacy renderer for safety.`,
+        );
+        await this.renderPlanDerivedArtifact(stage.name, i);
+        prevArtifact = this.state.stages[i].artifact ?? prevArtifact;
         return { control: 'continue', prevArtifact };
       }
 
