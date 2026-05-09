@@ -79,6 +79,17 @@ export type {
   RunFixLoopOptions,
   RunFixLoopResult,
 } from './steps/fix-loop.step.js';
+export {
+  disallowedToolsForPersona,
+  runPerRepoStageForRepo,
+  combinePerRepoArtifacts,
+  createPerRepoStageStep,
+} from './steps/per-repo-stage.step.js';
+export type {
+  RunPerRepoStageOptions,
+  RunPerRepoStageResult,
+  PerRepoStageStepOptions,
+} from './steps/per-repo-stage.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
