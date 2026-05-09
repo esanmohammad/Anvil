@@ -22,8 +22,8 @@ import {
   type PromptBuilderContext,
   type StageInfo,
   type KbTier,
-} from '../steps/prompt-builders.js';
-import type { ParsedTask } from '../engineer-task-bundler.js';
+} from '@esankhan3/anvil-core-pipeline';
+import type { ParsedTask } from '@esankhan3/anvil-core-pipeline';
 
 interface CtxOverrides {
   emit?: (event: string, payload: unknown) => void;

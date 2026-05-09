@@ -9,7 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { structurallyTruncate, looksLikeCode } from '../structural-truncator.js';
+import { structurallyTruncate, looksLikeCode } from '@esankhan3/anvil-core-pipeline';
 
 // ── Fixture builder ─────────────────────────────────────────────────────
 

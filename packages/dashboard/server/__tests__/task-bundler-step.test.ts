@@ -24,7 +24,7 @@ import {
 import {
   parseTasks,
   groupTasksForExecution,
-} from '../engineer-task-bundler.js';
+} from '@esankhan3/anvil-core-pipeline';
 
 const SAMPLE_TASKS_MD = `# Task Breakdown
 

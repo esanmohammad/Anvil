@@ -71,27 +71,8 @@ import {
 import {
   combinePerRepoArtifacts,
   disallowedToolsForPersona,
-} from './steps/per-repo-stage.step.js';
-import {
   runBuildForOneRepo,
-} from './steps/per-repo-build.step.js';
-import {
-  runClarifyForProject,
-} from './steps/clarify-stage.step.js';
-import {
-  runFixLoop,
   hasValidationFailures as hasValidationFailuresHelper,
-} from './steps/fix-loop.step.js';
-import {
-  runTestGenForProject,
-} from './steps/test-gen-stage.step.js';
-import {
-  pullBaseBranchForRepos,
-  runPostBuildGuards,
-  deployProject,
-  createFeatureBranches as createFeatureBranchesHelper,
-} from './steps/workspace-ops.js';
-import {
   buildProjectPrompt as buildProjectPromptHelper,
   buildRepoProjectPrompt as buildRepoProjectPromptHelper,
   buildClarifyExplorePrompt as buildClarifyExplorePromptHelper,
@@ -99,7 +80,17 @@ import {
   buildRepoStagePrompt as buildRepoStagePromptHelper,
   buildPerTaskPrompt as buildPerTaskPromptHelper,
   type PromptBuilderContext,
-} from './steps/prompt-builders.js';
+} from '@esankhan3/anvil-core-pipeline';
+// Adapters (legacy agentManager → AgentSession bridge) — stay in dashboard.
+import { runClarifyForProject } from './steps/clarify-stage.step.js';
+import { runFixLoop } from './steps/fix-loop.step.js';
+import { runTestGenForProject } from './steps/test-gen-stage.step.js';
+import {
+  pullBaseBranchForRepos,
+  runPostBuildGuards,
+  deployProject,
+  createFeatureBranches as createFeatureBranchesHelper,
+} from './steps/workspace-ops.js';
 import {
   extractAcceptanceCriteria,
   extractAffectedRepos,

@@ -37,7 +37,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 import { AgentManager, type AgentState } from '@esankhan3/anvil-agent-core';
 import { PipelineRunner } from './pipeline-runner.js';
-import { disallowedToolsForPersona } from './steps/per-repo-stage.step.js';
+import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import type { PipelineRunState } from './pipeline-runner.js';
 import { ProjectLoader } from './project-loader.js';

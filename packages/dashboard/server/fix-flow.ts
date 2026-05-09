@@ -20,6 +20,8 @@
  * (`fix → validate → fix-loop` with status dots).
  */
 
+// Note: dashboard's fix.step.ts shim accepts the legacy {agentManager,...}
+// shape so fix-flow.ts can keep its current call shape unchanged.
 import { runFix, type RunFixResult } from './steps/fix.step.js';
 import { runValidate, type RunValidateResult } from './steps/validate.step.js';
 import { runFixLoop } from './steps/fix-loop.step.js';
