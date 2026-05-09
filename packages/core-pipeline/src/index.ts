@@ -61,6 +61,15 @@ export {
 export type {
   PlanRiskStepOptions,
 } from './steps/plan-risk.step.js';
+export {
+  createClarifyStageStep,
+  runClarifyForProject,
+} from './steps/clarify-stage.step.js';
+export type {
+  ClarifyStageStepOptions,
+  RunClarifyForProjectOptions,
+  RunClarifyForProjectResult,
+} from './steps/clarify-stage.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
