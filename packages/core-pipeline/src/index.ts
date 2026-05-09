@@ -70,6 +70,15 @@ export type {
   RunClarifyForProjectOptions,
   RunClarifyForProjectResult,
 } from './steps/clarify-stage.step.js';
+export {
+  createFixLoopStep,
+  runFixLoop,
+} from './steps/fix-loop.step.js';
+export type {
+  FixLoopStepOptions,
+  RunFixLoopOptions,
+  RunFixLoopResult,
+} from './steps/fix-loop.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
