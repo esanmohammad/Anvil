@@ -16,10 +16,6 @@ import { homedir } from 'node:os';
 import { execSync, spawn as cpSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { AgentManager } from '@esankhan3/anvil-agent-core';
-import {
-  extractConventions as coreExtractConventions,
-  loadConventions as coreLoadConventions,
-} from '@esankhan3/anvil-convention-core';
 import { ProjectLoader } from './project-loader.js';
 import type { ProjectInfo } from './project-loader.js';
 import { FeatureStore } from './feature-store.js';
@@ -31,6 +27,7 @@ import {
   clearPipelineCheckpoint,
 } from './pipeline-checkpoint.js';
 import { ReviewerControl } from './reviewer-control.js';
+import { PromptContextCache } from './prompt-context-cache.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -114,7 +111,6 @@ import { enforceBudget, type PromptSection } from '@esankhan3/anvil-core-pipelin
 import { scorePlan, computeRiskTier } from '@esankhan3/anvil-core-pipeline';
 import {
   FeatureManifestStore,
-  renderManifestForPrompt,
   type PlannedFile,
   type TestBehavior,
 } from './feature-manifest.js';
@@ -163,20 +159,6 @@ const CLAUDE_BIN = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? pr
  * Check if the Claude CLI is authenticated.
  * Returns true if logged in, false otherwise.
  */
-/**
- * Render a Memory.content value (object | string) for prompt injection.
- * BM25 retrieval returns typed Memory<T> rows; pre-rewire we only ever
- * stored strings, so the JSON path is the post-rewire shape.
- */
-function formatContent(content: unknown): string {
-  if (typeof content === 'string') return content.slice(0, 280);
-  try {
-    return JSON.stringify(content).slice(0, 280);
-  } catch {
-    return '';
-  }
-}
-
 function checkClaudeAuth(): boolean {
   try {
     const out = execSync(`${CLAUDE_BIN} auth status --json`, { timeout: 10_000, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -275,13 +257,6 @@ export class PipelineRunner extends EventEmitter {
   private memoryStore: MemoryStore;
   private kbManager: KnowledgeBaseManager | null;
   private afterStageHook: AfterStageHook | null = null;
-  /**
-   * Phase 2: feature manifest is rendered into the projectPrompt of every
-   * stage so downstream agents stop re-deriving fields earlier stages already
-   * produced. Memoised per-snapshot — invalidated whenever a stage patches
-   * the manifest. Bytes are stable for all spawns of the same stage.
-   */
-  private cachedManifestBlock: string | null = null;
 
   setAfterStageHook(hook: AfterStageHook | null): void { this.afterStageHook = hook; }
 
@@ -379,7 +354,7 @@ export class PipelineRunner extends EventEmitter {
         } catch { /* best-effort — extractor may not have run */ }
       }
     }
-    this.invalidateManifestBlock();
+    this.promptCache.invalidateManifestBlock();
   }
 
   /**
@@ -431,238 +406,11 @@ export class PipelineRunner extends EventEmitter {
 
   // ── Phase 1 cache-stability memoization ─────────────────────────────
   //
-  // Stable inputs to the system prompt are computed ONCE per run so the
-  // resulting bytes are byte-identical across stages — that's what lets the
-  // provider's prompt cache fire (Anthropic explicit, OpenAI auto, Gemini
-  // auto). Reset is implicit: a new PipelineRunner instance gets fresh caches.
-  private cachedMemoryBlock: string | null = null;
-  private cachedConventionsBlock: string | null = null;
-  private cachedProjectYamlSlice: Map<number, string> = new Map();
-  private cachedKbBlock: Map<string, string> = new Map();
-  private lockedKbTierResolved: 'full' | 'repo-focused' | 'index-only' | null = null;
-
-  /**
-   * KB tier locked for the run. Stages 1–7 share one tier so the KB
-   * subsection of `projectPrompt` is byte-stable across them — that's the
-   * dominant byte mass and the dominant cache buster today. Clarify and
-   * Ship keep their existing exceptions (clarify needs the big-picture
-   * index; ship doesn't need any KB).
-   */
-  private getLockedKbTier(stage: StageDefinition): 'full' | 'repo-focused' | 'index-only' | 'none' {
-    if (stage.name === 'ship') return 'none';
-    if (stage.name === 'clarify') return 'index-only';
-    if (this.lockedKbTierResolved !== null) return this.lockedKbTierResolved;
-    // First lockable call wins. 'repo-focused' is the conservative balance:
-    // big enough for analyst/architect needs, small enough that engineers
-    // don't drown. Bump to 'full' here only if the project is unusually
-    // multi-repo and benefits from cross-repo context every stage.
-    this.lockedKbTierResolved = 'repo-focused';
-    return this.lockedKbTierResolved;
-  }
-
-  /**
-   * Memoised memory block (project + user profile, capped at 4KB).
-   *
-   * Retrieval is BM25-keyed by the run's feature description against
-   * the SQLite hot index — top-K relevant entries. An empty block is
-   * surfaced honestly when nothing relevant is found rather than
-   * falling back to "newest 4KB blob," which leaked stale unrelated
-   * notes into prompts.
-   */
-  private getStableMemoryBlock(): string {
-    if (this.cachedMemoryBlock !== null) return this.cachedMemoryBlock;
-    try {
-      const store = this.memoryStore.unwrap();
-      const projectNs = { scope: 'project' as const, projectId: this.config.project };
-      const userNs = { scope: 'user' as const, projectId: this.config.project };
-      const queryText = this.config.feature || '';
-
-      const projectHits = queryText
-        ? store.query(projectNs, { text: queryText, limit: 8 })
-        : store.query(projectNs, { limit: 8 });
-      const userHits = store.query(userNs, { limit: 5 });
-
-      const projectBlock = projectHits.length > 0
-        ? `## Recent project memories (BM25-ranked for "${queryText.slice(0, 60)}")\n` +
-          projectHits.map((m) => `- [${m.kind}${m.subtype ? `:${m.subtype}` : ''}] ${formatContent(m.content)}`).join('\n')
-        : '';
-      const userBlock = userHits.length > 0
-        ? `## User profile\n` +
-          userHits.map((m) => `- ${formatContent(m.content)}`).join('\n')
-        : '';
-
-      const combined = [projectBlock, userBlock].filter(Boolean).join('\n\n');
-      this.cachedMemoryBlock = combined.length > 4000
-        ? combined.slice(0, 4000) + '\n... [memory truncated]'
-        : combined;
-    } catch (err) {
-      console.warn('[pipeline] BM25 memory retrieval failed:', err);
-      this.cachedMemoryBlock = '';
-    }
-    return this.cachedMemoryBlock;
-  }
-
-  /**
-   * Memoised conventions block. Loads `<conventionsDir>/global.md` and
-   * `<conventionsDir>/<project>/conventions.md` once per run via
-   * @esankhan3/anvil-convention-core. Returns empty string on error or when the
-   * project has no conventions extracted yet — auto-warm runs at pipeline
-   * start to populate the file before clarify.
-   */
-  private getStableConventionsBlock(): string {
-    if (this.cachedConventionsBlock !== null) return this.cachedConventionsBlock;
-    try {
-      // Synchronous read via require-style — convention-core's loadConventions
-      // is async (matches the cli loader's fs/promises shape) so we handle
-      // both. Since pipeline-runner pre-populates this cache via warmConventions
-      // before stages fire, the synchronous fallback below should rarely run.
-      const md = this.conventionsMarkdownSync ?? '';
-      this.cachedConventionsBlock = md.length > 8000 ? md.slice(0, 8000) + '\n... [conventions truncated]' : md;
-    } catch {
-      this.cachedConventionsBlock = '';
-    }
-    return this.cachedConventionsBlock;
-  }
-
-  private conventionsMarkdownSync: string | null = null;
-
-  /**
-   * Warm the conventions cache before stage 1. If `<conventionsDir>/<project>/conventions.md`
-   * is missing, extract it from the workspace; then load + cache the markdown.
-   * Non-fatal — empty block is fine if extraction fails.
-   */
-  private async warmConventions(): Promise<void> {
-    const anvilHome = process.env.ANVIL_HOME ?? process.env.FF_HOME ?? join(homedir(), '.anvil');
-    const paths = {
-      conventionsDir: join(anvilHome, 'conventions'),
-      rulesDir: join(anvilHome, 'conventions', 'rules'),
-    };
-    const projectMd = join(paths.conventionsDir, this.config.project, 'conventions.md');
-
-    if (!existsSync(projectMd)) {
-      // Auto-warm — extract once. Workspace may not exist yet for fresh
-      // projects; fail silently in that case.
-      try {
-        const repoPaths = Object.values(this.repoPaths);
-        if (repoPaths.length > 0 && repoPaths.every((p) => existsSync(p))) {
-          this.emit('project-event', {
-            source: 'conventions',
-            message: `Extracting conventions for "${this.config.project}" (first run)`,
-          });
-          coreExtractConventions(paths, this.config.project, repoPaths);
-        }
-      } catch (err) {
-        console.warn('[pipeline] convention extract failed:', err);
-      }
-    }
-
-    try {
-      const md = await coreLoadConventions(paths, this.config.project);
-      this.conventionsMarkdownSync = md;
-    } catch {
-      this.conventionsMarkdownSync = '';
-    }
-  }
-
-  /** Memoised project YAML slice — same maxLen returns same bytes. */
-  private getStableProjectYamlSlice(maxLen: number): string {
-    const cached = this.cachedProjectYamlSlice.get(maxLen);
-    if (cached !== undefined) return cached;
-    const value = this.projectYaml.slice(0, maxLen) || '(not available)';
-    this.cachedProjectYamlSlice.set(maxLen, value);
-    return value;
-  }
-
-  /**
-   * Memoised KB block keyed by (tier, repoName). Replaces inline kbManager
-   * compositions that varied per stage even when inputs were identical.
-   */
-  private getStableKbBlock(
-    tier: 'full' | 'repo-focused' | 'index-only' | 'none',
-    repoName?: string,
-  ): { content: string; sourceLabel: 'none' | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob' } {
-    if (tier === 'none') return { content: '', sourceLabel: 'none' };
-    const key = `${tier}|${repoName ?? '__project__'}`;
-
-    const cached = this.cachedKbBlock.get(key);
-    if (cached !== undefined) {
-      // Recover the source label from the cached body. Encoded as a
-      // leading sentinel comment we strip on retrieval.
-      const label = (cached.match(/^<!-- anvil:kb-src:(\w[\w-]*) -->/) ?? [])[1] as
-        | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob' | undefined;
-      const content = cached.replace(/^<!-- anvil:kb-src:[\w-]+ -->\n?/, '');
-      return { content, sourceLabel: label ?? 'none' };
-    }
-
-    let content = '';
-    let sourceLabel: 'none' | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob' = 'none';
-    const indexPrompt = this.kbManager?.getIndexForPrompt(this.config.project) || '';
-
-    if (repoName) {
-      const repoKB = this.kbManager?.getGraphReport(this.config.project, repoName) || '';
-      if (tier === 'repo-focused') {
-        content = repoKB ? `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}` : '';
-        if (content) sourceLabel = 'repo-focused';
-      } else if (tier === 'index-only') {
-        content = indexPrompt;
-        if (content) sourceLabel = 'index-only';
-      } else if (indexPrompt) {
-        const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
-        content = `${indexPrompt}\n\n---\n\n## YOUR TARGET REPO: ${repoName}\n\n${repoKB || '(no repo-specific KB)'}\n\n---\n\n${queryContext}`;
-        sourceLabel = 'full-with-index';
-      } else {
-        const fullKB = this.kbManager?.getAllGraphReports(this.config.project) || '';
-        if (repoKB) {
-          content = `## YOUR TARGET REPO: ${repoName}\n\n${repoKB}`;
-          const otherRepos = fullKB.split('\n\n---\n\n').filter((s) => !s.includes(`## ${repoName}\n`));
-          if (otherRepos.length > 0) {
-            content += `\n\n---\n\n## OTHER REPOS (for cross-repo context)\n\n${otherRepos.join('\n\n---\n\n')}`;
-          }
-        } else {
-          content = fullKB;
-        }
-        if (content) sourceLabel = 'full-blob';
-      }
-    } else {
-      // Project-wide (non-repo) prompt path.
-      if (indexPrompt) {
-        const queryContext = this.kbManager?.getQueryContextForPrompt(this.config.project, this.config.feature) || '';
-        content = `${indexPrompt}\n\n---\n\n${queryContext}`;
-        sourceLabel = 'full-with-index';
-      } else {
-        content = this.kbManager?.getAllGraphReports(this.config.project) || '';
-        if (content) sourceLabel = 'full-blob';
-      }
-    }
-
-    if (content) {
-      this.cachedKbBlock.set(key, `<!-- anvil:kb-src:${sourceLabel} -->\n${content}`);
-    }
-    return { content, sourceLabel };
-  }
-
-  // ── Phase 2 manifest helpers ────────────────────────────────────────
-
-  /**
-   * Render the current feature manifest as a stable text block. Cached
-   * within a stage so multiple per-repo spawns reuse the same bytes; the
-   * cache is invalidated whenever the manifest is patched.
-   */
-  private getStableManifestBlock(): string {
-    if (this.cachedManifestBlock !== null) return this.cachedManifestBlock;
-    try {
-      const m = this.manifestStore.read(this.config.project, this.state.featureSlug);
-      this.cachedManifestBlock = renderManifestForPrompt(m);
-    } catch {
-      this.cachedManifestBlock = '';
-    }
-    return this.cachedManifestBlock;
-  }
-
-  /** Discard the cached render so the next read picks up patched fields. */
-  private invalidateManifestBlock(): void {
-    this.cachedManifestBlock = null;
-  }
+  // PromptContextCache owns memoised inputs to the system prompt
+  // (memory block, conventions, project YAML slice, KB block, manifest).
+  // Constructed in the runner constructor with the small dep set the
+  // cache needs.
+  private promptCache!: PromptContextCache;
 
   /**
    * Pre-fill the manifest from a plan seed. Called before stage 5 (build)
@@ -725,7 +473,7 @@ export class PipelineRunner extends EventEmitter {
       );
     }
 
-    this.invalidateManifestBlock();
+    this.promptCache.invalidateManifestBlock();
   }
 
   /**
@@ -829,7 +577,7 @@ export class PipelineRunner extends EventEmitter {
         console.warn(`[pipeline] manifest extractor ${stage.name} failed:`, err);
       }
     }
-    if (mutated) this.invalidateManifestBlock();
+    if (mutated) this.promptCache.invalidateManifestBlock();
   }
 
   // For interactive clarify — resolves when user provides input
@@ -880,6 +628,20 @@ export class PipelineRunner extends EventEmitter {
 
     // Load project YAML for context
     this.projectYaml = this.projectLoader.getProjectYamlRaw(config.project);
+
+    this.promptCache = new PromptContextCache({
+      project: config.project,
+      feature: config.feature,
+      memoryStore: this.memoryStore,
+      kbManager: this.kbManager,
+      manifestStore: this.manifestStore,
+      projectYaml: this.projectYaml,
+      repoPaths: () => this.repoPaths,
+      featureSlug: () => this.state.featureSlug,
+      emitProjectEvent: (level, message) => {
+        this.emit('project-event', { source: 'conventions', message, level });
+      },
+    });
 
     const featureSlug = FeatureStore.slugify(config.feature);
     const runId = `run-${Date.now().toString(36)}`;
@@ -1113,12 +875,12 @@ export class PipelineRunner extends EventEmitter {
       projectYaml: this.projectYaml,
       projectInfo: this.projectInfo,
       repoPaths: this.repoPaths,
-      getStableMemoryBlock: () => this.getStableMemoryBlock(),
-      getStableConventionsBlock: () => this.getStableConventionsBlock(),
-      getStableProjectYamlSlice: (n) => this.getStableProjectYamlSlice(n),
-      getStableKbBlock: (tier, repoName) => this.getStableKbBlock(tier, repoName),
-      getStableManifestBlock: () => this.getStableManifestBlock(),
-      getLockedKbTier: (stage) => this.getLockedKbTier(stage as StageDefinition),
+      getStableMemoryBlock: () => this.promptCache.getStableMemoryBlock(),
+      getStableConventionsBlock: () => this.promptCache.getStableConventionsBlock(),
+      getStableProjectYamlSlice: (n) => this.promptCache.getStableProjectYamlSlice(n),
+      getStableKbBlock: (tier, repoName) => this.promptCache.getStableKbBlock(tier, repoName),
+      getStableManifestBlock: () => this.promptCache.getStableManifestBlock(),
+      getLockedKbTier: (stage) => this.promptCache.getLockedKbTier(stage as StageDefinition),
       loadRepoArtifacts: (repoName) => this.loadRepoArtifacts(repoName),
       loadHighLevelRequirements: () => this.loadHighLevelRequirements(),
       kbManager: this.kbManager,
@@ -1207,7 +969,7 @@ export class PipelineRunner extends EventEmitter {
       // Pre-warm conventions block — extracts on first run if missing,
       // then loads the markdown into the run-scoped cache so every
       // stage prompt's {{conventions}} slot is populated identically.
-      await this.warmConventions().catch((err: unknown) => {
+      await this.promptCache.warmConventions().catch((err: unknown) => {
         console.warn('[pipeline] convention warm failed:', err);
       });
 
