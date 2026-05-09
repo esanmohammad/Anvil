@@ -8,6 +8,7 @@
 export type {
   Step,
   StepContext,
+  StepSkipContext,
   StepRetryPolicy,
   StepHookPoint,
   PipelineEvent,
@@ -43,6 +44,12 @@ export {
   attachFeatureStoreHook,
   attachApprovalGateHook,
   APPROVAL_GATE_CHANNEL,
+  attachStreamHook,
+  attachCheckpointHook,
+  createFileCheckpointStore,
+  attachPrUrlHook,
+  PR_URL_REGEX,
+  attachLivenessPrefetchHook,
 } from './hooks/index.js';
 export type {
   AuditLogHookOptions,
@@ -63,6 +70,19 @@ export type {
   ApprovalDecision,
   ApprovalGateHookOptions,
   ApprovalGateHookHandle,
+  StreamSnapshot,
+  StreamHookOptions,
+  StreamHookHandle,
+  CheckpointStatus,
+  CheckpointSnapshot,
+  CheckpointStore,
+  CheckpointHookOptions,
+  CheckpointHookHandle,
+  FileCheckpointStoreOptions,
+  PrUrlHookOptions,
+  PrUrlHookHandle,
+  LivenessPrefetchHookOptions,
+  LivenessPrefetchHookHandle,
 } from './hooks/index.js';
 export { VERSION } from './version.js';
 

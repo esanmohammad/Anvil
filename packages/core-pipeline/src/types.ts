@@ -35,7 +35,40 @@ export interface Step<I, O> {
    *                     `Record<string, O>` keyed by repo name. Phase 4a.
    */
   parallelism?: 'serial' | 'per-project' | 'per-repo';
+  /**
+   * Optional declarative skip predicate. Evaluated by the walker just
+   * before this step would run, AFTER the resume / completedSteps skip
+   * set has been consulted. When it returns true the walker emits
+   * `step:skipped` with `payload.reason === 'skipIf'`, threads the
+   * previous step's output into the next step (input passes through
+   * unchanged), and continues.
+   *
+   * Use cases:
+   *   - "plan-derived" stages that should be skipped when a planSeed is
+   *     present (`ctx.shared.planSeed != null`).
+   *   - Stages that should be skipped on a per-feature flag in
+   *     `ctx.shared` without forcing every consumer to call
+   *     `Pipeline.run({ resumeFromStep })`.
+   *
+   * The predicate sees a stripped-down `StepSkipContext` — no bus,
+   * emit, or signal — to keep skip decisions side-effect-free. If
+   * `skipIf` throws, the walker treats it as a terminal failure
+   * (emits `step:failed`); the walker does NOT silently fall through
+   * and run the step, since a thrown predicate signals a bug, not a
+   * "skip negative" answer.
+   */
+  skipIf?: (ctx: StepSkipContext) => boolean | Promise<boolean>;
 }
+
+/**
+ * Context handed to `Step.skipIf` predicates. Subset of `StepContext`
+ * with no mutation seams (no `emit`, no `bus`, no `signal`) so skip
+ * decisions are forced to be pure reads.
+ */
+export type StepSkipContext = Pick<
+  StepContext<unknown>,
+  'runId' | 'workspaceDir' | 'repoPaths' | 'shared' | 'artifacts' | 'input'
+>;
 
 export interface StepContext<I> {
   /** Stable run id (matches today's `~/.anvil/runs/<runId>/`). */
