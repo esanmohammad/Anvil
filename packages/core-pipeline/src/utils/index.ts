@@ -74,3 +74,13 @@ export type {
   PlanComment,
   PlanApproval,
 } from './plan-types.js';
+export {
+  renderRequirements,
+  renderRepoRequirements,
+  renderRepoSpecs,
+  renderRepoTasks,
+  planCoversRepo,
+  planCoversStagesForRepo,
+  planCoversCrossRepo,
+  summarisePlanSkip,
+} from './plan-to-artifacts.js';

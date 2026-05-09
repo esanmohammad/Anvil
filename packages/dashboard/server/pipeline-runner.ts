@@ -1134,7 +1134,7 @@ export class PipelineRunner extends EventEmitter {
     if (!seed) return;
     const { plan } = seed;
     const { renderRequirements, renderRepoRequirements, renderRepoSpecs, renderRepoTasks }
-      = await import('./plan-to-artifacts.js');
+      = await import('@esankhan3/anvil-core-pipeline');
 
     const project = this.config.project;
     const slug = this.state.featureSlug;

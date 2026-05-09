@@ -59,6 +59,14 @@ export {
   runTasksWithDependencyGraph,
   extractAllTaskFiles,
   bundleFiles,
+  renderRequirements,
+  renderRepoRequirements,
+  renderRepoSpecs,
+  renderRepoTasks,
+  planCoversRepo,
+  planCoversStagesForRepo,
+  planCoversCrossRepo,
+  summarisePlanSkip,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
