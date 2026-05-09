@@ -1,156 +1,85 @@
 /**
- * `validate` step factory — standalone validate stage callable from the
- * Fix flow (and any future flow that wants a validate pass without the
- * full build pipeline).
+ * Phase H2 — `validate.step` was promoted into
+ * `core-pipeline/src/steps/validate.step.ts` with a new signature
+ * accepting an `AgentRunner` (canonical agent invocation surface).
  *
- * Behavior parity with `pipeline-runner.ts`'s validate stage:
- *   - Per-repo fan-out when `repoNames.length > 0`, else single-workspace.
- *   - Combines per-repo outputs into one VALIDATE.md artifact.
- *   - Detects failure via `hasValidationFailures` (lifted from fix-loop).
- *   - Persona = 'tester'; allowedTools sourced by the caller.
+ * This file remains in dashboard as a back-compat adapter so existing
+ * callers (`fix-flow.ts`) keep using the legacy `agentManager + isCancelled
+ * + onSpawn + onTruncation + pollIntervalMs + sleep + ...` opts shape.
+ * Internally we wrap those into an `AgentManagerRunner` and call the
+ * canonical `runValidate(opts)`.
+ *
+ * Direct consumers should migrate to the canonical path:
+ *   import { runValidate, hasValidationFailures, extractRepoSection,
+ *     type RunValidateOptions, type RunValidateResult }
+ *     from '@esankhan3/anvil-core-pipeline';
+ *
+ * Construct an `AgentRunner` (e.g. dashboard's `AgentManagerRunner`)
+ * and pass it as `runner`.
  */
 
-import { spawnAndWait } from './agent-spawner.js';
-import { hasValidationFailures } from './fix-loop.step.js';
-import { disallowedToolsForPersona } from './per-repo-stage.step.js';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
+import {
+  runValidate as runValidateCanonical,
+  hasValidationFailures,
+  extractRepoSection,
+  type RunValidateResult,
+} from '@esankhan3/anvil-core-pipeline';
+import { AgentManagerRunner } from '../runners/agent-manager-runner.js';
 
+export {
+  hasValidationFailures,
+  extractRepoSection,
+};
+export type { RunValidateResult };
+
+/** Legacy options shape kept here for back-compat with fix-flow.ts. */
 export interface RunValidateOptions {
   agentManager: AgentManager;
   project: string;
-  /** Resolved model id for the validate stage. */
   model: string;
   workspaceDir: string;
   repoNames: string[];
   repoPaths: Record<string, string>;
-  /** Builds the per-repo project (system) prompt. Mirrors fix-loop's hook. */
   buildRepoProjectPrompt: (repoName: string) => string;
-  /** Builds the project-wide system prompt for single-workspace path. */
   buildProjectPrompt: () => string;
   isCancelled: () => boolean;
   onTruncation?: (agentName: string, outputTokens: number) => void;
-  /** Optional output-token ceiling. */
   maxOutputTokens?: number;
-  /** Per-stage allow list. Validate is read+exec only (lint/typecheck/tests). */
   allowedTools?: string[];
   pollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
-  /** Optional spawn-id sink so the caller can persist for future resume. */
   onSpawn?: (repoName: string | null, agentId: string) => void;
 }
 
-export interface RunValidateResult {
-  /** Combined VALIDATE.md across all repos. */
-  artifact: string;
-  /** True when at least one repo failed (or single-workspace mode failed). */
-  failed: boolean;
-  /** Per-repo outcome — empty for single-workspace mode. */
-  perRepo: Record<string, { failed: boolean; section: string }>;
-  cost: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-}
-
-const VALIDATE_PROMPT_REPO = (repoName: string) =>
-  `You are validating "${repoName}" for build errors, lint errors, and test failures.\n\n` +
-  `Run the project's build / lint / test commands as appropriate. Report each check\n` +
-  `as PASS or FAIL with a one-line reason. Do NOT modify any files.\n\n` +
-  `Format the output as:\n\n` +
-  `## ${repoName}\n` +
-  `- Build: PASS | FAIL: <reason>\n` +
-  `- Lint: PASS | FAIL: <reason>\n` +
-  `- Tests: PASS | FAIL: <reason>\n` +
-  `\nVERDICT: PASS | FAIL\n`;
-
-const VALIDATE_PROMPT_SINGLE =
-  `Validate the workspace for build errors, lint errors, and test failures.\n\n` +
-  `Run the project's build / lint / test commands as appropriate. Report each check\n` +
-  `as PASS or FAIL with a one-line reason. Do NOT modify any files.\n\n` +
-  `Format the output as:\n\n` +
-  `- Build: PASS | FAIL: <reason>\n` +
-  `- Lint: PASS | FAIL: <reason>\n` +
-  `- Tests: PASS | FAIL: <reason>\n` +
-  `\nVERDICT: PASS | FAIL\n`;
-
+/**
+ * Back-compat wrapper. Constructs an `AgentManagerRunner` from the
+ * legacy opts and dispatches to the canonical `runValidate`.
+ */
 export async function runValidate(opts: RunValidateOptions): Promise<RunValidateResult> {
-  if (opts.repoNames.length === 0) {
-    const result = await spawnAndWait({
-      agentManager: opts.agentManager,
-      spec: {
-        name: `validate-${opts.project}`,
-        persona: 'tester',
-        project: opts.project,
-        stage: 'validate',
-        prompt: VALIDATE_PROMPT_SINGLE,
-        model: opts.model,
-        cwd: opts.workspaceDir,
-        projectPrompt: opts.buildProjectPrompt(),
-        permissionMode: 'bypassPermissions',
-        disallowedTools: disallowedToolsForPersona('tester'),
-        allowedTools: opts.allowedTools,
-        maxOutputTokens: opts.maxOutputTokens,
-      },
-      isCancelled: opts.isCancelled,
-      onSpawn: (id) => opts.onSpawn?.(null, id),
-      onTruncation: opts.onTruncation,
-      pollIntervalMs: opts.pollIntervalMs,
-      sleep: opts.sleep,
-    });
-    return {
-      artifact: result.artifact,
-      failed: hasValidationFailures(result.artifact),
-      perRepo: {},
-      cost: result.cost,
-      inputTokens: result.inputTokens,
-      outputTokens: result.outputTokens,
-      cacheReadTokens: result.cacheReadTokens,
-      cacheWriteTokens: result.cacheWriteTokens,
-    };
-  }
-
-  const promises = opts.repoNames.map(async (repoName) => {
-    const repoPath = opts.repoPaths[repoName] ?? opts.workspaceDir;
-    const result = await spawnAndWait({
-      agentManager: opts.agentManager,
-      spec: {
-        name: `validate-${repoName}`,
-        persona: 'tester',
-        project: opts.project,
-        stage: `validate:${repoName}`,
-        prompt: VALIDATE_PROMPT_REPO(repoName),
-        model: opts.model,
-        cwd: repoPath,
-        projectPrompt: opts.buildRepoProjectPrompt(repoName),
-        permissionMode: 'bypassPermissions',
-        disallowedTools: disallowedToolsForPersona('tester'),
-        allowedTools: opts.allowedTools,
-        maxOutputTokens: opts.maxOutputTokens,
-      },
-      isCancelled: opts.isCancelled,
-      onSpawn: (id) => opts.onSpawn?.(repoName, id),
-      onTruncation: opts.onTruncation,
-      pollIntervalMs: opts.pollIntervalMs,
-      sleep: opts.sleep,
-    });
-    return { repoName, ...result };
+  const burnedModels = new Set<string>();
+  const runner = new AgentManagerRunner({
+    agentManager: opts.agentManager,
+    project: opts.project,
+    workspaceDir: opts.workspaceDir,
+    isCancelled: opts.isCancelled,
+    resolveModel: () => opts.model,
+    burnedModels,
+    maxAttempts: 1,
+    onSpawn: (agentId, req) => opts.onSpawn?.(req.repoName ?? null, agentId),
+    onTruncation: opts.onTruncation,
   });
 
-  const results = await Promise.all(promises);
-  const combined = results.map((r) => r.artifact).filter(Boolean).join('\n\n');
-  const perRepo: Record<string, { failed: boolean; section: string }> = {};
-  for (const r of results) {
-    perRepo[r.repoName] = { failed: hasValidationFailures(r.artifact), section: r.artifact };
-  }
-  return {
-    artifact: combined,
-    failed: hasValidationFailures(combined),
-    perRepo,
-    cost: results.reduce((s, r) => s + r.cost, 0),
-    inputTokens: results.reduce((s, r) => s + r.inputTokens, 0),
-    outputTokens: results.reduce((s, r) => s + r.outputTokens, 0),
-    cacheReadTokens: results.reduce((s, r) => s + r.cacheReadTokens, 0),
-    cacheWriteTokens: results.reduce((s, r) => s + r.cacheWriteTokens, 0),
-  };
+  return runValidateCanonical({
+    runner,
+    project: opts.project,
+    model: opts.model,
+    workspaceDir: opts.workspaceDir,
+    repoNames: opts.repoNames,
+    repoPaths: opts.repoPaths,
+    buildRepoProjectPrompt: opts.buildRepoProjectPrompt,
+    buildProjectPrompt: opts.buildProjectPrompt,
+    maxOutputTokens: opts.maxOutputTokens,
+    allowedTools: opts.allowedTools,
+  });
 }

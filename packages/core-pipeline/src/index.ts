@@ -23,6 +23,15 @@ export type {
   ClarifyResult,
   ClarifyEvent,
 } from './steps/clarify.step.js';
+export {
+  runValidate,
+  hasValidationFailures,
+  extractRepoSection,
+} from './steps/validate.step.js';
+export type {
+  RunValidateOptions,
+  RunValidateResult,
+} from './steps/validate.step.js';
 // `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
 // step's local interface is structurally identical, so we don't
 // re-export it here to avoid a duplicate-identifier error.
