@@ -27,8 +27,7 @@
  * to get the same value the legacy code returned from `getPlanRisk()`.
  */
 import type { Step } from '@esankhan3/anvil-core-pipeline';
-import type { Plan } from '../plan-store.js';
-import type { RiskScore } from '../plan-risk-types.js';
+import type { Plan, RiskScore } from '@esankhan3/anvil-core-pipeline';
 export declare const PLAN_RISK_ARTIFACT_ID = "PLAN-RISK.json";
 export interface PlanRiskStepOptions {
     /** Step id; defaults to `plan-risk`. */

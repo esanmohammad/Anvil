@@ -67,6 +67,8 @@ export {
   planCoversStagesForRepo,
   planCoversCrossRepo,
   summarisePlanSkip,
+  SCORER_VERSION,
+  SENSITIVE_PATH_PATTERNS,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
@@ -101,6 +103,9 @@ export type {
   PlanSection,
   PlanComment,
   PlanApproval,
+  RiskTier,
+  RiskFactor,
+  RiskScore,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {

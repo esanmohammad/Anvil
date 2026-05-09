@@ -84,3 +84,12 @@ export {
   planCoversCrossRepo,
   summarisePlanSkip,
 } from './plan-to-artifacts.js';
+export {
+  SCORER_VERSION,
+  SENSITIVE_PATH_PATTERNS,
+} from './plan-risk-types.js';
+export type {
+  RiskTier,
+  RiskFactor,
+  RiskScore,
+} from './plan-risk-types.js';

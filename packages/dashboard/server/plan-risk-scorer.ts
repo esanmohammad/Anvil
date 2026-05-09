@@ -13,14 +13,14 @@
  *   still making accumulations of risk visible.
  */
 
-import type { Plan } from './plan-store.js';
+import type { Plan } from '@esankhan3/anvil-core-pipeline';
 import {
   SCORER_VERSION,
   SENSITIVE_PATH_PATTERNS,
   type RiskFactor,
   type RiskScore,
   type RiskTier,
-} from './plan-risk-types.js';
+} from '@esankhan3/anvil-core-pipeline';
 
 // ── Optional plan fields ─────────────────────────────────────────────────
 //

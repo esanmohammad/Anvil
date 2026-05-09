@@ -21,8 +21,7 @@ import {
   PLAN_RISK_ARTIFACT_ID,
 } from '../steps/index.js';
 import { scorePlan } from '../plan-risk-scorer.js';
-import type { Plan } from '../plan-store.js';
-import type { RiskScore } from '../plan-risk-types.js';
+import type { Plan, RiskScore } from '@esankhan3/anvil-core-pipeline';
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
   return {
