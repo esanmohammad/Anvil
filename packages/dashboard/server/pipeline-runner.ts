@@ -58,8 +58,7 @@ import {
 import { pickAliveModelFromChainSync, prefetchLiveness, setLivenessTtlMs } from './provider-liveness.js';
 import { loadModelRegistry, DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
 import type { ModelRegistry, ProviderName, WalkerConfig } from '@esankhan3/anvil-agent-core';
-import { parseTasks, bundleFiles } from './engineer-task-bundler.js';
-import type { ParsedTask } from './engineer-task-bundler.js';
+import { parseTasks, bundleFiles, type ParsedTask } from '@esankhan3/anvil-core-pipeline';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { enforceBudget, type PromptSection } from '@esankhan3/anvil-core-pipeline';
 import { scorePlan, computeRiskTier } from './plan-risk-scorer.js';

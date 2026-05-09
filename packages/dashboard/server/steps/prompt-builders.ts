@@ -34,8 +34,7 @@ import { fileURLToPath } from 'node:url';
 
 import { budgetPromptContext } from '@esankhan3/anvil-core-pipeline';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
-import { bundleFiles, parseTasks } from '../engineer-task-bundler.js';
-import type { ParsedTask } from '../engineer-task-bundler.js';
+import { bundleFiles, parseTasks, type ParsedTask } from '@esankhan3/anvil-core-pipeline';
 import { enforceBudget, type PromptSection } from '@esankhan3/anvil-core-pipeline';
 import type { KnowledgeBaseManager } from '../knowledge-base-manager.js';
 import type { ProjectInfo } from '../project-loader.js';

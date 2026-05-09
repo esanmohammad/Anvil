@@ -1,4 +1,10 @@
-// Tests for engineer-task-bundler: parseTasks, extractAllTaskFiles, bundleFiles.
+/**
+ * Tests for engineer-task-bundler: parseTasks, extractAllTaskFiles,
+ * bundleFiles.
+ *
+ * Phase F6 — moved from `packages/dashboard/server/__tests__/` when the
+ * bundler was promoted into `core-pipeline/utils`. Coverage preserved.
+ */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +18,7 @@ import {
   groupTasksForExecution,
   parseTasks,
   type ParsedTask,
-} from '../engineer-task-bundler.js';
+} from '../utils/engineer-task-bundler.js';
 
 function writeRepoFile(repoRoot: string, rel: string, contents: string): void {
   const abs = join(repoRoot, rel);

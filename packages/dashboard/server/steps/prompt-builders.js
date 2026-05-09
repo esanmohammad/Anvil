@@ -32,7 +32,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { budgetPromptContext } from '@esankhan3/anvil-core-pipeline';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
-import { bundleFiles, parseTasks } from '../engineer-task-bundler.js';
+import { bundleFiles, parseTasks } from '@esankhan3/anvil-core-pipeline';
 import { enforceBudget } from '@esankhan3/anvil-core-pipeline';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = join(__filename, '..');

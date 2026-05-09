@@ -20,7 +20,7 @@
  * only owns the spawn-orchestration shape so 4f.7 can register the Step
  * once `Pipeline.run()` becomes the orchestrator.
  */
-import type { ParsedTask } from '../engineer-task-bundler.js';
+import { type ParsedTask } from '@esankhan3/anvil-core-pipeline';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import type { Step, StepContext } from '@esankhan3/anvil-core-pipeline';
 /**

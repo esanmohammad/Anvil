@@ -43,3 +43,19 @@ export type {
   PromptBudgetInput,
   PromptBudgetOutput,
 } from './context-budget.js';
+export {
+  parseTasks,
+  groupTasksForExecution,
+  runTasksWithDependencyGraph,
+  extractAllTaskFiles,
+  bundleFiles,
+} from './engineer-task-bundler.js';
+export type {
+  ParsedTask,
+  ExecutionGroup,
+  BundleOptions,
+  SkipReason,
+  BundleResult,
+  RunTasksOptions,
+  RunTasksHooks,
+} from './engineer-task-bundler.js';

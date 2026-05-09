@@ -21,7 +21,7 @@
  * once `Pipeline.run()` becomes the orchestrator.
  */
 import { spawnAndWait } from './agent-spawner.js';
-import { parseTasks, runTasksWithDependencyGraph } from '../engineer-task-bundler.js';
+import { parseTasks, runTasksWithDependencyGraph, } from '@esankhan3/anvil-core-pipeline';
 /**
  * Per-task disallowedTools rule. Differs from the general
  * `disallowedToolsForPersona('engineer')` (which only disables `Agent`):

@@ -22,8 +22,11 @@
  */
 
 import { spawnAndWait } from './agent-spawner.js';
-import { parseTasks, runTasksWithDependencyGraph } from '../engineer-task-bundler.js';
-import type { ParsedTask } from '../engineer-task-bundler.js';
+import {
+  parseTasks,
+  runTasksWithDependencyGraph,
+  type ParsedTask,
+} from '@esankhan3/anvil-core-pipeline';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import type { Step, StepContext } from '@esankhan3/anvil-core-pipeline';
 

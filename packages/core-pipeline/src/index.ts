@@ -54,6 +54,11 @@ export {
   estimateTokens,
   applyBudget,
   budgetPromptContext,
+  parseTasks,
+  groupTasksForExecution,
+  runTasksWithDependencyGraph,
+  extractAllTaskFiles,
+  bundleFiles,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
@@ -68,6 +73,13 @@ export type {
   ContextBudgetResult,
   PromptBudgetInput,
   PromptBudgetOutput,
+  ParsedTask,
+  ExecutionGroup,
+  BundleOptions,
+  SkipReason,
+  BundleResult,
+  RunTasksOptions,
+  RunTasksHooks,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {

@@ -25,7 +25,7 @@
  *   - The cache-stability invariant (P1 — byte-identical bytes across
  *     stages of one run) is preserved by the caller's memoised getters.
  */
-import type { ParsedTask } from '../engineer-task-bundler.js';
+import { type ParsedTask } from '@esankhan3/anvil-core-pipeline';
 import type { KnowledgeBaseManager } from '../knowledge-base-manager.js';
 import type { ProjectInfo } from '../project-loader.js';
 export type KbTier = 'full' | 'repo-focused' | 'index-only';

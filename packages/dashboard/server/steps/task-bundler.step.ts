@@ -34,7 +34,7 @@ import {
   groupTasksForExecution,
   type ExecutionGroup,
   type ParsedTask,
-} from '../engineer-task-bundler.js';
+} from '@esankhan3/anvil-core-pipeline';
 
 export const TASK_BUNDLES_ARTIFACT_ID = 'TASK-BUNDLES.json';
 
