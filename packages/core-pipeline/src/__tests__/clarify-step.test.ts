@@ -13,7 +13,7 @@ import {
   Pipeline,
   type PipelineEvent,
   type Step,
-} from '@esankhan3/anvil-core-pipeline';
+} from '../index.js';
 
 import {
   createClarifyStep,
@@ -21,7 +21,7 @@ import {
   parseClarifyQuestions,
   type ClarifyEvent,
   type ClarifyResult,
-} from '../steps/index.js';
+} from '../steps/clarify.step.js';
 
 const EXPLORE_OUTPUT = `Here are my questions:
 

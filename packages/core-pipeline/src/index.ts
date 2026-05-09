@@ -13,6 +13,20 @@ export type {
   ProjectLoaderLike,
 } from './storage-like.js';
 
+// Phase H — Step factories
+export {
+  createClarifyStep,
+  CLARIFY_QA_ARTIFACT_ID,
+} from './steps/clarify.step.js';
+export type {
+  ClarifyStepOptions,
+  ClarifyResult,
+  ClarifyEvent,
+} from './steps/clarify.step.js';
+// `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
+// step's local interface is structurally identical, so we don't
+// re-export it here to avoid a duplicate-identifier error.
+
 export type {
   Step,
   StepContext,
