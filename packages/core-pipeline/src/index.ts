@@ -106,6 +106,25 @@ export {
   runTestGenForProject,
   createTestGenStageStep,
 } from './steps/test-gen-stage.step.js';
+export {
+  loadPersonaPromptSync,
+  injectTemplateVars,
+  warnIfSystemPromptOversized,
+  buildManifestPrefix,
+  buildProjectPrompt,
+  buildRepoProjectPrompt,
+  buildClarifyExplorePrompt,
+  buildStagePrompt,
+  buildRepoStagePrompt,
+  buildPerTaskPrompt,
+} from './steps/prompt-builders.js';
+export type {
+  PromptBuilderContext,
+  PromptBuilderProjectInfo,
+  StageInfo,
+  RepoArtifacts,
+  KbTier,
+} from './steps/prompt-builders.js';
 export type {
   TestGenConventions,
   TestGenBehavior,

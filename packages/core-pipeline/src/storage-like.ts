@@ -91,6 +91,11 @@ export interface KbManagerLike {
    * pipeline start so per-stage prompt assembly is sync.
    */
   prefetchHybridContext(project: string, query: string, maxTokens?: number): Promise<void>;
+  /**
+   * Hybrid-retrieval slice for a feature query, formatted for prompt
+   * injection. Returns empty string when no context is cached.
+   */
+  getQueryContextForPrompt?(project: string, query: string): string;
 }
 
 // ── ProjectLoaderLike — factory.yaml loader ──────────────────────────
