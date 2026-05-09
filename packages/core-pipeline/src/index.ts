@@ -290,6 +290,7 @@ export {
   attachPrUrlHook,
   PR_URL_REGEX,
   attachLivenessPrefetchHook,
+  migrateLegacyCheckpoint,
 } from './hooks/index.js';
 export type {
   AuditLogHookOptions,
@@ -328,6 +329,8 @@ export type {
   PrUrlHookHandle,
   LivenessPrefetchHookOptions,
   LivenessPrefetchHookHandle,
+  LegacyPipelineCheckpoint,
+  MigratedCheckpointShared,
 } from './hooks/index.js';
 export { VERSION } from './version.js';
 

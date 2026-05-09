@@ -89,3 +89,8 @@ export type {
   CheckpointHookHandle,
   FileCheckpointStoreOptions,
 } from './checkpoint.hook.js';
+export { migrateLegacyCheckpoint } from './legacy-checkpoint-migration.js';
+export type {
+  LegacyPipelineCheckpoint,
+  MigratedCheckpointShared,
+} from './legacy-checkpoint-migration.js';
