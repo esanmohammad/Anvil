@@ -1823,10 +1823,33 @@ export class PipelineRunner extends EventEmitter {
       await this.ensureAuth(stage.name);
 
       if (stage.name === 'build') {
-        this.createFeatureBranches();
+        const branchName = `anvil/${this.state.featureSlug}`;
+        console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
+        createFeatureBranchesHelper({
+          featureSlug: this.state.featureSlug,
+          repoPaths: this.repoPaths,
+          repoNames: this.state.repoNames,
+          workspaceDir: this.workspaceDir,
+          onLog: (level, message) => {
+            if (level === 'info') console.log(`[pipeline] ${message}`);
+            else console.warn(`[pipeline] ${message}`);
+          },
+        });
       }
       if (stage.name === 'validate') {
-        this.runPostBuildGuards();
+        console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
+        const repos = this.state.repoNames.length > 0
+          ? this.state.repoNames.map((r) => ({ name: r, path: this.repoPaths[r] || join(this.workspaceDir, r) }))
+          : [{ name: this.config.project, path: this.workspaceDir }];
+        runPostBuildGuards({
+          repos,
+          getRepoCommands: (repoName) => this.projectLoader.getRepoCommands(this.config.project, repoName),
+          onLog: (level, message) => {
+            if (level === 'info') console.log(`[pipeline] ${message}`);
+            else console.warn(`[pipeline] ${message}`);
+          },
+        });
+        console.log('[pipeline] Post-build guards complete.');
       }
 
       this.state.currentStage = i;
@@ -1956,7 +1979,18 @@ export class PipelineRunner extends EventEmitter {
         }
 
         if (stage.name === 'ship' && this.config.deploy && !this.cancelled) {
-          this.deployToRemote();
+          deployProject({
+            project: this.config.project,
+            mode: this.config.deploy,
+            workspaceDir: this.workspaceDir,
+            configDeployCmd: this.projectLoader.getConfig(this.config.project)?.pipeline?.ship?.deploy,
+            envDeployCmd: process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD,
+            onArtifact: (artifact) => this.emit('artifact-written', artifact),
+            onLog: (level, message) => {
+              if (level === 'info') console.log(`[pipeline] ${message}`);
+              else console.warn(`[pipeline] ${message}`);
+            },
+          });
         }
 
         if (stage.name === 'requirements' && this.state.repoNames.length === 0) {
@@ -1968,7 +2002,7 @@ export class PipelineRunner extends EventEmitter {
           let fixAttempts = 0;
           const MAX_FIX_ATTEMPTS = 3;
 
-          while (fixAttempts < MAX_FIX_ATTEMPTS && this.hasValidationFailures(validateArtifact)) {
+          while (fixAttempts < MAX_FIX_ATTEMPTS && hasValidationFailuresHelper(validateArtifact)) {
             fixAttempts++;
             console.log(`[pipeline] Validation failed — fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}`);
 
@@ -1991,7 +2025,7 @@ export class PipelineRunner extends EventEmitter {
             this.writeStageArtifact(i, stage, validateArtifact);
           }
 
-          if (this.hasValidationFailures(validateArtifact)) {
+          if (hasValidationFailuresHelper(validateArtifact)) {
             console.warn(`[pipeline] Validation still failing after ${MAX_FIX_ATTEMPTS} fix attempts`);
           } else if (fixAttempts > 0) {
             console.log(`[pipeline] Validation recovered after ${fixAttempts} fix attempt(s)`);
@@ -2054,8 +2088,8 @@ export class PipelineRunner extends EventEmitter {
       model,
       allowedTools: this.allowedToolsForCurrentStage('clarify'),
       maxOutputTokens: maxOutputTokensForStage('clarify'),
-      explorePrompt: this.buildClarifyExplorePrompt(),
-      projectPrompt: this.buildProjectPrompt(STAGES[0]),
+      explorePrompt: buildClarifyExplorePromptHelper(this.getPromptContext()),
+      projectPrompt: buildProjectPromptHelper(this.getPromptContext(), STAGES[0]),
       isCancelled: () => this.cancelled,
       onAgentSpawned: (agentId) => {
         this.state.stages[index].agentId = agentId;
@@ -2154,7 +2188,7 @@ export class PipelineRunner extends EventEmitter {
         this.state.stages[index].repos[r].status = 'running';
       }
 
-      const projectPrompt = this.buildRepoProjectPrompt(stage, repoName);
+      const projectPrompt = buildRepoProjectPromptHelper(this.getPromptContext(), stage, repoName);
 
       // ── Build stage: per-task spawning (P5) ──
       // When the engineer's repo has parseable TASKS.md, spawn one engineer per task
@@ -2189,7 +2223,7 @@ export class PipelineRunner extends EventEmitter {
         continue;
       }
 
-      const prompt = this.buildRepoStagePrompt(stage, repoName, prevArtifact);
+      const prompt = buildRepoStagePromptHelper(this.getPromptContext(), stage, repoName, prevArtifact);
 
       // Delegate to the canonical AgentManagerRunner — it owns chain-
       // fallback, cancel, on-spawn telemetry, and onBurn surfacing. The
@@ -2342,7 +2376,7 @@ export class PipelineRunner extends EventEmitter {
       tasksMarkdown: repoArtifacts.tasks,
       buildPerTaskPrompt: (task) =>
         this.buildPerTaskPrompt(stage, repoName, repoPath, task, repoArtifacts.specs),
-      buildFallbackPrompt: () => this.buildRepoStagePrompt(stage, repoName, ''),
+      buildFallbackPrompt: () => buildRepoStagePromptHelper(this.getPromptContext(), stage, repoName, ''),
       isCancelled: () => this.cancelled,
       onProjectEvent: (level, message) => {
         this.emit('project-event', { source: 'pipeline', message, level });
@@ -2392,8 +2426,8 @@ export class PipelineRunner extends EventEmitter {
     stage: StageDefinition,
     prevArtifact: string,
   ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-    const prompt = this.buildStagePrompt(stage, prevArtifact);
-    const projectPrompt = this.buildProjectPrompt(stage);
+    const prompt = buildStagePromptHelper(this.getPromptContext(), stage, prevArtifact);
+    const projectPrompt = buildProjectPromptHelper(this.getPromptContext(), stage);
 
     // Delegate to the canonical AgentManagerRunner — same chain-fallback
     // semantics as before, just routed through the unified AgentRunner
@@ -2672,13 +2706,6 @@ export class PipelineRunner extends EventEmitter {
     } catch { /* defensive */ }
   }
 
-  // ── Validate-fix helpers ────────────────────────────────────────────
-
-  /** Check if validation artifact indicates failures */
-  private hasValidationFailures(artifact: string): boolean {
-    return hasValidationFailuresHelper(artifact);
-  }
-
   /**
    * Deterministic test-generation stage: fingerprint per repo → extract behaviors
    * from plan → ground → emit test cases → write to repos → persist TestSpec +
@@ -2750,9 +2777,9 @@ export class PipelineRunner extends EventEmitter {
         attempt,
         priorByRepo: this.fixLoopAgentByRepo,
         priorSingleId: this.fixLoopAgentSingle,
-        buildProjectPromptForBuildStage: () => this.buildProjectPrompt(buildStage),
+        buildProjectPromptForBuildStage: () => buildProjectPromptHelper(this.getPromptContext(), buildStage),
         buildRepoProjectPromptForBuildStage: (repoName: string) =>
-          this.buildRepoProjectPrompt(buildStage, repoName),
+          buildRepoProjectPromptHelper(this.getPromptContext(), buildStage, repoName),
         isCancelled: () => this.cancelled,
       }),
     );
@@ -2888,73 +2915,6 @@ export class PipelineRunner extends EventEmitter {
 
   // ── Silent post-build guards (format + lint auto-fix) ──────────────
 
-  /**
-   * Run formatters and linters with auto-fix in each repo after build.
-   * Runs silently — no UI stage, no agent. Just cleans up the code
-   * so validate starts with formatted, lint-clean code.
-   */
-  private runPostBuildGuards(): void {
-    console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
-    const repos = this.state.repoNames.length > 0
-      ? this.state.repoNames.map((r) => ({ name: r, path: this.repoPaths[r] || join(this.workspaceDir, r) }))
-      : [{ name: this.config.project, path: this.workspaceDir }];
-    runPostBuildGuards({
-      repos,
-      getRepoCommands: (repoName) => this.projectLoader.getRepoCommands(this.config.project, repoName),
-      onLog: (level, message) => {
-        if (level === 'info') console.log(`[pipeline] ${message}`);
-        else console.warn(`[pipeline] ${message}`);
-      },
-    });
-    console.log('[pipeline] Post-build guards complete.');
-  }
-
-  // ── Remote sandbox deployment ──────────────────────────────────────
-
-  /**
-   * Deploy the project to a sandbox.
-   * Resolution order:
-   *   1. pipeline.ship.deploy from factory.yaml
-   *   2. ANVIL_DEPLOY_CMD env var
-   *   3. Skip deployment entirely (just create PRs)
-   * Runs after ship stage. Non-blocking — pipeline completes even if deploy fails.
-   */
-  private deployToRemote(): void {
-    deployProject({
-      project: this.config.project,
-      mode: this.config.deploy,
-      workspaceDir: this.workspaceDir,
-      configDeployCmd: this.projectLoader.getConfig(this.config.project)?.pipeline?.ship?.deploy,
-      envDeployCmd: process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD,
-      onArtifact: (artifact) => this.emit('artifact-written', artifact),
-      onLog: (level, message) => {
-        if (level === 'info') console.log(`[pipeline] ${message}`);
-        else console.warn(`[pipeline] ${message}`);
-      },
-    });
-  }
-
-  // ── Feature branch creation ────────────────────────────────────────
-
-  /**
-   * Create a feature branch in each repo before the build stage.
-   * Branch name: anvil/<feature-slug>
-   */
-  private createFeatureBranches(): void {
-    const branchName = `anvil/${this.state.featureSlug}`;
-    console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
-    createFeatureBranchesHelper({
-      featureSlug: this.state.featureSlug,
-      repoPaths: this.repoPaths,
-      repoNames: this.state.repoNames,
-      workspaceDir: this.workspaceDir,
-      onLog: (level, message) => {
-        if (level === 'info') console.log(`[pipeline] ${message}`);
-        else console.warn(`[pipeline] ${message}`);
-      },
-    });
-  }
-
   // ── Artifact writing ───────────────────────────────────────────────
 
   private writeStageArtifact(_index: number, stage: StageDefinition, artifact: string): void {
@@ -3010,28 +2970,7 @@ export class PipelineRunner extends EventEmitter {
     }
   }
 
-  // ── Prompt building ─────────────────────────────────────────────────
-
-  private buildProjectPrompt(stage: StageDefinition): string {
-    return buildProjectPromptHelper(this.getPromptContext(), stage);
-  }
-
-  private buildRepoProjectPrompt(stage: StageDefinition, repoName: string): string {
-    return buildRepoProjectPromptHelper(this.getPromptContext(), stage, repoName);
-  }
-
-  private buildClarifyExplorePrompt(): string {
-    return buildClarifyExplorePromptHelper(this.getPromptContext());
-  }
-
-  private buildStagePrompt(stage: StageDefinition, prevArtifact: string): string {
-    return buildStagePromptHelper(this.getPromptContext(), stage, prevArtifact);
-  }
-
-  /**
-   * Load artifacts specific to a single repo from the feature store.
-   * Returns structured context the agent can work from.
-   */
+  /** Load per-repo artifacts the next stage's prompt-builder needs. */
   private loadRepoArtifacts(repoName: string): { requirements: string; specs: string; tasks: string; build: string } {
     const project = this.config.project;
     const slug = this.state.featureSlug;
@@ -3043,17 +2982,9 @@ export class PipelineRunner extends EventEmitter {
     };
   }
 
-  /**
-   * Load the high-level requirements artifact (shared across repos).
-   */
+  /** Load the high-level (cross-repo) requirements artifact. */
   private loadHighLevelRequirements(): string {
-    const project = this.config.project;
-    const slug = this.state.featureSlug;
-    return this.featureStore.readArtifact(project, slug, 'REQUIREMENTS.md') ?? '';
-  }
-
-  private buildRepoStagePrompt(stage: StageDefinition, repoName: string, prevArtifact: string): string {
-    return buildRepoStagePromptHelper(this.getPromptContext(), stage, repoName, prevArtifact);
+    return this.featureStore.readArtifact(this.config.project, this.state.featureSlug, 'REQUIREMENTS.md') ?? '';
   }
 
   private broadcastState(): void {
