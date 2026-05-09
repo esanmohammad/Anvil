@@ -98,6 +98,7 @@ import {
   attachCheckpointHook,
   createFileCheckpointStore,
   attachLivenessPrefetchHook,
+  attachDashboardStateRollupHook,
 } from '@esankhan3/anvil-core-pipeline';
 import { pickAliveModelFromChainSync, prefetchLiveness, setLivenessTtlMs } from './provider-liveness.js';
 import { loadModelRegistry, DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
@@ -1487,6 +1488,23 @@ export class PipelineRunner extends EventEmitter {
           repoNames: this.state.repoNames,
         }),
       });
+      // Step 1 of pipeline-runner slimming — rollup hook subscribes to
+      // `pipeline:*` / `step:*` / `stage:repo-progress` / `stage:cost-update`
+      // / `stage:fix-attempt` / `reviewer:note` and mutates `this.state`
+      // in place. Existing inline state mutations remain for the moment;
+      // each can be replaced with a `bus.emit(...)` call site-by-site
+      // without breaking the WS event vocabulary (the rollup hook also
+      // calls `broadcastState` so consumers see no behavior change).
+      // Dashboard's RepoAgentState.error is `string | null`; the canonical
+      // DashboardRollupRepoState uses `string | undefined`. Both shapes are
+      // structurally compatible at the assignment sites the hook actually
+      // touches (the hook only writes `string` or deletes the field).
+      // Cast through `unknown` to bridge the nullable difference.
+      const rollupHandle = attachDashboardStateRollupHook(this.pipelineBus, {
+        state: this.state as unknown as Parameters<typeof attachDashboardStateRollupHook>[1]['state'],
+        broadcast: () => this.broadcastState(),
+        debounceMs: 50,
+      });
       // Phase C4 — provider liveness probe wired via the bus. Runs
       // once on `pipeline:started`, BEFORE stage 0 spawns (await:true).
       // Replaces the inline `await this.prefetchProviderLiveness()`
@@ -1622,6 +1640,8 @@ export class PipelineRunner extends EventEmitter {
       streamHandle.unsubscribe();
       checkpointHandle.unsubscribe();
       livenessHandle.unsubscribe();
+      rollupHandle.flush();
+      rollupHandle.unsubscribe();
       planSkipUnsub();
       if (pipelineEarlyReturn) return this.state;
 
