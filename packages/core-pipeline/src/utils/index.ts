@@ -93,3 +93,10 @@ export type {
   RiskFactor,
   RiskScore,
 } from './plan-risk-types.js';
+export {
+  scorePlan,
+  computeRiskTier,
+} from './plan-risk-scorer.js';
+export type {
+  ScorePlanOpts,
+} from './plan-risk-scorer.js';

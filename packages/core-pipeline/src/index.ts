@@ -69,6 +69,8 @@ export {
   summarisePlanSkip,
   SCORER_VERSION,
   SENSITIVE_PATH_PATTERNS,
+  scorePlan,
+  computeRiskTier,
 } from './utils/index.js';
 export type {
   StructuralTruncateOptions,
@@ -106,6 +108,7 @@ export type {
   RiskTier,
   RiskFactor,
   RiskScore,
+  ScorePlanOpts,
 } from './utils/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {

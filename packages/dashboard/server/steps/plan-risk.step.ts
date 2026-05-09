@@ -30,7 +30,7 @@
 import type { Step, StepContext } from '@esankhan3/anvil-core-pipeline';
 
 import type { Plan, RiskScore } from '@esankhan3/anvil-core-pipeline';
-import { scorePlan } from '../plan-risk-scorer.js';
+import { scorePlan } from '@esankhan3/anvil-core-pipeline';
 
 export const PLAN_RISK_ARTIFACT_ID = 'PLAN-RISK.json';
 

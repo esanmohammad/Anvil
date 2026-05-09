@@ -20,7 +20,7 @@ import {
   createPlanRiskStep,
   PLAN_RISK_ARTIFACT_ID,
 } from '../steps/index.js';
-import { scorePlan } from '../plan-risk-scorer.js';
+import { scorePlan } from '@esankhan3/anvil-core-pipeline';
 import type { Plan, RiskScore } from '@esankhan3/anvil-core-pipeline';
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {

@@ -26,7 +26,7 @@
  * itself: any consumer downstream reads `ctx.artifacts.read('PLAN-RISK.json')`
  * to get the same value the legacy code returned from `getPlanRisk()`.
  */
-import { scorePlan } from '../plan-risk-scorer.js';
+import { scorePlan } from '@esankhan3/anvil-core-pipeline';
 export const PLAN_RISK_ARTIFACT_ID = 'PLAN-RISK.json';
 /**
  * Build a one-shot plan-risk Step. Phase 4f registers a single instance

@@ -1,17 +1,15 @@
 /**
  * Tests for plan-risk-scorer.
  *
- * Uses node:test + node:assert (built-in runner), matching the style of the
- * other tests in this directory. Run via:
- *   node --test packages/dashboard/server/__tests__/plan-risk-scorer.test.ts
- * (after tsc compile, or via a ts loader).
+ * Phase F10 — moved from packages/dashboard/server/__tests__/ when the
+ * scorer was promoted into core-pipeline/utils. Coverage preserved.
  */
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { scorePlan, computeRiskTier } from '../plan-risk-scorer.js';
-import type { Plan } from '../plan-store.js';
+import { scorePlan, computeRiskTier } from '../utils/plan-risk-scorer.js';
+import type { Plan } from '../utils/plan-types.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 

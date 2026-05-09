@@ -61,7 +61,7 @@ import type { ModelRegistry, ProviderName, WalkerConfig } from '@esankhan3/anvil
 import { parseTasks, bundleFiles, type ParsedTask } from '@esankhan3/anvil-core-pipeline';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { enforceBudget, type PromptSection } from '@esankhan3/anvil-core-pipeline';
-import { scorePlan, computeRiskTier } from './plan-risk-scorer.js';
+import { scorePlan, computeRiskTier } from '@esankhan3/anvil-core-pipeline';
 import {
   FeatureManifestStore,
   renderManifestForPrompt,
