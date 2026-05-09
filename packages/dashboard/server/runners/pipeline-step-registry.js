@@ -1,42 +1,17 @@
 /**
- * `buildPipelineStepRegistry` — assembles an `InMemoryStepRegistry`
- * with one Step per pipeline stage. Each Step delegates to a caller-
- * supplied `runStage` callback that mutates the shared run state.
+ * Phase B — `buildPipelineStepRegistry` was promoted into core-pipeline
+ * as `buildStandardStepRegistry`. This file is a back-compat re-export
+ * so any in-flight branch / external consumer still resolves.
  *
- * Today this registry is **not yet wired** into the dashboard's active
- * dispatch loop — pipeline-runner.ts still walks stages via its own
- * for-loop. The registry exists as the migration target: a future
- * `Pipeline.run()` call over this registry replaces the for-loop and
- * unlocks bus-driven WS event broadcasting (subscribe to
- * `step:started` / `step:completed` events instead of inline emits).
+ * @deprecated Import directly from `@esankhan3/anvil-core-pipeline`:
+ *   import { buildStandardStepRegistry } from '@esankhan3/anvil-core-pipeline';
  *
- * Migration recipe (post-R7):
- *   1. Construct the registry alongside the existing for-loop.
- *   2. In a new code path (env-flagged), call
- *      `new Pipeline({ registry, eventBus, hooks }).run({ runId, ... })`.
- *   3. Subscribe `step:started` → state.stages[i].status = 'running' +
- *      broadcastState; subscribe `step:completed` → analogous.
- *   4. Verify WS event-vocabulary parity (capture WS messages from
- *      both paths on the same input; assert byte-equal).
- *   5. Flip the env flag default to enabled. Delete the for-loop.
+ * This shim will be deleted in Phase D once the dashboard fully drives
+ * its run via `Pipeline.run()` over the standard registry.
  */
-import { InMemoryStepRegistry, } from '@esankhan3/anvil-core-pipeline';
-import { STAGES } from '@esankhan3/anvil-core-pipeline';
+import { buildStandardStepRegistry, } from '@esankhan3/anvil-core-pipeline';
+/** @deprecated Use `buildStandardStepRegistry` from `@esankhan3/anvil-core-pipeline`. */
 export function buildPipelineStepRegistry(deps) {
-    const registry = new InMemoryStepRegistry();
-    for (const stage of STAGES) {
-        const step = {
-            id: stage.name,
-            name: stage.label,
-            parallelism: 'serial',
-            run: async (ctx) => {
-                const prevArtifact = ctx.input ?? '';
-                const result = await deps.runStage(stage.name, prevArtifact);
-                return result.artifact;
-            },
-        };
-        registry.register(step);
-    }
-    return registry;
+    return buildStandardStepRegistry({ runStage: deps.runStage });
 }
 //# sourceMappingURL=pipeline-step-registry.js.map

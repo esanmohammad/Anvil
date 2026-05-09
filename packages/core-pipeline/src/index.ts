@@ -34,6 +34,12 @@ export { InMemoryStepRegistry } from './step-registry.js';
 export { InMemoryArtifactStore } from './artifacts.js';
 export { Pipeline, makePipelineEvent } from './pipeline.js';
 export type { PipelineDeps } from './pipeline.js';
+export { buildStandardStepRegistry } from './standard-registry.js';
+export type {
+  RunStageResult,
+  RunStageFn,
+  StandardRegistryDeps,
+} from './standard-registry.js';
 export {
   attachAuditLogHook,
   AUDIT_LOG_HOOKS,

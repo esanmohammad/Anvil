@@ -38,7 +38,7 @@ import {
 } from '@esankhan3/anvil-core-pipeline';
 import { AgentManagerRunner } from './runners/agent-manager-runner.js';
 import { AgentManagerSession } from './runners/agent-manager-session.js';
-import { buildPipelineStepRegistry } from './runners/pipeline-step-registry.js';
+import { buildStandardStepRegistry } from '@esankhan3/anvil-core-pipeline';
 import {
   Pipeline,
   InMemoryEventBus,
@@ -1678,7 +1678,7 @@ export class PipelineRunner extends EventEmitter {
       const completedStepIds = new Set<string>();
       while (true) {
         if (this.cancelled) break;
-        const stagePipelineRegistry = buildPipelineStepRegistry({
+        const stagePipelineRegistry = buildStandardStepRegistry({
           runStage: async (stageName, _prevForStep) => {
             // Map name → index. STAGES is the canonical ordering.
             const idx = STAGES.findIndex((s) => s.name === stageName);
