@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-core-pipeline",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Core pipeline runner for Anvil — typed Step<I,O> graph, EventBus, StepRegistry, lifecycle hooks. Replaces cli's monolithic orchestrator if-tree.",
   "type": "module",
   "license": "MIT",
@@ -31,5 +31,17 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/esanmohammad/Anvil.git",
+    "directory": "packages/core-pipeline"
+  },
+  "homepage": "https://github.com/esanmohammad/Anvil/tree/main/packages/core-pipeline#readme",
+  "bugs": {
+    "url": "https://github.com/esanmohammad/Anvil/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

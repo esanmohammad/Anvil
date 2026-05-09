@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-agent-core",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Shared LLM stack — unified LanguageModel interface, provider adapters, agent subprocess machinery, and cost calculation for cli + knowledge-core + headless runners.",
   "type": "module",
   "license": "MIT",
@@ -45,5 +45,17 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.15.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/esanmohammad/Anvil.git",
+    "directory": "packages/agent-core"
+  },
+  "homepage": "https://github.com/esanmohammad/Anvil/tree/main/packages/agent-core#readme",
+  "bugs": {
+    "url": "https://github.com/esanmohammad/Anvil/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

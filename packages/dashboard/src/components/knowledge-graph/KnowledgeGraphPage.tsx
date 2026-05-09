@@ -51,6 +51,28 @@ export function KnowledgeGraphPage({
   onRefreshKB,
   ws,
 }: KnowledgeGraphPageProps) {
+  // Refresh-outcome banner. Snapshots `lastRefreshed` when a refresh
+  // starts; after kbRefreshing flips false, compares the new value. Same
+  // value → knowledge-core skipped every repo (SHA unchanged) → surface
+  // "Up to date" so a no-op refresh isn't silent.
+  const [refreshOutcome, setRefreshOutcome] = useState<'up-to-date' | 'updated' | null>(null);
+  const refreshStartRef = useRef<{ lastRefreshed: string | null } | null>(null);
+  const wasRefreshingRef = useRef(false);
+  useEffect(() => {
+    if (kbRefreshing && !wasRefreshingRef.current) {
+      refreshStartRef.current = { lastRefreshed: kbStatus?.lastRefreshed ?? null };
+      setRefreshOutcome(null);
+    } else if (!kbRefreshing && wasRefreshingRef.current) {
+      const before = refreshStartRef.current?.lastRefreshed ?? null;
+      const after = kbStatus?.lastRefreshed ?? null;
+      setRefreshOutcome(before !== after ? 'updated' : 'up-to-date');
+      const t = window.setTimeout(() => setRefreshOutcome(null), 4000);
+      wasRefreshingRef.current = kbRefreshing;
+      return () => window.clearTimeout(t);
+    }
+    wasRefreshingRef.current = kbRefreshing;
+  }, [kbRefreshing, kbStatus?.lastRefreshed]);
+
   // Graph visualization state
   const [graphLevel, setGraphLevel] = useState<'project' | 'repo'>('project');
   const [selectedRepoForDrill, setSelectedRepoForDrill] = useState<string | null>(null);
@@ -273,6 +295,22 @@ export function KnowledgeGraphPage({
             }} />
           </div>
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>{effectiveProgress.message}</div>
+        </div>
+      )}
+
+      {/* Refresh-outcome banner — only visible right after a refresh completes */}
+      {!kbRefreshing && refreshOutcome && (
+        <div style={{
+          marginBottom: 8, padding: '6px 10px', fontSize: 11, flexShrink: 0,
+          color: refreshOutcome === 'up-to-date' ? 'var(--color-success)' : 'var(--accent)',
+          background: 'var(--bg-elevated-2)',
+          border: `1px solid ${refreshOutcome === 'up-to-date' ? 'var(--color-success)' : 'var(--accent)'}`,
+          borderRadius: 'var(--radius-xs)',
+          opacity: 0.9,
+        }}>
+          {refreshOutcome === 'up-to-date'
+            ? '✓ Knowledge base is up to date — no changes detected.'
+            : '✓ Knowledge base refreshed.'}
         </div>
       )}
 

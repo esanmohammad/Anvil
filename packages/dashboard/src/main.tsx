@@ -287,7 +287,17 @@ function App() {
   const [prs, setPrs] = useState<import('./components/pr-board/usePRData.js').PRData[]>([]);
   const [prsLoading, setPrsLoading] = useState(false);
   const [historySelectedRunId, setHistorySelectedRunId] = useState<string | null>(null);
-  const [projectsLoading, setProjectsLoading] = useState(true);
+  // Two-phase boot tracker. The home view stays in PendingView until BOTH
+  // halves of the init payload have actually landed:
+  //   - `initReceived`   → project list / runs / features / state
+  //   - `availableModels` → provider env-var + factory.yaml discovery
+  // Previously `setProjectsLoading(false)` fired the moment `init` arrived,
+  // so a slow `discoverAvailableModels` (Ollama probe, Anthropic model list)
+  // would resolve init with empty providers and the spinner would vanish
+  // before the data was actually usable. The `bootDeadline` flag is a hard
+  // 12-second escape hatch so the user is never stuck if discovery hangs.
+  const [initReceived, setInitReceived] = useState(false);
+  const [bootDeadlineHit, setBootDeadlineHit] = useState(false);
   const [actionPending, setActionPending] = useState<string | null>(null); // 'build' | 'fix' | 'research' | null
   const [activeRunsList, setActiveRunsList] = useState<Array<{
     id: string; type: string; project: string; description: string;
@@ -359,6 +369,18 @@ function App() {
   useEffect(() => {
     if (!activePause && reviewModalOpen) setReviewModalOpen(() => false);
   }, [activePause, reviewModalOpen]);
+
+  // 12-second hard cap on the boot loader — if discovery is genuinely stuck
+  // we still hand the user a usable home view rather than an indefinite
+  // spinner. After this fires, projectsLoading falls through.
+  useEffect(() => {
+    const t = window.setTimeout(() => setBootDeadlineHit(true), 12_000);
+    return () => window.clearTimeout(t);
+  }, []);
+
+  // Derived loader state. Hold the spinner until init has landed AND model
+  // discovery has produced a result, unless the deadline has fired.
+  const projectsLoading = !bootDeadlineHit && (!initReceived || availableModels === null);
 
   // Derived
   const activePipeline = toPipelineData(dashboardState?.activePipeline ?? null);
@@ -434,7 +456,7 @@ function App() {
         if (msg.payload.availableModels) {
           setAvailableModels(msg.payload.availableModels);
         }
-        setProjectsLoading(false);
+        setInitReceived(true);
         break;
       }
 
@@ -940,7 +962,12 @@ function App() {
     switch (currentRoute.id) {
       case 'home':
         if (projectsLoading || projectSwitching) {
-          return <PendingView label={projectSwitching ? `Switching to ${currentProject?.title || currentProject?.name || 'project'}...` : 'Loading projects...'} />;
+          const bootLabel = projectSwitching
+            ? `Switching to ${currentProject?.title || currentProject?.name || 'project'}...`
+            : !initReceived
+              ? 'Reading project configuration...'
+              : 'Detecting providers and models...';
+          return <PendingView label={bootLabel} />;
         }
         return (
           <HomePage

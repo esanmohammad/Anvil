@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-memory-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Long-term memory layer for Anvil — five-type taxonomy (working/episodic/semantic/procedural/profile), bi-temporal facts, code-fact drift detection, sleeptime ratification, PR-as-episode primitives.",
   "type": "module",
   "license": "MIT",
@@ -33,5 +33,17 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.15.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/esanmohammad/Anvil.git",
+    "directory": "packages/memory-core"
+  },
+  "homepage": "https://github.com/esanmohammad/Anvil/tree/main/packages/memory-core#readme",
+  "bugs": {
+    "url": "https://github.com/esanmohammad/Anvil/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

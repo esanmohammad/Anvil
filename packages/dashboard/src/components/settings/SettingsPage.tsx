@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Settings, Key, DollarSign, GitBranch, Bell, AlertCircle } from 'lucide-react';
+import { Settings, Key, DollarSign, GitBranch, Bell, AlertCircle, Check, X, RefreshCw, Pencil } from 'lucide-react';
 import { ComingSoonPanel } from '../common/ComingSoonPanel.js';
 import { TileSkeleton, useLoadingState } from '../common/Skeleton.js';
 
@@ -105,10 +105,14 @@ export function SettingsPage({ project, ws }: SettingsPageProps) {
 
   const handleSaveKey = useCallback((provider: string) => {
     if (!ws || !keyInput.trim()) return;
+    // Don't fire a follow-up `get-providers` here — the server already
+    // sends a fresh `providers` payload as the last step of its
+    // `set-auth-key` handler. A second concurrent get-providers can race
+    // the cache invalidation and clobber the fresh state with a stale
+    // "Not set" snapshot, leaving the UI showing the wrong status.
     ws.send(JSON.stringify({ action: 'set-auth-key', provider, key: keyInput.trim() }));
     setEditingProvider(null);
     setKeyInput('');
-    ws.send(JSON.stringify({ action: 'get-providers' }));
   }, [ws, keyInput]);
 
   const handleTestConnection = useCallback((provider: string) => {
@@ -430,58 +434,165 @@ function ProvidersTab({
         <section aria-label="API Providers">
           <h3 style={sectionHeaderStyle}>API Providers</h3>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            {apiProviders.map((p) => (
-              <div
-                key={p.name}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 12,
+            {apiProviders.map((p) => {
+              const isEditing = editingProvider === p.name;
+              const saveState = saveResult[p.name];
+              const testState = testResult[p.name];
+              const isTesting = testingProvider === p.name;
+              return (
+                <div key={p.name} style={{
+                  display: 'flex', flexDirection: 'column', gap: 6,
                   padding: '10px 14px',
                   background: 'var(--bg-elevated-2)',
                   border: '1px solid var(--separator)',
                   borderRadius: 'var(--radius-sm)',
                   fontSize: 13,
-                }}
-              >
-                <ProviderStatusDot active={p.isAvailable} />
-                <span style={{ fontWeight: 500, color: 'var(--text-primary)', minWidth: 120 }}>
-                  {p.displayName || p.name}
-                </span>
-                {p.envVar && (
-                  <span style={{
-                    fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-tertiary)',
-                  }}>
-                    {p.envVar}
-                  </span>
-                )}
-                {!p.isAvailable && (
-                  <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-                    Not set
-                  </span>
-                )}
-                {p.capabilities && p.capabilities.length > 0 && (
-                  <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
-                    {p.capabilities.map((cap) => (
-                      <span key={cap} style={capabilityBadgeStyle}>{cap}</span>
-                    ))}
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <ProviderStatusDot active={p.isAvailable} />
+                    <span style={{ fontWeight: 500, color: 'var(--text-primary)', minWidth: 120 }}>
+                      {p.displayName || p.name}
+                    </span>
+                    {p.envVar && (
+                      <span style={{
+                        fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-tertiary)',
+                      }}>
+                        {p.envVar}
+                      </span>
+                    )}
+                    {!p.isAvailable && !isEditing && (
+                      <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                        Not set
+                      </span>
+                    )}
+                    {p.capabilities && p.capabilities.length > 0 && (
+                      <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
+                        {p.capabilities.map((cap) => (
+                          <span key={cap} style={capabilityBadgeStyle}>{cap}</span>
+                        ))}
+                      </div>
+                    )}
+                    {!isEditing && p.envVar && (
+                      <div style={{ display: 'flex', gap: 6, marginLeft: p.capabilities?.length ? 8 : 'auto' }}>
+                        <button
+                          onClick={() => { setEditingProvider(p.name); setKeyInput(''); }}
+                          style={ghostBtnStyle}
+                          aria-label={p.isAvailable ? `Replace ${p.envVar}` : `Set ${p.envVar}`}
+                          title={p.isAvailable ? 'Replace key (overrides shell env)' : 'Add API key'}
+                        >
+                          {p.isAvailable ? <><Pencil size={11} /> Replace</> : <><Key size={11} /> Set key</>}
+                        </button>
+                        {p.isAvailable && (
+                          <button
+                            onClick={() => onTestConnection(p.name)}
+                            disabled={isTesting}
+                            style={{ ...ghostBtnStyle, opacity: isTesting ? 0.5 : 1 }}
+                            title="Test API connectivity"
+                          >
+                            <RefreshCw size={11} className={isTesting ? 'spin' : ''} />
+                            {isTesting ? 'Testing...' : 'Test'}
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
-            ))}
-            {apiProviders.filter((p) => !p.isAvailable && p.setupHint).map((p) => (
-              <div key={`${p.name}-hint`} style={{
-                padding: '6px 14px 6px 34px',
-                fontSize: 11,
-                color: 'var(--text-tertiary)',
-                fontFamily: 'var(--font-mono)',
-              }}>
-                {p.setupHint}
-              </div>
-            ))}
+
+                  {/* Inline edit row */}
+                  {isEditing && p.envVar && (
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center', paddingLeft: 20 }}>
+                      <input
+                        type="password"
+                        value={keyInput}
+                        onChange={(e) => setKeyInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') onSaveKey(p.name);
+                          if (e.key === 'Escape') { setEditingProvider(null); setKeyInput(''); }
+                        }}
+                        placeholder={`Paste your ${p.envVar} value`}
+                        autoFocus
+                        spellCheck={false}
+                        autoComplete="off"
+                        style={{
+                          flex: 1, padding: '6px 10px', fontSize: 12,
+                          fontFamily: 'var(--font-mono)',
+                          background: 'var(--bg-base)', color: 'var(--text-primary)',
+                          border: '1px solid var(--separator)', borderRadius: 'var(--radius-xs)',
+                          outline: 'none',
+                        }}
+                      />
+                      <button
+                        onClick={() => onSaveKey(p.name)}
+                        disabled={!keyInput.trim()}
+                        style={{ ...primaryBtnStyle, opacity: keyInput.trim() ? 1 : 0.4 }}
+                      >
+                        Save
+                      </button>
+                      <button
+                        onClick={() => { setEditingProvider(null); setKeyInput(''); }}
+                        style={ghostBtnStyle}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Feedback row */}
+                  {(saveState || testState) && (
+                    <div style={{ paddingLeft: 20, fontSize: 11, display: 'flex', gap: 12 }}>
+                      {saveState === 'saved' && (
+                        <span style={{ color: 'var(--color-success)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <Check size={11} /> Key saved to ~/.anvil/.env
+                        </span>
+                      )}
+                      {saveState === 'error' && (
+                        <span style={{ color: 'var(--color-error)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <X size={11} /> Failed to save key
+                        </span>
+                      )}
+                      {testState === 'ok' && (
+                        <span style={{ color: 'var(--color-success)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <Check size={11} /> Connection OK
+                        </span>
+                      )}
+                      {testState === 'fail' && (
+                        <span style={{ color: 'var(--color-error)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <X size={11} /> Connection failed — check key
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Setup hint when not set and not editing */}
+                  {!p.isAvailable && !isEditing && p.setupHint && (
+                    <div style={{
+                      paddingLeft: 20, fontSize: 11, color: 'var(--text-tertiary)',
+                    }}>
+                      {p.setupHint}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </section>
       )}
     </div>
   );
 }
+
+const ghostBtnStyle: React.CSSProperties = {
+  display: 'inline-flex', alignItems: 'center', gap: 4,
+  padding: '4px 10px', fontSize: 11, fontWeight: 500,
+  background: 'var(--bg-base)', color: 'var(--text-secondary)',
+  border: '1px solid var(--separator)', borderRadius: 'var(--radius-xs)',
+  cursor: 'pointer',
+};
+
+const primaryBtnStyle: React.CSSProperties = {
+  padding: '4px 12px', fontSize: 11, fontWeight: 500,
+  background: 'var(--accent)', color: '#fff',
+  border: 'none', borderRadius: 'var(--radius-xs)',
+  cursor: 'pointer',
+};
 
 export default SettingsPage;

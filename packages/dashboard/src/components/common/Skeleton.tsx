@@ -118,19 +118,20 @@ export interface LoadingState {
   reset: () => void;
 }
 
-const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_TIMEOUT_MSG =
-  'Dashboard server unreachable — check that anvil-loc dashboard is running.';
+  'Dashboard server is taking longer than expected — yaml / provider discovery may be slow.';
 
 /**
  * Tracks first-paint loading for a WS-driven page.
  *
  * - Starts in `loading: true`.
- * - Calling `loaded()` flips loading off and clears the timer.
+ * - Calling `loaded()` flips loading off and clears the timer + error.
  * - Calling `errored(msg)` flips loading off with an error.
- * - If neither fires within `timeoutMs`, surfaces a server-unreachable
- *   error so the user gets actionable text instead of a forever
- *   spinner.
+ * - If neither fires within `timeoutMs`, surfaces a soft warning *while
+ *   keeping the spinner up* so a slow yaml / env discovery doesn't strand
+ *   the user with an empty panel. The spinner only goes away when
+ *   `loaded()` or `errored()` actually fires.
  */
 export function useLoadingState(timeoutMs = DEFAULT_TIMEOUT_MS): LoadingState {
   const [loading, setLoading] = React.useState(true);
@@ -144,16 +145,22 @@ export function useLoadingState(timeoutMs = DEFAULT_TIMEOUT_MS): LoadingState {
     }
   }, []);
 
-  React.useEffect(() => {
+  const armTimer = React.useCallback(() => {
     timerRef.current = window.setTimeout(() => {
-      setLoading((isLoading) => {
-        if (isLoading) setError(DEFAULT_TIMEOUT_MSG);
-        return false;
-      });
+      // Surface a soft warning but DO NOT flip loading=false. A slow yaml
+      // or provider probe shouldn't make the spinner disappear before the
+      // data has actually arrived — that's the empty-panel bug we hit
+      // before. The caller still controls the eventual loaded/errored
+      // transition.
+      setError((prev) => prev ?? DEFAULT_TIMEOUT_MSG);
       timerRef.current = null;
     }, timeoutMs);
+  }, [timeoutMs]);
+
+  React.useEffect(() => {
+    armTimer();
     return clearTimer;
-  }, [timeoutMs, clearTimer]);
+  }, [armTimer, clearTimer]);
 
   const loaded = React.useCallback(() => {
     setLoading(false);
@@ -174,14 +181,8 @@ export function useLoadingState(timeoutMs = DEFAULT_TIMEOUT_MS): LoadingState {
     setLoading(true);
     setError(null);
     clearTimer();
-    timerRef.current = window.setTimeout(() => {
-      setLoading((isLoading) => {
-        if (isLoading) setError(DEFAULT_TIMEOUT_MSG);
-        return false;
-      });
-      timerRef.current = null;
-    }, timeoutMs);
-  }, [clearTimer, timeoutMs]);
+    armTimer();
+  }, [clearTimer, armTimer]);
 
   return { loading, error, loaded, errored, reset };
 }

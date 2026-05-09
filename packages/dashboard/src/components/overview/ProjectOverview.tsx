@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CheckCircle2, XCircle, Clock, RefreshCw, Brain, Shield, DollarSign, Sparkles } from 'lucide-react';
 import { ComingSoonPanel } from '../common/ComingSoonPanel.js';
 
@@ -66,6 +66,18 @@ export function ProjectOverview({ projectName, repos, conventions, features, kbS
   // the spend ledger is ready to surface.
   const [conventionRules, setConventionRules] = useState<ConventionRule[]>([]);
   const [generatingConventions, setGeneratingConventions] = useState(false);
+  // Same UX pattern as the KB refresh banner — surface "Up to date" when
+  // regeneration produced an identical rule set so the click isn't silent.
+  const [conventionsOutcome, setConventionsOutcome] = useState<'regenerated' | 'unchanged' | null>(null);
+  const conventionsBeforeRef = useRef<string | null>(null);
+
+  // Stable signature for "did the rules change?" — order-independent so a
+  // reshuffled-but-equivalent regenerate is still treated as unchanged.
+  const conventionsSignature = (rules: ConventionRule[], strings: string[]): string => {
+    const ruleKeys = rules.map((r) => `${r.name}::${r.severity}::${r.description}`).sort();
+    const strKeys = [...strings].sort();
+    return JSON.stringify([ruleKeys, strKeys]);
+  };
 
   useEffect(() => {
     if (!ws || !projectName) return;
@@ -78,14 +90,39 @@ export function ProjectOverview({ projectName, repos, conventions, features, kbS
       try {
         const msg = JSON.parse(event.data);
         if (msg.type === 'conventions' && msg.payload) {
-          setConventionRules(msg.payload.rules || []);
+          const newRules: ConventionRule[] = msg.payload.rules || [];
+          // If the user just kicked off a regenerate, diff the new rule set
+          // against the snapshot to decide which outcome banner to show.
+          if (generatingConventions && conventionsBeforeRef.current !== null) {
+            const after = conventionsSignature(newRules, conventions);
+            setConventionsOutcome(
+              after === conventionsBeforeRef.current ? 'unchanged' : 'regenerated',
+            );
+            conventionsBeforeRef.current = null;
+          }
+          setConventionRules(newRules);
           setGeneratingConventions(false);
         }
       } catch { /* ignore */ }
     };
     ws.addEventListener('message', handler);
     return () => ws.removeEventListener('message', handler);
-  }, [ws]);
+  }, [ws, generatingConventions, conventions]);
+
+  // Auto-clear the outcome banner after a few seconds.
+  useEffect(() => {
+    if (!conventionsOutcome) return;
+    const t = window.setTimeout(() => setConventionsOutcome(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [conventionsOutcome]);
+
+  const triggerRegenerate = () => {
+    if (!ws || !projectName) return;
+    conventionsBeforeRef.current = conventionsSignature(conventionRules, conventions);
+    setConventionsOutcome(null);
+    setGeneratingConventions(true);
+    ws.send(JSON.stringify({ action: 'generate-conventions', project: projectName }));
+  };
 
   const totalCost = features.reduce((sum, f) => sum + (f.totalCost || 0), 0);
   const languages = [...new Set(repos.map((r) => r.language).filter(Boolean))];
@@ -174,11 +211,7 @@ export function ProjectOverview({ projectName, repos, conventions, features, kbS
               file structure, naming, and testing approaches.
             </div>
             <button
-              onClick={() => {
-                if (!ws || !projectName) return;
-                setGeneratingConventions(true);
-                ws.send(JSON.stringify({ action: 'generate-conventions', project: projectName }));
-              }}
+              onClick={triggerRegenerate}
               disabled={generatingConventions}
               style={{
                 display: 'inline-flex', alignItems: 'center', gap: 6,
@@ -192,6 +225,9 @@ export function ProjectOverview({ projectName, repos, conventions, features, kbS
               <Sparkles size={12} />
               {generatingConventions ? 'Generating...' : 'Generate Conventions'}
             </button>
+            {conventionsOutcome && (
+              <ConventionsOutcomeBanner outcome={conventionsOutcome} />
+            )}
           </div>
         ) : (
           <>
@@ -200,11 +236,7 @@ export function ProjectOverview({ projectName, repos, conventions, features, kbS
                 {conventionRules.length + conventions.length} rule{conventionRules.length + conventions.length !== 1 ? 's' : ''} loaded
               </span>
               <button
-                onClick={() => {
-                  if (!ws || !projectName) return;
-                  setGeneratingConventions(true);
-                  ws.send(JSON.stringify({ action: 'generate-conventions', project: projectName }));
-                }}
+                onClick={triggerRegenerate}
                 disabled={generatingConventions}
                 style={{
                   display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -219,6 +251,9 @@ export function ProjectOverview({ projectName, repos, conventions, features, kbS
                 {generatingConventions ? 'Regenerating...' : 'Regenerate'}
               </button>
             </div>
+            {conventionsOutcome && (
+              <ConventionsOutcomeBanner outcome={conventionsOutcome} />
+            )}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
               {/* Severity-tagged rules from factory.yaml */}
               {conventionRules.map((rule, i) => {
@@ -344,6 +379,32 @@ function KnowledgeBaseSection({
   kbProgress: { repo: string; message: string; repoIndex: number; totalRepos: number } | null;
   onRefresh: () => void;
 }) {
+  // Track the last completed refresh outcome so the user gets feedback even
+  // when knowledge-core skipped every repo (SHA unchanged → no progress
+  // updates, no visible status change). Compare lastRefreshed before and
+  // after the refresh; if it didn't advance and nothing was indexed, the
+  // KB was already up to date.
+  const [refreshOutcome, setRefreshOutcome] = useState<'up-to-date' | 'updated' | null>(null);
+  const refreshStartRef = React.useRef<{ lastRefreshed: string | null } | null>(null);
+  const wasRefreshingRef = React.useRef(false);
+
+  useEffect(() => {
+    if (kbRefreshing && !wasRefreshingRef.current) {
+      // Refresh just started — capture baseline.
+      refreshStartRef.current = { lastRefreshed: kbStatus?.lastRefreshed ?? null };
+      setRefreshOutcome(null);
+    } else if (!kbRefreshing && wasRefreshingRef.current) {
+      // Refresh just finished — diff against baseline.
+      const before = refreshStartRef.current?.lastRefreshed ?? null;
+      const after = kbStatus?.lastRefreshed ?? null;
+      const changed = before !== after;
+      setRefreshOutcome(changed ? 'updated' : 'up-to-date');
+      const t = window.setTimeout(() => setRefreshOutcome(null), 4000);
+      return () => window.clearTimeout(t);
+    }
+    wasRefreshingRef.current = kbRefreshing;
+  }, [kbRefreshing, kbStatus?.lastRefreshed]);
+
   // No status yet or no repos
   if (!kbStatus || kbStatus.repos.length === 0) {
     return (
@@ -385,6 +446,15 @@ function KnowledgeBaseSection({
           <div style={{ marginTop: 10 }}>
             <ProgressBar current={kbProgress.repoIndex + 1} total={kbProgress.totalRepos} />
             <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>{kbProgress.message}</div>
+          </div>
+        )}
+        {!kbRefreshing && refreshOutcome === 'up-to-date' && (
+          <div style={{
+            marginTop: 10, padding: '6px 10px', fontSize: 11,
+            color: 'var(--color-success)', background: 'var(--bg-base)',
+            border: '1px solid var(--color-success)', borderRadius: 'var(--radius-xs)',
+          }}>
+            ✓ Nothing to index — repos have no main/master branch or are unchanged.
           </div>
         )}
       </div>
@@ -487,6 +557,44 @@ function KnowledgeBaseSection({
           <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>{kbProgress.message}</div>
         </div>
       )}
+
+      {/* Outcome banner — surfaces "nothing to do" so a no-op refresh isn't silent */}
+      {!kbRefreshing && refreshOutcome && (
+        <div style={{
+          marginTop: 10,
+          padding: '6px 10px',
+          fontSize: 11,
+          color: refreshOutcome === 'up-to-date' ? 'var(--color-success)' : 'var(--accent)',
+          background: 'var(--bg-base)',
+          border: `1px solid ${refreshOutcome === 'up-to-date' ? 'var(--color-success)' : 'var(--accent)'}`,
+          borderRadius: 'var(--radius-xs)',
+          opacity: 0.9,
+        }}>
+          {refreshOutcome === 'up-to-date'
+            ? '✓ Knowledge base is up to date — no changes detected.'
+            : '✓ Knowledge base refreshed.'}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConventionsOutcomeBanner({ outcome }: { outcome: 'regenerated' | 'unchanged' }) {
+  const isUnchanged = outcome === 'unchanged';
+  return (
+    <div style={{
+      marginTop: 10,
+      padding: '6px 10px',
+      fontSize: 11,
+      color: isUnchanged ? 'var(--color-success)' : 'var(--accent)',
+      background: 'var(--bg-base)',
+      border: `1px solid ${isUnchanged ? 'var(--color-success)' : 'var(--accent)'}`,
+      borderRadius: 'var(--radius-xs)',
+      opacity: 0.9,
+    }}>
+      {isUnchanged
+        ? '✓ Conventions are up to date — no rule changes detected.'
+        : '✓ Conventions regenerated.'}
     </div>
   );
 }

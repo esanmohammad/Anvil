@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-convention-core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Project convention extraction, rule engine, and promotion ledger for Anvil. Owns ~/.anvil/conventions/<project>/{conventions.md, rules.json}.",
   "type": "module",
   "license": "MIT",
@@ -30,5 +30,17 @@
   },
   "devDependencies": {
     "@types/node": "^22.15.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/esanmohammad/Anvil.git",
+    "directory": "packages/convention-core"
+  },
+  "homepage": "https://github.com/esanmohammad/Anvil/tree/main/packages/convention-core#readme",
+  "bugs": {
+    "url": "https://github.com/esanmohammad/Anvil/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -55,11 +55,11 @@
     "test:server": "npx tsc -p server/tsconfig.json && node --test server/out/__tests__/*.test.js"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.1.1",
-    "@esankhan3/anvil-convention-core": "^0.1.0",
-    "@esankhan3/anvil-core-pipeline": "^0.1.1",
-    "@esankhan3/anvil-knowledge-core": "^0.1.0",
-    "@esankhan3/anvil-memory-core": "^0.1.0",
+    "@esankhan3/anvil-agent-core": "^0.1.2",
+    "@esankhan3/anvil-convention-core": "^0.1.1",
+    "@esankhan3/anvil-core-pipeline": "^0.1.2",
+    "@esankhan3/anvil-knowledge-core": "^0.1.1",
+    "@esankhan3/anvil-memory-core": "^0.1.1",
     "lucide-react": "1.8.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

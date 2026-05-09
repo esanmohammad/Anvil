@@ -4110,6 +4110,8 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
           // Map provider name to env var (match both registry names and short names)
           const envVarMap: Record<string, string> = {
+            anthropic: 'ANTHROPIC_API_KEY',
+            adk: 'GEMINI_API_KEY',
             openai: 'OPENAI_API_KEY',
             gemini: 'GOOGLE_API_KEY',
             'gemini-api': 'GOOGLE_API_KEY',
@@ -4125,8 +4127,12 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
             break;
           }
 
-          // Set in current process
+          // Set in current process. Invalidate the discovery cache as the
+          // very next step so any concurrent `get-providers` call (the UI
+          // can race one in alongside this save) sees fresh state — not
+          // a stale "Not set" snapshot.
           process.env[envVar] = key;
+          invalidateProviderCache();
 
           // Persist to ~/.anvil/.env so it survives restarts
           const envFilePath = join(ANVIL_HOME, '.env');
@@ -4143,9 +4149,6 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           }
           mkdirSync(ANVIL_HOME, { recursive: true, mode: 0o700 });
           writeFileSync(envFilePath, envContent, { encoding: 'utf-8', mode: 0o600 });
-
-          // Invalidate provider cache so next get-providers reflects changes
-          invalidateProviderCache();
 
           console.log(`[dashboard] Set ${envVar} for provider "${provider}"`);
           ws.send(JSON.stringify({ type: 'auth-key-saved', payload: { provider, envVar, success: true } }));
@@ -4186,7 +4189,22 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           let success = false;
           let error = '';
 
-          if (provider === 'openai') {
+          if (provider === 'anthropic') {
+            const apiKey = process.env.ANTHROPIC_API_KEY;
+            if (!apiKey) { error = 'ANTHROPIC_API_KEY not set'; }
+            else {
+              const res = await fetch('https://api.anthropic.com/v1/models?limit=1', {
+                headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+                signal: AbortSignal.timeout(10000),
+              });
+              success = res.ok;
+              if (!success) error = `HTTP ${res.status}: ${await res.text().catch(() => '')}`.slice(0, 200);
+            }
+          } else if (provider === 'adk') {
+            const apiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY ?? process.env.ANTHROPIC_API_KEY;
+            if (!apiKey) { error = 'GEMINI_API_KEY / GOOGLE_API_KEY / ANTHROPIC_API_KEY not set'; }
+            else { success = true; /* presence-only check — ADK dispatches to either family */ }
+          } else if (provider === 'openai') {
             const apiKey = process.env.OPENAI_API_KEY;
             if (!apiKey) { error = 'OPENAI_API_KEY not set'; }
             else {

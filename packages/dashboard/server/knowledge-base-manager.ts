@@ -352,7 +352,27 @@ export class KnowledgeBaseManager {
 
     const meta = this.readMetadata(project, repoName);
 
+    // Knowledge-core (the new indexer) writes index_meta.json, not metadata.json.
+    // When metadata.json is missing, fall back to index_meta.json so a successful
+    // refresh isn't permanently mislabelled "stale" / "none".
     if (!meta) {
+      if (kcMeta?.lastIndexedSha) {
+        const isStale = currentSha != null && kcMeta.lastIndexedSha !== currentSha;
+        const nodeCount = this.countGraphNodes(project, repoName);
+        return {
+          repoName,
+          status: isStale ? 'stale' : 'ready',
+          lastRefreshed: kcMeta.lastIndexedAt,
+          lastCommitSha: kcMeta.lastIndexedSha,
+          currentCommitSha: currentSha,
+          nodeCount,
+          communityCount: 0,
+          error: null,
+          vectorChunks,
+          embeddingProvider,
+          lastEmbeddedAt,
+        };
+      }
       return {
         repoName,
         status: 'none',
@@ -368,13 +388,22 @@ export class KnowledgeBaseManager {
       };
     }
 
-    const isStale = currentSha && meta.lastCommitSha !== currentSha;
+    // When both metadata.json and index_meta.json exist, prefer whichever was
+    // written more recently — knowledge-core only updates index_meta.json on
+    // refresh, so a fresh refresh would otherwise still be reported via the
+    // older legacy SHA in metadata.json.
+    const kcAt = kcMeta?.lastIndexedAt ? new Date(kcMeta.lastIndexedAt).getTime() : 0;
+    const metaAt = meta.lastRefreshed ? new Date(meta.lastRefreshed).getTime() : 0;
+    const useKc = kcMeta?.lastIndexedSha != null && kcAt >= metaAt;
+    const effectiveSha = useKc ? kcMeta!.lastIndexedSha : meta.lastCommitSha;
+    const effectiveRefreshedAt = useKc ? kcMeta!.lastIndexedAt : meta.lastRefreshed;
+    const isStale = currentSha != null && effectiveSha !== currentSha;
 
     return {
       repoName,
       status: meta.status === 'error' ? 'error' : (isStale ? 'stale' : 'ready'),
-      lastRefreshed: meta.lastRefreshed,
-      lastCommitSha: meta.lastCommitSha,
+      lastRefreshed: effectiveRefreshedAt,
+      lastCommitSha: effectiveSha,
       currentCommitSha: currentSha,
       nodeCount: meta.nodeCount,
       communityCount: meta.communityCount,
@@ -383,6 +412,17 @@ export class KnowledgeBaseManager {
       embeddingProvider,
       lastEmbeddedAt,
     };
+  }
+
+  private countGraphNodes(project: string, repo: string): number {
+    const graphPath = join(this.repoDir(project, repo), 'graph.json');
+    if (!existsSync(graphPath)) return 0;
+    try {
+      const data = JSON.parse(readFileSync(graphPath, 'utf-8'));
+      return Array.isArray(data?.nodes) ? data.nodes.length : 0;
+    } catch {
+      return 0;
+    }
   }
 
   async getStatus(project: string): Promise<KBProjectStatus> {

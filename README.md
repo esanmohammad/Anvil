@@ -575,6 +575,28 @@ We rely on the best of the open ecosystem:
 
 ---
 
+## Packages
+
+The monorepo publishes a single user-facing CLI plus the building blocks
+it sits on top of. Every package below is published with **npm provenance**
+(sigstore attestation linking the tarball back to this repo) — `npm install`
+verifies the chain automatically.
+
+| Package | Purpose | npm |
+|---|---|---|
+| [**`@esankhan3/anvil-cli`**](packages/cli) | The user-facing CLI + bundled dashboard. Run `npx @esankhan3/anvil-cli` to start. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-cli.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-cli) [![downloads](https://img.shields.io/npm/dm/@esankhan3/anvil-cli.svg?label=&color=64748b)](https://www.npmjs.com/package/@esankhan3/anvil-cli) |
+| [`@esankhan3/anvil-agent-core`](packages/agent-core) | Shared LLM stack — unified `LanguageModel` interface, provider adapters, agent subprocess machinery, cost calc. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-agent-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-agent-core) |
+| [`@esankhan3/anvil-knowledge-core`](packages/knowledge-core) | AST chunking, tree-sitter parsing, embeddings, LanceDB vector store, hybrid retrieval. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-knowledge-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-knowledge-core) |
+| [`@esankhan3/anvil-memory-core`](packages/memory-core) | Long-term memory — five-type taxonomy, bi-temporal facts, drift detection, sleeptime ratification. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-memory-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-memory-core) |
+| [`@esankhan3/anvil-convention-core`](packages/convention-core) | Convention extraction, rule engine, promotion ledger. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-convention-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-convention-core) |
+| [`@esankhan3/anvil-core-pipeline`](packages/core-pipeline) | Typed `Step<I,O>` graph, `EventBus`, `StepRegistry`, lifecycle hooks. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-core-pipeline.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-core-pipeline) |
+| [`@esankhan3/code-search-mcp`](packages/code-search-mcp) | MCP server for multi-repo code search — GitHub org or local path, zero config. | [![npm](https://img.shields.io/npm/v/@esankhan3/code-search-mcp.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/code-search-mcp) |
+
+> The dashboard (`@anvil-dev/dashboard`) is bundled inside the cli — it is
+> not published as a standalone npm package.
+
+---
+
 ## Status
 
 <table>

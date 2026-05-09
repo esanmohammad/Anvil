@@ -199,8 +199,19 @@ breaks reproducibility — only invalidate on explicit `clearCache()`.
   in user memory).
 - No vendor LLM SDK imports. All provider work routes through
   `@anvil/agent-core`'s `AgentManager`.
-- No direct `@anvil/knowledge-core` imports. KB ops shell out to
-  the cli's `anvil index` via `KnowledgeBaseManager`.
+- No reimplementation of indexing / retrieval. `KnowledgeBaseManager`
+  in `server/knowledge-base-manager.ts` is a thin wrapper: it
+  dynamic-imports `@esankhan3/anvil-knowledge-core`'s `KnowledgeIndexer`
+  + `getRetriever` for chunking, AST graph build, embeddings, LanceDB,
+  and hybrid retrieval. The dashboard owns only the lifecycle layer on
+  top — `origin/main` SHA resolution + detached `git worktree` so the
+  user's working tree isn't touched, `getRepoStatus` / `getStatus` for
+  the Project Overview UI (reads knowledge-core's `index_meta.json` for
+  `lastIndexedSha` / `lastIndexedAt`), `SYSTEM_REPORT.md` deterministic
+  synthesis (cheap companion to knowledge-core's LLM-driven
+  `PROJECT_SUMMARY.md`), `project_index.json` compact keyword index for
+  prompt injection, yaml-based transport extraction, and the in-flight
+  hybrid-context cache (`prefetchHybridContext`).
 
 ## Where to look first
 
