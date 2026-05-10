@@ -296,6 +296,35 @@ function checkProjects(): CheckResult {
   };
 }
 
+/**
+ * Probe the `anvil/sandbox` image. Surfaced as an OPTIONAL check —
+ * Docker isn't required for read-only stages, but the user is more
+ * likely to discover `--pull-sandbox` from this row than from `-h`.
+ */
+function checkSandboxImage(): CheckResult {
+  const dockerBin = process.env.DOCKER_BIN ?? 'docker';
+  const tag = process.env.ANVIL_SANDBOX_TAG ?? 'anvil/sandbox:latest';
+  const dockerOut = tryExec(`${dockerBin} version --format '{{.Server.Version}}' 2>/dev/null`);
+  if (!dockerOut) {
+    return {
+      name: 'docker',
+      ok: false,
+      optional: true,
+      message: 'not installed (sandboxed stages will fall back to host; set ANVIL_SANDBOX_FORCE_NONE=1 to silence)',
+    };
+  }
+  const inspect = tryExec(`${dockerBin} image inspect ${tag} 2>/dev/null`);
+  if (inspect) {
+    return { name: 'sandbox image', ok: true, message: `${tag} present` };
+  }
+  return {
+    name: 'sandbox image',
+    ok: false,
+    optional: true,
+    message: `${tag} not pulled — run "anvil doctor --pull-sandbox"`,
+  };
+}
+
 function formatIcon(result: CheckResult): string {
   if (result.optional && !result.ok) return pc.yellow('\u25CB');
   return result.ok ? pc.green('\u2713') : pc.red('\u2717');
@@ -341,6 +370,7 @@ export async function runDoctor(): Promise<boolean> {
     checkAnvilHome(),
     checkProjects(),
     checkProviderKeys(),
+    checkSandboxImage(),
   ];
 
   const output = formatDoctorResults(results);
