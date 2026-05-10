@@ -349,10 +349,35 @@ export async function runDoctor(): Promise<boolean> {
   return results.every((r) => r.ok || r.optional);
 }
 
+/**
+ * `--pull-sandbox` — pre-warm the anvil/sandbox Docker image so the
+ * first sandboxed stage starts fast. Calls `docker image inspect`;
+ * if missing, `docker pull anvil/sandbox:latest`.
+ */
+async function pullSandboxImage(): Promise<boolean> {
+  const dockerBin = process.env.DOCKER_BIN ?? 'docker';
+  const tag = process.env.ANVIL_SANDBOX_TAG ?? 'anvil/sandbox:latest';
+  try {
+    execSync(`${dockerBin} image inspect ${tag}`, { stdio: ['ignore', 'pipe', 'pipe'] });
+    process.stdout.write(`${tag} already present\n`);
+    return true;
+  } catch {
+    /* fall through to pull */
+  }
+  try {
+    execSync(`${dockerBin} pull ${tag}`, { stdio: 'inherit' });
+    return true;
+  } catch (err) {
+    process.stderr.write(`pull failed: ${(err as Error).message}\n`);
+    return false;
+  }
+}
+
 export const doctorCommand = new Command('doctor')
   .description('Check project health and dependencies')
   .option('--bootstrap-models', 'Write ~/.anvil/models.yaml from the bundled default if missing, then pull any ollama models the registry references but does not have installed locally')
-  .action(async (opts: { bootstrapModels?: boolean }) => {
+  .option('--pull-sandbox', 'Pre-pull the anvil/sandbox Docker image so the first sandboxed stage starts fast')
+  .action(async (opts: { bootstrapModels?: boolean; pullSandbox?: boolean }) => {
     if (opts.bootstrapModels) {
       const { bootstrapModels, BootstrapError } = await import('./bootstrap-models.js');
       try {
@@ -368,6 +393,12 @@ export const doctorCommand = new Command('doctor')
         process.exitCode = 1;
         return;
       }
+    }
+
+    if (opts.pullSandbox) {
+      const ok = await pullSandboxImage();
+      if (!ok) process.exitCode = 1;
+      return;
     }
 
     const allOk = await runDoctor();
