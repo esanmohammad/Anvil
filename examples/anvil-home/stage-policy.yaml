@@ -100,6 +100,22 @@ stages:
     complexity: L
     prefer: [premium]                     # PREMIUM-ONLY — feature planning
 
+  # ── Web/browser tool support (Phase H — browser-web-tools-plan) ───────
+  # `web.fetch` reads page content via a cheap-tier summarizer so the
+  # main agent never sees raw HTML. `browser.extract` does the same for
+  # Tier-2 DOM extraction. Both stages prefer the smallest model that
+  # can summarize/extract reliably; chain-fallback handles upstream
+  # burns the same as every other stage.
+  web-summarizer:
+    capability: reasoning
+    complexity: S
+    prefer: [local, cheap]                # FREE-TIER — Haiku/Flash/8B class
+
+  browser-extractor:
+    capability: reasoning
+    complexity: S
+    prefer: [local, cheap]                # FREE-TIER — same as web-summarizer
+
   # ── Memory hygiene (Phase 4 / PR 4) ────────────────────────────────────
   # End-of-run reflection extracts typed lessons (semantic / fix-pattern,
   # approach, episodic, profile) from the run trace. Short, structured —

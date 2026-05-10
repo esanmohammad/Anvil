@@ -149,12 +149,15 @@ function createComputerBackend(opts: WebToolBridgeOpts) {
     async do(action: unknown, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       const a = action as { action?: string };
       const enriched = enrichCtx(ctx);
-      // Phase H8 — every Tier 3 action goes through the confirm gate.
+      // Phase H8 + H10-followup #9 — confirm-gate Tier 3 actions.
+      // `sessionKey` lets the user approve "all computer_use calls
+      // for this run/session" once instead of N modals per action.
       await confirmGate.confirm({
         tool: 'computer_use',
         description: `Tier 3 pixel browser action: ${a.action ?? '?'}`,
         risk: 'high',
         payload: action,
+        sessionKey: `computer:${enriched.runId}:${enriched.sessionId}`,
       });
       const runner = await ensure(enriched.runId!);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -168,7 +171,12 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
   const registry = new BrowserSessionRegistry(factory);
   const confirmGate = new ConfirmGate({ ask: opts.confirmer });
   const contextStore = new ContextStore();
-  const projectSlug = opts.projectSlug ?? 'default';
+  // projectSlug is now resolved per-call via `resolveProjectSlug(ctx)`,
+  // not at backend construction time, so allowedContexts can read live
+  // pipeline-policy state. The static `opts.projectSlug` is honored as
+  // a fallback when no step ctx is registered.
+  const fallbackProjectSlug = opts.projectSlug ?? 'default';
+  void fallbackProjectSlug;
 
   // Phase H7 — per-session no-progress detector + rate limiters.
   // Keyed on (runId, sessionId) so multiple concurrent sessions don't

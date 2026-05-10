@@ -160,7 +160,24 @@ function resolveStageModelWithFallback(stage: string): string {
     return resolveModelForStage(stage).primary;
   } catch (err) {
     if (err && typeof err === 'object' && (err as { name?: string }).name === 'UnknownStageError') {
-      return resolveModelForStage('research').primary;
+      // H10-followup #8 — clearer error chain. Stage missing from
+      // user's policy → try `research` as the FREE-tier fallback. If
+      // `research` is also missing, surface a single message that
+      // explains both the desired stage and the fallback failed so
+      // the user knows what to add.
+      try {
+        return resolveModelForStage('research').primary;
+      } catch (researchErr) {
+        if (researchErr && typeof researchErr === 'object'
+            && (researchErr as { name?: string }).name === 'UnknownStageError') {
+          throw new Error(
+            `web/browser tools require either a "${stage}" or a "research" stage in ` +
+            `your stage-policy.yaml. Add at least one. See ` +
+            `docs/browser-web-tools-guide.md for the recommended config.`,
+          );
+        }
+        throw researchErr;
+      }
     }
     throw err;
   }
