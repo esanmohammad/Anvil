@@ -10,10 +10,9 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { AgentManager } from '@esankhan3/anvil-agent-core';
 import { ProjectLoader } from './project-loader.js';
 import type { ProjectInfo } from './project-loader.js';
@@ -49,6 +48,22 @@ import {
   logCacheTelemetry as logCacheTelemetryFn,
   type RunnerTelemetryDeps,
 } from './runner-telemetry.js';
+import {
+  setupWorkspace as setupWorkspaceFn,
+  detectRepos as detectReposFn,
+  pullLatestMain as pullLatestMainFn,
+  getBaseBranch as getBaseBranchFn,
+  type BootstrapDeps,
+} from './pipeline-bootstrap.js';
+import {
+  loadPriorArtifacts as loadPriorArtifactsFn,
+  loadStageArtifact as loadStageArtifactFn,
+  loadRepoArtifacts as loadRepoArtifactsFn,
+  loadHighLevelRequirements as loadHighLevelRequirementsFn,
+  writeStageArtifact as writeStageArtifactFn,
+  writeRepoArtifact as writeRepoArtifactFn,
+  type ArtifactIODeps,
+} from './artifact-io.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -136,7 +151,6 @@ import { runClarifyForProject } from './steps/clarify-stage.step.js';
 import { runFixLoop } from './steps/fix-loop.step.js';
 import { runTestGenForProject } from './steps/test-gen-stage.step.js';
 import {
-  pullBaseBranchForRepos,
   runPostBuildGuards,
   deployProject,
   createFeatureBranches as createFeatureBranchesHelper,
@@ -848,89 +862,32 @@ export class PipelineRunner extends EventEmitter {
 
   // ── Workspace setup ────────────────────────────────────────────────
 
-  private async setupWorkspace(): Promise<void> {
-    console.log(`[pipeline] Setting up workspace for ${this.config.project}...`);
-
-    // Load project info from factory.yaml
-    try {
-      this.projectInfo = await this.projectLoader.getProject(this.config.project);
-      this.emit('project-event', {
-        source: 'project-context',
-        message: `Project config loaded: "${this.config.project}" (${this.projectInfo!.repos.length} repos)`,
-      });
-    } catch {
-      console.warn(`[pipeline] Could not load project config for ${this.config.project}`);
-      this.emit('project-event', {
-        source: 'project-context',
-        message: `Could not load project config for "${this.config.project}" — falling back to workspace scan`,
-        level: 'warn',
-      });
-    }
-
-    // Ensure workspace exists
-    const wsStatus = await this.projectLoader.ensureWorkspace(this.config.project);
-    if (!wsStatus.exists) {
-      console.warn(`[pipeline] Workspace not ready: ${wsStatus.path}`);
-    } else {
-      this.emit('project-event', {
-        source: 'project-context',
-        message: `Workspace ready at ${wsStatus.path}`,
-      });
-    }
-
-    // Resolve repo paths
-    this.repoPaths = this.projectLoader.getRepoLocalPaths(this.config.project);
-    const repoNames = Object.keys(this.repoPaths);
-
-    // Use explicit repos from config, or fall back to discovered repos
-    if (this.config.repos && this.config.repos.length > 0) {
-      this.state.repoNames = this.config.repos.filter((r) => repoNames.includes(r));
-    } else if (repoNames.length > 0) {
-      this.state.repoNames = repoNames;
-    }
-
-    // Initialize per-repo state for repo stages
-    for (const stage of this.state.stages) {
-      if (stage.perRepo) {
-        stage.repos = this.state.repoNames.map((name) => ({
-          repoName: name,
-          agentId: null,
-          status: 'pending',
-          cost: 0,
-          artifact: '',
-          error: null,
-        }));
-      }
-    }
-
-    // Pull latest main branch for each repo so we start from up-to-date code
-    await this.pullLatestMain();
-
-    this.broadcastState();
-    this.checkpoint(); // Save repos + workspace info
-    console.log(`[pipeline] Workspace ready. Repos: ${this.state.repoNames.join(', ') || '(none — will use project root)'}`);
-  }
-
-  /** Get the resolved base branch name */
-  private getBaseBranch(): string {
-    return this.config.baseBranch || 'main';
-  }
-
-  /**
-   * Checkout and pull the latest base branch for each repo before starting the pipeline.
-   * Uses config.baseBranch, then tries main, then master as fallback.
-   */
-  private async pullLatestMain(): Promise<void> {
-    await pullBaseBranchForRepos({
-      baseBranch: this.config.baseBranch,
-      repoPaths: this.repoPaths,
-      repoNames: this.state.repoNames,
+  /** Bundle the bootstrap dep set. Lazy refs; one-time per call. */
+  private depsForBootstrap(): BootstrapDeps {
+    return {
+      config: this.config,
+      projectLoader: this.projectLoader,
+      state: this.state,
       workspaceDir: this.workspaceDir,
-      onLog: (level, message) => {
-        if (level === 'info') console.log(`[pipeline] ${message}`);
-        else console.warn(`[pipeline] ${message}`);
-      },
-    });
+      emitProjectEvent: (payload) => this.emit('project-event', payload),
+      setProjectInfo: (info) => { this.projectInfo = info; },
+      setRepoPaths: (paths) => { this.repoPaths = paths; },
+      getRepoPaths: () => this.repoPaths,
+      broadcast: () => this.broadcastState(),
+      checkpoint: () => this.checkpoint(),
+    };
+  }
+
+  private setupWorkspace(): Promise<void> {
+    return setupWorkspaceFn(this.depsForBootstrap());
+  }
+
+  private getBaseBranch(): string {
+    return getBaseBranchFn(this.config);
+  }
+
+  private pullLatestMain(): Promise<void> {
+    return pullLatestMainFn(this.depsForBootstrap());
   }
 
   // ── One-stage dispatcher ─────────────────────────────────────────
@@ -1900,193 +1857,44 @@ export class PipelineRunner extends EventEmitter {
     };
   }
 
-  // ── Artifact loading (for resume) ──────────────────────────────────
+  // ── Artifact + repo I/O — delegate to siblings ─────────────────────
 
-  /** Load all prior stage artifacts to build context for resume */
+  /** Bundle the artifact-io dep set. */
+  private depsForArtifactIO(): ArtifactIODeps {
+    return {
+      config: this.config,
+      state: this.state,
+      featureStore: this.featureStore,
+      emit: (event, payload) => this.emit(event, payload),
+    };
+  }
+
   private loadPriorArtifacts(_upToStage: number): string {
-    const project = this.config.project;
-    const slug = this.state.featureSlug;
-    const parts: string[] = [];
-
-    // Load main artifacts
-    const mainArtifacts = ['CLARIFICATION.md', 'REQUIREMENTS.md'];
-    for (const file of mainArtifacts) {
-      const content = this.featureStore.readArtifact(project, slug, file);
-      if (content) parts.push(`## ${file}\n${content}`);
-    }
-
-    // Load per-repo artifacts
-    for (const repoName of this.state.repoNames) {
-      const repoArtifacts = ['REQUIREMENTS.md', 'SPECS.md', 'TASKS.md', 'BUILD.md', 'VALIDATE.md'];
-      for (const file of repoArtifacts) {
-        const content = this.featureStore.readArtifact(project, slug, `repos/${repoName}/${file}`);
-        if (content) parts.push(`## ${repoName}/${file}\n${content}`);
-      }
-    }
-
-    // Add failure context if available
-    if (this.config.failureContext) {
-      parts.push(`## Previous Failure\n${this.config.failureContext}`);
-    }
-
-    return parts.join('\n\n---\n\n');
+    return loadPriorArtifactsFn(this.depsForArtifactIO());
   }
 
-  /** Load a single stage's artifact from the feature store */
   private loadStageArtifact(stage: StageDefinition): string {
-    const project = this.config.project;
-    const slug = this.state.featureSlug;
-
-    const mainArtifactMap: Record<string, string> = {
-      clarify: 'CLARIFICATION.md',
-      requirements: 'REQUIREMENTS.md',
-      ship: 'SHIP.md',
-    };
-
-    const repoArtifactMap: Record<string, string> = {
-      'repo-requirements': 'REQUIREMENTS.md',
-      specs: 'SPECS.md',
-      tasks: 'TASKS.md',
-      build: 'BUILD.md',
-      validate: 'VALIDATE.md',
-    };
-
-    // Try main artifact
-    const mainFile = mainArtifactMap[stage.name];
-    if (mainFile) {
-      return this.featureStore.readArtifact(project, slug, mainFile) ?? '';
-    }
-
-    // Try per-repo artifacts (combine all repos)
-    const repoFile = repoArtifactMap[stage.name];
-    if (repoFile && this.state.repoNames.length > 0) {
-      const parts: string[] = [];
-      for (const repoName of this.state.repoNames) {
-        const content = this.featureStore.readArtifact(project, slug, `repos/${repoName}/${repoFile}`);
-        if (content) parts.push(`## ${repoName}\n${content}`);
-      }
-      return parts.join('\n\n');
-    }
-
-    return '';
+    return loadStageArtifactFn(this.depsForArtifactIO(), stage);
   }
-
-  // ── Repo detection ─────────────────────────────────────────────────
 
   private detectRepos(_requirementsArtifact: string): void {
-    // If we already have repos from project info, use those
-    if (this.state.repoNames.length > 0) return;
-
-    // Try to detect from workspace directory — only directories that are actual git repos
-    try {
-      const entries = readdirSync(this.workspaceDir, { withFileTypes: true });
-      const dirs = entries
-        .filter((e) => {
-          if (!e.isDirectory() || e.name.startsWith('.')) return false;
-          // Must contain a .git directory to be a real repo
-          const gitDir = join(this.workspaceDir, e.name, '.git');
-          return existsSync(gitDir);
-        })
-        .map((e) => e.name);
-      if (dirs.length > 0) {
-        this.state.repoNames = dirs;
-        // Also populate repoPaths so agents get the correct cwd
-        for (const dir of dirs) {
-          this.repoPaths[dir] = join(this.workspaceDir, dir);
-        }
-        console.log(`[pipeline] Detected repos from workspace: ${dirs.join(', ')}`);
-        // Re-initialize per-repo state
-        for (const stage of this.state.stages) {
-          if (stage.perRepo) {
-            stage.repos = dirs.map((name) => ({
-              repoName: name,
-              agentId: null,
-              status: 'pending',
-              cost: 0,
-              artifact: '',
-              error: null,
-            }));
-          }
-        }
-        this.broadcastState();
-      }
-    } catch {
-      // Workspace might not exist
-    }
+    detectReposFn(this.depsForBootstrap());
   }
 
-  // ── Silent post-build guards (format + lint auto-fix) ──────────────
-
-  // ── Artifact writing ───────────────────────────────────────────────
-
   private writeStageArtifact(_index: number, stage: StageDefinition, artifact: string): void {
-    try {
-      const artifactMap: Record<string, string> = {
-        clarify: 'CLARIFICATION.md',
-        requirements: 'REQUIREMENTS.md',
-        ship: 'SHIP.md',
-      };
-
-      const filename = artifactMap[stage.name];
-      if (filename) {
-        const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
-        this.featureStore.writeArtifact(this.config.project, this.state.featureSlug, filename, artifact);
-        // Emit so dashboard can show in changes tab
-        this.emit('artifact-written', {
-          stage: stage.name,
-          file: `${featureDir}/${filename}`,
-          summary: `${stage.label} artifact`,
-          content: artifact,
-        });
-      }
-    } catch (err) {
-      console.warn(`[pipeline] Failed to write artifact for ${stage.name}:`, err);
-    }
+    writeStageArtifactFn(this.depsForArtifactIO(), stage, artifact);
   }
 
   private writeRepoArtifact(stage: StageDefinition, repoName: string, artifact: string): void {
-    try {
-      const artifactMap: Record<string, string> = {
-        'repo-requirements': 'REQUIREMENTS.md',
-        specs: 'SPECS.md',
-        tasks: 'TASKS.md',
-        build: 'BUILD.md',
-        validate: 'VALIDATE.md',
-      };
-
-      const filename = artifactMap[stage.name];
-      if (filename) {
-        const relativePath = `repos/${repoName}/${filename}`;
-        const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
-        this.featureStore.writeArtifact(this.config.project, this.state.featureSlug, relativePath, artifact);
-        this.emit('artifact-written', {
-          stage: stage.name,
-          file: `${featureDir}/${relativePath}`,
-          repo: repoName,
-          summary: `${stage.label} for ${repoName}`,
-          content: artifact,
-        });
-      }
-    } catch (err) {
-      console.warn(`[pipeline] Failed to write repo artifact for ${stage.name}/${repoName}:`, err);
-    }
+    writeRepoArtifactFn(this.depsForArtifactIO(), stage, repoName, artifact);
   }
 
-  /** Load per-repo artifacts the next stage's prompt-builder needs. */
   private loadRepoArtifacts(repoName: string): { requirements: string; specs: string; tasks: string; build: string } {
-    const project = this.config.project;
-    const slug = this.state.featureSlug;
-    return {
-      requirements: this.featureStore.readArtifact(project, slug, `repos/${repoName}/REQUIREMENTS.md`) ?? '',
-      specs: this.featureStore.readArtifact(project, slug, `repos/${repoName}/SPECS.md`) ?? '',
-      tasks: this.featureStore.readArtifact(project, slug, `repos/${repoName}/TASKS.md`) ?? '',
-      build: this.featureStore.readArtifact(project, slug, `repos/${repoName}/BUILD.md`) ?? '',
-    };
+    return loadRepoArtifactsFn(this.depsForArtifactIO(), repoName);
   }
 
-  /** Load the high-level (cross-repo) requirements artifact. */
   private loadHighLevelRequirements(): string {
-    return this.featureStore.readArtifact(this.config.project, this.state.featureSlug, 'REQUIREMENTS.md') ?? '';
+    return loadHighLevelRequirementsFn(this.depsForArtifactIO());
   }
 
   private broadcastState(): void {
