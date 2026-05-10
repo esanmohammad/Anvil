@@ -519,3 +519,13 @@ export type {
   OrderedTaskBatch,
 } from './routing/resolve-model-for-task.js';
 export type { TaskPriority } from './routing/task-envelope.js';
+
+// Phase S — sandbox isolation surface.
+export * from './sandbox/index.js';
+export {
+  STAGE_SANDBOX_POLICY,
+  PACKAGE_MANAGER_ALLOW_LIST,
+  sandboxPolicyForStage,
+  stageIsSandboxed,
+  mergeStageSandboxPolicy,
+} from './routing/sandbox-policy.js';

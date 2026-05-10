@@ -47,6 +47,7 @@ import { STAGES as RUNNER_STAGES } from './pipeline-runner.js';
 import type { ResumeDecision } from './pipeline-pause-types.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
+import { registerSandboxRunnersAtBoot } from './sandbox/register-at-boot.js';
 import type { PipelineRunState } from './pipeline-runner.js';
 import { ProjectLoader } from './project-loader.js';
 import type { ProjectRepo } from './project-loader.js';
@@ -932,6 +933,14 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       }
     },
   }));
+  // ── Phase S follow-up #1 — register sandbox runtimes process-wide ──
+  // The dashboard owns the concrete Mode 1/2 runners; core-pipeline only
+  // ships the contract + the `none` runner. Register them here so any
+  // call to `getSandboxRunner('docker' | 'firecracker' | 'gvisor')`
+  // resolves to a real implementation. ANVIL_SANDBOX_FORCE_NONE skips
+  // registration entirely (Phase S follow-up #4) so users without
+  // Docker installed don't see "not registered" errors.
+  await registerSandboxRunnersAtBoot();
   const memoryStore = new MemoryStore();
   const kbManager = new KnowledgeBaseManager(projectLoader);
   const planStore = new PlanStore(ANVIL_HOME);
