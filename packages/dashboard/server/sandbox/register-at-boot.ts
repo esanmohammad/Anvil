@@ -21,6 +21,7 @@ import { registerSandboxRunner } from '@esankhan3/anvil-core-pipeline';
 import { DockerSandboxRunner } from './docker-runner.js';
 import { FirecrackerSandboxRunner } from './firecracker-runner.js';
 import { GVisorSandboxRunner } from './gvisor-runner.js';
+import { PooledSandboxRunner } from './pooled-runner.js';
 
 export interface BootRegistrationResult {
   registered: Array<'docker' | 'firecracker' | 'gvisor'>;
@@ -34,15 +35,13 @@ export async function registerSandboxRunnersAtBoot(): Promise<BootRegistrationRe
 
   const out: BootRegistrationResult = { registered: [] };
 
-  // Docker — the canonical Mode 1 runtime.
+  // Docker — the canonical Mode 1 runtime. Pool-wrapped so multiple
+  // stages within a run share warm containers (S7 design).
   try {
     const probe = new DockerSandboxRunner();
     if (await probe.isAvailable()) {
-      registerSandboxRunner('docker', () => new DockerSandboxRunner());
+      registerSandboxRunner('docker', () => new PooledSandboxRunner(new DockerSandboxRunner()));
       out.registered.push('docker');
-    } else {
-      // Probe used a fresh runner; nothing to clean up.
-      void probe;
     }
   } catch { /* probe failed — silently skip */ }
 
@@ -50,7 +49,7 @@ export async function registerSandboxRunnersAtBoot(): Promise<BootRegistrationRe
   try {
     const probe = new FirecrackerSandboxRunner();
     if (await probe.isAvailable()) {
-      registerSandboxRunner('firecracker', () => new FirecrackerSandboxRunner());
+      registerSandboxRunner('firecracker', () => new PooledSandboxRunner(new FirecrackerSandboxRunner()));
       out.registered.push('firecracker');
     }
   } catch { /* skip */ }
@@ -59,7 +58,7 @@ export async function registerSandboxRunnersAtBoot(): Promise<BootRegistrationRe
   try {
     const probe = new GVisorSandboxRunner();
     if (await probe.isAvailable()) {
-      registerSandboxRunner('gvisor', () => new GVisorSandboxRunner());
+      registerSandboxRunner('gvisor', () => new PooledSandboxRunner(new GVisorSandboxRunner()));
       out.registered.push('gvisor');
     }
   } catch { /* skip */ }

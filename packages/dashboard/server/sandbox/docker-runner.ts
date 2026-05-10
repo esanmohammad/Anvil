@@ -37,6 +37,8 @@ import type {
 } from '@esankhan3/anvil-core-pipeline/sandbox/types.js';
 import { dockerRunLimitArgs, detectLimitKill } from './resource-limits.js';
 import { buildCacheMounts, dockerCacheMountArgs, type CacheMode } from './cache-mounts.js';
+import { dockerRunNetworkArgs, resolveNetworkPolicy } from './network-policy.js';
+import { applyOverlay, captureBaselineMtimes } from './overlay-fs.js';
 
 /** Default base image. Overridable via `AcquireSandboxOpts.image`. */
 export const DEFAULT_SANDBOX_IMAGE = 'anvil/sandbox:latest';
@@ -72,19 +74,31 @@ export class DockerSandboxHandle implements SandboxHandle {
   readonly hostWorkdir: string;
   readonly image: string;
   readonly containerName: string;
+  readonly fsMode: 'overlay' | 'bind' | 'none';
   readonly createdAtMs = Date.now();
+  /** Baseline mtimes captured at acquire — used by overlay sync to
+   *  detect host edits during the sandbox lifetime. */
+  baselineMtimes: Map<string, number> | null = null;
   busy = false;
   closed = false;
 
   constructor(
     private readonly runner: DockerSandboxRunner,
-    opts: { id: string; containerName: string; hostWorkdir: string; image: string; limits: SandboxLimits },
+    opts: {
+      id: string;
+      containerName: string;
+      hostWorkdir: string;
+      image: string;
+      limits: SandboxLimits;
+      fsMode: 'overlay' | 'bind' | 'none';
+    },
   ) {
     this.id = opts.id;
     this.containerName = opts.containerName;
     this.hostWorkdir = opts.hostWorkdir;
     this.image = opts.image;
     this.limits = opts.limits;
+    this.fsMode = opts.fsMode;
   }
 
   async exec(args: SandboxExecArgs): Promise<SandboxExecResult> {
@@ -151,10 +165,32 @@ export class DockerSandboxHandle implements SandboxHandle {
 
   async syncToHost(_opts?: { mode?: 'merge' | 'replace' }): Promise<SandboxSyncResult> {
     void _opts;
-    // S2 uses bind-mode by default; the host already sees every write.
-    // Overlay propagation is S3.
+    if (this.fsMode === 'bind' || this.fsMode === 'none') {
+      // Host already sees every write; nothing to propagate.
+      return { added: [], modified: [], removed: [], conflictResolution: 'merged' };
+    }
+    // F3 — overlay mode. The current implementation still uses a
+    // bind mount for the workdir (real overlayfs requires a tmpfs
+    // upper layer; that's a follow-up). Until then, applyOverlay
+    // surfaces post-hoc conflicts: scan the host workdir for
+    // baseline-drifted files and flag them via the conflicts list.
+    if (!this.baselineMtimes) {
+      return { added: [], modified: [], removed: [], conflictResolution: 'merged' };
+    }
+    // No upper directory yet — call applyOverlay on a "mirror of
+    // self" so it produces the conflict report without writing.
+    // When real overlay arrives, the upperRoot path comes from the
+    // tmpfs mount.
+    const r = await applyOverlay(this.hostWorkdir, this.hostWorkdir, {
+      dryRun: true,
+      baselineMtimes: this.baselineMtimes,
+    }).catch(() => null);
+    if (!r) return { added: [], modified: [], removed: [], conflictResolution: 'merged' };
     return {
-      added: [], modified: [], removed: [], conflictResolution: 'merged',
+      added: r.added,
+      modified: r.modified,
+      removed: r.removed,
+      conflictResolution: r.conflictResolution,
     };
   }
 
@@ -224,6 +260,17 @@ export class DockerSandboxRunner implements SandboxRunner {
     // 1000 on Linux). Read-only mounts also benefit because tools
     // like `git` refuse to operate on a tree owned by a different uid
     // (the "dubious ownership" warning).
+    // F3 — resolve and splice the per-stage network policy. The
+    // AcquireSandboxOpts surface doesn't yet pass a fully-resolved
+    // policy, so we synthesise one from the limits.network field
+    // (set by core-pipeline's STAGE_SANDBOX_POLICY) plus any
+    // pre-resolved overlay the caller passed via opts.limits.network.
+    const resolved = opts.limits?.network
+      ? resolveNetworkPolicy({
+          stagePolicy: { mode: 'container', fsMode: 'overlay', limits: { network: opts.limits.network } },
+          projectOverlay: undefined,
+        })
+      : null;
     const args = [
       'run',
       '-d',                           // detached
@@ -236,6 +283,8 @@ export class DockerSandboxRunner implements SandboxRunner {
       ...dockerRunLimitArgs(opts.limits),
       // S8: read-only package-manager cache mounts.
       ...dockerCacheMountArgs(cacheMounts),
+      // F3: per-stage network policy (default-deny + allow-list).
+      ...(resolved ? dockerRunNetworkArgs(resolved) : []),
       // Block exec without a TTY so a poisoned container can't run an
       // interactive shell to phone home.
       '--init',
@@ -252,13 +301,21 @@ export class DockerSandboxRunner implements SandboxRunner {
       );
     }
 
+    const fsMode = opts.fsMode ?? 'overlay';
     const handle = new DockerSandboxHandle(this, {
       id: containerName,
       containerName,
       hostWorkdir,
       image,
       limits: opts.limits ?? {},
+      fsMode,
     });
+    if (fsMode === 'overlay') {
+      // F3 — capture baseline mtimes so syncToHost can detect host
+      // edits during the sandbox lifetime. Best-effort; failures
+      // degrade to "no baseline → no conflict detection".
+      handle.baselineMtimes = await captureBaselineMtimes(hostWorkdir).catch(() => new Map());
+    }
     this.handles.set(handle.id, handle);
     return handle;
   }
