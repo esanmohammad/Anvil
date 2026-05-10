@@ -35,6 +35,7 @@ import type {
   SandboxSnapshot,
   SandboxSyncResult,
 } from '@esankhan3/anvil-core-pipeline/sandbox/types.js';
+import { dockerRunLimitArgs, detectLimitKill } from './resource-limits.js';
 
 /** Default base image. Overridable via `AcquireSandboxOpts.image`. */
 export const DEFAULT_SANDBOX_IMAGE = 'anvil/sandbox:latest';
@@ -210,6 +211,8 @@ export class DockerSandboxRunner implements SandboxRunner {
       '--workdir', SANDBOX_WORKDIR,
       // S2: bind-mount only. Overlay arrives in S3.
       '--mount', `type=bind,src=${hostWorkdir},dst=${SANDBOX_WORKDIR}`,
+      // S5: per-stage resource limits — memory, cpus, pids, disk.
+      ...dockerRunLimitArgs(opts.limits),
       // Block exec without a TTY so a poisoned container can't run an
       // interactive shell to phone home.
       '--init',
@@ -346,7 +349,16 @@ export class DockerSandboxRunner implements SandboxRunner {
           stderr: res.stderr,
           durationMs: Date.now() - startedAt,
         };
-        if (res.killedByLimit) out.killedByLimit = res.killedByLimit;
+        if (res.killedByLimit) {
+          out.killedByLimit = res.killedByLimit;
+        } else {
+          // S5: classify exit codes / stderr for OOM / disk / pid kills.
+          const detected = detectLimitKill({
+            exitCode: res.exitCode,
+            stderr: res.stderr,
+          });
+          if (detected) out.killedByLimit = detected;
+        }
         if (res.truncated) out.truncated = res.truncated;
         resolve(out);
       });
