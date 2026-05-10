@@ -7392,15 +7392,30 @@ Findings array may be empty. No prose outside the JSON block.`;
     console.log(`[dashboard] sleeptime consolidation every ${Math.round(sleeptimeIntervalMs / 60_000)}m`);
   }
 
-  // Phase D3: Pattern-1 → Pattern-2 migration. Scan for in-flight
-  // runs that lack a row in the durable store and mark them as
-  // failed so the user knows to rerun. No artifacts are touched.
+  // Phase D3+F4: Pattern-1 migration + orphan takeover. Scans for
+  // in-flight runs without a durable row (Pattern-1) AND for
+  // crashed-peer runs whose lease has expired (orphan takeover).
+  // Auto-takeover acquires the lease so a resume orchestrator can
+  // continue the run from its durable cursor. No artifacts touched.
   try {
     const durableStore = getDurableStore();
-    const migrationStats = await runDurableMigration(durableStore);
-    if (migrationStats.scanned > 0 || migrationStats.orphaned > 0) {
+    const migrationStats = await runDurableMigration(durableStore, {
+      onTakeover: (runIds) => {
+        console.log(
+          `[dashboard] auto-takeover: claimed ${runIds.length} orphaned run(s) — ${runIds.join(', ')}`,
+        );
+        // The auto-replay queue (loaded later in boot) will pick up
+        // these runIds via its own scanner; we don't trigger
+        // Pipeline.run here to keep boot non-blocking.
+      },
+    });
+    if (
+      migrationStats.scanned > 0
+      || migrationStats.orphaned > 0
+      || migrationStats.takenOver > 0
+    ) {
       console.log(
-        `[dashboard] durable migration: scanned=${migrationStats.scanned} migrated=${migrationStats.migrated} orphaned=${migrationStats.orphaned} errors=${migrationStats.errors}`,
+        `[dashboard] durable migration: scanned=${migrationStats.scanned} migrated=${migrationStats.migrated} orphaned=${migrationStats.orphaned} takenOver=${migrationStats.takenOver} contested=${migrationStats.takeoverContested} errors=${migrationStats.errors}`,
       );
     }
   } catch (err) {
