@@ -378,7 +378,7 @@ async function runPerRepoStage(
 
     if (stage.name === 'build' && stage.persona === 'engineer') {
       promises.push(
-        runBuildForRepo(deps, index, repoIdx, stage, repoName, repoPath, projectPrompt)
+        runBuildForRepo(deps, index, repoIdx, stage, repoName, repoPath, projectPrompt, ctx)
           .then((res) => ({
             repoName,
             artifact: res.artifact,
@@ -536,11 +536,12 @@ async function runBuildForRepo(
   repoName: string,
   repoPath: string,
   projectPrompt: string,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const repoArtifacts = loadRepoArtifactsFn(deps.depsForArtifactIO(), repoName);
 
   const runner = makeAgentRunner(deps, stage.name);
-  const result = await runBuildForOneRepo({
+  const buildOpts = {
     runner,
     project: deps.config.project,
     stageName: stage.name,
@@ -555,10 +556,21 @@ async function runBuildForRepo(
       buildPerTaskPromptHelper(deps.getPromptContext(), repoName, repoPath, task, repoArtifacts.specs),
     buildFallbackPrompt: () => buildRepoStagePromptHelper(deps.getPromptContext(), stage, repoName, ''),
     isCancelled: () => deps.isCancelled(),
-    onProjectEvent: (level, message) => {
+    onProjectEvent: (level: 'info' | 'warn' | 'error', message: string) => {
       deps.emit('project-event', { source: 'pipeline', message, level });
     },
-  });
+  };
+  // Phase E5: durable wrap for per-repo build. Idempotency key
+  // includes the runId + repo to scope replay to this run.
+  // Per-task granularity is a future refinement (would require
+  // threading ctx through runBuildForOneRepo in core-pipeline).
+  const result = ctx
+    ? await ctx.effect(
+        `build:repo-${repoName}`,
+        async () => serializeAgentRunResult(await runBuildForOneRepo(buildOpts) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runBuildForOneRepo>>,
+        { idempotencyKey: `${ctx.runId}:${repoName}:build` },
+      )
+    : await runBuildForOneRepo(buildOpts);
 
   const repoStateDone = deps.state.stages[stageIndex].repos[repoIdx];
   if (repoStateDone) {
@@ -568,7 +580,18 @@ async function runBuildForRepo(
   }
   deps.broadcast();
   deps.checkpoint();
-  writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.artifact);
+  if (ctx) {
+    await ctx.effect(
+      `build:write-${repoName}`,
+      async () => {
+        writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.artifact);
+        return null;
+      },
+      { idempotencyKey: artifactIdempotencyKey('build', repoName, result.artifact) },
+    );
+  } else {
+    writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.artifact);
+  }
 
   return {
     artifact: result.artifact,
