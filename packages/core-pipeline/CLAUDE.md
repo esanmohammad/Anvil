@@ -116,6 +116,17 @@ you want supported, otherwise the resolver throws `UnknownStageError`.
       `buildClarifySynthesisPrompt`, `runClarifyQALoop`,
       `deriveClarifyQuestions`. The runner-agnostic primitives;
       callers wire their own input resolver.
+    - `qa.ts` — generic stage Q&A primitives shared across the
+      planning stages (requirements / repo-requirements / specs).
+      Exports `STAGE_QA_PROMPT_HEADER(maxQuestions)` (the prompt
+      prefix that opts an agent into asking up to N questions in a
+      `<questions>...</questions>` block before producing the
+      artifact), `parseStageQuestions(text, max)` (extracts the
+      block; `[]` when missing — signal the agent is producing the
+      artifact directly), and `formatStageAnswers(pairs)` (renders
+      the `<answers>...</answers>` block sent on resume). The
+      dashboard's `runStageWithQA` wires these into a multi-turn
+      session.
     - `telemetry.ts` — `writePerRepoTelemetry` writes JSONL records to
       `~/.anvil/runs/<runId>/per-repo-telemetry.jsonl` so silent-empty
       artifacts and cost anomalies leave a forensic trail.

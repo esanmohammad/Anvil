@@ -13,25 +13,33 @@ process, single file orchestrator (`server/dashboard-server.ts`).
   `prUrls` / `costLedger` / `runStore` rollups. Single-file by design
   — splitting it has been deferred until the WS event vocabulary
   (D10) is locked.
-- **`server/pipeline-runner.ts`** (~550 LOC) — per-run orchestrator
+- **`server/pipeline-runner.ts`** (~600 LOC) — per-run orchestrator
   shell. Owns the `PipelineRunner` class: state, public API
   (`setReviewNote` / `applyArtifactEdit` / `requestRerunFromStage` /
-  `iterateCurrentStageWithNote` / `provideInput` / `cancel` /
-  `getState` / `setAfterStageHook` / `checkpoint`), the constructor +
+  `iterateCurrentStageWithNote` / `provideInput` / `provideStageAnswer`
+  / `getStageQuestions` / `setQAPolicy` / `cancel` / `getState` /
+  `setAfterStageHook` / `checkpoint`), the constructor +
   workspace bootstrap, six `depsForX()` bag builders, and a thin
   `run()` body that calls `prepareRun` → `attachPipelineHooks` →
-  `runPipelineLoop`. The actual stage logic lives in siblings.
+  `runPipelineLoop`. The actual stage logic lives in siblings. Q&A
+  routing uses a per-(stageIndex, repoName?) `stageInputResolvers`
+  Map that fires once every question for the (stage, repo) has an
+  answer.
 - **`server/pipeline-stages.ts`** — `runOneStage` (the per-stage
   dispatcher: resume skip, planSeed branch, dispatch to
   clarify/perRepo/single, validate→fix loop, after-stage hook,
-  reviewer rerun, ship deploy) + 6 sub-functions (`runClarifyStage`,
+  reviewer rerun, ship deploy) + 7 sub-functions (`runClarifyStage`,
   `runPerRepoStage`, `runBuildForRepo`, `runSingleStage`,
-  `runTestGenStage`, `runFixLoop`) + `makeAgentSession` /
-  `makeAgentRunner` factories + `resetStagesForRerun`. Each free
+  `runStageWithQA`, `runTestGenStage`, `runFixLoop`) + `makeAgentSession`
+  / `makeAgentRunner` factories + `resetStagesForRerun`. Each free
   function takes a `StageOpsDeps` opts bag bundling state, config,
   side-effect hooks. Control-flow exits (`continue` / `next` /
   `cancelled` / `fail-early-return` / `rewind`) flow back to
   `pipeline-loop.ts` which translates them to walker sentinels.
+  `STAGES_WITH_QA = {requirements, repo-requirements, specs}` —
+  hard-coded scope for Q&A; agents in those stages may ask up to
+  `policy.qa.maxQuestionsPerStage` clarifying questions before
+  producing the artifact.
 - **`server/pipeline-loop.ts`** — `runPipelineLoop(opts)` drives
   `Pipeline.run()` from core-pipeline over an `InMemoryStepRegistry`
   built per iteration. Each Step's `runStage` callback delegates to
@@ -84,7 +92,25 @@ process, single file orchestrator (`server/dashboard-server.ts`).
 - **`server/pipeline-runner-types.ts`** — type declarations +
   module-level constants (`STAGES`, `STAGE_OUTPUT_LIMITS`,
   `LOCAL_TIER_STAGES`, `PLAN_DERIVED_STAGES`, token-stat helpers,
-  checkpoint reader, `AfterStageHook` contract).
+  checkpoint reader, `AfterStageHook` contract, `StageQuestion` type
+  + `questions?: StageQuestion[]` slot on `PipelineStageState` /
+  `RepoAgentState`).
+- **`server/pipeline-policy.ts`** — `loadPolicy(project)` always
+  returns a `PipelinePolicy` (never `null`). When no
+  `~/.anvil/projects/<slug>/pipeline-policy.yaml` exists, returns
+  `BUILTIN_DEFAULT_POLICY` (`enabled: true`, `pauseAfter: ['plan']`,
+  `autoApproveIfRisk: 'low'`, `autoApproveIfConfidence: 0.85`,
+  `qa: { enabled: true, maxQuestionsPerStage: 5 }`,
+  `cost: { onBreach: 'ask', perRun: 10, perProjectDaily: 30 }`).
+  `applyOverlay` layers `pipeline-policy.overlay.json` (managed by
+  the `/policy` page) on top of yaml/builtin. `evaluatePolicy`
+  short-circuits to `{pause: false, reason: 'disabled'}` when
+  `policy.enabled === false`.
+- **`server/pipeline-policy-validate.ts`** — `validatePolicyPatch`
+  enforces every overlay-writable field (`enabled`, `defaults.*`,
+  `cost.*`, `notifications.*`, `qa.*`); `deepMergeOverlay` is the
+  shallow-on-top + deep-merge-known-blocks helper used by the
+  `update-pipeline-policy` WS handler.
 - **`server/steps/`** — Step factories + pure helpers extracted out
   of `pipeline-runner.ts` over the Phase-4 series. See README §
   "Pipeline runner shape (Phase 4)" for the full module table.
@@ -116,9 +142,13 @@ process, single file orchestrator (`server/dashboard-server.ts`).
 - **`server/knowledge-base-manager.ts`** — wraps the cli's `anvil index`
   command so KB indexing runs out-of-process.
 - **`src/`** — React + Vite frontend. Mounts on the WS server's port,
-  renders run history, change diffs, activity log, KB graph,
-  pipeline-policy editor, settings. Phase-4 pipeline event vocabulary
-  is rendered by `src/components/output/`.
+  renders run history, change diffs, activity log, KB graph, settings,
+  and the dedicated `/policy` page (`src/components/policy/`:
+  `PolicyPage`, `usePolicy` hook, `policy-copy.ts` string library) +
+  the inline Q&A panel (`src/components/pipeline/StageQuestionsPanel`)
+  that mounts in the right pane of `PipelineContainer` whenever a
+  selected stage has unanswered questions. Phase-4 pipeline event
+  vocabulary is rendered by `src/components/output/`.
 
 ## Build + test
 
@@ -242,6 +272,41 @@ stack at `infra/observability/docker-compose.yml` lights up with
 zero config. `ANVIL_OTEL_DISABLED=1` short-circuits the probe;
 `ANVIL_OTEL_CONSOLE=1` dumps spans to stderr.
 
+### Pipeline policy is on by default
+
+`loadPolicy` never returns `null` — every project gets
+`BUILTIN_DEFAULT_POLICY` when no yaml exists, which gates a pause
+after Plan. The `setAfterStageHook` in `dashboard-server.ts` checks
+`policy.enabled === false` (master switch) instead of `if (!policy)`.
+Power users still keep yaml authority — the dashboard only writes to
+`pipeline-policy.overlay.json`, layered on top of yaml. To disable
+pauses for a project from the UI, the `/policy` page writes
+`{ enabled: false }` to the overlay; reverse via the master switch.
+
+### Stage Q&A flow
+
+When `policy.qa.enabled !== false` AND the stage is in `STAGES_WITH_QA`
+(`requirements` / `repo-requirements` / `specs`), `runSingleStage`
+delegates to `runStageWithQA(deps, ...)`. That helper:
+1. Spawns a multi-turn `AgentManagerSession` with the prompt prefixed
+   by `STAGE_QA_PROMPT_HEADER(maxQuestions)` from core-pipeline.
+2. Reads the first response. `parseStageQuestions(text, max)` looks for
+   `<questions>...</questions>`; missing = agent confident, first
+   response IS the artifact (return immediately).
+3. If questions present: populate `state.stages[i].questions = [...]`,
+   set status `'waiting'`, broadcast `stage-question` per question,
+   register a per-stage resolver via
+   `deps.setStageInputResolver(stageIndex, repoName, resolve)`.
+4. Once every question is answered (via `provideStageAnswer` from the
+   `provide-stage-answer` WS handler), the resolver fires with the
+   formatted `<answers>` block. The session resumes with
+   `session.sendInput(...)`; the second response is the artifact.
+
+The `qaPolicy` snapshot is loaded once before `run()` starts via
+`runner.setQAPolicy(loadPolicy(project, ANVIL_HOME).qa)`. Confident
+agents skip Q&A entirely with no extra prompt-token cost (the header
+is always added but the agent self-decides whether to ask).
+
 ### Project-prompt cache invariants (P1)
 
 `buildProjectPromptHelper` / `buildRepoProjectPromptHelper` (in
@@ -312,6 +377,21 @@ when an extractor patches a field).
 - Reviewer rewind not landing? Check `pipeline-loop.ts` — the
   `__anvilRewind` sentinel translates to `Pipeline.run({ rewindTo })`
   on the next iteration of the outer `while`.
+- Pipeline never pauses for review? Check
+  `dashboard-server.ts:setAfterStageHook` — the gate is
+  `policy.enabled === false`, not `if (!policy)`. The default policy
+  (`BUILTIN_DEFAULT_POLICY` in `pipeline-policy.ts`) pauses after Plan;
+  a project's `pipeline-policy.overlay.json` with `{ enabled: false }`
+  silences pauses without deleting the yaml.
+- Q&A panel doesn't appear in the dashboard? Verify the stage is in
+  `STAGES_WITH_QA` (`requirements` / `repo-requirements` / `specs`),
+  `policy.qa.enabled !== false`, and the agent emitted a
+  `<questions>...</questions>` block in its first response. If the
+  agent is confident, no questions, the panel never mounts — that's
+  correct.
+- Policy save fails with no error? Check the WS server reply for
+  `pipeline-policy-error`; the field-by-field validator rejects with
+  a specific message (e.g. `Unknown stage: foo`).
 
 ## Architecture + flow docs
 
