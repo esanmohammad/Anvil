@@ -5511,11 +5511,13 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
               status: r.status,
               cost: r.cost,
               error: r.error,
+              questions: r.questions,
             })) : undefined,
             // Phase 8 — surface routing decisions so the UI can show
             // "build → qwen3:14b" badges and 🔒/📝/⚡ permission glyphs.
             resolvedModel: s.resolvedModel,
             permissionClasses: s.permissionClasses,
+            questions: s.questions,
           })),
           startedAt: pipelineState.startedAt,
           cost: { inputTokens: 0, outputTokens: 0, estimatedCost: pipelineState.totalCost },

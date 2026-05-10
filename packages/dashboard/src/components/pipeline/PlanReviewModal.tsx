@@ -36,6 +36,12 @@ export interface PlanReviewModalProps {
   pipelineStages?: ReadonlyArray<{ name: string; label: string }>;
   /** Index of the just-paused stage. Caps the rerun-from dropdown. */
   currentStageIndex?: number;
+  /**
+   * Q&A history for the just-paused stage — when present, render a
+   * collapsed disclosure above the artifact summary so the reviewer
+   * has full context for what the agent built and why.
+   */
+  stageQuestions?: ReadonlyArray<{ index: number; text: string; answer?: string }>;
   onResolve: (decision: ResumeDecision) => void;
   onClose: () => void;
 }
@@ -77,6 +83,7 @@ export function PlanReviewModal({
   currentArtifact,
   pipelineStages,
   currentStageIndex,
+  stageQuestions,
   onResolve,
   onClose,
 }: PlanReviewModalProps) {
@@ -276,6 +283,25 @@ export function PlanReviewModal({
             minWidth: 0,
           }}>
             {riskScore && <PlanRiskPanel risk={riskScore} />}
+
+            {stageQuestions && stageQuestions.length > 0 && (
+              <Collapsible
+                title="Q&A from this stage"
+                open={false}
+                onToggle={() => { /* parent state too small to bother — local */ }}
+                icon={<FileText size={14} strokeWidth={1.75} style={{ color: 'var(--text-tertiary)' }} aria-hidden="true" />}
+                count={`${stageQuestions.filter((q) => q.answer).length}/${stageQuestions.length} answered`}
+              >
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  {stageQuestions.map((q) => (
+                    <div key={q.index} style={{ marginBottom: 8 }}>
+                      <p style={{ margin: 0, fontWeight: 600 }}>Q: {q.text}</p>
+                      <p style={{ margin: 0 }}>A: {q.answer ?? <em>(no answer)</em>}</p>
+                    </div>
+                  ))}
+                </div>
+              </Collapsible>
+            )}
 
             <Collapsible
               title="Plan summary"

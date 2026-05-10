@@ -10,13 +10,22 @@ export interface WSMessage<T = unknown> {
   id?: string;
 }
 
+export interface StageQuestion {
+  index: number;
+  text: string;
+  answer?: string;
+  answeredAt?: string;
+}
+
 export interface PipelineStage {
   name: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'waiting';
   progress: number; // 0-100
   startedAt?: number;
   completedAt?: number;
   repo?: string;
+  /** Stage-level Q&A — populated when an agent paused to ask the user questions. */
+  questions?: StageQuestion[];
 }
 
 export interface PipelineUpdate {

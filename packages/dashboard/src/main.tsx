@@ -1290,6 +1290,7 @@ function App() {
                 activities={runActivities}
                 rawOutput={rawOutput}
                 changes={changes}
+                ws={wsRef.current}
                 onSendInput={handleSendInput}
                 onStop={handleStop}
                 onResume={() => {
