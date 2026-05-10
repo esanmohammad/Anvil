@@ -99,7 +99,7 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper, attachDurableLogHook } from '@esankhan3/anvil-core-pipeline';
+import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper, attachDurableLogHook, LeaseManager } from '@esankhan3/anvil-core-pipeline';
 import { attachPipelineHooks } from './pipeline-hooks.js';
 import { runPipelineLoop } from './pipeline-loop.js';
 import { getDurableStore, durableHolderId } from './durable-store-singleton.js';
@@ -505,6 +505,7 @@ export class PipelineRunner extends EventEmitter {
       const durableStore = getDurableStore();
       const durableHolder = durableHolderId();
       let durableHookHandle: { unsubscribe(): void } | null = null;
+      let leaseManager: LeaseManager | null = null;
       if (durableStore) {
         try {
           await durableStore.createRun({
@@ -520,6 +521,22 @@ export class PipelineRunner extends EventEmitter {
             durableStore,
             this.state.runId,
           );
+          // Phase D6: heartbeat the lease so a crashed process's
+          // lease expires within ttlMs and a peer (or this process
+          // restarted) can take over.
+          leaseManager = new LeaseManager({
+            store: durableStore,
+            runId: this.state.runId,
+            holder: durableHolder,
+            ttlMs: 60_000,
+          });
+          leaseManager.on('lost', () => {
+            console.warn(`[pipeline-runner] Lost durable lease for ${this.state.runId} — another process took over.`);
+          });
+          leaseManager.on('error', (err: Error) => {
+            console.warn(`[pipeline-runner] Lease heartbeat error: ${err.message}`);
+          });
+          leaseManager.start();
         } catch (err) {
           console.warn(
             `[pipeline-runner] Durable store wiring failed; continuing in non-durable mode: ${err instanceof Error ? err.message : err}`,
@@ -545,7 +562,9 @@ export class PipelineRunner extends EventEmitter {
       } finally {
         hooksHandle.detach();
         durableHookHandle?.unsubscribe();
-        if (durableStore) {
+        if (leaseManager) {
+          await leaseManager.stop();
+        } else if (durableStore) {
           try {
             await durableStore.releaseLease(this.state.runId, durableHolder);
           } catch {

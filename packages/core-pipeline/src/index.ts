@@ -360,6 +360,9 @@ export {
   InMemoryDurableStore,
   SQLiteDurableStore,
   lintStepSource,
+  LeaseManager,
+  tryTakeOverLease,
+  findOrphanedRuns,
 } from './durable/index.js';
 
 // — Agent invocation surface (canonical AgentRunner type)

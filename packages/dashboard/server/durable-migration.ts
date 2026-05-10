@@ -18,7 +18,7 @@ import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-import type { DurableStore } from '@esankhan3/anvil-core-pipeline';
+import { findOrphanedRuns, type DurableStore } from '@esankhan3/anvil-core-pipeline';
 
 interface AuditEntry {
   hook: string;
@@ -32,6 +32,8 @@ export interface MigrationStats {
   scanned: number;
   migrated: number;
   errors: number;
+  /** Phase D6: durable runs marked `running` whose lease has expired. */
+  orphaned: number;
 }
 
 function anvilRunsDir(): string {
@@ -40,8 +42,31 @@ function anvilRunsDir(): string {
 }
 
 export async function runDurableMigration(store: DurableStore | null): Promise<MigrationStats> {
-  const stats: MigrationStats = { scanned: 0, migrated: 0, errors: 0 };
+  const stats: MigrationStats = { scanned: 0, migrated: 0, errors: 0, orphaned: 0 };
   if (!store) return stats;
+
+  // Phase D6: orphaned-run sweep. Any run with status='running' whose
+  // lease has expired belongs to a process that crashed. Mark it
+  // 'failed' so the user sees it in the run history; durable replay
+  // means a follow-up `anvil resume <runId>` can pick it up.
+  try {
+    const orphans = await findOrphanedRuns(store);
+    for (const runId of orphans) {
+      try {
+        await store.updateRunStatus(runId, 'failed');
+        await store.appendEvent({
+          runId,
+          kind: 'cancel:requested',
+          payload: { reason: 'orphaned-lease-on-startup' },
+        });
+        stats.orphaned += 1;
+      } catch {
+        /* skip individual failure */
+      }
+    }
+  } catch {
+    /* best-effort */
+  }
 
   const runsDir = anvilRunsDir();
   if (!existsSync(runsDir)) return stats;

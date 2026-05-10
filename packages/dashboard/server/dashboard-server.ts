@@ -7359,9 +7359,9 @@ Findings array may be empty. No prose outside the JSON block.`;
   try {
     const durableStore = getDurableStore();
     const migrationStats = await runDurableMigration(durableStore);
-    if (migrationStats.scanned > 0) {
+    if (migrationStats.scanned > 0 || migrationStats.orphaned > 0) {
       console.log(
-        `[dashboard] durable migration: scanned=${migrationStats.scanned} migrated=${migrationStats.migrated} errors=${migrationStats.errors}`,
+        `[dashboard] durable migration: scanned=${migrationStats.scanned} migrated=${migrationStats.migrated} orphaned=${migrationStats.orphaned} errors=${migrationStats.errors}`,
       );
     }
   } catch (err) {
