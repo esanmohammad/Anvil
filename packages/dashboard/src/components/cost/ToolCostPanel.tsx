@@ -43,6 +43,15 @@ const UNIT_USD: Record<string, number> = {
   'browser:console': 0.005,
   'browser:network': 0.005,
   'computer:action': 0.045,
+  // Phase S10 — sandbox runtime cost lines (per-acquire / per-exec
+  // wall-time-amortized estimate; payload `costUsd` overrides when present).
+  'sandbox:acquire': 0.001,
+  'sandbox:exec': 0.0005,
+  'sandbox:write': 0.0001,
+  'sandbox:edit': 0.0001,
+  'sandbox:read': 0.0001,
+  'sandbox:sync': 0.0002,
+  'sandbox:snapshot': 0.0005,
 };
 
 function bucketFor(effectKey: string): string {

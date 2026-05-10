@@ -41,7 +41,7 @@ interface DurableRun {
   workflowVer: number;
 }
 
-type Filter = 'all' | 'steps' | 'effects' | 'signals' | 'web' | 'browser' | 'computer';
+type Filter = 'all' | 'steps' | 'effects' | 'signals' | 'web' | 'browser' | 'computer' | 'sandbox';
 
 const KIND_COLORS: Record<string, string> = {
   'step:started': 'var(--color-primary, #0066ff)',
@@ -78,6 +78,20 @@ function summarisePayload(payload: unknown, effectKey: string | null = null): st
   }
   if (effectKey?.startsWith('computer:action')) {
     if (typeof obj.action === 'string') return obj.action;
+  }
+  // Phase S10 — sandbox effect summaries.
+  if (effectKey?.startsWith('sandbox:exec')) {
+    if (typeof obj.command === 'string') return `$ ${obj.command.slice(0, 60)}`;
+    if (typeof obj.exitCode === 'number') return `exit ${obj.exitCode}`;
+  }
+  if (effectKey?.startsWith('sandbox:acquire')) {
+    if (typeof obj.runtime === 'string') return `runtime=${obj.runtime}`;
+  }
+  if (effectKey?.startsWith('sandbox:write') || effectKey?.startsWith('sandbox:edit')) {
+    if (typeof obj.path === 'string') return obj.path;
+  }
+  if (effectKey?.startsWith('sandbox:limit-breach')) {
+    if (typeof obj.kind === 'string') return `breach: ${obj.kind}`;
   }
   if (typeof obj.message === 'string') return obj.message.slice(0, 80);
   if (typeof obj.idempotencyKey === 'string') return `key=${obj.idempotencyKey}`;
@@ -154,6 +168,9 @@ export function DurableTimeline({ runId, ws }: DurableTimelineProps) {
       if (filter === 'web') return (e.effectKey ?? '').startsWith('web:');
       if (filter === 'browser') return (e.effectKey ?? '').startsWith('browser:');
       if (filter === 'computer') return (e.effectKey ?? '').startsWith('computer:');
+      // Phase S10 — sandbox effect filter chip. Effect keys per §I.1
+      // are `sandbox:{op}:{runId}:{stage}[:{idx}:{hash}]`.
+      if (filter === 'sandbox') return (e.effectKey ?? '').startsWith('sandbox:');
       return true;
     });
   }, [events, filter]);
@@ -185,7 +202,7 @@ export function DurableTimeline({ runId, ws }: DurableTimelineProps) {
         </div>
       </div>
       <div style={styles.filters}>
-        {(['all', 'steps', 'effects', 'signals', 'web', 'browser', 'computer'] as const).map((f) => (
+        {(['all', 'steps', 'effects', 'signals', 'web', 'browser', 'computer', 'sandbox'] as const).map((f) => (
           <button
             key={f}
             type="button"
