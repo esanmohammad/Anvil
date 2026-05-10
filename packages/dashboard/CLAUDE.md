@@ -345,6 +345,78 @@ when an extractor patches a field).
   prompt injection, yaml-based transport extraction, and the in-flight
   hybrid-context cache (`prefetchHybridContext`).
 
+## Durable execution (Phases D1–D6 + E0–E10 + F1–F9)
+
+The dashboard is the primary consumer of `@esankhan3/anvil-core-pipeline`'s
+durable execution module. Key wiring:
+
+- **`server/durable-store-singleton.ts`** — process-wide
+  `SQLiteDurableStore` opened lazily at `~/.anvil/durable.db`.
+  `ANVIL_DURABLE_DISABLED=1` opts out (used by tests + by the
+  `test:server` script).
+- **`server/durable-migration.ts`** — boot-time scanner. Two
+  responsibilities: Pattern-1 sweep (Pattern-1 in-flight runs
+  marked failed) + orphan auto-takeover (Phase F4: expired-lease
+  runs are now claimed via `tryTakeOverLease` so the resume
+  orchestrator can replay them). Set `ANVIL_DURABLE_AUTO_TAKEOVER=0`
+  to revert to mark-failed.
+- **`server/durable-vacuum.ts`** — Phase F3 retention enforcement.
+  Runs once at boot + daily on `setInterval`. Drops terminal runs
+  older than `ANVIL_DURABLE_RETENTION_DAYS` (default 30).
+  `ANVIL_DURABLE_VACUUM_DISABLED=1` to skip.
+- **`server/pipeline-runner.ts`** — every `PipelineRunner.run()`:
+  1. Calls `getDurableStore()` + `createRun()` + `acquireLease()`.
+  2. Constructs a `LeaseManager` and starts heartbeat.
+  3. Attaches `attachDurableLogHook` to the pipelineBus.
+  4. Threads `durableStore` + `durableHolder` into `runPipelineLoop`.
+  5. On exit: stops the lease manager, releases the lease,
+     updates run status (completed/failed/cancelled).
+- **`server/pipeline-loop.ts`** — passes the store + holder into
+  `Pipeline.run()` via `PipelineDeps`.
+- **`server/pipeline-stages.ts`** — `runOneStage` accepts an
+  optional `ctx?: StepContext<string>`. When provided, all
+  external touches in the stage substages flow through
+  `ctx.effect(<stage>:<op>, fn, opts?)`. Effect names are
+  stage-prefixed; per-repo paths embed the repo as a token
+  (`build:spawn-task-<repo>-<taskId>`). Idempotency keys for
+  external effects: `<runId>:<repo>:<scope>` (build/ship) or
+  content-hash (artifact writes).
+- **`server/dashboard-server.ts`**:
+  - WS `get-durable-timeline` returns the per-event log for
+    a runId — consumed by the React `DurableTimeline` panel.
+  - WS `resume-pipeline` / `cancel-pipeline-pause` handlers
+    enqueue `reviewer-decision-<stage>` durable signals (Phase F1).
+- **`src/components/history/DurableTimeline.tsx`** — Phase F8 UI
+  panel. Mounted in `RunDetail` under a `<details>` disclosure;
+  filter chips for steps/effects/signals.
+
+### Effect-name conventions (24 sites converted in E1–E10)
+
+| Stage | Effect names |
+|---|---|
+| clarify | `clarify:run-for-project:<model>` |
+| requirements / tasks | `<stage>:session-start`, `:session-resume`, `:spawn-agent`, `:write-artifact` |
+| repo-requirements / specs | `<stage>:spawn-<repo>`, `:write-<repo>` |
+| build | `build:repo-<repo>`, `:write-<repo>`, `:spawn-task-<repo>-<taskId>` |
+| validate fix-loop | `validate:fix-attempt-<N>:<model>`, `:revalidate-write-<N>` |
+| test | `test:spawn-testgen` |
+| ship | `ship:deploy` (idempotencyKey = `<runId>:<project>:<mode>`) |
+| signals | `__signal:stage-answer-<i>`, `__signal:reviewer-decision-<stage>` |
+| system | `__anvil_now`, `__anvil_uuid`, `__anvil_random`, `__anvil_sleep` |
+
+### What stays direct (NOT through ctx.effect)
+
+- State-mutation projections (`state.stages[i].startedAt = new Date().toISOString()`).
+  Replay re-writes them; that's the expected user-facing behaviour.
+- Telemetry JSONL appenders (`writePerRepoTelemetry`).
+- Cost ledger writes.
+- State broadcasts (`deps.broadcast()`).
+- runId generation in `PipelineRunner` constructor.
+
+`npm run lint:stages` walks `pipeline-stages.ts` + core-pipeline's
+stages/steps with the durable-execution linter; advisory by
+default, set `ANVIL_LINT_STAGES_STRICT=1` to fail on violations.
+
 ## Where to look first
 
 - Adding a new pipeline stage? `core-pipeline/src/stages/registry.ts`
@@ -392,6 +464,25 @@ when an extractor patches a field).
 - Policy save fails with no error? Check the WS server reply for
   `pipeline-policy-error`; the field-by-field validator rejects with
   a specific message (e.g. `Unknown stage: foo`).
+- Durable run inspector? `src/components/history/DurableTimeline.tsx`
+  in RunDetail's "Durable execution log" disclosure. CLI equivalent:
+  `anvil run-replay <runId>` (read-only); resume request via
+  `anvil resume-durable <runId> --take`.
+- Run resumed unexpectedly on dashboard boot? Auto-takeover fired —
+  `findOrphanedRuns` found a `running` row with expired lease.
+  Check the boot log for "auto-takeover: claimed N orphaned run(s)".
+  Disable with `ANVIL_DURABLE_AUTO_TAKEOVER=0`.
+- Reviewer pause not unblocking on resume? Phase F1 race: the
+  `reviewer-decision-<stage>` signal is enqueued by
+  `resume-pipeline` / `cancel-pipeline-pause` WS handlers + raced
+  against the pauseStore polling loop in
+  `setAfterStageHook`. A crashed-process pause stays unblocked
+  on resume because the durable signal survives.
+- Replay re-spawns agents? Effect name mismatch. Verify the wrap in
+  `pipeline-stages.ts` uses a stable, stage-prefixed name; check
+  the durable timeline (RunDetail panel) for the recorded effect
+  keys; rerun-from-stage in the dashboard if `DeterminismViolationError`
+  surfaces.
 
 ## Architecture + flow docs
 

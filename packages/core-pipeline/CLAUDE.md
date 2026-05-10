@@ -199,15 +199,80 @@ responsible for their own thread safety inside it (typed contracts
 + explicit locking when relevant; the walker doesn't add a
 mutex).
 
+## Durable execution module (`src/durable/`)
+
+Phase D1–D6 + E0–E10 + F1–F9. Implements Pattern-2 — Temporal-class
+durable execution where every external effect is checkpointed and
+step bodies replay deterministically. See
+`docs/durable-execution-plan.md` (engine) +
+`docs/durable-effect-conversion-plan.md` (effect-site conversion).
+
+- **`durable/types.ts`** — `RunStatus`, `RunRecord`, `EventRecord`,
+  `SignalRecord`, `EffectEventPair`, plus error taxonomy
+  (`DeterminismViolationError`, `DurableStoreUnavailableError`,
+  `EffectResultNotSerialisableError`, `Pattern1MigrationError`).
+- **`durable/store.ts`** — `DurableStore` interface (lifecycle +
+  events + signals + lease + vacuum). The single seam every driver
+  implements.
+- **`durable/sqlite-store.ts`** — `SQLiteDurableStore` (default).
+  Better-sqlite3 + WAL mode. Schema in `~/.anvil/durable.db`.
+  Three tables: `runs`, `events`, `signals` + `meta`.
+- **`durable/in-memory-store.ts`** — `InMemoryDurableStore` (tests
+  + dev). Bit-identical contract to the SQLite driver.
+- **`durable/effect-runtime.ts`** — `EffectRuntime` implements
+  `ctx.effect / now / uuid / random / sleep / waitForSignal`. Owns
+  the per-step monotonic effect counter (idx). Replay protocol:
+  cursor over recordedEffects; matching `(name, idx)` returns the
+  recorded payload; mismatch → `DeterminismViolationError`. The
+  optional `effectFilter` predicate scopes the cursor for per-repo
+  fanout (Phase F6) — each repo's runtime sees only its own events.
+- **`durable/effect-helpers.ts`** — `serializeAgentRunResult` (drops
+  Set/Map/Buffer/undefined for JSON round-trip),
+  `contentHash(s, len)` (SHA-256 prefix), `artifactIdempotencyKey`
+  (stage|scope|hash format).
+- **`durable/lease-manager.ts`** — `LeaseManager` with periodic
+  heartbeat against `store.renewLease`. Emits `lost` when a peer
+  steals the lease. `tryTakeOverLease` for failover; `findOrphanedRuns`
+  for boot-time scan.
+- **`durable/lint.ts`** — `lintStepSource(src) → LintViolation[]`.
+  7 rules: no-direct-{date-now, math-random, crypto-uuid, fs-write,
+  fs-read, exec, setTimeout}. `(?<![.\w])` lookbehind avoids
+  flagging method calls (e.g. `regex.exec` is fine).
+- **`durable/replay-equivalence.ts`** — `seedStoreFromLog` +
+  `throwingSpy` / `countingSpy`: test seams for the canonical
+  two-pass replay-equivalence test pattern.
+
+### Effect protocol on `StepContext`
+
+`StepContext<I>` extends with six methods (always present; non-durable
+mode uses passthrough wrappers):
+
+```ts
+ctx.effect<T>(name, fn, opts?): Promise<T>   // record + replay
+ctx.now(): Promise<number>                   // recorded Date.now
+ctx.uuid(): Promise<string>                  // recorded randomUUID
+ctx.random(): Promise<number>                // recorded Math.random
+ctx.sleep(ms): Promise<void>                 // durable timer
+ctx.waitForSignal<T>(channel): Promise<T>    // durable signal queue
+```
+
+`Step` gains optional `version: number` (D4 — mismatch on replay
+throws DeterminismViolationError) and `compensate(ctx, output)`
+hook (D4 — invoked in reverse order on non-success terminal status).
+
+### Hooks involved
+
+- **`hooks/durable-log.hook.ts`** — primary persistence consumer.
+  Priority 200 (above audit-log's 100). Subscribes to step:* +
+  effect:* + signal:* events; awaited so a failure rejects the
+  bus emit (engine treats this as fatal infra-error).
+
 ## Things that don't exist in this package (intentionally)
 
-- No durable execution. We're at "Pattern 1" (audit-log + state-file
-  granularity). Step-level cross-process replay (Pattern 2) is
-  deferred until step boundaries stabilize. See P7 in
-  `CORE-PIPELINE-EXTRACT-ADR.md`.
 - No cross-process pub/sub. `EventBus` is in-process only. Distant
-  consumers (other CLI invocations, dashboards) read via the audit
-  log + state file. P10.
+  consumers (other CLI invocations, dashboards) read via the
+  durable store (primary) + audit log + state file (secondary
+  projections).
 - No vendor-specific code. Hooks accept structural types
   (e.g. `{ updateRun(record): Promise<void> }` for `RunStore`),
   not concrete classes — the cli passes its `RunStore`, the
@@ -231,6 +296,20 @@ mutex).
   `cli/src/pipeline/steps/*.step.ts`; dashboard via per-stage delegate
   in `dashboard/server/pipeline-stages.ts:runOneStage`. Either way the
   underlying body is the function in `stages/`.
+- Durable execution end-to-end? `pipeline.ts:Pipeline.run()` opens
+  the store + acquires lease + scans `step:completed` events for
+  the replay skip set; `buildContext` constructs an `EffectRuntime`
+  per step, with the per-repo `effectFilter` for fanout cases.
+- New effect site in step body? Wrap in `ctx.effect('<name>', fn,
+  opts?)` with stage-prefixed name (e.g. `requirements:spawn-agent`).
+  For per-repo, include `repoName` token: `<stage>:spawn-<repo>`.
+  Use `idempotencyKey` for external effects that must be exactly-once
+  (PR creation, deploy). The D5 lint rule + the `lint:stages` npm
+  script catch direct side-effect calls.
+- Replay equivalence proof? Pattern: pass-1 captures the durable
+  log live; pass-2 seeds an InMemoryDurableStore from the log + uses
+  `throwingSpy()` in the spawn closures; assert zero invocations.
+  See `__tests__/effect-replay-equivalence.test.ts` for fixtures.
 
 ## Related ADRs
 
