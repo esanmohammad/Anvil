@@ -420,13 +420,27 @@ export class PipelineRunner extends EventEmitter {
     if (remaining === 0) {
       const key = stageInputKey(stageIndex, repoName);
       const resolve = this.stageInputResolvers.get(key);
+      const answersBlock = formatStageAnswersHelper(list.map((q) => ({
+        question: q.text,
+        answer: q.answer ?? '',
+      })));
       if (resolve) {
-        const answersBlock = formatStageAnswersHelper(list.map((q) => ({
-          question: q.text,
-          answer: q.answer ?? '',
-        })));
         this.stageInputResolvers.delete(key);
         resolve(answersBlock);
+      }
+      // Phase E9: enqueue a durable signal so a crashed process
+      // resumes Q&A without re-prompting. The receiver
+      // (runStageWithQA) races the in-process resolver against
+      // ctx.waitForSignal — first one to land wins.
+      const durableStore = getDurableStore();
+      if (durableStore) {
+        void durableStore
+          .enqueueSignal(this.state.runId, `stage-answer-${stageIndex}`, answersBlock)
+          .catch((err) => {
+            console.warn(
+              `[pipeline-runner] enqueueSignal failed for stage-answer-${stageIndex}: ${err instanceof Error ? err.message : err}`,
+            );
+          });
       }
     }
     return { remaining, accepted: true };

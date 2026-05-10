@@ -710,9 +710,24 @@ async function runStageWithQA(
   }
   deps.emit('waiting-for-input', index, first.agentId ?? null);
 
-  const answersBlock = await new Promise<string>((resolve) => {
-    deps.setStageInputResolver(index, null, resolve);
-  });
+  // Phase E9: dual-path answer wait. When durable mode is on,
+  // ctx.waitForSignal reads from the durable signals queue (which
+  // `provideStageAnswer` populates alongside the in-process
+  // resolver Map for back-compat). This lets Q&A survive a
+  // process crash mid-wait — on replay the recorded answer
+  // payload returns without re-prompting the user.
+  //
+  // Non-durable mode keeps the resolver-Map behaviour unchanged.
+  const answersBlock = ctx
+    ? await Promise.race([
+        ctx.waitForSignal<string>(`stage-answer-${index}`),
+        new Promise<string>((resolve) => {
+          deps.setStageInputResolver(index, null, resolve);
+        }),
+      ])
+    : await new Promise<string>((resolve) => {
+        deps.setStageInputResolver(index, null, resolve);
+      });
 
   // Cancellation guard — the resolver fires with '' on cancel.
   if (!answersBlock) {
