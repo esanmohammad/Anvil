@@ -81,3 +81,13 @@ export {
   AgentNotFoundError,
   SessionResumeNotSupportedError,
 } from './types.js';
+
+// Process-level web/browser tool backend registry. The harness
+// (dashboard / cli) wires this once at boot; the bridge composes a
+// `WebToolExecutor` with these backends whenever a stage advertises
+// web_*/browser_*/computer_use names.
+export {
+  setWebToolBackends,
+  getWebToolBackends,
+  clearWebToolBackends,
+} from './web-tool-backends-registry.js';

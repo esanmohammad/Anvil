@@ -35,7 +35,8 @@ import { fileURLToPath } from 'node:url';
 // @ts-ignore — ws is a runtime dependency
 import { WebSocketServer, WebSocket } from 'ws';
 
-import { AgentManager, type AgentState } from '@esankhan3/anvil-agent-core';
+import { AgentManager, setWebToolBackends, type AgentState } from '@esankhan3/anvil-agent-core';
+import { createWebToolBridge } from './tools/web-tool-bridge.js';
 import { PipelineRunner } from './pipeline-runner.js';
 import { getDurableStore } from './durable-store-singleton.js';
 import { runDurableMigration } from './durable-migration.js';
@@ -183,6 +184,8 @@ const ALLOWED_ENV_KEYS = new Set([
   'OTEL_RESOURCE_ATTRIBUTES', 'ANVIL_OTEL_CONSOLE',
   'ANVIL_OTEL_DISABLED', 'ANVIL_OTEL_RECORD_CONTENT',
   'ANVIL_OTEL_METRICS_DISABLED', 'ANVIL_ENV',
+  // Phase H1+ — web/browser tool backend keys
+  'BRAVE_SEARCH_API_KEY', 'TAVILY_API_KEY', 'EXA_API_KEY', 'SERPAPI_API_KEY',
 ]);
 try {
   const envPath = join(ANVIL_HOME, '.env');
@@ -908,6 +911,12 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   // needed. Pass `{ adapterFactory: customFactory }` if a non-default
   // resolution is required (tests, custom routing).
   const agentManager = new AgentManager();
+  // ── Phase H1+ — register web/browser tool backends process-wide ───
+  // The agent-core bridge composes a `WebToolExecutor` whenever a stage
+  // includes web_*/browser_*/computer_use names in its allow-list AND
+  // backends are present. Wiring it here lets every spawn see the
+  // surface without each call site threading it.
+  setWebToolBackends(createWebToolBridge());
   const memoryStore = new MemoryStore();
   const kbManager = new KnowledgeBaseManager(projectLoader);
   const planStore = new PlanStore(ANVIL_HOME);

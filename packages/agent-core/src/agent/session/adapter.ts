@@ -85,6 +85,11 @@ export interface AdapterRequest {
    *  forwards it to `ModelAdapterConfig.mcpConfigPath` so claude-cli
    *  reads it via `--mcp-config <path>`. Not user-facing. */
   claudeMcpConfigPath?: string;
+  /** Web/browser tool backends for non-Claude agentic adapters
+   *  (Phase H1+). When provided AND `allowedTools` includes web_*
+   *  / browser_* / computer_use names, the bridge composes a
+   *  `WebToolExecutor` next to `BuiltinToolExecutor`. */
+  webToolBackends?: import('../../tools/web-executor.js').WebToolBackends;
 }
 
 /**

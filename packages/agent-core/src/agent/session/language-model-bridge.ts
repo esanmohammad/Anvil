@@ -40,7 +40,12 @@ import type {
 } from './legacy-adapter-types.js';
 import { instrumentModelAdapter } from '../../telemetry/instrument.js';
 import { getTracer } from '../../telemetry/tracer.js';
-import { BuiltinToolExecutor } from '../../tools/index.js';
+import {
+  BuiltinToolExecutor,
+  CompositeToolExecutor,
+  WebToolExecutor,
+} from '../../tools/index.js';
+import { getWebToolBackends } from './web-tool-backends-registry.js';
 import { loadModelRegistry } from '../../router/model-registry.js';
 
 // ── Capability mapping ───────────────────────────────────────────────────
@@ -463,7 +468,21 @@ function buildBuiltinExecutor(req: AdapterRequest): ToolExecutorLike | undefined
   const allowed = req.allowedTools && req.allowedTools.length > 0
     ? req.allowedTools
     : ['read_file', 'grep', 'glob', 'list'];
-  return new BuiltinToolExecutor({ allowedTools: allowed });
+  const fsExec = new BuiltinToolExecutor({ allowedTools: allowed });
+
+  // Compose a WebToolExecutor on top when the stage opts into web tools.
+  // Resolution order: explicit `req.webToolBackends` > process-level
+  // singleton (`setWebToolBackends`) > omit web exec entirely.
+  const wantsWeb = allowed.some((name) => /^(?:web_|browser_|computer_use$)/.test(name));
+  const backends = req.webToolBackends ?? getWebToolBackends();
+  if (wantsWeb && backends) {
+    const webExec = new WebToolExecutor({
+      allowedTools: allowed,
+      backends,
+    });
+    return new CompositeToolExecutor([fsExec, webExec]);
+  }
+  return fsExec;
 }
 
 /**
