@@ -13,21 +13,78 @@ process, single file orchestrator (`server/dashboard-server.ts`).
   `prUrls` / `costLedger` / `runStore` rollups. Single-file by design
   — splitting it has been deferred until the WS event vocabulary
   (D10) is locked.
-- **`server/pipeline-runner.ts`** — per-run orchestrator. Drives via
-  `Pipeline.run()` from `core-pipeline` over an `InMemoryStepRegistry`
-  built from `STAGES` in core-pipeline; each Step's `run` calls
-  `runOneStage(i)` which contains the per-stage body (resume skip,
-  planSeed branch, dispatch to clarify/perRepo/single, validate-fix
-  loop, after-stage hook, ship deploy). Control-flow exits
-  (`continue` / `break` / early-return / reviewer rewind) translate to
-  thrown sentinel errors with `__anvilCancel` / `__anvilFailReturn` /
-  `__anvilRewind` markers; the outer try unwinds to the right exit.
-  Reviewer rewind is handled by trimming `completedSteps` and
-  re-invoking `Pipeline.run()` from the rewind target. WS broadcasts
-  + `broadcastState()` + `checkpoint()` calls remain inline today;
-  bus subscribers (`attachAuditLogHook`, `attachCostTrackerHook` from
-  core-pipeline) are wired to the runner's `pipelineBus` for forensic
-  audit + cost rollup.
+- **`server/pipeline-runner.ts`** (~550 LOC) — per-run orchestrator
+  shell. Owns the `PipelineRunner` class: state, public API
+  (`setReviewNote` / `applyArtifactEdit` / `requestRerunFromStage` /
+  `iterateCurrentStageWithNote` / `provideInput` / `cancel` /
+  `getState` / `setAfterStageHook` / `checkpoint`), the constructor +
+  workspace bootstrap, six `depsForX()` bag builders, and a thin
+  `run()` body that calls `prepareRun` → `attachPipelineHooks` →
+  `runPipelineLoop`. The actual stage logic lives in siblings.
+- **`server/pipeline-stages.ts`** — `runOneStage` (the per-stage
+  dispatcher: resume skip, planSeed branch, dispatch to
+  clarify/perRepo/single, validate→fix loop, after-stage hook,
+  reviewer rerun, ship deploy) + 6 sub-functions (`runClarifyStage`,
+  `runPerRepoStage`, `runBuildForRepo`, `runSingleStage`,
+  `runTestGenStage`, `runFixLoop`) + `makeAgentSession` /
+  `makeAgentRunner` factories + `resetStagesForRerun`. Each free
+  function takes a `StageOpsDeps` opts bag bundling state, config,
+  side-effect hooks. Control-flow exits (`continue` / `next` /
+  `cancelled` / `fail-early-return` / `rewind`) flow back to
+  `pipeline-loop.ts` which translates them to walker sentinels.
+- **`server/pipeline-loop.ts`** — `runPipelineLoop(opts)` drives
+  `Pipeline.run()` from core-pipeline over an `InMemoryStepRegistry`
+  built per iteration. Each Step's `runStage` callback delegates to
+  `runOneStage(stageOps, …)`; the loop translates control flags to
+  thrown sentinel errors (`__anvilCancel` / `__anvilFailReturn` /
+  `__anvilRewind`) so reviewer rewind re-invokes `Pipeline.run`
+  with `rewindTo`. Hosts the `step:skipped` listener that renders
+  plan-derived artifacts back into the loop's `prevArtifact` slot.
+- **`server/pipeline-hooks.ts`** — `attachPipelineHooks(deps)` wires
+  the canonical core-pipeline lifecycle hooks (audit log, cost
+  tracker, stream debounce, file checkpoint, dashboard-state rollup,
+  liveness prefetch). Returns a `{ detach() }` thunk that flushes +
+  unsubscribes everything in one call.
+- **`server/runner-prep.ts`** — `resolveWorkspaceDir(project)` reads
+  factory.yaml / project.yaml workspace override (env-var + default
+  fallback). `prepareRun(deps)` owns run()'s pre-loop block: feature
+  record creation/resume, manifest ensure + plan-seed pre-fill, prior
+  artifact load, hybrid-context prefetch, KB warning/event surfacing.
+- **`server/manifest-bridge.ts`** — manifest helpers for the runner:
+  `populateManifestFromPlan`, `renderPlanDerivedArtifact`,
+  `extractAndUpdateManifest`, `clearManifestFieldsForStages`,
+  `manifestGetTouchedFiles`, plus a `PlanRiskCache` class.
+- **`server/model-resolution.ts`** — `resolveModelForStage`,
+  `pickModelForStage`, `allowedToolsForCurrentStage`,
+  `recordResolvedStageState`, `prefetchProviderLiveness`. The
+  resolution chain (factory.yaml override → registry → ANVIL_LOCAL_MODEL
+  → modelTier → `config.model`) lives here.
+- **`server/runner-telemetry.ts`** — `ensureAuth` (auth gate +
+  browser re-login flow), `writePerRepoTelemetry`,
+  `handleOutputTruncation`, `aggregateRunTokens`, `logCacheTelemetry`.
+- **`server/claude-auth.ts`** — `checkClaudeAuth` + `refreshClaudeAuth`
+  shell-out helpers (Claude CLI `auth status` + `auth login`).
+- **`server/pipeline-bootstrap.ts`** — `setupWorkspace`,
+  `getBaseBranch`, `pullLatestMain`, `detectRepos`. Workspace + repo
+  discovery flows through `BootstrapDeps`.
+- **`server/artifact-io.ts`** — `loadPriorArtifacts`,
+  `loadStageArtifact`, `loadRepoArtifacts`, `loadHighLevelRequirements`,
+  `writeStageArtifact`, `writeRepoArtifact` over the feature store.
+- **`server/prompt-context-cache.ts`** — `PromptContextCache` owns
+  per-run memoised inputs to the system prompt (memory block,
+  conventions, project YAML slice, KB block, manifest). Same bytes
+  across every stage so the provider prompt cache fires.
+- **`server/reviewer-control.ts`** — `ReviewerControl` is the pure
+  state machine for reviewer pause/note/edit/rerun-from/iterate. The
+  runner owns the FS / state-mutation side effects of these actions;
+  this helper owns the slot tracking.
+- **`server/pipeline-checkpoint.ts`** — `writePipelineCheckpoint` +
+  `clearPipelineCheckpoint` over the feature store's
+  `pipeline-state.json`.
+- **`server/pipeline-runner-types.ts`** — type declarations +
+  module-level constants (`STAGES`, `STAGE_OUTPUT_LIMITS`,
+  `LOCAL_TIER_STAGES`, `PLAN_DERIVED_STAGES`, token-stat helpers,
+  checkpoint reader, `AfterStageHook` contract).
 - **`server/steps/`** — Step factories + pure helpers extracted out
   of `pipeline-runner.ts` over the Phase-4 series. See README §
   "Pipeline runner shape (Phase 4)" for the full module table.
@@ -36,14 +93,13 @@ process, single file orchestrator (`server/dashboard-server.ts`).
   over the dashboard's heavyweight `AgentManager`:
     - `agent-manager-runner.ts` — `AgentManagerRunner` is the one-shot
       runner. Wraps `spawnAndWait` + `runWithChainFallback`. Used by
-      `runOneStage`'s single-stage / per-repo / per-task delegations.
+      `pipeline-stages.ts` for single-stage / per-repo / per-task
+      delegations (constructed via `makeAgentRunner(deps, stageName)`).
     - `agent-manager-session.ts` — `AgentManagerSession` is the
       multi-turn session. Wraps `agentManager.spawn` for `start()` and
       `agentManager.sendInput + waitForAgent` for `sendInput()`. Used
       by clarify (explore→Q&A→synthesize) and fix-loop (resume across
-      attempts).
-    - `pipeline-step-registry.ts` — `buildPipelineStepRegistry(opts)`
-      assembles the `InMemoryStepRegistry` driven by `Pipeline.run()`.
+      attempts). Constructed via `makeAgentSession(deps)`.
 - **`server/provider-registry.ts`** — discovery layer for the Settings
   UI. Reports each provider's display name, env var, model list,
   setup hint. Visibility toggles on env-var presence.
@@ -82,43 +138,50 @@ build step on the user's machine).
 
 ### Per-stage tool permissions
 
-Every `spawnAndWait` call in `pipeline-runner.ts` MUST thread
-`allowedTools: this.allowedToolsForCurrentStage(stageName)` into the
+Every spawn call in `pipeline-stages.ts` MUST thread
+`allowedTools: deps.allowedToolsForCurrentStage(stageName)` into the
 spawn spec — `LanguageModelBridge` reads this to scope the
 `BuiltinToolExecutor` for non-Claude agentic adapters
 (Ollama / OpenRouter / OpenCode). The five spawn sites are:
-`runClarifyForProject`, generic per-repo (`runPerRepoStageForRepo`),
-per-repo build (`runBuildForOneRepo`), single-stage (`spawnAndWait`),
-and fix-loop (`runFixLoop`). Forgetting one is the canonical "qwen
-ran but produced no diff" symptom.
+`runClarifyForProject` (in `runClarifyStage`), generic per-repo
+(`runPerRepoStage` body), per-repo build (`runBuildForOneRepo` via
+`runBuildForRepo`), single-stage (`runSingleStage` body), and fix-loop
+(`runFixLoop`). Forgetting one is the canonical "qwen ran but produced
+no diff" symptom.
 
 ### Chain-fallback on retryable upstream errors
 
-`runStageWithFallback<T>(stageName, attemptFn)` (max attempts read from
-`walker.max_attempts` in `~/.anvil/models.yaml`, default 5) wraps each
-spawn site. When the inner attempt throws an `UpstreamError`-shape
-(duck-typed: `name === 'UpstreamError' && retryable === true`), the
-runner adds the failed model to `runtimeBurnedModels` and re-resolves
-the stage's chain via `pickAliveModelFromChainSync(..., excludeModels=runtimeBurnedModels)`.
+`runWithChainFallback(opts, attempt)` (canonical, in core-pipeline;
+max attempts from `walker.max_attempts` in `~/.anvil/models.yaml`,
+default 5) wraps the clarify + fix-loop spawn sites in
+`pipeline-stages.ts`. The other per-repo / single / build spawn sites
+flow through `AgentManagerRunner` which has the same fallback baked in
+(see `server/runners/agent-manager-runner.ts`). When the inner attempt
+throws an `UpstreamError`-shape (duck-typed:
+`name === 'UpstreamError' && retryable === true`), the failing model
+is added to `runtimeBurnedModels` and the stage's chain re-resolves
+via `pickAliveModelFromChainSync(..., excludeModels=runtimeBurnedModels)`.
 The 429/quota burst on Alibaba upstream for `qwen3.5-plus` (an
 OpenCode→upstream provider quota issue, not the user's) is the
 canonical case this guards.
 
 The chain walker is reactive (post-failure burn) **plus** proactive
-(pre-call liveness probe). `prefetchProviderLiveness` runs once at
-pipeline start and probes every distinct provider in
-`~/.anvil/models.yaml`'s `models:` array (auto-derived — no hardcoded
-list). Cloud probes are env-var-presence only (`ANTHROPIC_API_KEY`,
-`OPENCODE_API_KEY`, etc.); Ollama hits `localhost:11434/api/tags`;
-ADK probes the union of Anthropic+Gemini keys (it dispatches to
-either). Probe results cache for `walker.liveness_ttl_ms` (default
-30000ms; set to 0 to disable caching). Probe + chain-walker live in
-`server/provider-liveness.ts`.
+(pre-call liveness probe). `prefetchProviderLiveness` (in
+`model-resolution.ts`) loads the walker block + probes every distinct
+provider in `~/.anvil/models.yaml`'s `models:` array (auto-derived —
+no hardcoded list). It's invoked once on `pipeline:started` via the
+canonical `attachLivenessPrefetchHook` wired by
+`attachPipelineHooks`. Cloud probes are env-var-presence only
+(`ANTHROPIC_API_KEY`, `OPENCODE_API_KEY`, etc.); Ollama hits
+`localhost:11434/api/tags`; ADK probes the union of Anthropic+Gemini
+keys (it dispatches to either). Probe results cache for
+`walker.liveness_ttl_ms` (default 30000ms; set to 0 to disable
+caching). Probe + chain-walker live in `server/provider-liveness.ts`.
 
 ### Per-repo stage atomicity
 
 When a per-repo step fans out across N repos and any one repo fails,
-the stage halts:
+the stage halts (in `pipeline-stages.ts:runPerRepoStage`):
 
 ```ts
 if (failedRepos.length > 0) throw new Error(`stage ${stage.name} failed for ${failedRepos.length} repo(s)`);
@@ -181,10 +244,14 @@ zero config. `ANVIL_OTEL_DISABLED=1` short-circuits the probe;
 
 ### Project-prompt cache invariants (P1)
 
-`buildProjectPromptHelper` / `buildRepoProjectPromptHelper` results
-are cached on `pipeline-runner.ts` keyed by
-`(projectId, repoName?, stageBucket)`. Mutating these prompts mid-run
-breaks reproducibility — only invalidate on explicit `clearCache()`.
+`buildProjectPromptHelper` / `buildRepoProjectPromptHelper` (in
+`@esankhan3/anvil-core-pipeline`) read their stable inputs from the
+runner's `PromptContextCache` (memory block, conventions, project
+YAML slice, KB block, manifest — all memoised per run so the
+provider prompt cache fires across stages). Mutating these inputs
+mid-run breaks reproducibility — only invalidate on explicit
+`promptCache.invalidateManifestBlock()` (called by manifest-bridge
+when an extractor patches a field).
 
 ## Things that don't exist in this package (intentionally)
 
@@ -217,13 +284,16 @@ breaks reproducibility — only invalidate on explicit `clearCache()`.
 
 - Adding a new pipeline stage? `core-pipeline/src/stages/registry.ts`
   is the canonical `STAGES` array; the per-stage body lives in
-  `pipeline-runner.ts:runOneStage` (split by `stage.name`); the actual
+  `pipeline-stages.ts:runOneStage` (split by `stage.name`); the actual
   agent prompt + dispatch lives in `core-pipeline/src/stages/<name>.ts`.
 - Pipeline orchestration end-to-end? `pipeline-runner.ts:run()` →
-  builds `pipelineBus` + `buildPipelineStepRegistry` →
-  `new Pipeline().run()`. Each Step's `run()` calls
-  `runOneStage(i)`. Cancellation / fail-early-return / reviewer rewind
-  flow through thrown sentinel errors.
+  `prepareRun()` (`runner-prep.ts`) → `attachPipelineHooks()`
+  (`pipeline-hooks.ts`) → `runPipelineLoop()` (`pipeline-loop.ts`) →
+  `Pipeline.run()` over a per-iteration `InMemoryStepRegistry`. Each
+  Step's `runStage` callback delegates to
+  `runOneStage(stageOps, …)` in `pipeline-stages.ts`. Cancellation /
+  fail-early-return / reviewer rewind flow through thrown sentinel
+  errors caught by the loop.
 - WS message vocabulary? Search for `case '<msg>'` in
   `dashboard-server.ts`.
 - Settings UI doesn't show a provider? `server/provider-registry.ts`
@@ -237,7 +307,11 @@ breaks reproducibility — only invalidate on explicit `clearCache()`.
   pattern lives in agent-core's `OpenRouterAdapter` /
   `OllamaAdapter`.
 - Per-repo stage advancing despite failures? Verify the
-  `failedRepos.length > 0 → throw` branch in `pipeline-runner.ts`.
+  `failedRepos.length > 0 → throw` branch in
+  `pipeline-stages.ts:runPerRepoStage`.
+- Reviewer rewind not landing? Check `pipeline-loop.ts` — the
+  `__anvilRewind` sentinel translates to `Pipeline.run({ rewindTo })`
+  on the next iteration of the outer `while`.
 
 ## Architecture + flow docs
 

@@ -218,7 +218,7 @@ mutex).
   multi-turn). Both consumers wrap it; behavior parity is the contract.
 - Stage Step factory? cli adopts via thin wrappers in
   `cli/src/pipeline/steps/*.step.ts`; dashboard via per-stage delegate
-  in `dashboard/server/pipeline-runner.ts:runOneStage`. Either way the
+  in `dashboard/server/pipeline-stages.ts:runOneStage`. Either way the
   underlying body is the function in `stages/`.
 
 ## Related ADRs
