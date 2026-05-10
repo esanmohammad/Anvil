@@ -3,6 +3,7 @@ import { RotateCcw, Undo2 } from 'lucide-react';
 import { RunTimeline } from './RunTimeline.js';
 import { DurableTimeline } from './DurableTimeline.js';
 import { ToolCostPanel } from '../cost/ToolCostPanel.js';
+import { SandboxPanel } from '../sandbox/SandboxPanel.js';
 import { Badge } from '../ui/Badge.js';
 import { MarkdownRenderer } from '../output/MarkdownRenderer.js';
 import type { RunSummary } from './RunRow.js';
@@ -262,6 +263,10 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
         </div>
         <div style={{ marginTop: 'var(--space-sm)' }}>
           <ToolCostPanel runId={run.id} ws={ws} />
+        </div>
+        <div style={{ marginTop: 'var(--space-sm)' }}>
+          {/* Phase S follow-up #5 — live sandbox stats per run. */}
+          <SandboxPanel runId={run.id} ws={ws} />
         </div>
       </details>
 
