@@ -9,3 +9,14 @@
  */
 
 export * from './types.js';
+export {
+  NoneSandboxHandle,
+  NoneSandboxRunner,
+} from './none-runner.js';
+export {
+  registerSandboxRunner,
+  isSandboxRunnerRegistered,
+  getSandboxRunner,
+  shutdownAllSandboxRunners,
+  __resetSandboxRegistryForTests,
+} from './runner-registry.js';
