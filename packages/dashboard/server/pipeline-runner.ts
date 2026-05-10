@@ -64,6 +64,10 @@ import {
   writeRepoArtifact as writeRepoArtifactFn,
   type ArtifactIODeps,
 } from './artifact-io.js';
+import {
+  runOneStage as runOneStageFn,
+  type StageOpsDeps,
+} from './pipeline-stages.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -87,7 +91,6 @@ import {
   maxOutputTokensForStage,
   listStageNames,
   zeroTokenStats,
-  sumTokenStats,
   readCheckpoint,
   findInterruptedPipelines,
 } from './pipeline-runner-types.js';
@@ -112,9 +115,6 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import { runWithChainFallback } from '@esankhan3/anvil-core-pipeline';
-import { AgentManagerRunner } from './runners/agent-manager-runner.js';
-import { AgentManagerSession } from './runners/agent-manager-session.js';
 import { buildStandardStepRegistry } from '@esankhan3/anvil-core-pipeline';
 import {
   Pipeline,
@@ -129,32 +129,8 @@ import {
 } from '@esankhan3/anvil-core-pipeline';
 import { DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
-import { parseTasks, bundleFiles, type ParsedTask } from '@esankhan3/anvil-core-pipeline';
-import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
-import { enforceBudget, type PromptSection } from '@esankhan3/anvil-core-pipeline';
+import { type PromptBuilderContext } from '@esankhan3/anvil-core-pipeline';
 import { FeatureManifestStore } from './feature-manifest.js';
-import {
-  combinePerRepoArtifacts,
-  disallowedToolsForPersona,
-  runBuildForOneRepo,
-  hasValidationFailures as hasValidationFailuresHelper,
-  buildProjectPrompt as buildProjectPromptHelper,
-  buildRepoProjectPrompt as buildRepoProjectPromptHelper,
-  buildClarifyExplorePrompt as buildClarifyExplorePromptHelper,
-  buildStagePrompt as buildStagePromptHelper,
-  buildRepoStagePrompt as buildRepoStagePromptHelper,
-  buildPerTaskPrompt as buildPerTaskPromptHelper,
-  type PromptBuilderContext,
-} from '@esankhan3/anvil-core-pipeline';
-// Adapters (legacy agentManager → AgentSession bridge) — stay in dashboard.
-import { runClarifyForProject } from './steps/clarify-stage.step.js';
-import { runFixLoop } from './steps/fix-loop.step.js';
-import { runTestGenForProject } from './steps/test-gen-stage.step.js';
-import {
-  runPostBuildGuards,
-  deployProject,
-  createFeatureBranches as createFeatureBranchesHelper,
-} from './steps/workspace-ops.js';
 
 // Claude auth helpers live in `./claude-auth.ts`; the runner consumes
 // them indirectly through `runner-telemetry.ensureAuth`.
@@ -247,35 +223,6 @@ export class PipelineRunner extends EventEmitter {
 
   iterateCurrentStageWithNote(currentStageIndex: number, note: string | null): void {
     this.reviewer.iterateCurrentStageWithNote(currentStageIndex, STAGES.length, note);
-  }
-
-  /**
-   * Reset stage state for indices [fromIndex .. toIndex] inclusive so the
-   * pipeline loop can replay them. Per-repo sub-state, costs, errors,
-   * artifacts and agentIds all cleared.
-   */
-  private resetStagesForRerun(fromIndex: number, toIndex: number): void {
-    for (let j = fromIndex; j <= toIndex; j++) {
-      const s = this.state.stages[j];
-      if (!s) continue;
-      s.status = 'pending';
-      s.artifact = '';
-      s.error = null;
-      s.cost = 0;
-      s.startedAt = null;
-      s.completedAt = null;
-      s.agentId = null;
-      s.tokens = undefined;
-      if (Array.isArray(s.repos)) {
-        for (const r of s.repos) {
-          r.status = 'pending';
-          r.artifact = '';
-          r.cost = 0;
-          r.error = null;
-          r.agentId = null;
-        }
-      }
-    }
   }
 
   /** Per-run plan risk cache (lazy compute, share across stages). */
@@ -890,971 +837,75 @@ export class PipelineRunner extends EventEmitter {
     return pullLatestMainFn(this.depsForBootstrap());
   }
 
-  // ── One-stage dispatcher ─────────────────────────────────────────
-  //
-  // Encodes the body of the legacy for-loop iteration as a single async
-  // method. Returns a control-flow flag so the caller can map it to
-  // `continue` / `break` / early-return / rewind. After verification,
-  // this method is the slot driven by `Pipeline.run()` over an
-  // `InMemoryStepRegistry` (each Step's `run()` calls this).
-  private async runOneStage(
-    i: number,
-    isResume: boolean,
-    resumeStage: number,
-    prevArtifactIn: string,
-  ): Promise<{
-    control: 'continue' | 'next' | 'cancelled' | 'fail-early-return' | 'rewind';
-    rewindTo?: number;
-    prevArtifact: string;
-  }> {
-    let prevArtifact = prevArtifactIn;
-    if (this.cancelled) return { control: 'cancelled', prevArtifact };
-    const stage = STAGES[i];
-
-    try {
-      // Skip completed stages when resuming
-      if (isResume && i < resumeStage) {
-        this.state.stages[i].status = 'completed';
-        this.state.stages[i].completedAt = new Date().toISOString();
-        const storedArtifact = this.loadStageArtifact(stage);
-        this.state.stages[i].artifact = storedArtifact;
-        this.broadcastState();
-        this.checkpoint();
-        return { control: 'continue', prevArtifact };
-      }
-
-      // Skip stages if configured
-      if (stage.name === 'clarify' && this.config.skipClarify) {
-        const seed = this.config.clarifySeedArtifact ?? 'Clarification skipped.';
-        this.state.stages[i].status = 'skipped';
-        this.state.stages[i].artifact = seed;
-        prevArtifact = seed;
-        if (this.config.clarifySeedArtifact) {
-          try {
-            this.featureStore.writeArtifact(
-              this.config.project,
-              this.state.featureSlug,
-              'CLARIFICATION.md',
-              this.config.clarifySeedArtifact,
-            );
-          } catch { /* not fatal */ }
-        }
-        this.broadcastState();
-        this.checkpoint();
-        return { control: 'continue', prevArtifact };
-      }
-      if (stage.name === 'ship' && this.config.skipShip) {
-        this.state.stages[i].status = 'skipped';
-        this.broadcastState();
-        this.checkpoint();
-        return { control: 'continue', prevArtifact };
-      }
-
-      // Plan-seed skip: stages 1–4 derive deterministically from the
-      // plan. Phase D1 — the rendering side-effects (artifact write,
-      // state mutation, broadcast, checkpoint) live in a step:skipped
-      // listener wired in `run()`. The skipIfByStage map activates
-      // the walker-driven skip so this branch is unreachable when a
-      // planSeed is present; we keep a guard log here as a tripwire.
-      if (this.config.planSeed && PLAN_DERIVED_STAGES.includes(stage.name)) {
-        console.warn(
-          `[pipeline] runOneStage(${stage.name}) reached with planSeed — `
-            + `skipIf path should have fired earlier. Falling through to `
-            + `legacy renderer for safety.`,
-        );
-        await renderPlanDerivedArtifactBridge(this.depsForManifest(), stage.name, i);
-        prevArtifact = this.state.stages[i].artifact ?? prevArtifact;
-        return { control: 'continue', prevArtifact };
-      }
-
-      // Test-gen stage
-      if (stage.name === 'test') {
-        if (!this.config.planSeed) {
-          this.state.stages[i].status = 'skipped';
-          this.state.stages[i].artifact = 'Test stage skipped (no plan seed).';
-          prevArtifact = this.state.stages[i].artifact;
-          this.state.stages[i].completedAt = new Date().toISOString();
-          this.broadcastState();
-          this.checkpoint();
-          return { control: 'continue', prevArtifact };
-        }
-        try {
-          const artifact = await this.runTestGenStage(i);
-          this.state.stages[i].status = 'completed';
-          this.state.stages[i].artifact = artifact;
-          this.state.stages[i].completedAt = new Date().toISOString();
-          prevArtifact = artifact;
-          this.broadcastState();
-          this.checkpoint();
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.warn('[pipeline] test-gen failed, continuing to validate:', msg);
-          this.state.stages[i].status = 'skipped';
-          this.state.stages[i].artifact = `Test stage skipped (${msg}).`;
-          this.state.stages[i].completedAt = new Date().toISOString();
-          this.broadcastState();
-          this.checkpoint();
-        }
-        return { control: 'continue', prevArtifact };
-      }
-
-      console.log(`[pipeline] Entering stage "${stage.name}" (${i + 1}/${STAGES.length})`);
-
-      this.reviewer.armForCurrentStage();
-      await this.ensureAuth(stage.name);
-
-      if (stage.name === 'build') {
-        const branchName = `anvil/${this.state.featureSlug}`;
-        console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
-        createFeatureBranchesHelper({
-          featureSlug: this.state.featureSlug,
-          repoPaths: this.repoPaths,
-          repoNames: this.state.repoNames,
-          workspaceDir: this.workspaceDir,
-          onLog: (level, message) => {
-            if (level === 'info') console.log(`[pipeline] ${message}`);
-            else console.warn(`[pipeline] ${message}`);
-          },
-        });
-      }
-      if (stage.name === 'validate') {
-        console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
-        const repos = this.state.repoNames.length > 0
-          ? this.state.repoNames.map((r) => ({ name: r, path: this.repoPaths[r] || join(this.workspaceDir, r) }))
-          : [{ name: this.config.project, path: this.workspaceDir }];
-        runPostBuildGuards({
-          repos,
-          getRepoCommands: (repoName) => this.projectLoader.getRepoCommands(this.config.project, repoName),
-          onLog: (level, message) => {
-            if (level === 'info') console.log(`[pipeline] ${message}`);
-            else console.warn(`[pipeline] ${message}`);
-          },
-        });
-        console.log('[pipeline] Post-build guards complete.');
-      }
-
-      this.state.currentStage = i;
-      this.state.stages[i].status = 'running';
-      this.state.stages[i].startedAt = new Date().toISOString();
-      this.broadcastState();
-      this.checkpoint();
-      this.emit('stage-start', i, '');
-
-      try {
-        let result: { artifact: string; cost: number; tokens: StageTokenStats };
-
-        if (stage.name === 'clarify') {
-          result = await this.runClarifyStage(i);
-        } else if (stage.perRepo && this.state.repoNames.length > 0) {
-          result = await this.runPerRepoStage(i, stage, prevArtifact);
-        } else {
-          result = await this.runSingleStage(i, stage, prevArtifact);
-        }
-
-        if (this.cancelled) return { control: 'cancelled', prevArtifact };
-
-        this.state.stages[i].status = 'completed';
-        this.state.stages[i].completedAt = new Date().toISOString();
-        this.state.stages[i].artifact = result.artifact;
-        this.state.stages[i].cost = result.cost;
-        this.state.stages[i].tokens = result.tokens;
-        this.state.totalCost += result.cost;
-        this.aggregateRunTokens(result.tokens);
-        this.logCacheTelemetry(stage.name, result.tokens);
-        prevArtifact = result.artifact;
-        this.broadcastState();
-        this.checkpoint();
-        this.emit('stage-complete', i, result.artifact, result.cost);
-
-        if (this.afterStageHook) {
-          try {
-            const risk = this.planRisk.get(this.config.planSeed);
-            await this.afterStageHook({
-              runId: this.state.runId,
-              project: this.config.project,
-              stageIndex: i,
-              stageName: stage.name,
-              artifact: result.artifact,
-              cost: result.cost,
-              totalCost: this.state.totalCost,
-              touchedFiles: manifestGetTouchedFiles(this.depsForManifest()),
-              riskTier: risk.tier,
-              confidence: risk.confidence,
-            });
-            if (this.cancelled) return { control: 'cancelled', prevArtifact };
-          } catch (err) {
-            console.warn(`[pipeline] after-stage hook rejected at ${stage.name}:`, err);
-            this.cancelled = true;
-            return { control: 'cancelled', prevArtifact };
-          }
-        }
-
-        // Reviewer rerun-from / iterate handling.
-        const rerun = this.reviewer.consumeRerunRequest();
-        if (rerun !== null) {
-          const target = rerun.targetIndex;
-          if (rerun.mode === 'iterate') {
-            this.resetStagesForRerun(target, target);
-            if (rerun.note) this.setReviewNote(rerun.note);
-            console.log(`[pipeline] Iterate requested → re-running stage ${target} (${STAGES[target].name}) with reviewer feedback`);
-          } else {
-            this.resetStagesForRerun(target, i);
-            clearManifestFieldsForStagesBridge(this.depsForManifest(), target, i);
-            if (rerun.note) {
-              this.config.failureContext =
-                `Rerun requested by reviewer at stage "${STAGES[target].name}":\n${rerun.note}`;
-            }
-            console.log(`[pipeline] Rerun-from requested → resetting to stage ${target} (${STAGES[target].name})`);
-          }
-          prevArtifact = target > 0
-            ? (this.state.stages[target - 1]?.artifact ?? '')
-            : '';
-          this.broadcastState();
-          this.checkpoint();
-          return { control: 'rewind', rewindTo: target, prevArtifact };
-        }
-
-        const edited = this.reviewer.consumeArtifactOverride();
-        if (edited !== null) {
-          prevArtifact = edited;
-        } else {
-          this.writeStageArtifact(i, stage, result.artifact);
-        }
-
-        try {
-          await extractAndUpdateManifestBridge(this.depsForManifest(), stage, result.artifact);
-        } catch (err) {
-          console.warn(`[pipeline] manifest extraction at ${stage.name} failed:`, err);
-        }
-
-        if (stage.name === 'build' && this.config.planSeed && !this.cancelled) {
-          try {
-            const { captureDeviation, updateLearnings } = await import('./plan-deviation.js');
-            const featureDir = this.featureStore.getFeatureDir(this.config.project, this.state.featureSlug);
-            const repoLocalPaths: Record<string, string> = {};
-            for (const r of this.state.repoNames) repoLocalPaths[r] = this.repoPaths[r] ?? '';
-            const deviation = captureDeviation(this.config.planSeed.plan, {
-              featureDir,
-              repoLocalPaths,
-              baseBranch: this.config.baseBranch ?? 'main',
-              branch: `anvil/${this.state.featureSlug}`,
-            });
-            const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME
-              || (await import('node:os')).homedir() + '/.anvil';
-            updateLearnings(
-              anvilHome,
-              this.config.project,
-              deviation,
-              this.state.totalCost,
-              this.config.planSeed.plan.estimate.usd,
-            );
-            this.emit('artifact-written', {
-              stage: 'build',
-              file: `${featureDir}/plan-deviation.json`,
-              summary: `Plan match rate: ${(deviation.summary.matchRate * 100).toFixed(0)}%`,
-              content: JSON.stringify(deviation, null, 2),
-            });
-          } catch (err) {
-            console.warn('[pipeline] Plan deviation capture failed:', err);
-          }
-        }
-
-        if (stage.name === 'ship' && this.config.deploy && !this.cancelled) {
-          deployProject({
-            project: this.config.project,
-            mode: this.config.deploy,
-            workspaceDir: this.workspaceDir,
-            configDeployCmd: this.projectLoader.getConfig(this.config.project)?.pipeline?.ship?.deploy,
-            envDeployCmd: process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD,
-            onArtifact: (artifact) => this.emit('artifact-written', artifact),
-            onLog: (level, message) => {
-              if (level === 'info') console.log(`[pipeline] ${message}`);
-              else console.warn(`[pipeline] ${message}`);
-            },
-          });
-        }
-
-        if (stage.name === 'requirements' && this.state.repoNames.length === 0) {
-          this.detectRepos(result.artifact);
-        }
-
-        if (stage.name === 'validate' && !this.cancelled) {
-          let validateArtifact = result.artifact;
-          let fixAttempts = 0;
-          const MAX_FIX_ATTEMPTS = 3;
-
-          while (fixAttempts < MAX_FIX_ATTEMPTS && hasValidationFailuresHelper(validateArtifact)) {
-            fixAttempts++;
-            console.log(`[pipeline] Validation failed — fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}`);
-
-            const fixResult = await this.runFixLoop(i, validateArtifact, fixAttempts);
-            this.state.totalCost += fixResult.cost;
-            this.aggregateRunTokens(fixResult.tokens);
-            this.logCacheTelemetry(`${stage.name}:fix-${fixAttempts}`, fixResult.tokens);
-
-            if (this.cancelled) return { control: 'cancelled', prevArtifact };
-
-            const revalidateResult = await this.runPerRepoStage(i, stage, fixResult.artifact);
-            validateArtifact = revalidateResult.artifact;
-            this.state.stages[i].artifact = validateArtifact;
-            this.state.stages[i].cost += revalidateResult.cost;
-            this.state.totalCost += revalidateResult.cost;
-            this.aggregateRunTokens(revalidateResult.tokens);
-            this.logCacheTelemetry(`${stage.name}:revalidate-${fixAttempts}`, revalidateResult.tokens);
-            this.broadcastState();
-
-            this.writeStageArtifact(i, stage, validateArtifact);
-          }
-
-          if (hasValidationFailuresHelper(validateArtifact)) {
-            console.warn(`[pipeline] Validation still failing after ${MAX_FIX_ATTEMPTS} fix attempts`);
-          } else if (fixAttempts > 0) {
-            console.log(`[pipeline] Validation recovered after ${fixAttempts} fix attempt(s)`);
-          } else {
-            console.log(`[pipeline] Validation clean — proceeding to Ship`);
-          }
-
-          prevArtifact = validateArtifact;
-        }
-
-        return { control: 'next', prevArtifact };
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        this.state.stages[i].status = 'failed';
-        this.state.stages[i].completedAt = new Date().toISOString();
-        this.state.stages[i].error = errorMsg;
-        this.state.status = 'failed';
-        this.broadcastState();
-        this.checkpoint();
-        this.emit('stage-fail', i, errorMsg);
-        this.emit('pipeline-fail', this.state);
-        this.featureStore.updateFeature(this.config.project, this.state.featureSlug, {
-          status: 'failed',
-        });
-        return { control: 'fail-early-return', prevArtifact };
-      }
-    } finally {
-      this.reviewer.clearForCurrentStage();
-    }
-  }
-
-  // ── Interactive Clarify (one question at a time) ─────────────────
-
-  private async runClarifyStage(index: number): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-    // Build a per-stage AgentManagerSession so explore + synthesize share
-    // the same multi-turn agent. Chain-fallback semantics aren't yet
-    // expressed in the session interface (the model is locked at
-    // `start()`); the runStageWithFallback wrapper still drives the
-    // outer retry loop for transient explore-phase failures.
-    const session = this.makeAgentSession();
-    const result = await runWithChainFallback(
-      {
-        stageName: 'clarify',
-        maxAttempts: this.walkerConfig.max_attempts,
-        resolveModel: () => this.resolveModelForStage('clarify'),
-        onBurn: ({ model, status }) => {
-          this.runtimeBurnedModels.add(model);
-          console.warn(`[pipeline] clarify: ${model} hit ${status} (retryable); burning + falling back`);
-          this.emit('project-event', {
-            source: 'routing',
-            message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
-            level: 'warn',
-          });
-        },
-      },
-      (model) => runClarifyForProject({
-      agentSession: session,
-      project: this.config.project,
-      workspaceDir: this.workspaceDir,
-      model,
-      allowedTools: this.allowedToolsForCurrentStage('clarify'),
-      maxOutputTokens: maxOutputTokensForStage('clarify'),
-      explorePrompt: buildClarifyExplorePromptHelper(this.getPromptContext()),
-      projectPrompt: buildProjectPromptHelper(this.getPromptContext(), STAGES[0]),
-      isCancelled: () => this.cancelled,
-      onAgentSpawned: (agentId) => {
-        this.state.stages[index].agentId = agentId;
-        this.broadcastState();
-        this.emit('stage-start', index, agentId);
-        this.emit('project-event', {
-          source: 'pipeline',
-          stage: 'clarify',
-          message: `[clarify] clarifier agent spawned (model: ${model}) — awaiting first response…`,
-        });
-      },
-      onTruncation: (agentName, outputTokens) => {
-        this.handleOutputTruncation(agentName, outputTokens);
-      },
-      onClarifyQuestion: (questionIndex, totalQuestions, question) => {
-        this.emit('clarify-question', {
-          stageIndex: index,
-          questionIndex,
-          totalQuestions,
-          question,
-        });
-      },
-      onWaitingForInput: (agentId) => {
-        this.state.stages[index].status = 'waiting';
-        this.state.status = 'waiting';
-        this.state.waitingForInput = true;
-        this.broadcastState();
-        this.emit('waiting-for-input', index, agentId);
-      },
-      onAnswerReceived: (answer) => {
-        this.emit('user-input', { stageIndex: index, text: answer });
-        this.state.waitingForInput = false;
-        this.broadcastState();
-      },
-      onClarifyAck: (questionIndex, totalQuestions, hasMore) => {
-        this.emit('clarify-ack', {
-          stageIndex: index,
-          questionIndex,
-          totalQuestions,
-          hasMore,
-        });
-      },
-      onSynthesizeStart: () => {
-        this.state.stages[index].status = 'running';
-        this.state.status = 'running';
-        this.state.waitingForInput = false;
-        this.broadcastState();
-      },
-      inputResolver: () => new Promise<string>((resolve) => {
-        this.inputResolve = resolve;
-      }),
-    }),
-    );
-
-    return {
-      artifact: result.artifact,
-      cost: result.cost,
-      tokens: {
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-        cacheReadTokens: result.cacheReadTokens,
-        cacheWriteTokens: result.cacheWriteTokens,
-      },
-    };
-  }
-
-  // ── Per-repo stage execution ───────────────────────────────────────
-
-  private async runPerRepoStage(
-    index: number,
-    stage: StageDefinition,
-    prevArtifact: string,
-  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-    const repos = this.state.repoNames;
-
-    if (repos.length === 0) {
-      // Fallback to single-agent mode
-      return this.runSingleStage(index, stage, prevArtifact);
-    }
-
-    // Spawn agents for all repos in parallel
-    const promises: Promise<{
-      repoName: string;
-      artifact: string;
-      cost: number;
-      tokens: StageTokenStats;
-    }>[] = [];
-
-    for (let r = 0; r < repos.length; r++) {
-      const repoName = repos[r];
-      const repoPath = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
-      const repoIdx = r;
-
-      // Mark repo as running
-      if (this.state.stages[index].repos[r]) {
-        this.state.stages[index].repos[r].status = 'running';
-      }
-
-      const projectPrompt = buildRepoProjectPromptHelper(this.getPromptContext(), stage, repoName);
-
-      // ── Build stage: per-task spawning (P5) ──
-      // When the engineer's repo has parseable TASKS.md, spawn one engineer per task
-      // (in dependency-aware groups) instead of one engineer for the whole repo.
-      // Each per-task spawn shares the same stable system prompt, which lets the
-      // Claude CLI prompt cache hit across spawns.
-      if (stage.name === 'build' && stage.persona === 'engineer') {
-        promises.push(
-          this.runBuildForRepo(index, repoIdx, stage, repoName, repoPath, projectPrompt)
-            .then((res) => ({
-              repoName,
-              artifact: res.artifact,
-              cost: res.cost,
-              tokens: res.tokens,
-            }))
-            .catch((err) => {
-              const errorMsg = err instanceof Error ? err.message : String(err);
-              const repoState = this.state.stages[index].repos[repoIdx];
-              if (repoState) {
-                repoState.status = 'failed';
-                repoState.error = errorMsg;
-              }
-              this.broadcastState();
-              return {
-                repoName,
-                artifact: '',
-                cost: 0,
-                tokens: zeroTokenStats(),
-              };
-            }),
-        );
-        continue;
-      }
-
-      const prompt = buildRepoStagePromptHelper(this.getPromptContext(), stage, repoName, prevArtifact);
-
-      // Delegate to the canonical AgentManagerRunner — it owns chain-
-      // fallback, cancel, on-spawn telemetry, and onBurn surfacing. The
-      // empty-artifact retry stays here because it's per-repo / per-call.
-      const runner = this.makeAgentRunner(stage.name);
-      promises.push(
-        (async () => {
-          let result;
-          try {
-            // Wrap the runner.run in our own retry layer so an empty
-            // artifact (returned as success by the adapter when
-            // claude-cli silent-emptied) triggers chain-fallback through
-            // the runner's already-installed mechanism.
-            const runOnce = async () => {
-              const r = await runner.run({
-                persona: stage.persona,
-                projectPrompt,
-                userPrompt: prompt,
-                workingDir: repoPath,
-                stage: stage.name,
-                allowedTools: this.allowedToolsForCurrentStage(stage.name),
-                maxOutputTokens: maxOutputTokensForStage(stage.name),
-                repoName,
-              });
-              if (!r.output || r.output.trim().length < 50) {
-                const err = new Error(
-                  `[per-repo:${stage.name}/${repoName}] empty artifact (${r.output?.length ?? 0} chars)`,
-                );
-                (err as Error & { name: string; retryable: boolean; status: number }).name = 'UpstreamError';
-                (err as Error & { name: string; retryable: boolean; status: number }).retryable = true;
-                (err as Error & { name: string; retryable: boolean; status: number }).status = 503;
-                throw err;
-              }
-              return r;
-            };
-            result = await runOnce();
-          } catch (err) {
-            const errorMsg = err instanceof Error ? err.message : String(err);
-            const repoState = this.state.stages[index].repos[repoIdx];
-            if (repoState) {
-              repoState.status = 'failed';
-              repoState.error = errorMsg;
-            }
-            this.broadcastState();
-            return {
-              repoName,
-              artifact: '',
-              cost: 0,
-              tokens: zeroTokenStats(),
-            };
-          }
-
-          // Mark repo as completed
-          const repoState = this.state.stages[index].repos[repoIdx];
-          if (repoState) {
-            repoState.status = 'completed';
-            repoState.cost = result.costUsd ?? 0;
-            repoState.artifact = result.output;
-          }
-          this.broadcastState();
-          this.checkpoint();
-
-          this.writeRepoArtifact(stage, repoName, result.output);
-
-          this.writePerRepoTelemetry(stage.name, repoName, {
-            outputBytes: result.output?.length ?? 0,
-            outputTokens: result.outputTokens ?? 0,
-            inputTokens: result.inputTokens ?? 0,
-            cacheReadTokens: result.cacheReadTokens ?? 0,
-            cacheWriteTokens: result.cacheWriteTokens ?? 0,
-            costUsd: result.costUsd ?? 0,
-          });
-
-          return {
-            repoName,
-            artifact: result.output,
-            cost: result.costUsd ?? 0,
-            tokens: {
-              inputTokens: result.inputTokens ?? 0,
-              outputTokens: result.outputTokens ?? 0,
-              cacheReadTokens: result.cacheReadTokens ?? 0,
-              cacheWriteTokens: result.cacheWriteTokens ?? 0,
-            },
-          };
-        })(),
-      );
-    }
-
-    // Wait for all repos to complete
-    const results = await Promise.all(promises);
-    const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
-    const tokens = sumTokenStats(results.map((r) => r.tokens));
-    const successResults = results.filter((r) => r.artifact);
-    const failedRepos = results.filter((r) => !r.artifact).map((r) => r.repoName);
-
-    // Combine artifacts (legacy "## <repo>\n\n<artifact>" separator format).
-    const combined = combinePerRepoArtifacts(successResults);
-
-    // Per-repo stages are atomic: every repo must produce an artifact
-    // before we advance. Previously this only threw when EVERY repo
-    // failed (legacy partial-success behavior); a single-repo failure
-    // would silently advance with the surviving repo's output, and the
-    // next stage would run with missing context. The user observed
-    // this directly — "frontend is not checked still moved to next
-    // step". Fail-fast here so the dashboard surfaces the failure on
-    // the failing repo's tile and the pipeline halts for retry.
-    if (failedRepos.length > 0) {
-      throw new Error(
-        `Per-repo stage "${stage.name}" failed on ${failedRepos.length} of ${repos.length} repo(s): ${failedRepos.join(', ')}. ` +
-        `Stage cannot advance — retry the run or rerun this stage after fixing the underlying error.`,
-      );
-    }
-
-    return { artifact: combined, cost: totalCost, tokens };
-  }
-
-  // ── Build stage: per-task spawning ─────────────────────────────────
-
-  /**
-   * Run the build stage for one repo by spawning one engineer per task,
-   * grouped into parallel batches by `groupTasksForExecution`.
-   *
-   * Falls back to a single repo-wide spawn when TASKS.md isn't parseable.
-   * The fallback path keeps Read/Grep/Glob/Agent disabled (P1) so behaviour
-   * matches the prior bundle-per-repo flow.
-   */
-  private async runBuildForRepo(
-    stageIndex: number,
-    repoIdx: number,
-    stage: StageDefinition,
-    repoName: string,
-    repoPath: string,
-    projectPrompt: string,
-  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-    const repoArtifacts = this.loadRepoArtifacts(repoName);
-
-    // Per-task spawns flow through AgentManagerRunner — chain-fallback,
-    // empty-throw retry, and on-spawn telemetry are baked in.
-    const runner = this.makeAgentRunner(stage.name);
-    const result = await runBuildForOneRepo({
-      runner,
-      project: this.config.project,
-      stageName: stage.name,
-      persona: stage.persona,
-      allowedTools: this.allowedToolsForCurrentStage(stage.name),
-      maxOutputTokens: maxOutputTokensForStage(stage.name),
-      repoName,
-      repoPath,
-      projectPrompt,
-      tasksMarkdown: repoArtifacts.tasks,
-      buildPerTaskPrompt: (task) =>
-        this.buildPerTaskPrompt(stage, repoName, repoPath, task, repoArtifacts.specs),
-      buildFallbackPrompt: () => buildRepoStagePromptHelper(this.getPromptContext(), stage, repoName, ''),
-      isCancelled: () => this.cancelled,
-      onProjectEvent: (level, message) => {
-        this.emit('project-event', { source: 'pipeline', message, level });
-      },
-    });
-
-    const repoStateDone = this.state.stages[stageIndex].repos[repoIdx];
-    if (repoStateDone) {
-      repoStateDone.status = 'completed';
-      repoStateDone.cost = result.cost;
-      repoStateDone.artifact = result.artifact;
-    }
-    this.broadcastState();
-    this.checkpoint();
-    this.writeRepoArtifact(stage, repoName, result.artifact);
-
-    return {
-      artifact: result.artifact,
-      cost: result.cost,
-      tokens: {
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-        cacheReadTokens: result.cacheReadTokens,
-        cacheWriteTokens: result.cacheWriteTokens,
-      },
-    };
-  }
-
-  /**
-   * Build the user prompt for ONE task: the task's own markdown block, the
-   * spec sections it references, and the files it touches pre-bundled.
-   */
-  private buildPerTaskPrompt(
-    _stage: StageDefinition,
-    repoName: string,
-    repoPath: string,
-    task: ParsedTask,
-    specsMd: string,
-  ): string {
-    return buildPerTaskPromptHelper(this.getPromptContext(), repoName, repoPath, task, specsMd);
-  }
-
-  // ── Single-agent stage execution ───────────────────────────────────
-
-  private async runSingleStage(
-    index: number,
-    stage: StageDefinition,
-    prevArtifact: string,
-  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-    const prompt = buildStagePromptHelper(this.getPromptContext(), stage, prevArtifact);
-    const projectPrompt = buildProjectPromptHelper(this.getPromptContext(), stage);
-
-    // Delegate to the canonical AgentManagerRunner — same chain-fallback
-    // semantics as before, just routed through the unified AgentRunner
-    // surface so the same code path drives single-stage runs in both cli
-    // (after R7 wires up its own runner) and dashboard.
-    const runner = this.makeAgentRunner(stage.name);
-    const result = await runner.run({
-      persona: stage.persona,
-      projectPrompt,
-      userPrompt: prompt,
-      workingDir: this.workspaceDir,
-      stage: stage.name,
-      allowedTools: this.allowedToolsForCurrentStage(stage.name),
-      disallowedTools: disallowedToolsForPersona(stage.persona),
-      maxOutputTokens: maxOutputTokensForStage(stage.name),
-    });
-
-    // Stamp the agentId on the stage record so the dashboard surface
-    // links the activity feed back to this stage.
-    if (result.agentId) {
-      this.state.stages[index].agentId = result.agentId;
-      this.broadcastState();
-    }
-
-    return {
-      artifact: result.output,
-      cost: result.costUsd ?? 0,
-      tokens: {
-        inputTokens: result.inputTokens ?? 0,
-        outputTokens: result.outputTokens ?? 0,
-        cacheReadTokens: result.cacheReadTokens ?? 0,
-        cacheWriteTokens: result.cacheWriteTokens ?? 0,
-      },
-    };
-  }
-
-  /**
-   * Construct an AgentManagerSession for stages that need multi-turn
-   * agent semantics (clarify's explore→Q&A→synthesize, fix-loop). The
-   * resolver picks the model on the initial `start()` call; subsequent
-   * `sendInput` calls re-spawn an adapter against the same session id.
-   */
-  private makeAgentSession(): AgentManagerSession {
-    return new AgentManagerSession({
-      agentManager: this.agentManager,
-      project: this.config.project,
-      workspaceDir: this.workspaceDir,
-      isCancelled: () => this.cancelled,
-      resolveModel: (stageName) => this.resolveModelForStage(stageName),
-      onTruncation: (agentName, outputTokens) => {
-        this.handleOutputTruncation(agentName, outputTokens);
-      },
-    });
-  }
-
-  /**
-   * Construct an AgentManagerRunner scoped to one stage. Threads the
-   * dashboard's chain-fallback resolver, cancellation, on-spawn telemetry,
-   * and truncation callback into the canonical runner shape.
-   */
-  private makeAgentRunner(stageName: string): AgentManagerRunner {
-    return new AgentManagerRunner({
-      agentManager: this.agentManager,
-      project: this.config.project,
-      workspaceDir: this.workspaceDir,
-      isCancelled: () => this.cancelled,
-      resolveModel: () => this.resolveModelForStage(stageName),
-      burnedModels: this.runtimeBurnedModels,
-      maxAttempts: this.walkerConfig.max_attempts,
-      onSpawn: (agentId, req) => {
-        // Find the stage by name + repo (when per-repo) and stamp agentId.
-        const stageIdx = this.state.stages.findIndex((s) => s.name === stageName);
-        if (stageIdx !== -1) {
-          if (req.repoName) {
-            const repo = this.state.stages[stageIdx].repos.find((r) => r.repoName === req.repoName);
-            if (repo) repo.agentId = agentId;
-          } else {
-            this.state.stages[stageIdx].agentId = agentId;
-            this.emit('stage-start', stageIdx, agentId);
-          }
-          this.broadcastState();
-        }
-        const tag = req.repoName ? `${stageName}/${req.repoName}` : stageName;
-        this.emit('project-event', {
-          source: 'pipeline',
-          stage: stageName,
-          message: `[${tag}] ${req.persona} agent spawned — awaiting first response…`,
-        });
-      },
-      onTruncation: (agentName, outputTokens) => {
-        this.handleOutputTruncation(agentName, outputTokens);
-      },
-      onBurn: ({ model, status }) => {
-        this.runtimeBurnedModels.add(model);
-        this.emit('project-event', {
-          source: 'routing',
-          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
-          level: 'warn',
-        });
-      },
-    });
-  }
-
-  // ── Auth helper ──────────────────────────────────────────────────────
-
-  /**
-   * Ensure Claude CLI auth is valid before spawning agents for a stage.
-   * If the token has expired:
-   *   1. Checkpoints current state so the pipeline is resumable
-   *   2. Pauses the pipeline with a 'waiting-auth' status
-   *   3. Sends a browser notification to alert the user
-   *   4. Opens the login flow automatically
-   *   5. Polls until auth succeeds, then resumes
-   */
-  /** Bundle the runner-telemetry dep set. Lazy refs; one-time per call. */
+  // runOneStage + 6 sub-functions + makeAgentRunner + makeAgentSession
+  // live in `./pipeline-stages.ts`. The runner exposes a thin
+  // `runOneStage` wrapper that bundles the dep set on each call.
+
+  /** Per-run fix-loop session refs, threaded into the validate→fix loop. */
+  private fixLoopAgentByRepo: Map<string, string> = new Map();
+  private fixLoopAgentSingle: string | null = null;
+
+  /** Bundle the runner-telemetry dep set. */
   private depsForTelemetry(): RunnerTelemetryDeps {
     return {
       state: this.state,
       broadcast: () => this.broadcastState(),
       checkpoint: () => this.checkpoint(),
       emit: (event, payload) => this.emit(event as 'auth-required' | 'project-event', payload as never),
-      resolveModel: (stageName) => this.resolveModelForStage(stageName),
+      resolveModel: (stageName) => resolveModelForStageBridge(this.depsForResolution(), stageName),
     };
   }
 
-  private ensureAuth(stageName: string): Promise<void> {
-    return ensureAuthBridge(this.depsForTelemetry(), stageName);
-  }
-
-  private writePerRepoTelemetry(
-    stageName: string,
-    repoName: string,
-    stats: {
-      outputBytes: number;
-      outputTokens: number;
-      inputTokens: number;
-      cacheReadTokens: number;
-      cacheWriteTokens: number;
-      costUsd: number;
-    },
-  ): void {
-    writePerRepoTelemetryFn(this.depsForTelemetry(), stageName, repoName, stats);
-  }
-
-  private handleOutputTruncation(agentName: string, outputTokens: number): void {
-    handleOutputTruncationFn(this.depsForTelemetry(), agentName, outputTokens);
-  }
-
-  private aggregateRunTokens(t: StageTokenStats): void {
-    aggregateRunTokensFn(this.depsForTelemetry(), t);
-  }
-
-  private logCacheTelemetry(stageName: string, t: StageTokenStats): void {
-    logCacheTelemetryFn(this.depsForTelemetry(), stageName, t);
-  }
-
-  /**
-   * Deterministic test-generation stage: fingerprint per repo → extract behaviors
-   * from plan → ground → emit test cases → write to repos → persist TestSpec +
-   * TestCase artifacts. No LLM calls in Phase 1; validate runs whatever lands.
-   */
-  private async runTestGenStage(stageIndex: number): Promise<string> {
-    const repoNames = this.state.repoNames.length
-      ? this.state.repoNames
-      : Object.keys(this.repoPaths);
-    const repoLocalPaths: Record<string, string> = {};
-    for (const r of repoNames) repoLocalPaths[r] = this.repoPaths[r] ?? join(this.workspaceDir, r);
-
-    return runTestGenForProject({
-      planSeed: this.config.planSeed ?? null,
-      project: this.config.project,
-      model: this.config.model,
-      workspaceDir: this.workspaceDir,
-      repoLocalPaths,
-      onConventionsDetected: (artifact) => {
-        this.state.stages[stageIndex].artifact = artifact;
-      },
-      onArtifactWritten: (event) => {
-        this.emit('artifact-written', event);
-      },
-    });
-  }
-
-  /** Run engineer agents to fix validation issues, then return */
-  /** Per-repo agent ids carried across fix-loop attempts so attempt 2+ resumes the prior session (P9). */
-  private fixLoopAgentByRepo: Map<string, string> = new Map();
-  private fixLoopAgentSingle: string | null = null;
-
-  private async runFixLoop(
-    _validateStageIndex: number,
-    validateArtifact: string,
-    attempt: number,
-  ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-    const buildStage = STAGES.find((s) => s.name === 'build')!;
-    const repoPaths: Record<string, string> = {};
-    for (const repoName of this.state.repoNames) {
-      repoPaths[repoName] = this.repoPaths[repoName] || join(this.workspaceDir, repoName);
-    }
-    const session = this.makeAgentSession();
-    const result = await runWithChainFallback(
-      {
-        stageName: 'fix-loop',
-        maxAttempts: this.walkerConfig.max_attempts,
-        resolveModel: () => this.resolveModelForStage('fix-loop'),
-        onBurn: ({ model, status }) => {
-          this.runtimeBurnedModels.add(model);
-          console.warn(`[pipeline] fix-loop: ${model} hit ${status} (retryable); burning + falling back`);
-          this.emit('project-event', {
-            source: 'routing',
-            message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
-            level: 'warn',
-          });
-        },
-      },
-      (model) => runFixLoop({
-        agentSession: session,
-        project: this.config.project,
-        model,
-        allowedTools: this.allowedToolsForCurrentStage('fix-loop'),
-        maxOutputTokens: maxOutputTokensForStage('build'),
-        workspaceDir: this.workspaceDir,
-        repoNames: this.state.repoNames,
-        repoPaths,
-        validateArtifact,
-        attempt,
-        priorByRepo: this.fixLoopAgentByRepo,
-        priorSingleId: this.fixLoopAgentSingle,
-        buildProjectPromptForBuildStage: () => buildProjectPromptHelper(this.getPromptContext(), buildStage),
-        buildRepoProjectPromptForBuildStage: (repoName: string) =>
-          buildRepoProjectPromptHelper(this.getPromptContext(), buildStage, repoName),
-        isCancelled: () => this.cancelled,
-      }),
-    );
-    if (result.newSingleId !== null) {
-      this.fixLoopAgentSingle = result.newSingleId;
-    }
+  /** Bundle the stage-ops dep set. Lazy refs; one-time per call. */
+  private depsForStageOps(): StageOpsDeps {
     return {
-      artifact: result.artifact,
-      cost: result.cost,
-      tokens: {
-        inputTokens: result.inputTokens,
-        outputTokens: result.outputTokens,
-        cacheReadTokens: result.cacheReadTokens,
-        cacheWriteTokens: result.cacheWriteTokens,
-      },
+      config: this.config,
+      state: this.state,
+      workspaceDir: this.workspaceDir,
+      repoPaths: () => this.repoPaths,
+      walkerConfig: () => this.walkerConfig,
+      runtimeBurnedModels: this.runtimeBurnedModels,
+      isCancelled: () => this.cancelled,
+      setCancelled: () => { this.cancelled = true; },
+      agentManager: this.agentManager,
+      projectLoader: this.projectLoader,
+      featureStore: this.featureStore,
+      getPromptContext: () => this.getPromptContext(),
+      reviewer: this.reviewer,
+      setReviewNote: (note) => this.setReviewNote(note),
+      planRisk: this.planRisk,
+      afterStageHook: () => this.afterStageHook,
+      broadcast: () => this.broadcastState(),
+      checkpoint: () => this.checkpoint(),
+      emit: (event, ...args) => this.emit(event as never, ...args as never[]),
+      resolveModelForStage: (stageName) => resolveModelForStageBridge(this.depsForResolution(), stageName),
+      allowedToolsForCurrentStage: (stageName) => allowedToolsForCurrentStageBridge(this.depsForResolution(), stageName),
+      ensureAuth: (stageName) => ensureAuthBridge(this.depsForTelemetry(), stageName),
+      depsForManifest: () => this.depsForManifest(),
+      depsForArtifactIO: () => this.depsForArtifactIO(),
+      depsForBootstrap: () => this.depsForBootstrap(),
+      aggregateRunTokens: (t) => aggregateRunTokensFn(this.depsForTelemetry(), t),
+      logCacheTelemetry: (stage, t) => logCacheTelemetryFn(this.depsForTelemetry(), stage, t),
+      handleOutputTruncation: (agentName, outputTokens) => handleOutputTruncationFn(this.depsForTelemetry(), agentName, outputTokens),
+      writePerRepoTelemetry: (stage, repo, stats) => writePerRepoTelemetryFn(this.depsForTelemetry(), stage, repo, stats),
+      setInputResolve: (resolve) => { this.inputResolve = resolve; },
+      fixLoopAgentByRepo: this.fixLoopAgentByRepo,
+      getFixLoopAgentSingle: () => this.fixLoopAgentSingle,
+      setFixLoopAgentSingle: (id) => { this.fixLoopAgentSingle = id; },
     };
+  }
+
+  private runOneStage(
+    i: number,
+    isResume: boolean,
+    resumeStage: number,
+    prevArtifactIn: string,
+  ): Promise<{
+    control: "continue" | "next" | "cancelled" | "fail-early-return" | "rewind";
+    rewindTo?: number;
+    prevArtifact: string;
+  }> {
+    return runOneStageFn(this.depsForStageOps(), i, isResume, resumeStage, prevArtifactIn);
   }
 
   // ── Artifact + repo I/O — delegate to siblings ─────────────────────
