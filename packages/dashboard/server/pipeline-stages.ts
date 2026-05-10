@@ -31,8 +31,11 @@ import {
   disallowedToolsForPersona,
   STAGE_QA_PROMPT_HEADER,
   parseStageQuestions,
+  serializeAgentRunResult,
+  artifactIdempotencyKey,
   type ParsedTask,
   type PromptBuilderContext,
+  type StepContext,
 } from '@esankhan3/anvil-core-pipeline';
 import { runClarifyForProject } from './steps/clarify-stage.step.js';
 import { runFixLoop as runFixLoopStep } from './steps/fix-loop.step.js';
@@ -236,8 +239,75 @@ export function makeAgentRunner(deps: StageOpsDeps, stageName: string): AgentMan
 async function runClarifyStage(
   deps: StageOpsDeps,
   index: number,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const session = makeAgentSession(deps);
+  const runOnce = (model: string) => runClarifyForProject({
+    agentSession: session,
+    project: deps.config.project,
+    workspaceDir: deps.workspaceDir,
+    model,
+    allowedTools: deps.allowedToolsForCurrentStage('clarify'),
+    maxOutputTokens: maxOutputTokensForStage('clarify'),
+    explorePrompt: buildClarifyExplorePromptHelper(deps.getPromptContext()),
+    projectPrompt: buildProjectPromptHelper(deps.getPromptContext(), STAGES[0]),
+    isCancelled: () => deps.isCancelled(),
+    onAgentSpawned: (agentId) => {
+      deps.state.stages[index].agentId = agentId;
+      deps.broadcast();
+      deps.emit('stage-start', index, agentId);
+      deps.emit('project-event', {
+        source: 'pipeline',
+        stage: 'clarify',
+        message: `[clarify] clarifier agent spawned (model: ${model}) — awaiting first response…`,
+      });
+    },
+    onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
+    onClarifyQuestion: (questionIndex, totalQuestions, question) => {
+      deps.emit('clarify-question', {
+        stageIndex: index,
+        questionIndex,
+        totalQuestions,
+        question,
+      });
+    },
+    onWaitingForInput: (agentId) => {
+      deps.state.stages[index].status = 'waiting';
+      deps.state.status = 'waiting';
+      deps.state.waitingForInput = true;
+      deps.broadcast();
+      deps.emit('waiting-for-input', index, agentId);
+    },
+    onAnswerReceived: (answer) => {
+      deps.emit('user-input', { stageIndex: index, text: answer });
+      deps.state.waitingForInput = false;
+      deps.broadcast();
+    },
+    onClarifyAck: (questionIndex, totalQuestions, hasMore) => {
+      deps.emit('clarify-ack', {
+        stageIndex: index,
+        questionIndex,
+        totalQuestions,
+        hasMore,
+      });
+    },
+    onSynthesizeStart: () => {
+      deps.state.stages[index].status = 'running';
+      deps.state.status = 'running';
+      deps.state.waitingForInput = false;
+      deps.broadcast();
+    },
+    inputResolver: () => new Promise<string>((resolve) => {
+      deps.setInputResolve(resolve);
+    }),
+  });
+
+  // Phase E1: wrap the chain-fallback in ctx.effect when a durable
+  // store is wired. Effect name includes the model identifier so a
+  // chain rotation between runs surfaces as DeterminismViolationError
+  // (caller reruns from-stage with the same chain). The system effect
+  // is the *outer* runWithChainFallback call — each model attempt
+  // inside the chain stays a single recorded effect.
   const result = await runWithChainFallback(
     {
       stageName: 'clarify',
@@ -253,65 +323,12 @@ async function runClarifyStage(
         });
       },
     },
-    (model) => runClarifyForProject({
-      agentSession: session,
-      project: deps.config.project,
-      workspaceDir: deps.workspaceDir,
-      model,
-      allowedTools: deps.allowedToolsForCurrentStage('clarify'),
-      maxOutputTokens: maxOutputTokensForStage('clarify'),
-      explorePrompt: buildClarifyExplorePromptHelper(deps.getPromptContext()),
-      projectPrompt: buildProjectPromptHelper(deps.getPromptContext(), STAGES[0]),
-      isCancelled: () => deps.isCancelled(),
-      onAgentSpawned: (agentId) => {
-        deps.state.stages[index].agentId = agentId;
-        deps.broadcast();
-        deps.emit('stage-start', index, agentId);
-        deps.emit('project-event', {
-          source: 'pipeline',
-          stage: 'clarify',
-          message: `[clarify] clarifier agent spawned (model: ${model}) — awaiting first response…`,
-        });
-      },
-      onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
-      onClarifyQuestion: (questionIndex, totalQuestions, question) => {
-        deps.emit('clarify-question', {
-          stageIndex: index,
-          questionIndex,
-          totalQuestions,
-          question,
-        });
-      },
-      onWaitingForInput: (agentId) => {
-        deps.state.stages[index].status = 'waiting';
-        deps.state.status = 'waiting';
-        deps.state.waitingForInput = true;
-        deps.broadcast();
-        deps.emit('waiting-for-input', index, agentId);
-      },
-      onAnswerReceived: (answer) => {
-        deps.emit('user-input', { stageIndex: index, text: answer });
-        deps.state.waitingForInput = false;
-        deps.broadcast();
-      },
-      onClarifyAck: (questionIndex, totalQuestions, hasMore) => {
-        deps.emit('clarify-ack', {
-          stageIndex: index,
-          questionIndex,
-          totalQuestions,
-          hasMore,
-        });
-      },
-      onSynthesizeStart: () => {
-        deps.state.stages[index].status = 'running';
-        deps.state.status = 'running';
-        deps.state.waitingForInput = false;
-        deps.broadcast();
-      },
-      inputResolver: () => new Promise<string>((resolve) => {
-        deps.setInputResolve(resolve);
-      }),
-    }),
+    ctx
+      ? (model) => ctx.effect(
+          `clarify:run-for-project:${model}`,
+          async () => serializeAgentRunResult(await runOnce(model) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runOnce>>,
+        )
+      : runOnce,
   );
 
   return {
@@ -333,11 +350,12 @@ async function runPerRepoStage(
   index: number,
   stage: StageDefinition,
   prevArtifact: string,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const repos = deps.state.repoNames;
 
   if (repos.length === 0) {
-    return runSingleStage(deps, index, stage, prevArtifact);
+    return runSingleStage(deps, index, stage, prevArtifact, ctx);
   }
 
   const promises: Promise<{
@@ -581,6 +599,8 @@ async function runStageWithQA(
   stage: StageDefinition,
   prevArtifact: string,
   maxQuestions: number,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const baseUserPrompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
   const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
@@ -679,10 +699,11 @@ async function runSingleStage(
   index: number,
   stage: StageDefinition,
   prevArtifact: string,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const qa = isQAEnabled(deps, stage.name);
   if (qa.enabled) {
-    return runStageWithQA(deps, index, stage, prevArtifact, qa.max);
+    return runStageWithQA(deps, index, stage, prevArtifact, qa.max, ctx);
   }
 
   const prompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
@@ -817,6 +838,16 @@ export async function runOneStage(
   isResume: boolean,
   resumeStage: number,
   prevArtifactIn: string,
+  /**
+   * Walker StepContext. Optional so legacy callers / tests that
+   * invoke `runOneStage` directly keep working. When supplied, the
+   * stage's effect-bearing calls go through `ctx.effect(...)` so
+   * a durable store records them. When undefined, calls fire
+   * directly — the contract is a transparent superset.
+   *
+   * Phase E1+ of the effect-site conversion plan.
+   */
+  ctx?: StepContext<string>,
 ): Promise<{
   control: 'continue' | 'next' | 'cancelled' | 'fail-early-return' | 'rewind';
   rewindTo?: number;
@@ -950,11 +981,11 @@ export async function runOneStage(
       let result: { artifact: string; cost: number; tokens: StageTokenStats };
 
       if (stage.name === 'clarify') {
-        result = await runClarifyStage(deps, i);
+        result = await runClarifyStage(deps, i, ctx);
       } else if (stage.perRepo && deps.state.repoNames.length > 0) {
-        result = await runPerRepoStage(deps, i, stage, prevArtifact);
+        result = await runPerRepoStage(deps, i, stage, prevArtifact, ctx);
       } else {
-        result = await runSingleStage(deps, i, stage, prevArtifact);
+        result = await runSingleStage(deps, i, stage, prevArtifact, ctx);
       }
 
       if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };

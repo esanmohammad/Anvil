@@ -78,11 +78,11 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
         specs: () => opts.config.planSeed != null,
         tasks: () => opts.config.planSeed != null,
       },
-      runStage: async (stageName) => {
+      runStage: async (stageName, _prevArtifact, ctx) => {
         const idx = STAGES.findIndex((s) => s.name === stageName);
         if (idx < 0) throw new Error(`Unknown stage in registry: ${stageName}`);
         const ctrl = await runOneStageFn(
-          opts.stageOps, idx, stageState.isResume, stageState.resumeStage, stageState.prevArtifact,
+          opts.stageOps, idx, stageState.isResume, stageState.resumeStage, stageState.prevArtifact, ctx,
         );
         stageState.prevArtifact = ctrl.prevArtifact;
         if (ctrl.control === 'cancelled') {
