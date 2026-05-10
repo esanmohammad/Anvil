@@ -146,6 +146,12 @@ export interface PipelineDeps {
 export class Pipeline {
   private readonly artifacts = new InMemoryArtifactStore();
   private readonly shared: Record<string, unknown>;
+  /**
+   * Per-step recorded output, populated as steps complete. Used by
+   * the compensation walker (Phase D4) to feed each step's
+   * `step.compensate(ctx, output)` hook the right value.
+   */
+  private readonly stepOutputs = new Map<string, unknown>();
 
   constructor(private readonly deps: PipelineDeps) {
     this.shared = deps.initialShared ?? {};
@@ -293,11 +299,37 @@ export class Pipeline {
         }
       }
 
+      // Phase D4: durable version check. On replay (durableStore
+      // present) compare the step's declared version against the
+      // recorded version of any prior `step:started` event for this
+      // step. A bumped version invalidates the recorded effects;
+      // the user must rerun from the affected stage.
+      if (durableStore) {
+        const events = await durableStore.readEvents(runId);
+        const priorStarted = events.find(
+          (e) => e.kind === 'step:started' && e.stepId === step.id,
+        );
+        const priorVersion =
+          priorStarted && typeof priorStarted.payload === 'object' && priorStarted.payload !== null
+            ? (priorStarted.payload as { version?: number }).version
+            : undefined;
+        const currentVersion = step.version ?? 1;
+        if (priorVersion !== undefined && priorVersion !== currentVersion) {
+          throw new DeterminismViolationError(
+            runId,
+            step.id,
+            'version-mismatch',
+            `step "${step.id}" replayed at version=${currentVersion} but log records version=${priorVersion}`,
+          );
+        }
+      }
+
       await this.emit(bus, {
         hook: 'step:started',
         runId,
         stepId: step.id,
         ts: this.iso(now),
+        payload: { version: step.version ?? 1 },
       });
 
       const stepStart = now();
@@ -306,12 +338,14 @@ export class Pipeline {
         const stepDurationMs = now() - stepStart;
         completedSteps.push(step.id);
         prevOutput = out;
+        // Track output for compensation (D4).
+        this.stepOutputs.set(step.id, out);
         await this.emit(bus, {
           hook: 'step:completed',
           runId,
           stepId: step.id,
           ts: this.iso(now),
-          payload: { durationMs: stepDurationMs },
+          payload: { durationMs: stepDurationMs, version: step.version ?? 1 },
         });
       } catch (err) {
         failedStep = step.id;
@@ -345,9 +379,55 @@ export class Pipeline {
         payload: { completedSteps, failedStep, durationMs, costUsd },
         error: this.serializeError(lastError),
       });
+      // Phase D4: compensation walk. After a non-success terminal
+      // status, walk the completed steps in reverse and invoke
+      // each step's `compensate(ctx, output)` hook if defined.
+      // Compensation effects flow through the same EffectRuntime,
+      // so a crash mid-rollback resumes the rollback (not the
+      // forward path) on the next process — that's what makes
+      // Pattern-2 compensation durable.
+      await this.runCompensationWalk(orderedSteps, completedSteps, failedStep, prevOutput);
     }
 
     return { runId, status, completedSteps, failedStep, durationMs, costUsd };
+  }
+
+  /**
+   * Reverse-walk completed steps, invoking compensate(ctx, output)
+   * on each step that defines one. Errors during compensation are
+   * recorded but don't halt the walk — best-effort rollback.
+   */
+  private async runCompensationWalk(
+    orderedSteps: ReadonlyArray<Step<unknown, unknown>>,
+    completedIds: string[],
+    failedStepId: string | undefined,
+    prevOutput: unknown,
+  ): Promise<void> {
+    const { bus, runId } = this.deps;
+    const now = this.deps.now ?? Date.now;
+    // Reverse order, skipping the step that actually failed (it
+    // never produced an output to roll back).
+    const toCompensate = [...completedIds].reverse().filter((id) => id !== failedStepId);
+    for (const id of toCompensate) {
+      const step = orderedSteps.find((s) => s.id === id);
+      if (!step?.compensate) continue;
+      const output = this.stepOutputs.get(id);
+      if (output === undefined) continue;
+      try {
+        const ctx = await this.buildContext(step, prevOutput);
+        await step.compensate(ctx, output);
+      } catch (err) {
+        // Best-effort: surface as a fire-and-forget event but keep walking.
+        bus.emitFireAndForget({
+          hook: 'step:failed',
+          runId,
+          stepId: step.id,
+          ts: this.iso(now),
+          payload: { phase: 'compensate' },
+          error: this.serializeError(err),
+        });
+      }
+    }
   }
 
   private async runStepWithSubSteps(
