@@ -14,3 +14,8 @@ export {
   filterByDomainAllowList,
   filterByDomainBlockList,
 } from './domain-matcher.js';
+export {
+  setCurrentStepContext,
+  getCurrentStepContext,
+  type StepContextLike,
+} from './current-step-context.js';

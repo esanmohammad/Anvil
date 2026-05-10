@@ -12,6 +12,7 @@
  * computer).
  */
 
+import { createHash } from 'node:crypto';
 import type { ToolCall, ToolSchema } from '../types.js';
 import type {
   WebSearchArgs,
@@ -20,6 +21,7 @@ import type {
   WebFetchResult,
 } from '@esankhan3/anvil-core-pipeline';
 import type { ExecCtx, ToolExecutor, ToolResult } from './types.js';
+import { getCurrentStepContext } from './current-step-context.js';
 
 export interface WebSearchBackend {
   /** Run a search; the executor wraps the result in the canonical shape. */
@@ -116,7 +118,11 @@ export class WebToolExecutor implements ToolExecutor {
           if (!this.backends.search) {
             return { isError: true, content: 'web_search backend not configured.' };
           }
-          const result = await this.backends.search.search(validated, ctx);
+          const result = await durableWrap(
+            'web:search',
+            shortHash(JSON.stringify(validated)),
+            () => this.backends.search!.search(validated, ctx),
+          );
           return { isError: false, content: formatSearchResult(result) };
         }
         case 'web_fetch': {
@@ -124,7 +130,11 @@ export class WebToolExecutor implements ToolExecutor {
           if (!this.backends.fetch) {
             return { isError: true, content: 'web_fetch backend not configured.' };
           }
-          const result = await this.backends.fetch.fetch(validated, ctx);
+          const result = await durableWrap(
+            'web:fetch',
+            shortHash(`${validated.url}\u241F${validated.prompt}`),
+            () => this.backends.fetch!.fetch(validated, ctx),
+          );
           return { isError: false, content: formatFetchResult(result) };
         }
         default:
@@ -134,6 +144,22 @@ export class WebToolExecutor implements ToolExecutor {
       return { isError: true, content: errorMessage(err) };
     }
   }
+}
+
+/**
+ * Wrap a tool call in `ctx.effect()` when a step context is registered
+ * (Phase H3). When no context is active (e.g. ad-hoc CLI commands or
+ * test paths), the function is invoked directly. Effect names follow
+ * the §J convention from the browser-web-tools plan.
+ */
+async function durableWrap<T>(effectName: string, key: string, fn: () => Promise<T>): Promise<T> {
+  const ctx = getCurrentStepContext();
+  if (!ctx) return fn();
+  return ctx.effect(`${effectName}:${key}`, fn, { idempotencyKey: key });
+}
+
+function shortHash(input: string): string {
+  return createHash('sha256').update(input).digest('hex').slice(0, 16);
 }
 
 // ── Argument validation ─────────────────────────────────────────────────

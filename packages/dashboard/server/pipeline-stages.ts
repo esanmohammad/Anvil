@@ -44,6 +44,7 @@
 import { join } from 'node:path';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
+import { setCurrentStepContext } from '@esankhan3/anvil-agent-core';
 import {
   runWithChainFallback,
   combinePerRepoArtifacts,
@@ -1005,6 +1006,11 @@ export async function runOneStage(
   if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
   const stage = STAGES[i];
 
+  // Phase H3 — register the current StepContext so the WebToolExecutor
+  // can wrap web_search/web_fetch in `ctx.effect(...)`. Cleared in the
+  // outer `finally`. No-op when ctx is undefined (legacy/test paths).
+  if (ctx) setCurrentStepContext(ctx);
+
   try {
     if (isResume && i < resumeStage) {
       deps.state.stages[i].status = 'completed';
@@ -1375,5 +1381,6 @@ export async function runOneStage(
     }
   } finally {
     deps.reviewer.clearForCurrentStage();
+    if (ctx) setCurrentStepContext(undefined);
   }
 }

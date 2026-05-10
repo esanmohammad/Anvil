@@ -502,6 +502,14 @@ export {
   stageMayInvokeWebTool,
 } from './tools/web-tool-registry.js';
 export {
+  wrapWebEffect,
+  searchIdempotencyKey,
+  fetchIdempotencyKey,
+  navigateIdempotencyKey,
+  extractIdempotencyKey,
+} from './tools/effect-wrapping.js';
+export type { WebEffectOptions } from './tools/effect-wrapping.js';
+export {
   resolveModelForTask,
   orderTasksForDispatch,
   TaskCycleError,
