@@ -4,10 +4,14 @@
  *   - Exa (semantic; needs EXA_API_KEY).
  *   - Tavily (AI-native; free tier; needs TAVILY_API_KEY).
  *   - SerpAPI (needs SERPAPI_API_KEY).
+ *   - SearxNG (free / self-hostable; needs SEARXNG_BASE_URL).
  *
  * Resolution order:
  *   1. `~/.anvil/web-search.yaml` `provider:` field (if present).
- *   2. First env var found in [Brave, Tavily, Exa, SerpAPI] order.
+ *   2. First env var found in [Brave, Tavily, Exa, SerpAPI, SearxNG] order.
+ *      SearxNG goes last so users who explicitly paid for Brave / Tavily /
+ *      Exa get their preferred provider; SearxNG is the catch-all when
+ *      nothing else is wired.
  *   3. Throws — caller bubbles a friendly error to the agent.
  *
  * The executor wraps the backend's response in the canonical
@@ -27,7 +31,7 @@ import {
   type WebSearchBackend,
 } from '@esankhan3/anvil-agent-core';
 
-export type WebSearchProvider = 'brave' | 'exa' | 'tavily' | 'serpapi';
+export type WebSearchProvider = 'brave' | 'exa' | 'tavily' | 'serpapi' | 'searxng';
 
 export interface WebSearchAdapterOpts {
   /** Pinned provider; falls back to env-var auto-detect when absent. */
@@ -40,7 +44,13 @@ export interface WebSearchAdapterOpts {
 
 export class WebSearchAdapter implements WebSearchBackend {
   private readonly provider: WebSearchProvider;
+  /** API key for key-based providers; SearxNG base URL for the
+   *  searxng provider (key reused as the credential slot to avoid
+   *  per-provider state). For SearxNG with a hardened public
+   *  instance, `apiKey` is the optional bearer token. */
   private readonly apiKey: string;
+  /** SearxNG base URL when provider === 'searxng'. Empty for others. */
+  private readonly baseUrl: string;
   private readonly httpFetch: typeof fetch;
 
   constructor(opts: WebSearchAdapterOpts = {}) {
@@ -48,6 +58,7 @@ export class WebSearchAdapter implements WebSearchBackend {
     const detected = detectProvider(opts.provider, env);
     this.provider = detected.provider;
     this.apiKey = detected.apiKey;
+    this.baseUrl = detected.baseUrl ?? '';
     this.httpFetch = opts.fetch ?? fetch;
   }
 
@@ -71,6 +82,8 @@ export class WebSearchAdapter implements WebSearchBackend {
         return this.searchExa(args, limit);
       case 'serpapi':
         return this.searchSerpApi(args, limit);
+      case 'searxng':
+        return this.searchSearxng(args, limit);
     }
   }
 
@@ -133,32 +146,77 @@ export class WebSearchAdapter implements WebSearchBackend {
       snippet: r.snippet,
     }));
   }
+
+  /**
+   * SearxNG — free, self-hostable, privacy-respecting metasearch.
+   * Reads from `<base>/search?q=...&format=json`. The optional
+   * `SEARXNG_API_KEY` is forwarded as `Authorization: Bearer …` for
+   * hardened public instances; absent for default unauthenticated
+   * use.
+   */
+  private async searchSearxng(args: WebSearchArgs, limit: number): Promise<WebSearchHit[]> {
+    if (!this.baseUrl) {
+      throw new Error('web_search: searxng provider requires SEARXNG_BASE_URL');
+    }
+    const trimmed = this.baseUrl.replace(/\/+$/, '');
+    const url = new URL(`${trimmed}/search`);
+    url.searchParams.set('q', args.query);
+    url.searchParams.set('format', 'json');
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    const res = await this.httpFetch(url, { headers });
+    if (!res.ok) throw new Error(`SearxNG search failed: ${res.status}`);
+    let body: { results?: Array<{ title?: string; url?: string; content?: string }> };
+    try {
+      body = await res.json() as typeof body;
+    } catch {
+      throw new Error(
+        'SearxNG returned non-JSON. Enable JSON output in your instance config: ' +
+        '`search.formats: [json]` in `settings.yml`.',
+      );
+    }
+    return (body.results ?? [])
+      .filter((r): r is { title: string; url: string; content?: string } =>
+        typeof r.title === 'string' && typeof r.url === 'string')
+      .slice(0, limit)
+      .map((r) => ({ title: r.title, url: r.url, snippet: r.content }));
+  }
 }
 
 function detectProvider(
   pinned: WebSearchProvider | undefined,
   env: (k: string) => string | undefined,
-): { provider: WebSearchProvider; apiKey: string } {
+): { provider: WebSearchProvider; apiKey: string; baseUrl?: string } {
+  // Order matters — SearxNG goes last so users with paid Brave / Tavily
+  // / Exa keys still get their preferred provider when both are set.
   const envMap: Array<[WebSearchProvider, string]> = [
     ['brave', 'BRAVE_SEARCH_API_KEY'],
     ['tavily', 'TAVILY_API_KEY'],
     ['exa', 'EXA_API_KEY'],
     ['serpapi', 'SERPAPI_API_KEY'],
+    ['searxng', 'SEARXNG_BASE_URL'],
   ];
   if (pinned) {
     const entry = envMap.find(([p]) => p === pinned);
-    const apiKey = entry ? env(entry[1]) : undefined;
-    if (!apiKey) {
+    const credential = entry ? env(entry[1]) : undefined;
+    if (!credential) {
       throw new Error(`web_search: provider "${pinned}" requested but ${entry?.[1] ?? '<env>'} not set`);
     }
-    return { provider: pinned, apiKey };
+    if (pinned === 'searxng') {
+      return { provider: pinned, apiKey: env('SEARXNG_API_KEY') ?? '', baseUrl: credential };
+    }
+    return { provider: pinned, apiKey: credential };
   }
   for (const [p, key] of envMap) {
     const v = env(key);
-    if (v) return { provider: p, apiKey: v };
+    if (!v) continue;
+    if (p === 'searxng') {
+      return { provider: p, apiKey: env('SEARXNG_API_KEY') ?? '', baseUrl: v };
+    }
+    return { provider: p, apiKey: v };
   }
   throw new Error(
     'web_search: no search provider configured. Set BRAVE_SEARCH_API_KEY, ' +
-    'TAVILY_API_KEY, EXA_API_KEY, or SERPAPI_API_KEY.',
+    'TAVILY_API_KEY, EXA_API_KEY, SERPAPI_API_KEY, or SEARXNG_BASE_URL.',
   );
 }

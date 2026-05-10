@@ -57,8 +57,45 @@ Set ONE of these env vars in `~/.anvil/.env` or in the dashboard's
 - `TAVILY_API_KEY` (free tier, AI-native)
 - `EXA_API_KEY` (best semantic ranking)
 - `SERPAPI_API_KEY`
+- `SEARXNG_BASE_URL` (free; self-hostable; privacy-respecting metasearch)
 
-Auto-detection picks the first one set in the order above.
+Auto-detection picks the first one set in the order above. SearxNG
+goes last so users who already pay for Brave / Tavily / Exa keep
+their preferred provider.
+
+#### Self-hosted SearxNG (recommended for production)
+
+SearxNG aggregates results from many search engines without sending
+your queries to a tracking service. Run a local instance:
+
+```sh
+docker run -d --name searxng \
+  -p 8888:8080 \
+  -v "${PWD}/searxng:/etc/searxng" \
+  --restart=unless-stopped \
+  searxng/searxng
+```
+
+Then enable JSON output in `searxng/settings.yml` (the volume
+above is created on first run):
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+```
+
+Restart the container, then:
+
+```sh
+echo "SEARXNG_BASE_URL=http://localhost:8888" >> ~/.anvil/.env
+```
+
+For hardened public instances that require a bearer token, also
+set `SEARXNG_API_KEY=<token>`. Public instance lists:
+[searx.space](https://searx.space) — but rate limits there are
+aggressive; self-hosting is the recommended path for any non-toy use.
 
 ### Tier 1 — fetch + summarizer
 

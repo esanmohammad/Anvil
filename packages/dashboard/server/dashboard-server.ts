@@ -187,6 +187,10 @@ const ALLOWED_ENV_KEYS = new Set([
   'ANVIL_OTEL_METRICS_DISABLED', 'ANVIL_ENV',
   // Phase H1+ — web/browser tool backend keys
   'BRAVE_SEARCH_API_KEY', 'TAVILY_API_KEY', 'EXA_API_KEY', 'SERPAPI_API_KEY',
+  // SearxNG — free, self-hostable metasearch. Base URL is the
+  // configuration; the optional API key is for hardened public
+  // instances that require a bearer token.
+  'SEARXNG_BASE_URL', 'SEARXNG_API_KEY',
 ]);
 try {
   const envPath = join(ANVIL_HOME, '.env');
