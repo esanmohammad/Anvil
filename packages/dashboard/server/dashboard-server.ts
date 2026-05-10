@@ -45,7 +45,11 @@ import { scheduleDurableVacuum } from './durable-vacuum.js';
 import { dispatchTakenOverRuns } from './durable-resume-queue.js';
 import { STAGES as RUNNER_STAGES } from './pipeline-runner.js';
 import type { ResumeDecision } from './pipeline-pause-types.js';
-import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
+import {
+  disallowedToolsForPersona,
+  getSandboxRunner,
+  isSandboxRunnerRegistered,
+} from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import { registerSandboxRunnersAtBoot } from './sandbox/register-at-boot.js';
 import type { PipelineRunState } from './pipeline-runner.js';
@@ -1827,6 +1831,42 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           ws.send(JSON.stringify({ type: 'durable-timeline', payload: { runId, run, events } }));
         } catch (err) {
           ws.send(JSON.stringify({ type: 'error', payload: { message: `durable-timeline failed: ${err instanceof Error ? err.message : err}` } }));
+        }
+        break;
+      }
+
+      case 'get-sandbox-stats': {
+        // Phase S follow-up #6 — surface live sandbox state for the
+        // SandboxPanel UI. Walks every registered runtime and returns
+        // a flat list. RunId is currently advisory (the runners pool
+        // across runs); future work can scope by runId via the pool's
+        // poolKey project/runId components.
+        const runId = typeof msg.runId === 'string' ? msg.runId : null;
+        try {
+          const entries: Array<{
+            id: string;
+            runtime: string;
+            ageMs: number;
+            busy: boolean;
+            monitor?: undefined;
+          }> = [];
+          for (const runtime of ['none', 'docker', 'firecracker', 'gvisor'] as const) {
+            if (!isSandboxRunnerRegistered(runtime)) continue;
+            try {
+              const runner = getSandboxRunner(runtime);
+              const list = await runner.list();
+              for (const e of list) entries.push({ ...e });
+            } catch { /* runner not actually available — skip */ }
+          }
+          ws.send(JSON.stringify({
+            type: 'sandbox-stats',
+            payload: { runId, entries },
+          }));
+        } catch (err) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            payload: { message: `sandbox-stats failed: ${err instanceof Error ? err.message : err}` },
+          }));
         }
         break;
       }
