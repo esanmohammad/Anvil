@@ -433,7 +433,18 @@ async function runPerRepoStage(
             }
             return r;
           };
-          result = await runOnce();
+          // Phase E3: durable wrap for per-repo spawn. Effect name
+          // includes the repo so per-repo crashes resume per-repo.
+          // Empty-artifact retry preserved — the throw inside fn
+          // surfaces as effect:failed (retryable upstream error)
+          // and the outer chain-fallback in surrounding code path
+          // re-resolves the model.
+          result = ctx
+            ? await ctx.effect(
+                `${stage.name}:spawn-${repoName}`,
+                async () => serializeAgentRunResult(await runOnce() as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runOnce>>,
+              )
+            : await runOnce();
         } catch (err) {
           const errorMsg = err instanceof Error ? err.message : String(err);
           const repoState = deps.state.stages[index].repos[repoIdx];
@@ -459,7 +470,19 @@ async function runPerRepoStage(
         deps.broadcast();
         deps.checkpoint();
 
-        writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.output);
+        // Phase E3: durable wrap for per-repo artifact write.
+        if (ctx) {
+          await ctx.effect(
+            `${stage.name}:write-${repoName}`,
+            async () => {
+              writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.output);
+              return null;
+            },
+            { idempotencyKey: artifactIdempotencyKey(stage.name, repoName, result.output) },
+          );
+        } else {
+          writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.output);
+        }
 
         deps.writePerRepoTelemetry(stage.name, repoName, {
           outputBytes: result.output?.length ?? 0,
