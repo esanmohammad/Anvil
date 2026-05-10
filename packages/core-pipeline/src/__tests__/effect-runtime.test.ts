@@ -107,6 +107,40 @@ describe('EffectRuntime — replay', () => {
     );
   });
 
+  it('Phase G2: replays preserve UpstreamError retryable + status + name shape', async () => {
+    // Pass 1 — record an UpstreamError live.
+    const { store, runtime } = await newRuntime();
+    await assert.rejects(
+      () => runtime.effect('a', async () => {
+        const err = new Error('upstream 503') as Error & {
+          name: string; retryable: boolean; status: number;
+        };
+        err.name = 'UpstreamError';
+        err.retryable = true;
+        err.status = 503;
+        throw err;
+      }),
+      /upstream 503/,
+    );
+
+    // Pass 2 — replay; ReplayedEffectError must carry retryable=true,
+    // status=503, name='UpstreamError' so chain-fallback predicates pass.
+    const recorded = await store.readEffectEvents(RUN_ID, STEP);
+    const replay = new EffectRuntime({ store, runId: RUN_ID, stepId: STEP, recordedEffects: recorded });
+    let captured: unknown;
+    try {
+      await replay.effect('a', async () => 'never');
+    } catch (err) {
+      captured = err;
+    }
+    assert.ok(captured instanceof ReplayedEffectError, 'should be ReplayedEffectError');
+    const err = captured as Error & { name: string; retryable?: boolean; status?: number };
+    assert.equal(err.name, 'UpstreamError', 'name preserved');
+    assert.equal(err.retryable, true, 'retryable flag preserved');
+    assert.equal(err.status, 503, 'status preserved');
+    assert.match(err.message, /upstream 503/, 'message preserved');
+  });
+
   it('crashed mid-effect (started without completion) re-runs fn and writes completed', async () => {
     const { store } = await newRuntime();
     await store.appendEvent({ runId: RUN_ID, kind: 'effect:started', stepId: STEP, effectKey: 'a', effectIdx: 0, payload: {} });

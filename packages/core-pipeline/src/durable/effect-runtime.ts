@@ -211,8 +211,15 @@ export class EffectRuntime {
         return next.completed.payload as T;
       }
       if (next.failed) {
-        const err = (next.failed.payload as { message?: string } | null)?.message ?? 'effect failed';
-        throw new ReplayedEffectError(err);
+        // Phase G2: reconstruct the original error shape so chain-
+        // fallback / retry policies behave correctly on replay.
+        // ReplayedEffectError stays the *type* (so callers that want
+        // to detect "this is a replay" still can via instanceof) but
+        // we copy `name`, `retryable`, `status`, `cause` from the
+        // recorded payload so duck-typed checks (e.g. the canonical
+        // `err.name === 'UpstreamError' && err.retryable === true`
+        // chain-fallback predicate) still work.
+        throw reconstructErrorFromPayload(next.failed.payload);
       }
       // Started but never completed — crashed mid-effect, fall through
       // to live execution. Note: we do NOT re-record `effect:started`
@@ -250,14 +257,20 @@ export class EffectRuntime {
     try {
       result = await this.runWithRetry(fn, opts.retry);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      // Phase G2: capture the full error shape so chain-fallback +
+      // retry policies behave correctly on replay. Without
+      // `name`/`retryable`/`status`, a previously-burned upstream
+      // model would replay as a generic ReplayedEffectError and the
+      // walker would treat it as terminal — defeating the whole
+      // chain-fallback semantic.
+      const errorPayload = serializeErrorForReplay(err);
       await this.deps.store.appendEvent({
         runId: this.deps.runId,
         kind: 'effect:failed',
         stepId: this.deps.stepId,
         effectKey: name,
         effectIdx: idx,
-        payload: { message, completedAt: new Date(this.realNow()).toISOString() },
+        payload: { ...errorPayload, completedAt: new Date(this.realNow()).toISOString() },
       });
       throw err;
     }
@@ -298,11 +311,71 @@ export class EffectRuntime {
   }
 }
 
+/**
+ * `ReplayedEffectError` — thrown on replay when the recorded effect
+ * was a failure. Carries the same duck-typed properties the original
+ * error had (`retryable`, `status`, `name`, `cause`) so callers that
+ * pattern-match on these (chain-fallback's
+ * `err.name === 'UpstreamError' && err.retryable === true` predicate,
+ * for example) keep working on replay. Phase G2.
+ */
 export class ReplayedEffectError extends Error {
-  constructor(message: string) {
+  // Index-signature so duck-typed checks like
+  // `(err as { retryable?: boolean }).retryable` resolve at runtime.
+  [key: string]: unknown;
+  constructor(message: string, props?: Record<string, unknown>) {
     super(`[replayed effect failure] ${message}`);
     this.name = 'ReplayedEffectError';
+    if (props) {
+      for (const [k, v] of Object.entries(props)) {
+        if (k === 'message' || k === 'stack') continue;
+        // Preserve `name` if recorded — overrides the default
+        // 'ReplayedEffectError' so `err.name === 'UpstreamError'`
+        // checks pass on replay.
+        (this as Record<string, unknown>)[k] = v;
+      }
+    }
   }
+}
+
+/**
+ * Capture the duck-typed surface of an Error for the durable log.
+ * Includes the standard message/name/stack plus any enumerable
+ * own properties (covers UpstreamError's `retryable` + `status`
+ * shape used by the chain-fallback predicate).
+ */
+function serializeErrorForReplay(err: unknown): Record<string, unknown> {
+  if (!(err instanceof Error)) {
+    return { message: String(err) };
+  }
+  const out: Record<string, unknown> = {
+    message: err.message,
+    name: err.name,
+  };
+  // Capture enumerable own properties — e.g. UpstreamError's
+  // `retryable: true`, `status: 503`, `cause`.
+  for (const k of Object.keys(err)) {
+    const v = (err as unknown as Record<string, unknown>)[k];
+    // Skip non-serialisable shapes.
+    if (typeof v === 'function') continue;
+    try {
+      JSON.stringify(v);
+      out[k] = v;
+    } catch {
+      // Shape isn't JSON-clean; record a string fallback.
+      out[k] = String(v);
+    }
+  }
+  return out;
+}
+
+function reconstructErrorFromPayload(payload: unknown): ReplayedEffectError {
+  if (!payload || typeof payload !== 'object') {
+    return new ReplayedEffectError('effect failed');
+  }
+  const obj = payload as Record<string, unknown>;
+  const message = typeof obj.message === 'string' ? obj.message : 'effect failed';
+  return new ReplayedEffectError(message, obj);
 }
 
 function defaultSleep(ms: number): Promise<void> {
