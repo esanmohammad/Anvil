@@ -484,6 +484,63 @@ default, set `ANVIL_LINT_STAGES_STRICT=1` to fail on violations.
   keys; rerun-from-stage in the dashboard if `DeterminismViolationError`
   surfaces.
 
+## Browser + web tool surface (Phases H0–H10)
+
+Three tiers of agent-callable tools that read the live web and drive
+real browsers. Per-stage gating rides on top of the existing
+`STAGE_TOOL_PERMISSIONS` table via `STAGE_WEB_PERMISSIONS` in
+core-pipeline.
+
+- **Tier 1 (`web.*`)** — `web_search` + `web_fetch`. Backends in
+  `server/tools/web-search.ts` (Brave/Tavily/Exa/SerpAPI) and
+  `server/tools/web-fetch.ts` (axios + Turndown + cheap-tier
+  summarizer). Provider-agnostic: `web_fetch`'s summarizer runs
+  through `resolveModelForStage('web-summarizer')`, falling back to
+  `research` when the user hasn't added the new stage to
+  `~/.anvil/stage-policy.yaml`.
+- **Tier 2 (`browser.*`)** — Playwright child process. DOM serializer
+  in `server/browser/dom-serializer.ts` walks a structured snapshot,
+  assigns interactive indices, strips `<script>`/event-handlers/
+  injection patterns. `BrowserSession` (`session-manager.ts`) +
+  `BrowserSessionRegistry` track per-(runId, sessionId) lifecycle
+  with 15-min TTLs. Playwright is an optional dep — dynamic-imported
+  via `new Function('m','return import(m)')` so the build doesn't
+  need it.
+- **Tier 3 (`computer.*`)** — Docker-backed Xvfb + Chromium runner.
+  `computer-use/computer-use-translator.ts` emits the per-provider
+  native schema (Anthropic `computer_20251124`, OpenAI
+  `computer_use_preview`, Gemini computer). Default-disabled; opt in
+  via `pipeline-policy.overlay.json: tools.browsePixel.enabled = true`.
+
+**Wiring path** — `dashboard-server.ts` calls
+`setWebToolBackends(createWebToolBridge({ summarizerInvoker, ... }))`
+once at boot. The agent-core bridge composes a `WebToolExecutor` next
+to the FS `BuiltinToolExecutor` whenever a stage's allowedTools
+include any `web_*` / `browser_*` / `computer_use` name.
+
+**Durable replay** — every web/browser/computer effect records via
+`ctx.effect()` (Phase H3+H7). Effect names follow §J of the plan:
+`web:search:<hash>`, `web:fetch:<urlHash>`, `browser:navigate:<urlHash>`,
+`browser:click:<idx>`, `computer:action:<actionHash>`. The
+`getCurrentStepContext()` slot in agent-core is set by
+`pipeline-stages.ts:runOneStage` so deeply-nested agent loops get
+durable wrapping for free.
+
+**Defenses (§H, on by default)** — Haiku-class summarizer pre-filter,
+allow/block-list domain enforcement, DOM injection-pattern stripping
+(`[INST]`, `<system>`, "ignore prior instructions"), per-session
+rate limits (1/sec click; 6/min screenshot), no-progress detector
+(3 identical observations triggers `[__anvilBrowseStalled]`), confirm
+gate on `browser_evaluate` / `browser_attach_context` / all
+`computer_use` actions, 15-min session TTL.
+
+**UI** — `DurableTimeline` (history pane) gains `web` / `browser` /
+`computer` filter chips and per-tool summary rendering;
+`ToolCostPanel` aggregates spend by namespace.
+
+**User guide** — `docs/browser-web-tools-guide.md`. Plan reference:
+`docs/browser-web-tools-plan.md` + `docs/browser-web-tools-survey.md`.
+
 ## Architecture + flow docs
 
 - `README.md` — package overview, build commands, storage layout,

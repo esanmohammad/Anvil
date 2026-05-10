@@ -311,6 +311,39 @@ hook (D4 — invoked in reverse order on non-success terminal status).
   `throwingSpy()` in the spawn closures; assert zero invocations.
   See `__tests__/effect-replay-equivalence.test.ts` for fixtures.
 
+## Browser + web tool surface (Phase H0)
+
+`tools/web-types.ts` + `tools/web-tool-registry.ts` declare the type
+surface and per-stage permission classes for the three-tier
+browser/web tool plan (`docs/browser-web-tools-plan.md`):
+
+- **WebToolClass**: `network` (web.*) | `browse-headless` (browser.*
+  excl. evaluate) | `browse-eval` (browser.evaluate) | `browse-pixel`
+  (computer.*).
+- **`STAGE_WEB_PERMISSIONS`** layers on top of `STAGE_TOOL_PERMISSIONS`.
+  `build` and `ship` are network-blocked; `validate` gets the most
+  (network + headless + eval + pixel); analysis stages get `network`
+  only.
+- **`allowedToolsForStage(stage)`** now merges the FS surface
+  (read/write/exec) with the web tool surface — callers see one
+  unified list.
+- **`stage-policy.yaml`** ships two routing stages: `web-summarizer`
+  (used by `web.fetch`) and `browser-extractor` (used by
+  `browser.extract`). Both `prefer: [local, cheap]` — Haiku/Flash/8B
+  class. The dashboard-side summarizer falls back to `research` when
+  these stages aren't in the user's `stage-policy.yaml`.
+- **`tools/effect-wrapping.ts`** — `wrapWebEffect(ctx, name, key, fn)`
+  + canonical idempotency-key builders for search / fetch / navigate
+  / extract. Effect names follow the §J convention: `web:search:<hash>`,
+  `web:fetch:<urlHash>`, `browser:navigate:<urlHash>`, etc. The dashboard
+  registers the active step context via agent-core's
+  `setCurrentStepContext` so the WebToolExecutor wraps tool calls
+  automatically.
+
+Implementation lives in agent-core (executor + composite + domain
+matcher) and dashboard (backends + bridge + browser session
+manager).
+
 ## Related ADRs
 
 - `CORE-PIPELINE-EXTRACT-ADR.md` — original extraction (P1–P10).

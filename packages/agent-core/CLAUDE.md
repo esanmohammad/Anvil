@@ -269,6 +269,42 @@ when a new flagship rev ships.
 - Yaml config format? `router/config-loader.ts:defaultRouterConfig`
   is the compiled-in default — that's the canonical schema example.
 
+## Browser + web tool surface (Phases H1+)
+
+`tools/web-executor.ts` mirrors `BuiltinToolExecutor` for the
+network/browser tool surface (`web_search`, `web_fetch`, every
+`browser_*`, `computer_use`). Backends are dependency-injected via
+`WebToolBackends` so agent-core stays vendor-neutral:
+
+- `WebSearchBackend` — production wires Brave/Tavily/Exa/SerpAPI from
+  the dashboard.
+- `WebFetchBackend` — production wires axios + Turndown + cheap-tier
+  summarizer (also dashboard-side).
+- `BrowserBackend` — production wires Playwright + the dashboard's
+  session/context/recorder layer.
+- `ComputerUseBackend` — production wires Docker + Anvil's pinned
+  computer-use image; mocked in tests.
+
+`tools/composite.ts` — `CompositeToolExecutor` dispatches by tool name
+across multiple sub-executors so FS + web surfaces live in one
+unified `listSchemas()` for the agent.
+
+`agent/session/web-tool-backends-registry.ts` — process-level slot
+the dashboard sets at boot (`setWebToolBackends(...)`). The bridge
+(`language-model-bridge.ts:buildBuiltinExecutor`) auto-composes a
+`WebToolExecutor` with the FS executor whenever the stage's
+allowedTools include any `web_*` / `browser_*` / `computer_use`
+name.
+
+`tools/current-step-context.ts` — process-level `StepContext` slot.
+The dashboard sets it at the top of `runOneStage` and clears it in
+the finally; the WebToolExecutor reads it inside `execute()` and
+wraps each tool call in `ctx.effect(...)` so durable replay applies
+to web/browser actions for free.
+
+`tools/domain-matcher.ts` — minimal glob matcher for allow/block
+lists (`*.host`, `**.host`, `host/*`, exact host).
+
 ## Architecture + flow docs
 
 - `ARCHITECTURE.md` — module map, layering, type surface, public exports.
