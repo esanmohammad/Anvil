@@ -21,6 +21,7 @@ import { ConfirmGate, type ConfirmRequest } from '../browser/confirm-gate.js';
 import { ContextStore } from '../browser/contexts.js';
 import { NoProgressDetector, RateLimiter, RateLimitError } from '../browser/no-progress-detector.js';
 import { createHash } from 'node:crypto';
+import type { ComputerRunnerFactory, ComputerRunner } from '../computer-use/docker-runner.js';
 
 export interface WebToolBridgeOpts {
   /** Pinned search provider; auto-detected when omitted. */
@@ -47,6 +48,9 @@ export interface WebToolBridgeOpts {
   /** Per-project context allow-list (overlay's
    *  `tools.browseHeadless.contexts`). */
   allowedContexts?: readonly string[];
+  /** Tier 3 — Docker-backed computer-use runner factory. When omitted,
+   *  Tier 3 tools aren't advertised. */
+  computerRunnerFactory?: ComputerRunnerFactory;
 }
 
 /**
@@ -87,12 +91,42 @@ export function createWebToolBridge(opts: WebToolBridgeOpts = {}): WebToolBacken
       },
     },
     browser: createBrowserBackend(opts),
+    computer: opts.computerRunnerFactory ? createComputerBackend(opts) : undefined,
   };
 }
 
 interface BrowserBackendCtx {
   runId?: string;
   sessionId?: string;
+}
+
+function createComputerBackend(opts: WebToolBridgeOpts) {
+  const factory = opts.computerRunnerFactory!;
+  const confirmGate = new ConfirmGate({ ask: opts.confirmer });
+  const runners = new Map<string, ComputerRunner>();
+
+  async function ensure(runId: string): Promise<ComputerRunner> {
+    let r = runners.get(runId);
+    if (!r) { r = await factory({ runId }); runners.set(runId, r); }
+    return r;
+  }
+
+  return {
+    async do(action: unknown, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      const a = action as { action?: string };
+      // Phase H8 — every Tier 3 action goes through the confirm gate.
+      await confirmGate.confirm({
+        tool: 'computer_use',
+        description: `Tier 3 pixel browser action: ${a.action ?? '?'}`,
+        risk: 'high',
+        payload: action,
+      });
+      const runId = ctx.runId ?? 'standalone';
+      const runner = await ensure(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return runner.do(action as any);
+    },
+  };
 }
 
 function createBrowserBackend(opts: WebToolBridgeOpts) {

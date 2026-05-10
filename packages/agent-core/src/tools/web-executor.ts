@@ -68,10 +68,22 @@ export interface BrowserBackend {
   attachContext?(args: { name: string }, ctx: ExecCtx): Promise<BrowserState>;
 }
 
+export interface ComputerUseBackend {
+  /** Execute a single canonical action; returns post-action screenshot. */
+  do(action: unknown, ctx: ExecCtx): Promise<{
+    imageBase64?: string;
+    width?: number;
+    height?: number;
+    text?: string;
+    error?: { code: string; message: string };
+  }>;
+}
+
 export interface WebToolBackends {
   search?: WebSearchBackend;
   fetch?: WebFetchBackend;
   browser?: BrowserBackend;
+  computer?: ComputerUseBackend;
 }
 
 export interface WebToolExecutorOpts {
@@ -299,6 +311,29 @@ const SCHEMAS: Record<string, ToolSchema> = {
       required: ['name'],
     },
   },
+  computer_use: {
+    name: 'computer_use',
+    description:
+      'Tier 3 pixel-coordinate browser. Emit a canonical action (click/type/scroll/etc.); ' +
+      'returns the post-action screenshot. Available only on vision-capable models with ' +
+      'computer-use support (Claude 4.5+, GPT-4o CUA, Gemini 2.5 Computer Use). ' +
+      'GATED: every action requires user confirmation.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', description: 'screenshot | click | double_click | right_click | type | key | scroll | mouse_move | drag | wait' },
+        coordinate: { type: 'array', items: { type: 'number' } },
+        text: { type: 'string' },
+        button: { type: 'string', enum: ['left', 'middle', 'right'] },
+        modifiers: { type: 'array', items: { type: 'string' } },
+        direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
+        amount: { type: 'number' },
+        path: { type: 'array', items: { type: 'array', items: { type: 'number' } } },
+        durationMs: { type: 'number' },
+      },
+      required: ['action'],
+    },
+  },
 };
 
 export class WebToolExecutor implements ToolExecutor {
@@ -365,6 +400,18 @@ export class WebToolExecutor implements ToolExecutor {
         case 'browser_evaluate':
         case 'browser_attach_context':
           return this.dispatchBrowser(call.name, args, ctx);
+        case 'computer_use': {
+          if (!this.backends.computer) {
+            return { isError: true, content: 'computer_use: backend not configured. Tier 3 requires Docker + a vision-capable model.' };
+          }
+          const result = await durableWrap(
+            'computer:action',
+            shortHash(JSON.stringify(args)),
+            () => this.backends.computer!.do(args, ctx),
+          );
+          if (result.error) return { isError: true, content: `${result.error.code}: ${result.error.message}` };
+          return { isError: false, content: `[computer ${String(args.action)} ${result.width ?? '?'}×${result.height ?? '?'}] ${result.text ?? ''}` };
+        }
         default:
           return { isError: true, content: `Unknown web tool "${call.name}".` };
       }
