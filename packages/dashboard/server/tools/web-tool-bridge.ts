@@ -19,6 +19,8 @@ import { BrowserSessionRegistry, type BrowserRunnerFactory } from '../browser/se
 import { createPlaywrightRunner } from '../browser/playwright-runner.js';
 import { ConfirmGate, type ConfirmRequest } from '../browser/confirm-gate.js';
 import { ContextStore } from '../browser/contexts.js';
+import { NoProgressDetector, RateLimiter, RateLimitError } from '../browser/no-progress-detector.js';
+import { createHash } from 'node:crypto';
 
 export interface WebToolBridgeOpts {
   /** Pinned search provider; auto-detected when omitted. */
@@ -100,6 +102,50 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
   const contextStore = new ContextStore();
   const projectSlug = opts.projectSlug ?? 'default';
 
+  // Phase H7 — per-session no-progress detector + rate limiters.
+  // Keyed on (runId, sessionId) so multiple concurrent sessions don't
+  // share state.
+  const detectors = new Map<string, NoProgressDetector>();
+  const clickLimits = new Map<string, RateLimiter>();
+  const screenshotLimits = new Map<string, RateLimiter>();
+
+  function sessionKey(ctx: BrowserBackendCtx): string {
+    return `${ctx.runId ?? 'standalone'}\u241F${ctx.sessionId ?? ''}`;
+  }
+  function detectorFor(ctx: BrowserBackendCtx): NoProgressDetector {
+    const k = sessionKey(ctx);
+    let d = detectors.get(k);
+    if (!d) { d = new NoProgressDetector(); detectors.set(k, d); }
+    return d;
+  }
+  function clickLimitFor(ctx: BrowserBackendCtx): RateLimiter {
+    const k = sessionKey(ctx);
+    let r = clickLimits.get(k);
+    if (!r) { r = new RateLimiter(1, 1000); clickLimits.set(k, r); }
+    return r;
+  }
+  function screenshotLimitFor(ctx: BrowserBackendCtx): RateLimiter {
+    const k = sessionKey(ctx);
+    let r = screenshotLimits.get(k);
+    if (!r) { r = new RateLimiter(6, 60_000); screenshotLimits.set(k, r); }
+    return r;
+  }
+
+  function recordProgress(ctx: BrowserBackendCtx, kind: string, state: { url: string; domText: string }): void {
+    const tuple = {
+      url: state.url,
+      viewportHash: createHash('sha256').update(state.domText).digest('hex').slice(0, 16),
+      lastInteractionType: kind,
+    };
+    const r = detectorFor(ctx).observe(tuple);
+    if (r.stalled && state) {
+      // Annotate the state so the agent sees the warning.
+      Object.assign(state, {
+        domText: `[__anvilBrowseStalled — ${r.streak} actions without progress; consider browser_done]\n${state.domText}`,
+      });
+    }
+  }
+
   function acquire(ctx: BrowserBackendCtx) {
     const runId = ctx.runId ?? 'standalone';
     const sessionId = ctx.sessionId ?? `s-${randomUUID()}`;
@@ -107,14 +153,27 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
     return registry.acquire({ runId, sessionId, userDataDir, headless: true });
   }
 
+  function clearSessionState(ctx: BrowserBackendCtx): void {
+    const k = sessionKey(ctx);
+    detectors.delete(k);
+    clickLimits.delete(k);
+    screenshotLimits.delete(k);
+  }
+  void RateLimitError;
+
   return {
     async navigate(args: import('@esankhan3/anvil-core-pipeline').BrowserNavigateArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       const session = acquire(ctx);
-      return session.navigate({ url: args.url, newTab: args.newTab, timeoutMs: args.timeoutMs });
+      const state = await session.navigate({ url: args.url, newTab: args.newTab, timeoutMs: args.timeoutMs });
+      recordProgress(ctx, 'navigate', state);
+      return state;
     },
     async click(args: import('@esankhan3/anvil-core-pipeline').BrowserClickArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      clickLimitFor(ctx).consume();
       const session = acquire(ctx);
-      return session.click(args.index);
+      const state = await session.click(args.index);
+      recordProgress(ctx, 'click', state);
+      return state;
     },
     async input(args: import('@esankhan3/anvil-core-pipeline').BrowserInputArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       const session = acquire(ctx);
@@ -129,8 +188,10 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
       const runId = ctx.runId ?? 'standalone';
       const sessionId = ctx.sessionId ?? '';
       if (sessionId) await registry.release(runId, sessionId);
+      clearSessionState(ctx);
     },
     async screenshot(args: import('@esankhan3/anvil-core-pipeline').BrowserScreenshotArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      screenshotLimitFor(ctx).consume();
       const session = acquire(ctx);
       const runner = await session.getRunner();
       const r = await runner.screenshot(args);
