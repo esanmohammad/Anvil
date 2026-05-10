@@ -84,9 +84,9 @@ export const STAGE_SANDBOX_POLICY: Readonly<Record<string, StageSandboxPolicyEnt
     notes: 'distillation only — no FS, no network',
   },
 
-  // — Implementation stages (mode flips to 'container' in S12) —
+  // — Implementation stages (S12: mode flipped to 'container') —
   build: {
-    mode: 'none',
+    mode: 'container',
     fsMode: 'overlay',
     limits: {
       memoryMiB: 4096,
@@ -99,7 +99,7 @@ export const STAGE_SANDBOX_POLICY: Readonly<Record<string, StageSandboxPolicyEnt
     notes: 'heavy stage — package install network needed',
   },
   test: {
-    mode: 'none',
+    mode: 'container',
     fsMode: 'overlay',
     limits: {
       memoryMiB: 4096,
@@ -112,7 +112,7 @@ export const STAGE_SANDBOX_POLICY: Readonly<Record<string, StageSandboxPolicyEnt
     notes: 'npm test / pytest',
   },
   validate: {
-    mode: 'none',
+    mode: 'container',
     fsMode: 'overlay',
     limits: {
       memoryMiB: 2048,
@@ -125,7 +125,7 @@ export const STAGE_SANDBOX_POLICY: Readonly<Record<string, StageSandboxPolicyEnt
     notes: 'lint + smoke; tightest budget — runs many times',
   },
   ship: {
-    mode: 'none',
+    mode: 'container',
     fsMode: 'overlay',
     limits: {
       memoryMiB: 1024,
@@ -144,7 +144,7 @@ export const STAGE_SANDBOX_POLICY: Readonly<Record<string, StageSandboxPolicyEnt
 
   // — Ad-hoc commands —
   fix: {
-    mode: 'none',
+    mode: 'container',
     fsMode: 'overlay',
     limits: {
       memoryMiB: 4096,
@@ -157,7 +157,7 @@ export const STAGE_SANDBOX_POLICY: Readonly<Record<string, StageSandboxPolicyEnt
     notes: 'same scope as build',
   },
   'fix-loop': {
-    mode: 'none',
+    mode: 'container',
     fsMode: 'overlay',
     limits: {
       memoryMiB: 4096,

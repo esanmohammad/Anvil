@@ -34,12 +34,13 @@ describe('STAGE_SANDBOX_POLICY — Phase S0', () => {
     }
   });
 
-  it('Phase S0 keeps every stage at mode="none" so behavior is unchanged', () => {
-    // S12 flips build/test/validate/ship/fix/fix-loop to "container".
-    // Until then every stage is mode=none — failing this test catches an
-    // accidental early flip.
+  it('Phase S12 keeps read-only stages at mode="none" but flips execute stages to "container"', () => {
+    // S12 flipped build/test/validate/ship/fix/fix-loop to "container";
+    // every other stage stays "none" because they don't exec.
+    const containerStages = new Set(['build', 'test', 'validate', 'ship', 'fix', 'fix-loop']);
     for (const [stage, entry] of Object.entries(STAGE_SANDBOX_POLICY)) {
-      assert.equal(entry.mode, 'none', `stage ${stage} should still be mode=none in S0`);
+      const expected = containerStages.has(stage) ? 'container' : 'none';
+      assert.equal(entry.mode, expected, `stage ${stage} should be mode=${expected}`);
     }
   });
 
@@ -82,7 +83,8 @@ describe('sandboxPolicyForStage', () => {
 
   it('stageIsSandboxed reflects the mode', () => {
     assert.equal(stageIsSandboxed('clarify'), false);
-    assert.equal(stageIsSandboxed('build'), false); // S0 default — flips in S12
+    assert.equal(stageIsSandboxed('build'), true); // S12 — container
+    assert.equal(stageIsSandboxed('validate'), true);
     assert.equal(stageIsSandboxed('made-up'), false);
   });
 });
