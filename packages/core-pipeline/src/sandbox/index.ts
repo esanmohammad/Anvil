@@ -20,3 +20,20 @@ export {
   shutdownAllSandboxRunners,
   __resetSandboxRegistryForTests,
 } from './runner-registry.js';
+export {
+  StatHashCache,
+  hashWorkdir,
+  DEFAULT_HASH_SKIP,
+  type WorkdirHash,
+  type HashOptions,
+} from './state-hash.js';
+export {
+  sandboxEffectName,
+  wrapSandboxAcquire,
+  wrapSandboxExec,
+  wrapSandboxWrite,
+  wrapSandboxEdit,
+  wrapSandboxSync,
+  wrapSandboxClose,
+  type DurableSandboxOptions,
+} from './durable-wrap.js';
