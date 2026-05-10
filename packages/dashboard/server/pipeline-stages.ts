@@ -599,15 +599,14 @@ async function runStageWithQA(
   stage: StageDefinition,
   prevArtifact: string,
   maxQuestions: number,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  _ctx?: StepContext<string>,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const baseUserPrompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
   const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
   const qaPrompt = STAGE_QA_PROMPT_HEADER(maxQuestions) + baseUserPrompt;
 
   const session = makeAgentSession(deps);
-  const first = await session.start({
+  const startReq = {
     persona: stage.persona,
     projectPrompt,
     userPrompt: qaPrompt,
@@ -616,7 +615,16 @@ async function runStageWithQA(
     allowedTools: deps.allowedToolsForCurrentStage(stage.name),
     disallowedTools: disallowedToolsForPersona(stage.persona),
     maxOutputTokens: maxOutputTokensForStage(stage.name),
-  });
+  };
+  // Phase E2: durable wrap for the Q&A session start. On replay the
+  // recorded first.output (questions or artifact) returns directly,
+  // skipping the agent spawn.
+  const first = ctx
+    ? await ctx.effect(
+        `${stage.name}:session-start`,
+        async () => serializeAgentRunResult(await session.start(startReq) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof session.start>>,
+      )
+    : await session.start(startReq);
 
   if (first.agentId) {
     deps.state.stages[index].agentId = first.agentId;
@@ -680,7 +688,16 @@ async function runStageWithQA(
   deps.state.waitingForInput = false;
   deps.broadcast();
 
-  const second = await session.sendInput(first.sessionId, answersBlock);
+  // Phase E2: durable wrap for Q&A session resume. On replay the
+  // recorded artifact returns directly; the answers block was
+  // already in the recorded session-start payload so the agent
+  // doesn't see it twice.
+  const second = ctx
+    ? await ctx.effect(
+        `${stage.name}:session-resume`,
+        async () => serializeAgentRunResult(await session.sendInput(first.sessionId, answersBlock) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof session.sendInput>>,
+      )
+    : await session.sendInput(first.sessionId, answersBlock);
 
   return {
     artifact: second.output,
@@ -710,7 +727,7 @@ async function runSingleStage(
   const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
 
   const runner = makeAgentRunner(deps, stage.name);
-  const result = await runner.run({
+  const runReq = {
     persona: stage.persona,
     projectPrompt,
     userPrompt: prompt,
@@ -719,7 +736,15 @@ async function runSingleStage(
     allowedTools: deps.allowedToolsForCurrentStage(stage.name),
     disallowedTools: disallowedToolsForPersona(stage.persona),
     maxOutputTokens: maxOutputTokensForStage(stage.name),
-  });
+  };
+  // Phase E2/E4: durable wrap for single-stage agent spawns
+  // (requirements when Q&A disabled, tasks, validate-without-fanout).
+  const result = ctx
+    ? await ctx.effect(
+        `${stage.name}:spawn-agent`,
+        async () => serializeAgentRunResult(await runner.run(runReq) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runner.run>>,
+      )
+    : await runner.run(runReq);
 
   if (result.agentId) {
     deps.state.stages[index].agentId = result.agentId;
@@ -1055,7 +1080,21 @@ export async function runOneStage(
       if (edited !== null) {
         prevArtifact = edited;
       } else {
-        writeStageArtifactFn(deps.depsForArtifactIO(), stage, result.artifact);
+        // Phase E2: durable wrap for stage artifact write. Idempotency key
+        // includes the content hash so re-runs with the same body collapse;
+        // re-runs with a different body surface as a determinism violation.
+        if (ctx) {
+          await ctx.effect(
+            `${stage.name}:write-artifact`,
+            async () => {
+              writeStageArtifactFn(deps.depsForArtifactIO(), stage, result.artifact);
+              return null;
+            },
+            { idempotencyKey: artifactIdempotencyKey(stage.name, 'stage', result.artifact) },
+          );
+        } else {
+          writeStageArtifactFn(deps.depsForArtifactIO(), stage, result.artifact);
+        }
       }
 
       try {
