@@ -811,26 +811,37 @@ async function runSingleStage(
 
 // ── Test-gen stage ─────────────────────────────────────────────────
 
-async function runTestGenStage(deps: StageOpsDeps, stageIndex: number): Promise<string> {
+async function runTestGenStage(
+  deps: StageOpsDeps,
+  stageIndex: number,
+  ctx?: StepContext<string>,
+): Promise<string> {
   const repoNames = deps.state.repoNames.length
     ? deps.state.repoNames
     : Object.keys(deps.repoPaths());
   const repoLocalPaths: Record<string, string> = {};
   for (const r of repoNames) repoLocalPaths[r] = deps.repoPaths()[r] ?? join(deps.workspaceDir, r);
 
-  return runTestGenForProject({
+  const opts = {
     planSeed: deps.config.planSeed ?? null,
     project: deps.config.project,
     model: deps.config.model,
     workspaceDir: deps.workspaceDir,
     repoLocalPaths,
-    onConventionsDetected: (artifact) => {
+    onConventionsDetected: (artifact: string) => {
       deps.state.stages[stageIndex].artifact = artifact;
     },
-    onArtifactWritten: (event) => {
+    onArtifactWritten: (event: unknown) => {
       deps.emit('artifact-written', event);
     },
-  });
+  };
+  // Phase E7: durable wrap for test-gen. Single effect — the
+  // test-gen path inside runTestGenForProject is already
+  // serial-per-repo internally; per-repo granularity is a future
+  // refinement that would require threading ctx into core-pipeline.
+  return ctx
+    ? ctx.effect('test:spawn-testgen', async () => runTestGenForProject(opts))
+    : runTestGenForProject(opts);
 }
 
 // ── Validate→fix loop ──────────────────────────────────────────────
@@ -999,7 +1010,7 @@ export async function runOneStage(
         return { control: 'continue', prevArtifact };
       }
       try {
-        const artifact = await runTestGenStage(deps, i);
+        const artifact = await runTestGenStage(deps, i, ctx);
         deps.state.stages[i].status = 'completed';
         deps.state.stages[i].artifact = artifact;
         deps.state.stages[i].completedAt = new Date().toISOString();
@@ -1194,18 +1205,36 @@ export async function runOneStage(
       }
 
       if (stage.name === 'ship' && deps.config.deploy && !deps.isCancelled()) {
-        deployProject({
+        const deployOpts = {
           project: deps.config.project,
           mode: deps.config.deploy,
           workspaceDir: deps.workspaceDir,
           configDeployCmd: deps.projectLoader.getConfig(deps.config.project)?.pipeline?.ship?.deploy,
           envDeployCmd: process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD,
-          onArtifact: (artifact) => deps.emit('artifact-written', artifact),
-          onLog: (level, message) => {
+          onArtifact: (artifact: unknown) => deps.emit('artifact-written', artifact),
+          onLog: (level: string, message: string) => {
             if (level === 'info') console.log(`[pipeline] ${message}`);
             else console.warn(`[pipeline] ${message}`);
           },
-        });
+        };
+        // Phase E8: durable wrap for nexus deploy. Idempotency
+        // key includes runId so a re-run of the same project +
+        // mode replays cleanly. Note: deployProject's external
+        // idempotency (e.g. nexus dedup on deploy id) lives in
+        // deployProject itself; this wrap protects against
+        // re-spawning the deploy command on resume.
+        if (ctx) {
+          await ctx.effect(
+            'ship:deploy',
+            async () => {
+              deployProject(deployOpts);
+              return null;
+            },
+            { idempotencyKey: `${ctx.runId}:${deps.config.project}:${deps.config.deploy ?? 'local'}` },
+          );
+        } else {
+          deployProject(deployOpts);
+        }
       }
 
       if (stage.name === 'requirements' && deps.state.repoNames.length === 0) {
