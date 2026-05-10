@@ -39,6 +39,7 @@ import { AgentManager, type AgentState } from '@esankhan3/anvil-agent-core';
 import { PipelineRunner } from './pipeline-runner.js';
 import { getDurableStore } from './durable-store-singleton.js';
 import { runDurableMigration } from './durable-migration.js';
+import { scheduleDurableVacuum } from './durable-vacuum.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import type { PipelineRunState } from './pipeline-runner.js';
@@ -7404,6 +7405,17 @@ Findings array may be empty. No prose outside the JSON block.`;
     }
   } catch (err) {
     console.warn(`[dashboard] durable migration skipped: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Phase F3: durable-store vacuum. Runs once at boot then daily
+  // to drop terminal runs older than the retention window
+  // (default 30d, override via ANVIL_DURABLE_RETENTION_DAYS).
+  // Skip with ANVIL_DURABLE_VACUUM_DISABLED=1.
+  try {
+    const durableStore = getDurableStore();
+    await scheduleDurableVacuum(durableStore);
+  } catch (err) {
+    console.warn(`[dashboard] durable vacuum schedule skipped: ${err instanceof Error ? err.message : err}`);
   }
 
   return new Promise(() => {
