@@ -541,6 +541,74 @@ gate on `browser_evaluate` / `browser_attach_context` / all
 **User guide** — `docs/browser-web-tools-guide.md`. Plan reference:
 `docs/browser-web-tools-plan.md` + `docs/browser-web-tools-survey.md`.
 
+## Sandbox isolation surface (Phases S0–S13)
+
+Phase S0–S12 isolated the `build` / `test` / `validate` / `ship` /
+`fix` / `fix-loop` stages. Read-only stages stay on host. Phase S12
+flipped the per-stage default mode from `'none'` → `'container'`.
+
+- **`server/sandbox/docker-runner.ts`** — `DockerSandboxRunner` +
+  `DockerSandboxHandle`. Drives the host's `docker` CLI via
+  `child_process` (no `dockerode` dep). Each `acquire()` starts a
+  long-lived container with the host workdir bind-mounted at
+  `/workspace`; `exec()` calls `docker exec`; `close()` calls
+  `docker rm -f`. The CLI driver makes the runner work without
+  installing extra npm packages on the user's machine.
+- **`server/sandbox/firecracker-runner.ts`** — Mode 2 microVM via
+  `firecracker-containerd`'s `ctr` CLI. Off by default. Linux + KVM
+  only. `isAvailable()` probes `/dev/kvm` + `ctr version`.
+- **`server/sandbox/gvisor-runner.ts`** — extends `DockerSandboxRunner`
+  with `--runtime=runsc` injected into `docker run`. Off by default.
+  Linux + `runsc` only.
+- **`server/sandbox/overlay-fs.ts`** — pure FS module: walks an
+  upper-layer directory and applies the diff to the host workdir.
+  Conflict policy: `host-wins` (default) writes
+  `<file>.anvil-conflict`; `sandbox-wins` overwrites.
+  `captureBaselineMtimes()` records pre-sandbox state for conflict
+  detection.
+- **`server/sandbox/network-policy.ts`** — `resolveNetworkPolicy()`
+  layers (project blockList > stage allowList > project allowList >
+  package-manager allow-list > default deny). `dockerRunNetworkArgs()`
+  picks the cheapest enforcement: `--network none` for default-deny
+  + empty allowList; `--network anvil-sandbox --dns ...` for richer
+  policy. `dnsmasqConfigBody()` + `iptablesRulesForPolicy()` render
+  the in-namespace network setup.
+- **`server/sandbox/resource-limits.ts`** — `dockerRunLimitArgs()`
+  emits `--memory` / `--memory-swap` / `--cpus` / `--pids-limit` /
+  `--storage-opt size=`. `detectLimitKill()` classifies exit codes +
+  stderr patterns into `killedByLimit: oom | pid | disk | timeout`.
+- **`server/sandbox/cache-mounts.ts`** — read-only host cache mounts
+  for npm / yarn / pnpm / pip / cargo / Go. Per-stage opt-in to
+  read-write so `npm install` populates the host cache.
+- **`server/sandbox/pool.ts`** — `SandboxPool` wraps any
+  `SandboxRunner` with a per-(project, image, fsMode, limits) warm
+  cache. Idle TTL eviction (5 min default), maxIdle (4) + maxTotal
+  (16) caps, FIFO waiters with timeout.
+
+**Durable replay** — every sandbox boundary crossing records via
+`ctx.effect()`. Effect names follow §I.1 of the plan:
+`sandbox:acquire:<runId>:<stage>`, `sandbox:exec:<idx>:<commandHash>`,
+`sandbox:write:<idx>:<pathHash>`, etc. The state-hash Merkle digest
+(`hashWorkdir` in core-pipeline) bounds replay determinism — if the
+workdir's content drifts, replay throws
+`SandboxDeterminismViolationError` instead of silently returning a
+stale result.
+
+**UI** — `DurableTimeline` gains a `sandbox` filter chip and per-row
+summaries (`$ <command>`, `runtime=<name>`, etc.). `ToolCostPanel`
+adds a sandbox stream with rough wall-time-amortized estimates;
+payload `costUsd` overrides when present (matches the H10-followup
+pattern). `SandboxPanel.tsx` renders the live runtime stats from
+the new `sandbox-stats` WS push.
+
+**CLI** — `anvil sandbox-runtime shell|prune|stats` for diagnostics;
+`anvil doctor --pull-sandbox` pre-warms the image. The existing
+`anvil sandbox` command (Nexus deploy sandbox) is unchanged — that's
+a different concept.
+
+**User guide** — `docs/sandbox-isolation-guide.md`. Plan reference:
+`docs/sandbox-isolation-plan.md`.
+
 ## Architecture + flow docs
 
 - `README.md` — package overview, build commands, storage layout,

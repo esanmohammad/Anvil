@@ -344,6 +344,46 @@ Implementation lives in agent-core (executor + composite + domain
 matcher) and dashboard (backends + bridge + browser session
 manager).
 
+## Sandbox isolation contract (Phases S0–S13)
+
+Phase S0 introduced the `SandboxRunner` / `SandboxHandle` contract;
+Phase S6 wired it into the durable execution log; Phase S12 flipped
+the default mode for `build` / `test` / `validate` / `ship` / `fix` /
+`fix-loop` from `'none'` to `'container'`.
+
+- **`src/sandbox/types.ts`** — full TS surface for runners and handles
+  (`SandboxRunner`, `SandboxHandle`, `AcquireSandboxOpts`,
+  `SandboxLimits`, `NetworkPolicy`, `SandboxExecArgs`,
+  `SandboxExecResult`, `SandboxSnapshot`, `SandboxSyncResult`,
+  `StageSandboxPolicyEntry`, `SandboxDeterminismViolationError`).
+- **`src/sandbox/none-runner.ts`** — `NoneSandboxRunner` /
+  `NoneSandboxHandle`. Passthrough — runs `sh -c` on the host. Default
+  for read-only stages.
+- **`src/sandbox/runner-registry.ts`** — process-wide factory
+  (`registerSandboxRunner` / `getSandboxRunner`). Concrete Mode 1/2
+  runners (Docker, Firecracker, gVisor) live in dashboard + register
+  at boot.
+- **`src/sandbox/state-hash.ts`** — `hashWorkdir()` content-addressed
+  Merkle digest of the workdir for replay determinism. Skip-globs for
+  `node_modules` / `.git` / `dist` / `target` / `.cargo`. `StatHashCache`
+  keyed on `(path, size, mtimeMs)` for ~free re-hashing between turns.
+- **`src/sandbox/durable-wrap.ts`** — wrappers that record each
+  acquire/exec/write/edit/sync/close as a `ctx.effect()`. Idempotency
+  keys per §I.2:
+  - `exec` keyed on `contentHash(command + sandboxStateHash)` — replay
+    determinism is bounded by input state.
+  - `acquire` keyed on `(runId, stage, image, limitsHash)`.
+  - `write` keyed on `(runId, stage, path, contentHash(content))`.
+  - `edit` keyed on `(runId, stage, path, contentHash(old + new))`.
+- **`src/routing/sandbox-policy.ts`** — `STAGE_SANDBOX_POLICY` table +
+  `sandboxPolicyForStage` + `mergeStageSandboxPolicy`. Read-only
+  stages default to `mode='none'`; execute stages default to
+  `mode='container'` (post-S12). Policy is overridable via the
+  dashboard's `pipeline-policy.overlay.json: sandbox.*` block.
+
+**User guide** — `docs/sandbox-isolation-guide.md`. Plan reference:
+`docs/sandbox-isolation-plan.md`.
+
 ## Related ADRs
 
 - `CORE-PIPELINE-EXTRACT-ADR.md` — original extraction (P1–P10).
