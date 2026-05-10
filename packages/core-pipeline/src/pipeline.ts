@@ -40,8 +40,11 @@
  *     Steps that need per-repo failure tolerance handle it inside `run()`.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import { InMemoryArtifactStore } from './artifacts.js';
 import type {
+  EffectOptions,
   EventBus,
   LlmHandles,
   MemoryHandles,
@@ -54,6 +57,9 @@ import type {
   StepRetryPolicy,
   StepSkipContext,
 } from './types.js';
+import type { DurableStore } from './durable/store.js';
+import { EffectRuntime } from './durable/effect-runtime.js';
+import { DeterminismViolationError } from './durable/types.js';
 
 export interface PipelineDeps {
   registry: StepRegistry;
@@ -115,6 +121,26 @@ export interface PipelineDeps {
    * `__anvilRewind` flow.
    */
   rewindTo?: string;
+  /**
+   * Optional `DurableStore` — when supplied, every step gets an
+   * effect runtime that records `ctx.effect` calls into the
+   * durable log, and on resume those calls return recorded
+   * results without re-running. See
+   * `docs/durable-execution-plan.md` §F for the replay protocol.
+   *
+   * When omitted, `ctx.effect`/`now`/`uuid`/`random`/`sleep`/
+   * `waitForSignal` become trivial wrappers — `effect(name, fn)`
+   * just calls `fn()`, `now()` returns `Date.now()`, etc. The
+   * walker behaviour is byte-identical to the pre-D2 contract.
+   * Phase D2 of the durable execution rollout.
+   */
+  durableStore?: DurableStore;
+  /**
+   * Identity of the holding process — used by the durable log
+   * hook + lease arbitration. Defaults to `${pid}@${hostname}`.
+   * Phase D2.
+   */
+  durableHolder?: string;
 }
 
 export class Pipeline {
@@ -134,7 +160,7 @@ export class Pipeline {
   }
 
   async run(): Promise<PipelineRunResult> {
-    const { registry, bus, runId, signal, resumeFromStep, completedSteps: priorCompleted, rewindTo } = this.deps;
+    const { registry, bus, runId, signal, resumeFromStep, completedSteps: priorCompleted, rewindTo, durableStore } = this.deps;
     const now = this.deps.now ?? Date.now;
     const startedAt = now();
     const completedSteps: string[] = [];
@@ -153,9 +179,22 @@ export class Pipeline {
 
     // Resolve the skip set from resumeFromStep + completedSteps + rewindTo.
     const orderedSteps = registry.steps();
-    const skipReason: Map<string, 'completed' | 'resume' | 'rewind'> = new Map();
+    const skipReason: Map<string, 'completed' | 'resume' | 'rewind' | 'replay-completed'> = new Map();
     if (priorCompleted) {
       for (const id of priorCompleted) skipReason.set(id, 'completed');
+    }
+
+    // Durable replay: every step that has `step:completed` in the
+    // log on entry skips with reason 'replay-completed'. This is
+    // additive to priorCompleted/resumeFromStep — replay survives
+    // even when the caller didn't pass those flags.
+    if (durableStore) {
+      const events = await durableStore.readEvents(runId);
+      for (const ev of events) {
+        if (ev.kind === 'step:completed' && ev.stepId) {
+          skipReason.set(ev.stepId, 'replay-completed');
+        }
+      }
     }
 
     if (resumeFromStep) {
@@ -207,12 +246,18 @@ export class Pipeline {
       }
 
       if (skipSet.has(step.id)) {
+        const reason = skipReason.get(step.id) ?? (resumeFromStep ? 'resume' : 'completed');
+        // Don't double-record `step:skipped` for replay-completed
+        // steps — the original `step:completed` is already in the
+        // durable log. Emit the event for in-process consumers
+        // (audit log, dashboard) but skip the durable hook will
+        // see the duplicate runId+stepId and elide.
         await this.emit(bus, {
           hook: 'step:skipped',
           runId,
           stepId: step.id,
           ts: this.iso(now),
-          payload: { reason: skipReason.get(step.id) ?? (resumeFromStep ? 'resume' : 'completed') },
+          payload: { reason },
         });
         // Track in completedSteps so the result reflects what the run "saw".
         completedSteps.push(step.id);
@@ -408,7 +453,7 @@ export class Pipeline {
     fanoutOpts?: { repoName?: string },
   ): Promise<unknown> {
     const policy = step.retryPolicy;
-    const ctx = this.buildContext(step, input, fanoutOpts);
+    const ctx = await this.buildContext(step, input, fanoutOpts);
     if (!policy || policy.attempts <= 0) {
       return step.run(ctx);
     }
@@ -443,12 +488,12 @@ export class Pipeline {
     throw lastErr;
   }
 
-  private buildContext<I>(
+  private async buildContext<I>(
     step: Step<I, unknown>,
     input: unknown,
     fanoutOpts?: { repoName?: string },
-  ): StepContext<I> {
-    const { runId, workspaceDir, repoPaths, memory, llm, bus, signal } = this.deps;
+  ): Promise<StepContext<I>> {
+    const { runId, workspaceDir, repoPaths, memory, llm, bus, signal, durableStore } = this.deps;
     const sig = signal ?? new AbortController().signal;
     const artifactsView = this.artifacts;
     const emit = (artifactId: string, data: unknown): void => {
@@ -461,6 +506,38 @@ export class Pipeline {
         payload: { artifactId, data },
       });
     };
+
+    let effectFn: StepContext<I>['effect'];
+    let nowFn: StepContext<I>['now'];
+    let uuidFn: StepContext<I>['uuid'];
+    let randomFn: StepContext<I>['random'];
+    let sleepFn: StepContext<I>['sleep'];
+    let waitForSignalFn: StepContext<I>['waitForSignal'];
+
+    if (durableStore) {
+      const recorded = await durableStore.readEffectEvents(runId, step.id);
+      const runtime = new EffectRuntime({
+        store: durableStore,
+        runId,
+        stepId: step.id,
+        recordedEffects: recorded,
+        signal: sig,
+      });
+      effectFn = (name, fn, opts) => runtime.effect(name, fn, opts);
+      nowFn = () => runtime.now();
+      uuidFn = () => runtime.uuid();
+      randomFn = () => runtime.random();
+      sleepFn = (ms) => runtime.sleep(ms);
+      waitForSignalFn = (channel) => runtime.waitForSignal(channel);
+    } else {
+      effectFn = passthroughEffect;
+      nowFn = passthroughNow;
+      uuidFn = passthroughUuid;
+      randomFn = passthroughRandom;
+      sleepFn = passthroughSleep;
+      waitForSignalFn = passthroughWaitForSignal;
+    }
+
     return {
       runId,
       workspaceDir,
@@ -474,6 +551,12 @@ export class Pipeline {
       memory,
       llm,
       signal: sig,
+      effect: effectFn,
+      now: nowFn,
+      uuid: uuidFn,
+      random: randomFn,
+      sleep: sleepFn,
+      waitForSignal: waitForSignalFn,
     };
   }
 
@@ -523,6 +606,29 @@ export function makePipelineEvent<P>(
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ── Non-durable mode passthroughs (Phase D2) ──────────────────────
+async function passthroughEffect<T>(_name: string, fn: () => Promise<T>, _opts?: EffectOptions): Promise<T> {
+  return fn();
+}
+async function passthroughNow(): Promise<number> {
+  return Date.now();
+}
+async function passthroughUuid(): Promise<string> {
+  return randomUUID();
+}
+async function passthroughRandom(): Promise<number> {
+  return Math.random();
+}
+async function passthroughSleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
+async function passthroughWaitForSignal<T>(_channel: string): Promise<T> {
+  throw new Error(
+    'StepContext.waitForSignal called without a durable store. '
+      + 'Pass `durableStore` to Pipeline.run() to enable durable signal channels.',
+  );
 }
 
 function computeBackoff(policy: StepRetryPolicy, attempt: number): number {
