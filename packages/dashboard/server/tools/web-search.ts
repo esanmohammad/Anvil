@@ -51,8 +51,7 @@ export class WebSearchAdapter implements WebSearchBackend {
     this.httpFetch = opts.fetch ?? fetch;
   }
 
-  async search(args: WebSearchArgs, _ctx?: unknown): Promise<WebSearchResult> {
-    void _ctx;
+  async search(args: WebSearchArgs): Promise<WebSearchResult> {
     const limit = args.limit ?? 10;
     const raw = await this.dispatch(args, limit);
     let results: WebSearchHit[] = raw;

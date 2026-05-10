@@ -199,8 +199,18 @@ anvil browser list -p <project-slug>
 
 Every web/browser action is recorded as a `ctx.effect(...)` event.
 On crash recovery (G1 takeover) the recorded answer / DOM state
-returns instantly; the network call doesn't fire again. The dashboard's
-**Run history → Durable execution log** tab shows:
+returns instantly; the network call doesn't fire again.
+
+> **Caveat — browser session continuity on resume.** Auto-takeover
+> replays the durable log, but the Playwright child process from the
+> original run is gone. Cookies set via `browser_navigate` within the
+> run are lost on resume. Recorded *answers* still surface (so the
+> agent sees the same DOM state it saw before the crash), but if the
+> agent re-issues a `browser_navigate` after the resume cursor, the
+> new session starts unauthenticated. Use a named context
+> (`anvil browser login`) when persistent auth is required.
+
+The dashboard's **Run history → Durable execution log** tab shows:
 
 - Filter chips: `all / steps / effects / signals / web / browser / computer`.
 - Per-tool cost panel — aggregates spend by namespace.

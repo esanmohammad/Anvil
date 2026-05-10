@@ -441,6 +441,13 @@ interface RawOverlay {
   };
   notifications?: Partial<NotificationConfig>;
   qa?: Partial<AgentQuestionPolicy>;
+  tools?: Record<string, {
+    enabled?: boolean;
+    stages?: string[];
+    allowedDomains?: string[];
+    blockedDomains?: string[];
+    contexts?: string[];
+  }>;
 }
 
 /** Layer the dashboard-managed overlay JSON on top of the base policy. */
@@ -471,6 +478,17 @@ function applyOverlay(base: PipelinePolicy, projectSlug: string, home: string): 
   }
   if (overlay.qa && typeof overlay.qa === 'object') {
     out.qa = { ...(base.qa ?? {}), ...overlay.qa };
+  }
+  // H10-followup #1 — propagate `tools.*` blocks (network, browseHeadless,
+  // browseEval, browsePixel) so per-class enabled/stages/contexts/
+  // allowedDomains land in the in-memory policy that consumers
+  // (model-resolution, web-tool-bridge) read.
+  if (overlay.tools && typeof overlay.tools === 'object') {
+    const baseTools = (base as { tools?: Record<string, unknown> }).tools ?? {};
+    (out as { tools?: Record<string, unknown> }).tools = {
+      ...baseTools,
+      ...overlay.tools,
+    };
   }
   return out;
 }

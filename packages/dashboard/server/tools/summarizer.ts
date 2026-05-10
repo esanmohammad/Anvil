@@ -121,8 +121,16 @@ export async function summarize(opts: SummarizerCallOpts): Promise<SummarizerRes
         if (opts.modelOverride) return opts.modelOverride;
         return resolveStageModelWithFallback(stage);
       },
-      onBurn: () => {
-        // Logged by the surrounding cost ledger; nothing to do here.
+      onBurn: ({ model, status, message }) => {
+        // H10-followup #3 — surface chain-walk events so the dashboard
+        // shows when Haiku 429s and we fall through to gpt-4o-mini /
+        // similar. The event stream is already wired into the
+        // `project-event` flow via stderr; future work threads a
+        // proper event bus.
+        // eslint-disable-next-line no-console
+        console.error(
+          `[${stage}] burned model "${model}" (status=${status}): ${message}. Falling through chain.`,
+        );
       },
     },
     async (model) => {

@@ -76,7 +76,8 @@ export function createWebToolBridge(opts: WebToolBridgeOpts = {}): WebToolBacken
             fetch: opts.fetch,
           });
         }
-        return cachedSearch.search(args, ctx);
+        void ctx;
+        return cachedSearch.search(args);
       },
     },
     fetch: {
@@ -173,10 +174,7 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
   const contextStore = new ContextStore();
   // projectSlug is now resolved per-call via `resolveProjectSlug(ctx)`,
   // not at backend construction time, so allowedContexts can read live
-  // pipeline-policy state. The static `opts.projectSlug` is honored as
-  // a fallback when no step ctx is registered.
-  const fallbackProjectSlug = opts.projectSlug ?? 'default';
-  void fallbackProjectSlug;
+  // pipeline-policy state.
 
   // Phase H7 — per-session no-progress detector + rate limiters.
   // Keyed on (runId, sessionId) so multiple concurrent sessions don't

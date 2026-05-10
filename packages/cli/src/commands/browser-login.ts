@@ -77,28 +77,92 @@ browserCommand
   });
 
 browserCommand
+  .command('refresh <name>')
+  .description('Re-launch a headed Chromium against the saved URL so you can re-authenticate a stale context.')
+  .option('-p, --project <slug>', 'project slug', 'default')
+  .option('--root <path>', 'override contexts root')
+  .action(async (name: string, opts: BrowserLoginOptions) => {
+    const project = opts.project ?? 'default';
+    const root = opts.root ?? join(homedir(), '.anvil', 'browser', 'contexts');
+    const dir = join(root, project, name);
+    const { existsSync, readFileSync, writeFileSync } = await import('node:fs');
+    if (!existsSync(dir)) {
+      console.error(`Context "${name}" not found for project "${project}". Run \`anvil browser login\` first.`);
+      process.exitCode = 1;
+      return;
+    }
+    let url: string;
+    try {
+      const meta = JSON.parse(readFileSync(join(dir, 'metadata.json'), 'utf8')) as { url?: string };
+      if (!meta.url) throw new Error('metadata missing url');
+      url = meta.url;
+    } catch (err) {
+      console.error(`Failed to read context metadata: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    let playwright: { chromium: { launchPersistentContext: (...a: unknown[]) => Promise<unknown> } } | undefined;
+    try {
+      const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<typeof playwright>;
+      playwright = await dynImport('playwright');
+    } catch {
+      console.error('playwright is not installed. Install with: npm install -w @anvil-dev/dashboard playwright && npx playwright install chromium');
+      process.exitCode = 2;
+      return;
+    }
+    if (!playwright) return;
+
+    console.log(`Refreshing context "${name}" → ${url}`);
+    console.log('Re-authenticate, then close the window to save.');
+    const context = await playwright.chromium.launchPersistentContext(dir, {
+      headless: false,
+      viewport: { width: 1280, height: 800 },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const page = await (context as any).newPage();
+    await page.goto(url);
+    await new Promise<void>((resolve) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (context as any).on('close', resolve);
+    });
+    // Update refreshedAt.
+    try {
+      const meta = JSON.parse(readFileSync(join(dir, 'metadata.json'), 'utf8')) as Record<string, unknown>;
+      meta.refreshedAt = new Date().toISOString();
+      writeFileSync(join(dir, 'metadata.json'), JSON.stringify(meta, null, 2));
+    } catch { /* best effort */ }
+    console.log(`Refreshed context "${name}".`);
+  });
+
+browserCommand
   .command('list')
   .description('List saved browser contexts.')
   .option('-p, --project <slug>', 'project slug', 'default')
   .option('--root <path>', 'override contexts root')
   .action(async (opts: BrowserLoginOptions) => {
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval
-    const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<{ ContextStore: new (o: { root?: string }) => { list: (p: string) => unknown[] } }>;
-    const mod = await dynImport(join(import.meta.url, '..', '..', '..', '..', 'dashboard', 'server', 'browser', 'contexts.js'));
-    void mod;
-    // Read directory listing without depending on the dashboard module:
     const project = opts.project ?? 'default';
     const root = opts.root ?? join(homedir(), '.anvil', 'browser', 'contexts');
+    const { readdirSync, readFileSync, existsSync } = await import('node:fs');
     const dir = join(root, project);
-    try {
-      const { readdirSync } = await import('node:fs');
-      const names = readdirSync(dir);
-      if (names.length === 0) {
-        console.log(`(no contexts for project "${project}")`);
-        return;
-      }
-      for (const name of names) console.log(name);
-    } catch {
+    if (!existsSync(dir)) {
       console.log(`(no contexts for project "${project}")`);
+      return;
+    }
+    const names = readdirSync(dir);
+    if (names.length === 0) {
+      console.log(`(no contexts for project "${project}")`);
+      return;
+    }
+    for (const name of names) {
+      const metaPath = join(dir, name, 'metadata.json');
+      let line = name;
+      try {
+        const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { url?: string; createdAt?: string };
+        if (meta.url || meta.createdAt) {
+          line = `${name}  ${meta.url ?? ''}  ${meta.createdAt ?? ''}`.trim();
+        }
+      } catch { /* metadata missing — show bare name */ }
+      console.log(line);
     }
   });

@@ -23,6 +23,7 @@ import {
   allowedToolsForStage,
   permissionClassesForStage,
 } from '@esankhan3/anvil-core-pipeline';
+import { createRequire } from 'node:module';
 import { pickAliveModelFromChainSync, prefetchLiveness, setLivenessTtlMs } from './provider-liveness.js';
 import type { ProjectLoader } from './project-loader.js';
 import {
@@ -113,9 +114,14 @@ export function pickModelForStage(deps: ModelResolutionDeps, stageName: string):
 }
 
 /**
- * Per-stage tool-permission set. Resolution: stage-policy default →
- * factory.yaml allow extends → factory.yaml deny strips. Empty result
- * falls back to read-only.
+ * Per-stage tool-permission set. Resolution:
+ *   1. Built-in `STAGE_TOOL_PERMISSIONS` + `STAGE_WEB_PERMISSIONS`.
+ *   2. factory.yaml `allow_tools` extends, `deny_tools` strips.
+ *   3. pipeline-policy.overlay.json `tools.{network,browseHeadless,
+ *      browseEval,browsePixel}` blocks: `enabled: false` strips the
+ *      whole class for this stage; `stages: [...]` replaces the
+ *      stage allow-list (stages NOT in the array lose the class).
+ * Empty result falls back to read-only.
  */
 export function allowedToolsForCurrentStage(deps: ModelResolutionDeps, stageName: string): string[] {
   const base = new Set(allowedToolsForStage(stageName));
@@ -123,8 +129,60 @@ export function allowedToolsForCurrentStage(deps: ModelResolutionDeps, stageName
     .getConfig(deps.config.project)?.pipeline?.permissions?.[stageName];
   if (overrides?.allow_tools) for (const t of overrides.allow_tools) base.add(t);
   if (overrides?.deny_tools) for (const t of overrides.deny_tools) base.delete(t);
+
+  // H10-followup #1 — apply pipeline-policy overlay's tools.* gating.
+  applyToolsOverlay(deps, stageName, base);
+
   if (base.size === 0) return ['read_file', 'grep', 'glob', 'list'];
   return [...base].sort();
+}
+
+const WEB_TOOLS_BY_OVERLAY_KEY: Record<string, readonly string[]> = {
+  network: ['web_search', 'web_fetch'],
+  browseHeadless: [
+    'browser_navigate', 'browser_click', 'browser_input', 'browser_scroll',
+    'browser_search_page', 'browser_extract', 'browser_screenshot',
+    'browser_console_messages', 'browser_network_requests',
+    'browser_new_tab', 'browser_close_tab', 'browser_tabs',
+    'browser_done', 'browser_attach_context',
+  ],
+  browseEval: ['browser_evaluate'],
+  browsePixel: ['computer_use'],
+};
+
+function applyToolsOverlay(deps: ModelResolutionDeps, stageName: string, allowed: Set<string>): void {
+  // Lazy-load policy + overlay; failures degrade to "no overlay" rather
+  // than throwing — the user never sees a stage permission resolution
+  // turn into a hard failure.
+  let toolsPolicy: Record<string, { enabled?: boolean; stages?: string[] }> | undefined;
+  try {
+    // The dashboard injects loadPolicy via deps elsewhere; require it
+    // via a synchronous CJS shim so this resolver stays a pure
+    // function. `import.meta.url` is a stable anchor for createRequire.
+    const req = createRequire(import.meta.url);
+    const { loadPolicy } = req('./pipeline-policy.js') as typeof import('./pipeline-policy.js');
+    // ANVIL_HOME defaults to ~/.anvil; loadPolicy reads from
+    // <home>/projects/<slug>/pipeline-policy.overlay.json. The
+    // dashboard sets ANVIL_HOME on the env at boot.
+    const home = process.env.ANVIL_HOME ?? `${process.env.HOME ?? ''}/.anvil`;
+    const policy = loadPolicy(deps.config.project, home);
+    toolsPolicy = (policy as { tools?: Record<string, { enabled?: boolean; stages?: string[] }> }).tools;
+  } catch { /* no policy / not available — leave allowed unchanged */ }
+
+  if (!toolsPolicy) return;
+
+  for (const [key, toolNames] of Object.entries(WEB_TOOLS_BY_OVERLAY_KEY)) {
+    const block = toolsPolicy[key];
+    if (!block) continue;
+    if (block.enabled === false) {
+      for (const t of toolNames) allowed.delete(t);
+      continue;
+    }
+    if (Array.isArray(block.stages) && !block.stages.includes(stageName)) {
+      // stages override: this stage isn't in the explicit list → strip.
+      for (const t of toolNames) allowed.delete(t);
+    }
+  }
 }
 
 /**

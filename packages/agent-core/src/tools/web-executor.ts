@@ -564,7 +564,7 @@ export class WebToolExecutor implements ToolExecutor {
  */
 async function durableWrap<T>(effectName: string, key: string, fn: () => Promise<T>): Promise<T> {
   const ctx = getCurrentStepContext();
-  if (!ctx) return fn();
+  if (!ctx || typeof ctx.effect !== 'function') return fn();
   return ctx.effect(`${effectName}:${key}`, fn, { idempotencyKey: key });
 }
 
