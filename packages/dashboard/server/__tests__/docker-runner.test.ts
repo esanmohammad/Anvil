@@ -97,6 +97,10 @@ describe('DockerSandboxRunner — stub spawn', () => {
       assert.ok(runCall!.argv.includes('--workdir'));
       assert.ok(runCall!.argv.some((a) => a.startsWith('type=bind,src=')));
       assert.ok(runCall!.argv.includes('anvil/sandbox:test'));
+      // F9 — uid/gid passthrough so bind writes land owned by host user.
+      if (typeof process.getuid === 'function') {
+        assert.ok(runCall!.argv.includes('--user'));
+      }
     } finally {
       await fsp.rm(tempRoot, { recursive: true, force: true });
     }

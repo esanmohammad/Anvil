@@ -217,11 +217,19 @@ export class DockerSandboxRunner implements SandboxRunner {
     const cacheMounts = buildCacheMounts({
       defaultMode: this.opts.cacheMode,
     });
+    // F9 — bind cache mounts inherit host uid/gid via --user. Without
+    // this, RW cache mounts (e.g. npm install populating ~/.npm) fail
+    // when the container's `anvil` user (uid 1001) tries to write to
+    // a directory owned by the host user (typically uid 501 on macOS,
+    // 1000 on Linux). Read-only mounts also benefit because tools
+    // like `git` refuse to operate on a tree owned by a different uid
+    // (the "dubious ownership" warning).
     const args = [
       'run',
       '-d',                           // detached
       '--name', containerName,
       '--workdir', SANDBOX_WORKDIR,
+      ...this.userArgs(),
       // S2: bind-mount only. Overlay arrives in S3.
       '--mount', `type=bind,src=${hostWorkdir},dst=${SANDBOX_WORKDIR}`,
       // S5: per-stage resource limits — memory, cpus, pids, disk.
@@ -284,6 +292,22 @@ export class DockerSandboxRunner implements SandboxRunner {
       await h.close().catch(() => { /* best-effort */ });
     }
     this.handles.clear();
+  }
+
+  /**
+   * Return `--user <uid>:<gid>` so bind-mounted writes land owned by
+   * the host user. F9 — fixes uid mismatch between container's
+   * `anvil` user (uid 1001) and host user (501 on macOS / 1000 on
+   * Linux). Defaults to `process.getuid()` / `process.getgid()`.
+   * On platforms without these (Windows-ish), returns no flag.
+   */
+  private userArgs(): string[] {
+    if (process.env.ANVIL_SANDBOX_NO_USER === '1') return [];
+    // Type guard — Node 22 always has these on POSIX, undefined elsewhere.
+    const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+    const gid = typeof process.getgid === 'function' ? process.getgid() : null;
+    if (uid === null || gid === null) return [];
+    return ['--user', `${uid}:${gid}`];
   }
 
   async execInsideContainer(
