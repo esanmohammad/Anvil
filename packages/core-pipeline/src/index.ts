@@ -371,6 +371,11 @@ export {
   runClarifyQALoop,
   deriveClarifyQuestions,
 } from './stages/clarify.js';
+export {
+  STAGE_QA_PROMPT_HEADER,
+  parseStageQuestions,
+  formatStageAnswers,
+} from './stages/qa.js';
 
 // — Routing (stage policy + capability/complexity resolver + task envelope)
 export {

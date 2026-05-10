@@ -1948,6 +1948,36 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         break;
       }
 
+      case 'provide-stage-answer': {
+        // Routes per-question Q&A answers to the active pipeline runner.
+        // Frontend payload: { stageIndex, repoName?, questionIndex, text }.
+        const m = msg as {
+          stageIndex?: number;
+          repoName?: string;
+          questionIndex?: number;
+          text?: string;
+        };
+        if (!activePipelineRunner) {
+          ws.send(JSON.stringify({ type: 'pipeline-error', payload: { message: 'no active pipeline run' } }));
+          break;
+        }
+        if (typeof m.stageIndex !== 'number' || typeof m.questionIndex !== 'number' || typeof m.text !== 'string') {
+          ws.send(JSON.stringify({ type: 'pipeline-error', payload: { message: 'stageIndex + questionIndex + text required' } }));
+          break;
+        }
+        try {
+          activePipelineRunner.provideStageAnswer(
+            m.stageIndex,
+            m.repoName ?? null,
+            m.questionIndex,
+            m.text,
+          );
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'pipeline-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
+        }
+        break;
+      }
+
       case 'spawn-agent': {
         if (msg.project && msg.feature) {
           const configWs = getWorkspaceFromConfig(msg.project);
@@ -5107,6 +5137,13 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       planSeed: options?.planSeed,
     }, memoryStore, kbManager);
 
+    // Snapshot project Q&A policy into the runner before run() starts.
+    // Used by pipeline-stages to gate the requirements/specs Q&A path.
+    try {
+      const policySnapshot = loadPolicy(project, ANVIL_HOME);
+      runner.setQAPolicy(policySnapshot.qa);
+    } catch { /* fall through — runner stays in non-Q&A path */ }
+
     // ── Phase 2: core-pipeline EventBus + lifecycle hooks ───────────────
     // The bus is constructed per-run. Phase 4 will rewrite pipeline-runner to
     // emit through this bus; until then no publishers exist on it and the
@@ -5535,6 +5572,39 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       pipelineActivities.push(entry);
       outputBuffer.push(entry);
       broadcast({ type: 'agent-output', payload: { entries: [entry], runId: pipelineRunId } });
+    });
+
+    // Stage Q&A — generic events for non-clarify planning stages (requirements,
+    // repo-requirements, specs). The frontend renders questions inline on the
+    // stage card via StageQuestionsPanel.
+    runner.on('stage-question', (data: {
+      stageIndex: number;
+      stageName: string;
+      repoName?: string;
+      questionIndex: number;
+      totalQuestions: number;
+      question: string;
+    }) => {
+      broadcast({ type: 'stage-question', payload: data });
+      const entry = {
+        timestamp: Date.now(),
+        stage: data.stageName,
+        type: 'stdout' as const,
+        content: `**Question ${data.questionIndex + 1} of ${data.totalQuestions}** (${data.stageName}):\n\n${data.question}`,
+        kind: 'stage-question',
+      };
+      pipelineActivities.push(entry);
+      outputBuffer.push(entry);
+      broadcast({ type: 'agent-output', payload: { entries: [entry], runId: pipelineRunId } });
+    });
+
+    runner.on('stage-answer-recorded', (data: {
+      stageIndex: number;
+      repoName?: string | null;
+      questionIndex: number;
+      remaining: number;
+    }) => {
+      broadcast({ type: 'stage-answer-recorded', payload: data });
     });
 
     // Show user input as a visible entry in the output

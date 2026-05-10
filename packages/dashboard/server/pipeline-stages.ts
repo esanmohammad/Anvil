@@ -29,6 +29,8 @@ import {
   buildRepoStagePrompt as buildRepoStagePromptHelper,
   buildPerTaskPrompt as buildPerTaskPromptHelper,
   disallowedToolsForPersona,
+  STAGE_QA_PROMPT_HEADER,
+  parseStageQuestions,
   type ParsedTask,
   type PromptBuilderContext,
 } from '@esankhan3/anvil-core-pipeline';
@@ -138,6 +140,12 @@ export interface StageOpsDeps {
 
   // Clarify input resolver (writable slot)
   setInputResolve: (resolve: ((text: string) => void) | null) => void;
+
+  // Stage Q&A controls.
+  /** Read the project's Q&A policy block — disabled by default returns undefined. */
+  getQAPolicy: () => { enabled?: boolean; maxQuestionsPerStage?: number } | undefined;
+  /** Register an input resolver for a (stageIndex, repoName?) Q&A round. */
+  setStageInputResolver: (stageIndex: number, repoName: string | null, resolve: ((text: string) => void) | null) => void;
 
   // Fix-loop session refs (mutable)
   fixLoopAgentByRepo: Map<string, string>;
@@ -535,12 +543,148 @@ async function runBuildForRepo(
 
 // ── Single-agent stage execution ───────────────────────────────────
 
+/**
+ * Stage names whose agents may pause to ask the user clarifying
+ * questions before producing the artifact. Hard-coded so users can't
+ * enable Q&A on `build` (a known anti-pattern: see plan §2 non-goals).
+ */
+const STAGES_WITH_QA: ReadonlySet<string> = new Set([
+  'requirements',
+  'repo-requirements',
+  'specs',
+]);
+
+function isQAEnabled(deps: StageOpsDeps, stageName: string): { enabled: boolean; max: number } {
+  if (!STAGES_WITH_QA.has(stageName)) return { enabled: false, max: 0 };
+  const policy = deps.getQAPolicy();
+  if (!policy || policy.enabled === false) return { enabled: false, max: 0 };
+  const max = typeof policy.maxQuestionsPerStage === 'number' && policy.maxQuestionsPerStage > 0
+    ? policy.maxQuestionsPerStage
+    : 5;
+  return { enabled: true, max };
+}
+
+/**
+ * Q&A-aware single-stage runner. Spawns a multi-turn session with a
+ * `<questions>...</questions>` opt-in header in the prompt. If the agent
+ * emits questions, the runner pauses, broadcasts each question to the
+ * dashboard, awaits user answers via the per-stage input resolver, then
+ * resumes the session with an `<answers>...</answers>` block. The
+ * session's second response is the artifact.
+ *
+ * Confident agents skip the Q&A block entirely; the first response IS
+ * the artifact and we return immediately.
+ */
+async function runStageWithQA(
+  deps: StageOpsDeps,
+  index: number,
+  stage: StageDefinition,
+  prevArtifact: string,
+  maxQuestions: number,
+): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
+  const baseUserPrompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
+  const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
+  const qaPrompt = STAGE_QA_PROMPT_HEADER(maxQuestions) + baseUserPrompt;
+
+  const session = makeAgentSession(deps);
+  const first = await session.start({
+    persona: stage.persona,
+    projectPrompt,
+    userPrompt: qaPrompt,
+    workingDir: deps.workspaceDir,
+    stage: stage.name,
+    allowedTools: deps.allowedToolsForCurrentStage(stage.name),
+    disallowedTools: disallowedToolsForPersona(stage.persona),
+    maxOutputTokens: maxOutputTokensForStage(stage.name),
+  });
+
+  if (first.agentId) {
+    deps.state.stages[index].agentId = first.agentId;
+    deps.broadcast();
+  }
+
+  const questions = parseStageQuestions(first.output, maxQuestions);
+  if (questions.length === 0) {
+    // Agent was confident — first response is the artifact.
+    return {
+      artifact: first.output,
+      cost: first.costUsd ?? 0,
+      tokens: {
+        inputTokens: first.inputTokens ?? 0,
+        outputTokens: first.outputTokens ?? 0,
+        cacheReadTokens: first.cacheReadTokens ?? 0,
+        cacheWriteTokens: first.cacheWriteTokens ?? 0,
+      },
+    };
+  }
+
+  // Q&A path — populate state, broadcast each question, await answers.
+  const stageState = deps.state.stages[index];
+  stageState.questions = questions.map((text, qi) => ({ index: qi, text }));
+  stageState.status = 'waiting';
+  deps.state.status = 'waiting';
+  deps.state.waitingForInput = true;
+  deps.broadcast();
+  for (let qi = 0; qi < questions.length; qi += 1) {
+    deps.emit('stage-question', {
+      stageIndex: index,
+      stageName: stage.name,
+      questionIndex: qi,
+      totalQuestions: questions.length,
+      question: questions[qi],
+    });
+  }
+  deps.emit('waiting-for-input', index, first.agentId ?? null);
+
+  const answersBlock = await new Promise<string>((resolve) => {
+    deps.setStageInputResolver(index, null, resolve);
+  });
+
+  // Cancellation guard — the resolver fires with '' on cancel.
+  if (!answersBlock) {
+    return {
+      artifact: '',
+      cost: first.costUsd ?? 0,
+      tokens: {
+        inputTokens: first.inputTokens ?? 0,
+        outputTokens: first.outputTokens ?? 0,
+        cacheReadTokens: first.cacheReadTokens ?? 0,
+        cacheWriteTokens: first.cacheWriteTokens ?? 0,
+      },
+    };
+  }
+
+  // Resume — the agent now has the answers and produces the artifact.
+  stageState.status = 'running';
+  deps.state.status = 'running';
+  deps.state.waitingForInput = false;
+  deps.broadcast();
+
+  const second = await session.sendInput(first.sessionId, answersBlock);
+
+  return {
+    artifact: second.output,
+    cost: (first.costUsd ?? 0) + (second.costUsd ?? 0),
+    tokens: {
+      inputTokens: (first.inputTokens ?? 0) + (second.inputTokens ?? 0),
+      outputTokens: (first.outputTokens ?? 0) + (second.outputTokens ?? 0),
+      cacheReadTokens: (first.cacheReadTokens ?? 0) + (second.cacheReadTokens ?? 0),
+      cacheWriteTokens: (first.cacheWriteTokens ?? 0) + (second.cacheWriteTokens ?? 0),
+    },
+  };
+}
+
 async function runSingleStage(
   deps: StageOpsDeps,
   index: number,
   stage: StageDefinition,
   prevArtifact: string,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
+  const qa = isQAEnabled(deps, stage.name);
+  if (qa.enabled) {
+    return runStageWithQA(deps, index, stage, prevArtifact, qa.max);
+  }
+
   const prompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
   const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
 

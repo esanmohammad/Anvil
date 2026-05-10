@@ -102,6 +102,14 @@ export function providerOfModelId(modelId: string): ProviderName {
 
 // ── Per-repo agent tracking ─────────────────────────────────────────────
 
+/** A question an agent asked during a stage, with the user's answer if provided. */
+export interface StageQuestion {
+  index: number;            // 0-based position in the question list
+  text: string;             // the agent's question
+  answer?: string;          // undefined until user answers; trimmed string after
+  answeredAt?: string;      // ISO timestamp
+}
+
 export interface RepoAgentState {
   repoName: string;
   agentId: string | null;
@@ -109,6 +117,8 @@ export interface RepoAgentState {
   cost: number;
   artifact: string;
   error: string | null;
+  /** Per-repo Q&A — populated when the agent for this repo is in mid-Q&A. */
+  questions?: StageQuestion[];
 }
 
 // ── Pipeline state ──────────────────────────────────────────────────────
@@ -158,6 +168,8 @@ export interface PipelineStageState {
   resolvedModel?: string;
   /** Tool-permission classes ('read' / 'write' / 'exec'). */
   permissionClasses?: ('read' | 'write' | 'exec')[];
+  /** Stage-level Q&A — populated when the agent asks questions before producing the artifact. */
+  questions?: StageQuestion[];
 }
 
 export interface PipelineRunState {

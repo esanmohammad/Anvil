@@ -99,7 +99,7 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import { InMemoryEventBus } from '@esankhan3/anvil-core-pipeline';
+import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper } from '@esankhan3/anvil-core-pipeline';
 import { attachPipelineHooks } from './pipeline-hooks.js';
 import { runPipelineLoop } from './pipeline-loop.js';
 import { DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
@@ -119,6 +119,11 @@ import { FeatureManifestStore } from './feature-manifest.js';
 // Re-exported above for back-compat.
 
 // ── Pipeline Runner ───────────────────────────────────────────────────
+
+/** Build the lookup key for a per-(stage, repo) Q&A input resolver. */
+function stageInputKey(stageIndex: number, repoName: string | null): string {
+  return `${stageIndex}|${repoName ?? '__'}`;
+}
 
 export class PipelineRunner extends EventEmitter {
   private agentManager: AgentManager;
@@ -197,6 +202,24 @@ export class PipelineRunner extends EventEmitter {
 
   // For interactive clarify — resolves when user provides input
   private inputResolve: ((text: string) => void) | null = null;
+
+  /**
+   * Per-(stageIndex, repoName?) input resolvers for stage Q&A. The
+   * resolver fires once every question for the stage has an answer; the
+   * server resolves it with a `<answers>...</answers>` block ready to
+   * paste back into the agent session via `agentSession.sendInput`.
+   *
+   * Key: `${stageIndex}|${repoName ?? '__'}`.
+   */
+  private stageInputResolvers = new Map<string, (text: string) => void>();
+
+  /** Project Q&A policy snapshot — set by the dashboard before run() starts. */
+  private qaPolicy: { enabled?: boolean; maxQuestionsPerStage?: number } | undefined;
+
+  /** Wire the project's Q&A policy block into the runner before `run()`. */
+  setQAPolicy(policy: { enabled?: boolean; maxQuestionsPerStage?: number } | undefined): void {
+    this.qaPolicy = policy;
+  }
 
   constructor(
     agentManager: AgentManager,
@@ -368,6 +391,55 @@ export class PipelineRunner extends EventEmitter {
     }
   }
 
+  /**
+   * Record the user's answer for one Q&A question on a specific stage
+   * (and repo, when the stage is per-repo). Mutates state, broadcasts a
+   * `stage-answer-recorded` event, and — once every question for this
+   * (stage, repo) has an answer — resolves the agent's input promise
+   * with a formatted `<answers>` block. Returns the new "remaining"
+   * count so the WS handler can echo it back.
+   */
+  provideStageAnswer(stageIndex: number, repoName: string | null, questionIndex: number, text: string): {
+    remaining: number;
+    accepted: boolean;
+  } {
+    const stage = this.state.stages[stageIndex];
+    if (!stage) return { remaining: 0, accepted: false };
+    const list = repoName
+      ? stage.repos.find((r) => r.repoName === repoName)?.questions
+      : stage.questions;
+    if (!list) return { remaining: 0, accepted: false };
+    const target = list.find((q) => q.index === questionIndex);
+    if (!target) return { remaining: 0, accepted: false };
+    target.answer = text.trim();
+    target.answeredAt = new Date().toISOString();
+    const remaining = list.filter((q) => !q.answer).length;
+    this.broadcastState();
+    this.emit('stage-answer-recorded', { stageIndex, repoName, questionIndex, remaining });
+    if (remaining === 0) {
+      const key = stageInputKey(stageIndex, repoName);
+      const resolve = this.stageInputResolvers.get(key);
+      if (resolve) {
+        const answersBlock = formatStageAnswersHelper(list.map((q) => ({
+          question: q.text,
+          answer: q.answer ?? '',
+        })));
+        this.stageInputResolvers.delete(key);
+        resolve(answersBlock);
+      }
+    }
+    return { remaining, accepted: true };
+  }
+
+  /** Read-only view of the questions for a (stage, repo) — used by the dashboard. */
+  getStageQuestions(stageIndex: number, repoName: string | null = null) {
+    const stage = this.state.stages[stageIndex];
+    if (!stage) return [];
+    return repoName
+      ? stage.repos.find((r) => r.repoName === repoName)?.questions ?? []
+      : stage.questions ?? [];
+  }
+
   cancel(): void {
     this.cancelled = true;
     // Kill all running agents
@@ -529,6 +601,12 @@ export class PipelineRunner extends EventEmitter {
       handleOutputTruncation: (agentName, outputTokens) => handleOutputTruncationFn(this.depsForTelemetry(), agentName, outputTokens),
       writePerRepoTelemetry: (stage, repo, stats) => writePerRepoTelemetryFn(this.depsForTelemetry(), stage, repo, stats),
       setInputResolve: (resolve) => { this.inputResolve = resolve; },
+      getQAPolicy: () => this.qaPolicy,
+      setStageInputResolver: (stageIndex, repoName, resolve) => {
+        const key = stageInputKey(stageIndex, repoName);
+        if (resolve) this.stageInputResolvers.set(key, resolve);
+        else this.stageInputResolvers.delete(key);
+      },
       fixLoopAgentByRepo: this.fixLoopAgentByRepo,
       getFixLoopAgentSingle: () => this.fixLoopAgentSingle,
       setFixLoopAgentSingle: (id) => { this.fixLoopAgentSingle = id; },
