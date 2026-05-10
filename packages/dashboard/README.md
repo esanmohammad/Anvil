@@ -29,8 +29,12 @@ browser tab and you get:
   community, click-through to source.
 - **Memory inspector** — query the five-type memory store live,
   see what got proposed, what got ratified, what got drift-flagged.
-- **Pipeline policy editor** — model-per-stage routing in a UI; no
-  YAML edit needed.
+- **Policy** — dedicated `/policy` page for review pauses, cost
+  caps, agent Q&A, and notifications. Pause-after-Plan is on by
+  default for every project; flip the master switch off per project
+  to skip pauses entirely. Yaml-authored policy files in
+  `~/.anvil/projects/<slug>/pipeline-policy.yaml` keep working —
+  the dashboard layers an overlay JSON on top of them.
 - **Settings** — provider keys, OTel endpoint, Ollama host, all
   written to `~/.anvil/.env` from the browser.
 

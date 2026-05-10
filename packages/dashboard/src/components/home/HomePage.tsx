@@ -268,6 +268,43 @@ const statusColors: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------------------
+// First-run banner — appears once after upgrade to announce the policy
+// default-on rollout. Dismissed forever via localStorage.
+// ---------------------------------------------------------------------------
+
+function PolicyDefaultOnNotice(): React.ReactElement | null {
+  const KEY = 'policyDefaultOnNoticeSeen';
+  const [show, setShow] = useState<boolean>(() => {
+    try { return window.localStorage.getItem(KEY) !== '1'; } catch { return false; }
+  });
+  if (!show) return null;
+  function dismiss(): void {
+    try { window.localStorage.setItem(KEY, '1'); } catch { /* ignore */ }
+    setShow(false);
+  }
+  return (
+    <div className="card" style={{
+      padding: 12,
+      marginBottom: 16,
+      width: '100%',
+      display: 'flex',
+      alignItems: 'flex-start',
+      gap: 10,
+      borderColor: 'var(--accent)',
+    }}>
+      <div style={{ flex: 1 }}>
+        <strong>Anvil now pauses for review after each plan.</strong>
+        <p style={{ margin: '4px 0 0 0', fontSize: 13, color: 'var(--text-secondary)' }}>
+          Manage when, what cost limits apply, and whether agents may ask clarifying questions on the new{' '}
+          <a href="#/policy" style={{ color: 'var(--accent)' }}>Policy</a> page.
+        </p>
+      </div>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={dismiss}>Got it</button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -447,6 +484,7 @@ repos:
       margin: '0 auto',
       width: '100%',
     }}>
+      <PolicyDefaultOnNotice />
       {/* Heading */}
       <h1 style={{
         fontSize: 24,

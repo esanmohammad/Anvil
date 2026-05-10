@@ -211,13 +211,19 @@ export function SettingsPage({ project, ws }: SettingsPageProps) {
           />
         )}
 
-        {/* -------- Budget (Coming Soon) -------- */}
+        {/* -------- Budget — moved to /policy -------- */}
         {activeTab === 'budget' && (
-          <ComingSoonPanel
-            icon={<DollarSign size={32} style={{ color: 'var(--text-tertiary)', marginBottom: 8 }} />}
-            title="Budget"
-            description="Per-run and daily spending caps, alert thresholds, and cost approval policy. Coming soon."
-          />
+          <div className="card" style={{ padding: 20, textAlign: 'center' }}>
+            <DollarSign size={32} style={{ color: 'var(--text-tertiary)', marginBottom: 8 }} />
+            <h3 style={{ margin: '0 0 6px 0' }}>Pipeline policy &amp; cost</h3>
+            <p style={{ color: 'var(--text-secondary)', margin: '0 0 12px 0', fontSize: 13 }}>
+              Decide when Anvil pauses for review and how it spends. Manage every control on the dedicated Policy page.
+            </p>
+            <button type="button" className="btn btn-primary"
+                    onClick={() => { window.location.hash = '/policy'; }}>
+              Open Policy
+            </button>
+          </div>
         )}
 
         {/* -------- Hooks (Coming Soon) -------- */}

@@ -81,6 +81,14 @@ export function PausedBanner({ data, onReview, onCancel }: PausedBannerProps) {
             {pause.reason}
             {matched ? <span style={{ color: 'var(--text-tertiary)' }}> · {matched}</span> : null}
             {remaining ? <span style={{ color: 'var(--text-tertiary)' }}> · timeout {remaining}</span> : null}
+            {' · '}
+            <a
+              href={`#/policy${pause.project ? `?project=${encodeURIComponent(pause.project)}` : ''}`}
+              style={{ color: 'var(--text-tertiary)', textDecoration: 'underline' }}
+              title="Manage when Anvil pauses runs"
+            >
+              Why am I seeing this?
+            </a>
           </div>
         </div>
 
