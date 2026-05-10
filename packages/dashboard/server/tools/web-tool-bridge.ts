@@ -17,6 +17,8 @@ import { WebFetchAdapter } from './web-fetch.js';
 import type { SummarizerInvoker } from './summarizer.js';
 import { BrowserSessionRegistry, type BrowserRunnerFactory } from '../browser/session-manager.js';
 import { createPlaywrightRunner } from '../browser/playwright-runner.js';
+import { ConfirmGate, type ConfirmRequest } from '../browser/confirm-gate.js';
+import { ContextStore } from '../browser/contexts.js';
 
 export interface WebToolBridgeOpts {
   /** Pinned search provider; auto-detected when omitted. */
@@ -35,6 +37,14 @@ export interface WebToolBridgeOpts {
    *  tests inject a stub. When omitted, defaults to
    *  `createPlaywrightRunner` — Playwright must be installed for Tier 2. */
   browserRunnerFactory?: BrowserRunnerFactory;
+  /** Async confirmer for `browser_evaluate` / `browser_attach_context` /
+   *  computer.*. Test seam — production wires through the WebSocket UI. */
+  confirmer?: (req: ConfirmRequest) => Promise<boolean>;
+  /** Project slug for context attachment. Default `'default'`. */
+  projectSlug?: string;
+  /** Per-project context allow-list (overlay's
+   *  `tools.browseHeadless.contexts`). */
+  allowedContexts?: readonly string[];
 }
 
 /**
@@ -86,6 +96,9 @@ interface BrowserBackendCtx {
 function createBrowserBackend(opts: WebToolBridgeOpts) {
   const factory = opts.browserRunnerFactory ?? createPlaywrightRunner;
   const registry = new BrowserSessionRegistry(factory);
+  const confirmGate = new ConfirmGate({ ask: opts.confirmer });
+  const contextStore = new ContextStore();
+  const projectSlug = opts.projectSlug ?? 'default';
 
   function acquire(ctx: BrowserBackendCtx) {
     const runId = ctx.runId ?? 'standalone';
@@ -124,9 +137,35 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
       return { ...r, capturedAt: new Date().toISOString() };
     },
     async evaluate(args: import('@esankhan3/anvil-core-pipeline').BrowserEvaluateArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      // Phase H6 — confirm-required for arbitrary JS.
+      await confirmGate.confirm({
+        tool: 'browser_evaluate',
+        description: 'Evaluate JavaScript in the page context (high risk: can read storage, exfiltrate data).',
+        risk: 'high',
+        payload: { expression: args.expression.slice(0, 500) },
+      });
       const session = acquire(ctx);
       const runner = await session.getRunner();
       return runner.evaluate(args);
+    },
+    async attachContext(args: { name: string }, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      // Phase H6 — confirm + per-project allow-list check.
+      contextStore.assertAllowed(args.name, opts.allowedContexts);
+      await confirmGate.confirm({
+        tool: 'browser_attach_context',
+        description: `Attach saved auth context "${args.name}" to the running session.`,
+        risk: 'medium',
+        payload: { name: args.name },
+      });
+      const meta = contextStore.read(projectSlug, args.name);
+      if (!meta) {
+        throw new Error(`browser context "${args.name}" not found. Run \`anvil browser login ${args.name} <url>\`.`);
+      }
+      const session = acquire(ctx);
+      // Snapshot to surface current state; actual cookie injection is
+      // Playwright-runner-specific and lands when the runner gains a
+      // `loadStorageState` method (deferred).
+      return session.navigate({ url: meta.url });
     },
     async searchPage(args: import('@esankhan3/anvil-core-pipeline').BrowserSearchPageArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       const session = acquire(ctx);
