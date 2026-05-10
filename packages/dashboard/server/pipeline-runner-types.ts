@@ -321,6 +321,16 @@ export function findInterruptedPipelines(anvilHome: string): PipelineCheckpoint[
  * Hook fired after each stage completes. Returning a rejected promise
  * cancels the pipeline; resolving with `{ pause: true }` suspends
  * execution until `resume()` is called.
+ *
+ * The `waitForReviewerDecision` callback is the durable-signal-aware
+ * pause primitive (Phase F1 of the durable execution rollout). When
+ * the after-stage hook needs to block the pipeline pending a
+ * reviewer decision, it MUST call this callback rather than
+ * polling — the callback is wired to `ctx.waitForSignal(channel)`
+ * when durable mode is on, falling back to caller-supplied polling
+ * when off. Crash-recovery: a reviewer decision recorded before the
+ * crash returns immediately on replay; the user doesn't have to
+ * re-decide.
  */
 export interface AfterStageHook {
   (info: {
@@ -334,5 +344,12 @@ export interface AfterStageHook {
     touchedFiles?: string[];
     riskTier?: 'low' | 'med' | 'high';
     confidence?: number;
+    /**
+     * Block until a reviewer decision lands on the named channel.
+     * Returns the decision payload (caller-supplied shape) or null on
+     * timeout / cancellation. Idempotent on replay — a previously
+     * recorded decision returns immediately.
+     */
+    waitForReviewerDecision?: (channel: string) => Promise<unknown>;
   }): Promise<void>;
 }

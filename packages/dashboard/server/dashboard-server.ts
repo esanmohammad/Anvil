@@ -4376,6 +4376,18 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           ws.send(JSON.stringify(env));
           const state = pauseStore.get((msg as { runId?: string }).runId ?? '');
           if (state) {
+            // Phase F1: enqueue durable reviewer-decision signal so a
+            // crashed workflow process resumes from-stage with the
+            // recorded decision, no re-prompting. Best-effort —
+            // failure logs but doesn't block the WS reply.
+            const durableStore = getDurableStore();
+            if (durableStore && state.resumeDecision) {
+              void durableStore
+                .enqueueSignal(state.runId, `reviewer-decision-${state.stage}`, state.resumeDecision)
+                .catch((err) => {
+                  console.warn(`[dashboard] reviewer-decision enqueueSignal failed: ${err instanceof Error ? err.message : err}`);
+                });
+            }
             auditLog.record({
               runId: state.runId, project: state.project,
               event: state.resumeDecision?.action === 'cancel' ? 'rejected'
@@ -4419,7 +4431,19 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           const env = handleCancelPause(pauseStore, msg as unknown as Record<string, unknown>, 'dashboard-user');
           ws.send(JSON.stringify(env));
           const state = pauseStore.get((msg as { runId?: string }).runId ?? '');
-          if (state) broadcast({ type: 'pipeline-cancelled', payload: { pause: state } } as ServerMessage);
+          if (state) {
+            // Phase F1: enqueue durable cancel signal so the workflow
+            // unblocks from waitForReviewerDecision with a cancel action.
+            const durableStore = getDurableStore();
+            if (durableStore) {
+              void durableStore
+                .enqueueSignal(state.runId, `reviewer-decision-${state.stage}`, { action: 'cancel' })
+                .catch((err) => {
+                  console.warn(`[dashboard] cancel enqueueSignal failed: ${err instanceof Error ? err.message : err}`);
+                });
+            }
+            broadcast({ type: 'pipeline-cancelled', payload: { pause: state } } as ServerMessage);
+          }
         } catch (err) {
           ws.send(JSON.stringify({ type: 'pipeline-pause-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
         }
@@ -5275,8 +5299,17 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           void notifyPipelinePaused(pause, base, token);
         } catch { /* ignore */ }
 
-        // Block until the pause transitions out of 'paused-awaiting-user'.
-        await new Promise<void>((resolve) => {
+        // Phase F1: durable signal pause. When info.waitForReviewerDecision
+        // is wired, the workflow blocks on the durable signals queue
+        // — a decision enqueued by handleResumePipeline /
+        // handleCancelPause survives a process crash. On replay the
+        // recorded decision returns immediately.
+        //
+        // Both paths run because pauseStore drives the modal UI (a
+        // projection); the durable signal is the authoritative
+        // workflow gate. Whichever resolves first wins.
+        const channel = `reviewer-decision-${info.stageName}`;
+        const polling = new Promise<void>((resolve) => {
           const tick = setInterval(() => {
             const latest = pauseStore.get(info.runId);
             if (!latest || latest.status !== 'paused-awaiting-user') {
@@ -5285,6 +5318,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
             }
           }, 1000);
         });
+        if (info.waitForReviewerDecision) {
+          await Promise.race([info.waitForReviewerDecision(channel), polling]);
+        } else {
+          await polling;
+        }
 
         const final = pauseStore.get(info.runId);
         if (final?.resumeDecision?.action === 'cancel') {

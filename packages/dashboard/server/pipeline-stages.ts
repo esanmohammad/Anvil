@@ -1143,6 +1143,14 @@ export async function runOneStage(
       if (afterStageHook) {
         try {
           const risk = deps.planRisk.get(deps.config.planSeed);
+          // Phase F1: durable-signal-aware reviewer pause. When ctx
+          // is provided, the after-stage hook can call
+          // waitForReviewerDecision(channel) which delegates to
+          // ctx.waitForSignal — a recorded decision on replay
+          // returns immediately without re-blocking on the user.
+          const waitForReviewerDecision = ctx
+            ? (channel: string) => ctx.waitForSignal(channel)
+            : undefined;
           await afterStageHook({
             runId: deps.state.runId,
             project: deps.config.project,
@@ -1154,6 +1162,7 @@ export async function runOneStage(
             touchedFiles: manifestGetTouchedFiles(deps.depsForManifest()),
             riskTier: risk.tier,
             confidence: risk.confidence,
+            ...(waitForReviewerDecision ? { waitForReviewerDecision } : {}),
           });
           if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
         } catch (err) {
