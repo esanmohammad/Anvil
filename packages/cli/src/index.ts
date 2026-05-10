@@ -9,6 +9,7 @@ import { dashboardCommand } from './commands/dashboard.js';
 import { runReplayCommand } from './commands/run-replay.js';
 import { resumeDurableCommand } from './commands/resume-durable.js';
 import { browserCommand } from './commands/browser-login.js';
+import { sandboxRuntimeCommand } from './commands/sandbox-runtime.js';
 
 const program = new Command();
 
@@ -26,6 +27,7 @@ program.addCommand(dashboardCommand);
 program.addCommand(runReplayCommand);
 program.addCommand(resumeDurableCommand);
 program.addCommand(browserCommand);
+program.addCommand(sandboxRuntimeCommand);
 
 // Default action — launch dashboard
 if (process.argv.length <= 2) {
