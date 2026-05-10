@@ -96,6 +96,70 @@ export interface PipelinePolicy {
   qa?: AgentQuestionPolicy;
   /** Browser/web tool gating overlay (Phase H). */
   tools?: ToolsPolicy;
+  /** Sandbox isolation overlay (Phase S — see docs/sandbox-isolation-plan.md §F). */
+  sandbox?: SandboxPolicy;
+}
+
+/**
+ * Sandbox isolation policy — overlay on top of core-pipeline's
+ * `STAGE_SANDBOX_POLICY` table. Set `default.runtime` to globally pin
+ * a runtime; set `perStage[<stage>]` to override the canonical entry
+ * for one stage; set `network.allowList`/`blockList` to scope egress.
+ */
+export interface SandboxPolicy {
+  /** Sandbox-wide defaults applied to every stage's resolved entry. */
+  default?: SandboxDefaultBlock;
+  /** Per-stage overrides keyed by stage name (e.g. "build", "ship"). */
+  perStage?: Record<string, SandboxStageOverrideBlock>;
+  /** Project-wide network policy layered under the per-stage policy. */
+  network?: SandboxNetworkBlock;
+  /** Cost / quota controls (sum across all sandboxes per run). */
+  limits?: SandboxBudgetLimits;
+}
+
+export interface SandboxDefaultBlock {
+  /** Concrete runtime to vend by default. */
+  runtime?: 'none' | 'docker' | 'podman' | 'firecracker' | 'gvisor';
+  /** Default resource limits applied per stage. */
+  limits?: SandboxResourceLimits;
+}
+
+export interface SandboxStageOverrideBlock {
+  /** Override the per-stage runtime mode. */
+  mode?: 'none' | 'container' | 'microVM';
+  /** Override the runtime backing the mode. */
+  runtime?: 'none' | 'docker' | 'podman' | 'firecracker' | 'gvisor';
+  /** Override the filesystem propagation mode. */
+  fsMode?: 'overlay' | 'bind' | 'none';
+  /** Override the resource limits. */
+  limits?: SandboxResourceLimits;
+  /** Per-stage network policy. Overrides project + table defaults. */
+  network?: SandboxNetworkBlock;
+}
+
+export interface SandboxResourceLimits {
+  memoryMiB?: number;
+  cpus?: number;
+  timeoutSeconds?: number;
+  pids?: number;
+  diskMiB?: number;
+}
+
+export interface SandboxNetworkBlock {
+  default?: 'deny' | 'allow';
+  allowList?: string[];
+  blockList?: string[];
+  allowLoopback?: boolean;
+  dnsResolver?: string;
+}
+
+export interface SandboxBudgetLimits {
+  /** Hard cap on summed exec wall time per run (seconds). */
+  perRunWallSeconds?: number;
+  /** Per-stage cap (seconds) — overrides §F default when stricter. */
+  perStageWallSeconds?: number;
+  /** Sum across all sandboxes for the run (MiB). */
+  totalDiskMiB?: number;
 }
 
 export interface PolicyEvaluationInput {

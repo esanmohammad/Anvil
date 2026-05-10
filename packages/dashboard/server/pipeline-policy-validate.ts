@@ -55,7 +55,51 @@ export interface PolicyPatch {
     browseEval?: WebToolPatch;
     browsePixel?: WebToolPatch;
   };
+  sandbox?: SandboxPolicyPatch;
 }
+
+export interface SandboxPolicyPatch {
+  default?: {
+    runtime?: 'none' | 'docker' | 'podman' | 'firecracker' | 'gvisor';
+    limits?: SandboxResourceLimitsPatch;
+  };
+  perStage?: Record<string, SandboxStageOverridePatch>;
+  network?: SandboxNetworkPatch;
+  limits?: {
+    perRunWallSeconds?: number;
+    perStageWallSeconds?: number;
+    totalDiskMiB?: number;
+  };
+}
+
+export interface SandboxStageOverridePatch {
+  mode?: 'none' | 'container' | 'microVM';
+  runtime?: 'none' | 'docker' | 'podman' | 'firecracker' | 'gvisor';
+  fsMode?: 'overlay' | 'bind' | 'none';
+  limits?: SandboxResourceLimitsPatch;
+  network?: SandboxNetworkPatch;
+}
+
+export interface SandboxResourceLimitsPatch {
+  memoryMiB?: number;
+  cpus?: number;
+  timeoutSeconds?: number;
+  pids?: number;
+  diskMiB?: number;
+}
+
+export interface SandboxNetworkPatch {
+  default?: 'deny' | 'allow';
+  allowList?: string[];
+  blockList?: string[];
+  allowLoopback?: boolean;
+  dnsResolver?: string;
+}
+
+const VALID_RUNTIMES: readonly string[] = ['none', 'docker', 'podman', 'firecracker', 'gvisor'];
+const VALID_MODES: readonly string[] = ['none', 'container', 'microVM'];
+const VALID_FS_MODES: readonly string[] = ['overlay', 'bind', 'none'];
+const VALID_NET_DEFAULTS: readonly string[] = ['deny', 'allow'];
 
 export interface WebToolPatch {
   enabled?: boolean;
@@ -216,6 +260,126 @@ export function validatePolicyPatch(patch: unknown): ValidationResult {
     }
   }
 
+  if (p.sandbox !== undefined) {
+    const r = validateSandboxBlock(p.sandbox);
+    if (!r.ok) return r;
+  }
+
+  return { ok: true };
+}
+
+function validateSandboxBlock(s: unknown): ValidationResult {
+  if (s === null || typeof s !== 'object') {
+    return { ok: false, error: 'sandbox must be an object' };
+  }
+  const sb = s as SandboxPolicyPatch;
+
+  if (sb.default !== undefined) {
+    if (sb.default === null || typeof sb.default !== 'object') {
+      return { ok: false, error: 'sandbox.default must be an object' };
+    }
+    if (sb.default.runtime !== undefined && !VALID_RUNTIMES.includes(sb.default.runtime)) {
+      return { ok: false, error: `sandbox.default.runtime must be one of ${VALID_RUNTIMES.join(', ')}` };
+    }
+    if (sb.default.limits !== undefined) {
+      const r = validateResourceLimits(sb.default.limits, 'sandbox.default.limits');
+      if (!r.ok) return r;
+    }
+  }
+
+  if (sb.perStage !== undefined) {
+    if (sb.perStage === null || typeof sb.perStage !== 'object') {
+      return { ok: false, error: 'sandbox.perStage must be an object' };
+    }
+    for (const [stage, override] of Object.entries(sb.perStage)) {
+      if (typeof stage !== 'string' || stage.length === 0) {
+        return { ok: false, error: 'sandbox.perStage keys must be non-empty stage names' };
+      }
+      if (override === null || typeof override !== 'object') {
+        return { ok: false, error: `sandbox.perStage.${stage} must be an object` };
+      }
+      const r = validateStageOverride(override, `sandbox.perStage.${stage}`);
+      if (!r.ok) return r;
+    }
+  }
+
+  if (sb.network !== undefined) {
+    const r = validateNetwork(sb.network, 'sandbox.network');
+    if (!r.ok) return r;
+  }
+
+  if (sb.limits !== undefined) {
+    if (sb.limits === null || typeof sb.limits !== 'object') {
+      return { ok: false, error: 'sandbox.limits must be an object' };
+    }
+    for (const k of ['perRunWallSeconds', 'perStageWallSeconds', 'totalDiskMiB'] as const) {
+      const v = sb.limits[k];
+      if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) {
+        return { ok: false, error: `sandbox.limits.${k} must be a non-negative number` };
+      }
+    }
+  }
+
+  return { ok: true };
+}
+
+function validateStageOverride(o: SandboxStageOverridePatch, prefix: string): ValidationResult {
+  if (o.mode !== undefined && !VALID_MODES.includes(o.mode)) {
+    return { ok: false, error: `${prefix}.mode must be one of ${VALID_MODES.join(', ')}` };
+  }
+  if (o.runtime !== undefined && !VALID_RUNTIMES.includes(o.runtime)) {
+    return { ok: false, error: `${prefix}.runtime must be one of ${VALID_RUNTIMES.join(', ')}` };
+  }
+  if (o.fsMode !== undefined && !VALID_FS_MODES.includes(o.fsMode)) {
+    return { ok: false, error: `${prefix}.fsMode must be one of ${VALID_FS_MODES.join(', ')}` };
+  }
+  if (o.limits !== undefined) {
+    const r = validateResourceLimits(o.limits, `${prefix}.limits`);
+    if (!r.ok) return r;
+  }
+  if (o.network !== undefined) {
+    const r = validateNetwork(o.network, `${prefix}.network`);
+    if (!r.ok) return r;
+  }
+  return { ok: true };
+}
+
+function validateResourceLimits(l: SandboxResourceLimitsPatch, prefix: string): ValidationResult {
+  for (const k of ['memoryMiB', 'cpus', 'timeoutSeconds', 'pids', 'diskMiB'] as const) {
+    const v = l[k];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+      return { ok: false, error: `${prefix}.${k} must be a non-negative number` };
+    }
+  }
+  return { ok: true };
+}
+
+function validateNetwork(n: SandboxNetworkPatch, prefix: string): ValidationResult {
+  if (typeof n !== 'object' || n === null) {
+    return { ok: false, error: `${prefix} must be an object` };
+  }
+  if (n.default !== undefined && !VALID_NET_DEFAULTS.includes(n.default)) {
+    return { ok: false, error: `${prefix}.default must be one of ${VALID_NET_DEFAULTS.join(', ')}` };
+  }
+  for (const arr of ['allowList', 'blockList'] as const) {
+    const v = n[arr];
+    if (v === undefined) continue;
+    if (!Array.isArray(v)) {
+      return { ok: false, error: `${prefix}.${arr} must be an array of strings` };
+    }
+    for (const s of v) {
+      if (typeof s !== 'string' || s.length === 0) {
+        return { ok: false, error: `${prefix}.${arr} entries must be non-empty strings` };
+      }
+    }
+  }
+  if (n.allowLoopback !== undefined && typeof n.allowLoopback !== 'boolean') {
+    return { ok: false, error: `${prefix}.allowLoopback must be boolean` };
+  }
+  if (n.dnsResolver !== undefined && (typeof n.dnsResolver !== 'string' || n.dnsResolver.length === 0)) {
+    return { ok: false, error: `${prefix}.dnsResolver must be a non-empty string` };
+  }
   return { ok: true };
 }
 
@@ -300,6 +464,34 @@ export function deepMergeOverlay(
       merged[key] = { ...baseBlock, ...patchBlock };
     }
     out.tools = merged;
+  }
+
+  if (patch.sandbox !== undefined) {
+    const baseSandbox = (existing.sandbox as Record<string, unknown> | undefined) ?? {};
+    const merged: Record<string, unknown> = { ...baseSandbox };
+
+    if (patch.sandbox.default !== undefined) {
+      const baseDefault = (baseSandbox.default as Record<string, unknown> | undefined) ?? {};
+      merged.default = { ...baseDefault, ...patch.sandbox.default };
+    }
+    if (patch.sandbox.perStage !== undefined) {
+      const basePerStage = (baseSandbox.perStage as Record<string, unknown> | undefined) ?? {};
+      const mergedPerStage: Record<string, unknown> = { ...basePerStage };
+      for (const [stage, override] of Object.entries(patch.sandbox.perStage)) {
+        const baseOverride = (basePerStage[stage] as Record<string, unknown> | undefined) ?? {};
+        mergedPerStage[stage] = { ...baseOverride, ...override };
+      }
+      merged.perStage = mergedPerStage;
+    }
+    if (patch.sandbox.network !== undefined) {
+      const baseNetwork = (baseSandbox.network as Record<string, unknown> | undefined) ?? {};
+      merged.network = { ...baseNetwork, ...patch.sandbox.network };
+    }
+    if (patch.sandbox.limits !== undefined) {
+      const baseLimits = (baseSandbox.limits as Record<string, unknown> | undefined) ?? {};
+      merged.limits = { ...baseLimits, ...patch.sandbox.limits };
+    }
+    out.sandbox = merged;
   }
 
   return out;
