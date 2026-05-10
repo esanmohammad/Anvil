@@ -14,6 +14,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { getCurrentSandboxHandle } from './current-sandbox-handle.js';
 import { mkdirSync, readFileSync, statSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 
@@ -314,6 +315,30 @@ const HANDLERS: Record<string, Handler> = {
 // ───────────────────────────────────────────────────────────────────────
 
 async function runBash(command: string, ctx: ExecCtx, timeoutMs: number): Promise<ToolResult> {
+  // Phase S follow-up #2 — when a sandbox handle is registered for
+  // the current stage, dispatch through it instead of spawning on
+  // the host. The handle's exec() returns a SandboxExecResult; we
+  // translate that into our ToolResult shape.
+  const handle = getCurrentSandboxHandle();
+  if (handle && typeof handle.exec === 'function') {
+    try {
+      const r = await handle.exec({
+        command,
+        timeoutMs,
+        signal: ctx.abortSignal,
+      });
+      const tail = r.stdout + (r.stderr ? `\n\n[stderr]\n${r.stderr}` : '');
+      const body = tail || '(no output)';
+      const limitNote = r.killedByLimit ? `\n\n[killed by ${r.killedByLimit}]` : '';
+      const exitNote = r.exitCode === null
+        ? ''
+        : r.exitCode !== 0 ? `\n\n[exit ${r.exitCode}]` : '';
+      const isError = r.exitCode !== 0 || r.killedByLimit !== undefined;
+      return { isError, content: body + limitNote + exitNote };
+    } catch (err) {
+      return { isError: true, content: `sandbox exec failed: ${(err as Error).message}` };
+    }
+  }
   // Use `sh -c` so the model can pipe + redirect, but never invoke an
   // interactive shell. Args are NOT interpolated by the agent — the
   // entire command string comes from the model in one piece.

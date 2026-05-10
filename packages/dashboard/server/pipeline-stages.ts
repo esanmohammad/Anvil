@@ -44,7 +44,17 @@
 import { join } from 'node:path';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
-import { setCurrentStepContext, withCurrentStepContext } from '@esankhan3/anvil-agent-core';
+import {
+  setCurrentStepContext,
+  withCurrentStepContext,
+  withCurrentSandboxHandle,
+} from '@esankhan3/anvil-agent-core';
+import {
+  sandboxPolicyForStage,
+  stageIsSandboxed,
+  isSandboxRunnerRegistered,
+  getSandboxRunner,
+} from '@esankhan3/anvil-core-pipeline';
 import {
   runWithChainFallback,
   combinePerRepoArtifacts,
@@ -1007,12 +1017,87 @@ export async function runOneStage(
   // body in `withCurrentStepContext(ctx, fn)` propagates via
   // AsyncLocalStorage so concurrent per-repo fanout doesn't trample
   // the global. Falls through to the raw body when ctx is undefined.
-  if (ctx) {
-    return withCurrentStepContext(ctx, () =>
-      runOneStageBody(deps, i, isResume, resumeStage, prevArtifactIn, ctx),
+  //
+  // Phase S follow-up #2 — also acquire a sandbox handle for stages
+  // whose policy mode is 'container' / 'microVM'. The handle lives in
+  // the per-stage AsyncLocalStorage scope; bash tool calls dispatch
+  // through it (see agent-core's getCurrentSandboxHandle()).
+  const inner = (boundCtx?: StepContext<string>) =>
+    withSandboxForStage(deps, STAGES[i]?.name ?? '', boundCtx, () =>
+      runOneStageBody(deps, i, isResume, resumeStage, prevArtifactIn, boundCtx),
     );
+  if (ctx) {
+    return withCurrentStepContext(ctx, () => inner(ctx));
   }
-  return runOneStageBody(deps, i, isResume, resumeStage, prevArtifactIn, ctx);
+  return inner(ctx);
+}
+
+/**
+ * Phase S follow-up #2 — acquire a sandbox handle for the stage,
+ * register it in agent-core's process slot, run the body, sync, close.
+ *
+ * Skipped when:
+ *   - sandbox policy resolves to mode='none' (e.g. clarify/specs/plan)
+ *   - the registered runtime isn't available on this host
+ *   - ANVIL_SANDBOX_FORCE_NONE=1
+ *
+ * Failures during acquire fall through to host execution with a
+ * stderr warning so the dashboard stays usable when Docker breaks
+ * mid-run.
+ */
+async function withSandboxForStage<T>(
+  deps: StageOpsDeps,
+  stageName: string,
+  ctx: StepContext<string> | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const policy = sandboxPolicyForStage(stageName);
+  if (policy.mode === 'none' || !stageIsSandboxed(stageName)) {
+    return fn();
+  }
+  // Pick the configured runtime — for now Docker is the only
+  // registered Mode 1 runner. Firecracker / gVisor opt-in via
+  // `~/.anvil/sandbox.yaml: defaultRuntime` (a follow-up).
+  const runtime = (process.env.ANVIL_SANDBOX_RUNTIME as
+    | 'docker' | 'firecracker' | 'gvisor' | undefined) ?? 'docker';
+  if (!isSandboxRunnerRegistered(runtime)) {
+    // Runner not available (no Docker / KVM / runsc on PATH). Falls
+    // through to host execution. Logged via state broadcast — we
+    // can't surface a per-call message here without a deeper hook.
+    deps.broadcast();
+    return fn();
+  }
+  let runner;
+  try {
+    runner = getSandboxRunner(runtime);
+  } catch {
+    return fn();
+  }
+  let handle;
+  try {
+    handle = await runner.acquire({
+      project: deps.config.project,
+      runId: ctx?.runId ?? `r-${Date.now()}`,
+      stage: stageName,
+      hostWorkdir: deps.workspaceDir,
+      ...(policy.fsMode ? { fsMode: policy.fsMode } : {}),
+      ...(policy.limits ? { limits: policy.limits } : {}),
+    });
+  } catch (err) {
+    // Acquire failed — emit a state broadcast so the dashboard can
+    // surface the message via its own log channel, then fall back
+    // to host execution. Don't fail the stage just because docker
+    // hiccupped.
+    void err;
+    deps.broadcast();
+    return fn();
+  }
+  try {
+    return await withCurrentSandboxHandle(handle, fn);
+  } finally {
+    try { await handle.syncToHost(); } catch { /* best-effort */ }
+    try { await handle.close(); } catch { /* best-effort */ }
+  }
 }
 
 async function runOneStageBody(

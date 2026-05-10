@@ -20,3 +20,9 @@ export {
   getCurrentStepContext,
   type StepContextLike,
 } from './current-step-context.js';
+export {
+  setCurrentSandboxHandle,
+  withCurrentSandboxHandle,
+  getCurrentSandboxHandle,
+  type SandboxHandleLike,
+} from './current-sandbox-handle.js';
