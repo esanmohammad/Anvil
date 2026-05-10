@@ -81,6 +81,25 @@ describe('sandboxPolicyForStage', () => {
     assert.equal(entry.fsMode, 'none');
   });
 
+  it('forceNone: true collapses every stage to mode=none', () => {
+    const build = sandboxPolicyForStage('build', { forceNone: true });
+    assert.equal(build.mode, 'none');
+    assert.equal(build.fsMode, 'none');
+    assert.match(build.notes ?? '', /forced to none/);
+  });
+
+  it('ANVIL_SANDBOX_FORCE_NONE=1 collapses via env var', () => {
+    const original = process.env.ANVIL_SANDBOX_FORCE_NONE;
+    process.env.ANVIL_SANDBOX_FORCE_NONE = '1';
+    try {
+      const build = sandboxPolicyForStage('build');
+      assert.equal(build.mode, 'none');
+    } finally {
+      if (original === undefined) delete process.env.ANVIL_SANDBOX_FORCE_NONE;
+      else process.env.ANVIL_SANDBOX_FORCE_NONE = original;
+    }
+  });
+
   it('stageIsSandboxed reflects the mode', () => {
     assert.equal(stageIsSandboxed('clarify'), false);
     assert.equal(stageIsSandboxed('build'), true); // S12 — container

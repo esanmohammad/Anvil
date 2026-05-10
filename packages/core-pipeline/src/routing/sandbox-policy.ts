@@ -175,16 +175,32 @@ export const STAGE_SANDBOX_POLICY: Readonly<Record<string, StageSandboxPolicyEnt
  * Look up the policy entry for a stage. Stages not in the table fall
  * back to `'none'` (no isolation, no limits) so unknown stages keep
  * working without a "missing policy" error.
+ *
+ * `ANVIL_SANDBOX_FORCE_NONE=1` (or `opts.forceNone: true`) collapses
+ * every entry to `mode='none'` regardless of the table — escape hatch
+ * for users without Docker installed who still want the dashboard to
+ * run. Phase S follow-up #4.
  */
-export function sandboxPolicyForStage(stage: string): StageSandboxPolicyEntry {
+export function sandboxPolicyForStage(
+  stage: string,
+  opts: { forceNone?: boolean } = {},
+): StageSandboxPolicyEntry {
+  const forceNone = opts.forceNone ?? process.env.ANVIL_SANDBOX_FORCE_NONE === '1';
   const entry = STAGE_SANDBOX_POLICY[stage];
-  if (entry) return entry;
-  return { mode: 'none', fsMode: 'none', notes: 'unknown stage — defaults to none' };
+  if (!entry) return { mode: 'none', fsMode: 'none', notes: 'unknown stage — defaults to none' };
+  if (forceNone) {
+    return {
+      mode: 'none',
+      fsMode: 'none',
+      notes: `${entry.notes ?? ''} (forced to none via ANVIL_SANDBOX_FORCE_NONE)`.trim(),
+    };
+  }
+  return entry;
 }
 
 /** True iff the stage runs inside an isolated runtime by default. */
-export function stageIsSandboxed(stage: string): boolean {
-  const entry = sandboxPolicyForStage(stage);
+export function stageIsSandboxed(stage: string, opts: { forceNone?: boolean } = {}): boolean {
+  const entry = sandboxPolicyForStage(stage, opts);
   return entry.mode !== 'none';
 }
 
