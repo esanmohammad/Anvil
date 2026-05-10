@@ -840,6 +840,7 @@ async function runFixLoop(
   _validateStageIndex: number,
   validateArtifact: string,
   attempt: number,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const buildStage = STAGES.find((s) => s.name === 'build')!;
   const repoPaths: Record<string, string> = {};
@@ -847,6 +848,29 @@ async function runFixLoop(
     repoPaths[repoName] = deps.repoPaths()[repoName] || join(deps.workspaceDir, repoName);
   }
   const session = makeAgentSession(deps);
+  const runFixOnce = (model: string) => runFixLoopStep({
+    agentSession: session,
+    project: deps.config.project,
+    model,
+    allowedTools: deps.allowedToolsForCurrentStage('fix-loop'),
+    maxOutputTokens: maxOutputTokensForStage('build'),
+    workspaceDir: deps.workspaceDir,
+    repoNames: deps.state.repoNames,
+    repoPaths,
+    validateArtifact,
+    attempt,
+    priorByRepo: deps.fixLoopAgentByRepo,
+    priorSingleId: deps.getFixLoopAgentSingle(),
+    buildProjectPromptForBuildStage: () => buildProjectPromptHelper(deps.getPromptContext(), buildStage),
+    buildRepoProjectPromptForBuildStage: (repoName: string) =>
+      buildRepoProjectPromptHelper(deps.getPromptContext(), buildStage, repoName),
+    isCancelled: () => deps.isCancelled(),
+  });
+  // Phase E6: durable wrap for fix-loop attempts. Effect name
+  // includes the attempt number so successive fix iterations
+  // record distinct events; the per-step idx counter would also
+  // disambiguate, but the explicit attempt index is more
+  // diagnostic in the durable log.
   const result = await runWithChainFallback(
     {
       stageName: 'fix-loop',
@@ -862,24 +886,12 @@ async function runFixLoop(
         });
       },
     },
-    (model) => runFixLoopStep({
-      agentSession: session,
-      project: deps.config.project,
-      model,
-      allowedTools: deps.allowedToolsForCurrentStage('fix-loop'),
-      maxOutputTokens: maxOutputTokensForStage('build'),
-      workspaceDir: deps.workspaceDir,
-      repoNames: deps.state.repoNames,
-      repoPaths,
-      validateArtifact,
-      attempt,
-      priorByRepo: deps.fixLoopAgentByRepo,
-      priorSingleId: deps.getFixLoopAgentSingle(),
-      buildProjectPromptForBuildStage: () => buildProjectPromptHelper(deps.getPromptContext(), buildStage),
-      buildRepoProjectPromptForBuildStage: (repoName: string) =>
-        buildRepoProjectPromptHelper(deps.getPromptContext(), buildStage, repoName),
-      isCancelled: () => deps.isCancelled(),
-    }),
+    ctx
+      ? (model) => ctx.effect(
+          `validate:fix-attempt-${attempt}:${model}`,
+          async () => serializeAgentRunResult(await runFixOnce(model) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runFixOnce>>,
+        )
+      : runFixOnce,
   );
   if (result.newSingleId !== null) {
     deps.setFixLoopAgentSingle(result.newSingleId);
@@ -1209,14 +1221,14 @@ export async function runOneStage(
           fixAttempts++;
           console.log(`[pipeline] Validation failed — fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}`);
 
-          const fixResult = await runFixLoop(deps, i, validateArtifact, fixAttempts);
+          const fixResult = await runFixLoop(deps, i, validateArtifact, fixAttempts, ctx);
           deps.state.totalCost += fixResult.cost;
           deps.aggregateRunTokens(fixResult.tokens);
           deps.logCacheTelemetry(`${stage.name}:fix-${fixAttempts}`, fixResult.tokens);
 
           if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
 
-          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact);
+          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact, ctx);
           validateArtifact = revalidateResult.artifact;
           deps.state.stages[i].artifact = validateArtifact;
           deps.state.stages[i].cost += revalidateResult.cost;
@@ -1225,7 +1237,21 @@ export async function runOneStage(
           deps.logCacheTelemetry(`${stage.name}:revalidate-${fixAttempts}`, revalidateResult.tokens);
           deps.broadcast();
 
-          writeStageArtifactFn(deps.depsForArtifactIO(), stage, validateArtifact);
+          // Phase E6: wrap revalidate write. Effect name includes
+          // the attempt count so successive revalidates land as
+          // distinct events.
+          if (ctx) {
+            await ctx.effect(
+              `validate:revalidate-write-${fixAttempts}`,
+              async () => {
+                writeStageArtifactFn(deps.depsForArtifactIO(), stage, validateArtifact);
+                return null;
+              },
+              { idempotencyKey: artifactIdempotencyKey('validate', `revalidate-${fixAttempts}`, validateArtifact) },
+            );
+          } else {
+            writeStageArtifactFn(deps.depsForArtifactIO(), stage, validateArtifact);
+          }
         }
 
         if (hasValidationFailuresHelper(validateArtifact)) {
