@@ -27,9 +27,11 @@
   "dependencies": {
     "@esankhan3/anvil-agent-core": "^0.1.1",
     "@esankhan3/anvil-memory-core": "^0.1.0",
+    "better-sqlite3": "^11.10.0",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.2"
   },
   "repository": {

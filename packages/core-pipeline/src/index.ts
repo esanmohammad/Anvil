@@ -334,6 +334,29 @@ export type {
 } from './hooks/index.js';
 export { VERSION } from './version.js';
 
+// — Durable execution (Phase D1+)
+export type {
+  RunStatus,
+  NewRunRecord,
+  RunRecord,
+  DurableEventKind,
+  NewEventRecord,
+  EventRecord,
+  EffectEventPair,
+  SignalRecord,
+  DurableStore,
+  VacuumStats,
+  SQLiteDurableStoreOptions,
+} from './durable/index.js';
+export {
+  DeterminismViolationError,
+  DurableStoreUnavailableError,
+  EffectResultNotSerialisableError,
+  Pattern1MigrationError,
+  InMemoryDurableStore,
+  SQLiteDurableStore,
+} from './durable/index.js';
+
 // — Agent invocation surface (canonical AgentRunner type)
 export type { AgentRunner, AgentRunRequest, AgentRunResult } from './agent-runner.js';
 export type { AgentSession, AgentSessionResult } from './agent-session.js';
