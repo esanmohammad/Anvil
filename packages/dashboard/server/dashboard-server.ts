@@ -37,6 +37,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 import { AgentManager, setWebToolBackends, type AgentState } from '@esankhan3/anvil-agent-core';
 import { createWebToolBridge } from './tools/web-tool-bridge.js';
+import { createDefaultSummarizerInvoker } from './tools/default-summarizer-invoker.js';
 import { PipelineRunner } from './pipeline-runner.js';
 import { getDurableStore } from './durable-store-singleton.js';
 import { runDurableMigration } from './durable-migration.js';
@@ -913,10 +914,12 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const agentManager = new AgentManager();
   // ── Phase H1+ — register web/browser tool backends process-wide ───
   // The agent-core bridge composes a `WebToolExecutor` whenever a stage
-  // includes web_*/browser_*/computer_use names in its allow-list AND
+  // includes web_/browser_/computer_use names in its allow-list AND
   // backends are present. Wiring it here lets every spawn see the
   // surface without each call site threading it.
-  setWebToolBackends(createWebToolBridge());
+  setWebToolBackends(createWebToolBridge({
+    summarizerInvoker: createDefaultSummarizerInvoker(),
+  }));
   const memoryStore = new MemoryStore();
   const kbManager = new KnowledgeBaseManager(projectLoader);
   const planStore = new PlanStore(ANVIL_HOME);
