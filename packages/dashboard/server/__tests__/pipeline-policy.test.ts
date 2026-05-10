@@ -6,12 +6,17 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   parseYaml,
   matchesGlob,
   evaluatePolicy,
   defaultPolicy,
+  loadPolicy,
+  BUILTIN_DEFAULT_POLICY,
 } from '../pipeline-policy.js';
 import type { PipelinePolicy } from '../pipeline-policy-types.js';
 
@@ -137,8 +142,121 @@ describe('evaluatePolicy', () => {
   it('defaultPolicy pauses after plan and nothing else', () => {
     const policy = defaultPolicy();
     const planned = evaluatePolicy(policy, { stage: 'plan', touchedFiles: ['x.ts'] });
+    // Builtin sets autoApproveIfRisk='low' + autoApproveIfConfidence=0.85 — without
+    // a riskTier or confidence input the defaults still pause.
     assert.equal(planned.pause, true);
     const implemented = evaluatePolicy(policy, { stage: 'implement', touchedFiles: ['x.ts'] });
     assert.equal(implemented.pause, false);
+  });
+
+  it('returns disabled when policy.enabled === false', () => {
+    const policy: PipelinePolicy = {
+      version: '1.0.0',
+      enabled: false,
+      defaults: { pauseAfter: ['plan'] },
+      paths: [{ match: '**/*.ts', pauseAfter: ['plan'] }],
+    };
+    const decision = evaluatePolicy(policy, { stage: 'plan', touchedFiles: ['src/x.ts'] });
+    assert.equal(decision.pause, false);
+    assert.equal(decision.reason, 'disabled');
+  });
+
+  it('still pauses when policy.enabled is true and stage is gated', () => {
+    const policy: PipelinePolicy = {
+      version: '1.0.0',
+      enabled: true,
+      defaults: { pauseAfter: ['plan'] },
+      paths: [],
+    };
+    const decision = evaluatePolicy(policy, { stage: 'plan', touchedFiles: ['x.ts'] });
+    assert.equal(decision.pause, true);
+    assert.equal(decision.reason, 'defaults-pause');
+  });
+});
+
+// ── loadPolicy: layering with builtin / yaml / overlay ───────────────────
+
+describe('loadPolicy', () => {
+  function makeHome(): string {
+    return mkdtempSync(join(tmpdir(), 'anvil-policy-'));
+  }
+  function projectDir(home: string, slug: string): string {
+    const dir = join(home, 'projects', slug);
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  it('returns BUILTIN_DEFAULT_POLICY when no yaml or overlay exists', () => {
+    const home = makeHome();
+    try {
+      const policy = loadPolicy('greenfield', home);
+      assert.equal(policy.enabled, true);
+      assert.deepEqual(policy.defaults.pauseAfter, ['plan']);
+      assert.equal(policy.qa?.enabled, true);
+      assert.equal(policy.qa?.maxQuestionsPerStage, 5);
+      assert.equal(policy.cost?.onBreach, 'ask');
+      assert.equal(policy.cost?.limits?.perRun, 10.00);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('yaml file overrides the builtin', () => {
+    const home = makeHome();
+    try {
+      const dir = projectDir(home, 'with-yaml');
+      writeFileSync(join(dir, 'pipeline-policy.yaml'),
+        'version: 1.0.0\ndefaults:\n  pauseAfter: [plan, implement]\n', 'utf-8');
+      const policy = loadPolicy('with-yaml', home);
+      assert.deepEqual(policy.defaults.pauseAfter, ['plan', 'implement']);
+      // Yaml without explicit `enabled` still defaults to on.
+      assert.equal(policy.enabled, true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('overlay layers on top of the builtin', () => {
+    const home = makeHome();
+    try {
+      const dir = projectDir(home, 'overlay-only');
+      writeFileSync(join(dir, 'pipeline-policy.overlay.json'),
+        JSON.stringify({ enabled: false, cost: { limits: { perRun: 50 } } }), 'utf-8');
+      const policy = loadPolicy('overlay-only', home);
+      assert.equal(policy.enabled, false);
+      assert.equal(policy.cost?.limits?.perRun, 50);
+      // Builtin's default still flows through for unset overlay fields.
+      assert.equal(policy.cost?.onBreach, 'ask');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('overlay layers on top of yaml (overlay wins for shared fields)', () => {
+    const home = makeHome();
+    try {
+      const dir = projectDir(home, 'yaml-and-overlay');
+      writeFileSync(join(dir, 'pipeline-policy.yaml'),
+        'version: 1.0.0\ndefaults:\n  pauseAfter: [plan]\n', 'utf-8');
+      writeFileSync(join(dir, 'pipeline-policy.overlay.json'),
+        JSON.stringify({ defaults: { pauseAfter: ['plan', 'implement'] } }), 'utf-8');
+      const policy = loadPolicy('yaml-and-overlay', home);
+      assert.deepEqual(policy.defaults.pauseAfter, ['plan', 'implement']);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('malformed overlay is ignored, base policy survives', () => {
+    const home = makeHome();
+    try {
+      const dir = projectDir(home, 'bad-overlay');
+      writeFileSync(join(dir, 'pipeline-policy.overlay.json'), '{not json', 'utf-8');
+      const policy = loadPolicy('bad-overlay', home);
+      assert.equal(policy.enabled, true);
+      assert.deepEqual(policy.defaults.pauseAfter, BUILTIN_DEFAULT_POLICY.defaults.pauseAfter);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

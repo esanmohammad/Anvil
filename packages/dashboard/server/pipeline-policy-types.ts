@@ -39,13 +39,24 @@ export interface PolicyDefaults {
   autoApproveIfConfidence?: number;    // 0..1
 }
 
+export interface AgentQuestionPolicy {
+  /** Master toggle for Q&A across planning stages. Default true. */
+  enabled?: boolean;
+  /** Hard cap on how many questions an agent may ask per stage. Default 5. */
+  maxQuestionsPerStage?: number;
+}
+
 export interface PipelinePolicy {
   version: string;            // schema version
+  /** Master switch for review pauses. Default true. When false, no pause ever fires. */
+  enabled?: boolean;
   defaults: PolicyDefaults;
   paths: PathRule[];
   cost?: CostPolicy;
   notifications?: NotificationConfig;
   reviewers?: Array<{ match: string; users: string[] }>;
+  /** Agent Q&A controls — applies to clarify/requirements/repo-requirements/specs stages. */
+  qa?: AgentQuestionPolicy;
 }
 
 export interface PolicyEvaluationInput {

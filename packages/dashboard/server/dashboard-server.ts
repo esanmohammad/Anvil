@@ -1212,7 +1212,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
   /** Compute a unified cost snapshot for (project, runId?) at this moment. */
   function computeCostSnapshot(project: string, runId?: string | null): unknown {
-    const policy = (() => { try { return loadPolicy(project, ANVIL_HOME); } catch { return null; } })();
+    const policy: PipelinePolicy | null = (() => { try { return loadPolicy(project, ANVIL_HOME); } catch { return null; } })();
     const budget = (() => { try { return projectLoader.getBudgetConfig(project); } catch { return {} as Record<string, unknown>; } })();
     const policyLimits = policy?.cost?.limits ?? {};
     const perRunLimit = policyLimits.perRun ?? (typeof budget.max_per_run === 'number' ? budget.max_per_run : undefined);
@@ -5160,10 +5160,11 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     // ── Feature-flagged policy hook: pause after configured stages ──
     {
       runner.setAfterStageHook(async (info) => {
-        // Gate purely on the project's policy YAML — no env var. Projects
-        // without a pipeline-policy.yaml get no pauses.
+        // Policy is now always defined (BUILTIN_DEFAULT_POLICY when no yaml).
+        // The master switch — overlay or yaml `enabled: false` — short-circuits
+        // here without firing a pause.
         const policy = loadPolicy(info.project, ANVIL_HOME);
-        if (!policy) return;
+        if (policy.enabled === false) return;
         // Map the runner's fine-grained stage taxonomy onto the policy's
         // 5-stage taxonomy. Without this, stages like `validate` fall back
         // to `implement` and silently re-trigger any path-rule that lists
@@ -5280,7 +5281,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         } catch {
           policy = null;
         }
-        if (!policy?.cost) return;
+        if (!policy || !policy.cost) return;
 
         const stage = (
           ['plan', 'implement', 'review', 'test', 'ship'].includes(info.stage ?? '')
