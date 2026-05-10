@@ -24,6 +24,7 @@ import {
   wrapSandboxWrite,
   wrapSandboxEdit,
   sandboxEffectName,
+  buildHandleStateHasher,
 } from '../sandbox/index.js';
 
 let tempRoot: string;
@@ -157,6 +158,39 @@ describe('durable-wrap — wrapSandboxExec', () => {
     await wrapSandboxExec(ctx as any, { runId: 'r1', stage: 'build', idx: 0, sandboxStateHash: async () => 'B' },
       exec, async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 0 }));
     assert.notEqual(recorded[0]!.idempotencyKey, recorded[1]!.idempotencyKey);
+  });
+});
+
+describe('buildHandleStateHasher', () => {
+  it('produces a stable hash across two invocations on the same dir', async () => {
+    const dir = path.join(tempRoot, 'hasher');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, 'a.txt'), 'alpha');
+    const hasher = buildHandleStateHasher({ workdir: dir });
+    const h1 = await hasher();
+    const h2 = await hasher();
+    assert.equal(h1, h2);
+    assert.match(h1, /^sha256:/);
+  });
+
+  it('hash changes when workdir contents change', async () => {
+    const dir = path.join(tempRoot, 'hasher2');
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, 'a.txt'), 'one');
+    const hasher = buildHandleStateHasher({ workdir: dir });
+    const before = await hasher();
+    await fsp.writeFile(path.join(dir, 'a.txt'), 'two');
+    const after = await hasher();
+    assert.notEqual(before, after);
+  });
+
+  it('returns a stable failure marker when workdir is missing', async () => {
+    const hasher = buildHandleStateHasher({ workdir: '/path/does/not/exist/anvil-test' });
+    const h = await hasher();
+    // hashWorkdir tolerates missing dirs (yields empty digest); the
+    // marker may be empty-tree or hash-failed — assert it's deterministic.
+    const h2 = await hasher();
+    assert.equal(h, h2);
   });
 });
 

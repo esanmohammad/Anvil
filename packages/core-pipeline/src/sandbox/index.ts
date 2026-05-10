@@ -35,5 +35,6 @@ export {
   wrapSandboxEdit,
   wrapSandboxSync,
   wrapSandboxClose,
+  buildHandleStateHasher,
   type DurableSandboxOptions,
 } from './durable-wrap.js';

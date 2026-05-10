@@ -18,6 +18,7 @@
 
 import type { StepContext } from '../types.js';
 import { contentHash } from '../durable/effect-helpers.js';
+import { hashWorkdir, StatHashCache } from './state-hash.js';
 import type {
   SandboxExecArgs,
   SandboxExecResult,
@@ -138,4 +139,21 @@ export async function wrapSandboxClose(
   const idempotencyKey = `${args.runId}:${args.stage}:close`;
   const name = sandboxEffectName('close', args.runId, args.stage);
   return ctx.effect(name, fn, { idempotencyKey });
+}
+
+/**
+ * Build a `sandboxStateHash` callback bound to a handle's workdir.
+ * Pass into `wrapSandboxExec.args.sandboxStateHash` to opt the call
+ * into state-hash-bounded replay determinism (§I.3).
+ *
+ * The returned function lazily creates one StatHashCache per
+ * handle so successive exec calls re-use mtime+size→hash entries
+ * (replay correctness vs perf).
+ */
+export function buildHandleStateHasher(handle: { workdir: string }): () => Promise<string> {
+  const cache = new StatHashCache();
+  return async () => {
+    const r = await hashWorkdir(handle.workdir, { statCache: cache }).catch(() => null);
+    return r?.contentHash ?? 'sha256:hash-failed';
+  };
 }
