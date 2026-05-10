@@ -36,6 +36,7 @@ import type {
   SandboxSyncResult,
 } from '@esankhan3/anvil-core-pipeline/sandbox/types.js';
 import { dockerRunLimitArgs, detectLimitKill } from './resource-limits.js';
+import { buildCacheMounts, dockerCacheMountArgs, type CacheMode } from './cache-mounts.js';
 
 /** Default base image. Overridable via `AcquireSandboxOpts.image`. */
 export const DEFAULT_SANDBOX_IMAGE = 'anvil/sandbox:latest';
@@ -56,6 +57,8 @@ export interface DockerSandboxOptions {
   defaultImage?: string;
   /** Idle TTL — handles past this age get swept by `sweep()`. */
   idleTtlMs?: number;
+  /** Default cache-mount mode. Default 'read-only'. */
+  cacheMode?: CacheMode;
   /** Test seam: replace the spawn function (used by docker-runner tests
    *  to inject a stub `docker` CLI). */
   spawnFn?: typeof spawn;
@@ -185,13 +188,20 @@ export class DockerSandboxHandle implements SandboxHandle {
 
 export class DockerSandboxRunner implements SandboxRunner {
   private readonly handles = new Map<string, DockerSandboxHandle>();
-  private readonly opts: Required<Omit<DockerSandboxOptions, 'spawnFn'>> & { spawnFn?: typeof spawn };
+  private readonly opts: {
+    dockerBin: string;
+    defaultImage: string;
+    idleTtlMs: number;
+    cacheMode: CacheMode;
+    spawnFn?: typeof spawn;
+  };
 
   constructor(opts: DockerSandboxOptions = {}) {
     this.opts = {
       dockerBin: opts.dockerBin ?? process.env.DOCKER_BIN ?? 'docker',
       defaultImage: opts.defaultImage ?? DEFAULT_SANDBOX_IMAGE,
       idleTtlMs: opts.idleTtlMs ?? 5 * 60 * 1000,
+      cacheMode: opts.cacheMode ?? 'read-only',
       ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
     };
   }
@@ -204,6 +214,9 @@ export class DockerSandboxRunner implements SandboxRunner {
       throw new Error(`hostWorkdir does not exist: ${hostWorkdir}`);
     });
 
+    const cacheMounts = buildCacheMounts({
+      defaultMode: this.opts.cacheMode,
+    });
     const args = [
       'run',
       '-d',                           // detached
@@ -213,6 +226,8 @@ export class DockerSandboxRunner implements SandboxRunner {
       '--mount', `type=bind,src=${hostWorkdir},dst=${SANDBOX_WORKDIR}`,
       // S5: per-stage resource limits — memory, cpus, pids, disk.
       ...dockerRunLimitArgs(opts.limits),
+      // S8: read-only package-manager cache mounts.
+      ...dockerCacheMountArgs(cacheMounts),
       // Block exec without a TTY so a poisoned container can't run an
       // interactive shell to phone home.
       '--init',
