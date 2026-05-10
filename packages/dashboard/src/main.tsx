@@ -40,6 +40,7 @@ import { PlanReviewModal } from './components/pipeline/PlanReviewModal.js';
 import { usePausedRuns } from './components/pipeline/usePausedRuns.js';
 import { CostBreachHistoryPage } from './components/cost-breaches/CostBreachHistoryPage.js';
 import { MemoryPage } from './components/memory/MemoryPage.js';
+import { PolicyPage } from './components/policy/PolicyPage.js';
 
 // ---------------------------------------------------------------------------
 // Raw content cleaner — strips JSON, tool inputs, commands from Claude's text
@@ -1363,6 +1364,9 @@ function App() {
 
       case 'settings':
         return <SettingsPage project={currentProject?.name ?? null} ws={wsRef.current} />;
+
+      case 'policy':
+        return <PolicyPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'history':
         return <RunHistoryList
