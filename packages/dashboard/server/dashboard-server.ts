@@ -89,6 +89,7 @@ import {
 import { CheckpointSimilarityIndex } from './checkpoint-similarity-index.js';
 import { embedPrompt } from './prompt-similarity.js';
 import { loadPolicy, evaluatePolicy } from './pipeline-policy.js';
+import { validatePolicyPatch, deepMergeOverlay, type PolicyPatch } from './pipeline-policy-validate.js';
 import type { PipelinePolicy } from './pipeline-policy-types.js';
 import {
   notifyPipelinePaused, notifyCostBreach,
@@ -4473,43 +4474,34 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       }
 
       case 'update-pipeline-policy': {
-        const { project, patch } = msg as {
-          project?: string;
-          patch?: { cost?: { onBreach?: 'ask' | 'auto-approve' | 'auto-reject'; autoApproveBelow?: number; graceWindowSeconds?: number; limits?: { perRun?: number; perProjectDaily?: number } } };
-        };
+        const { project, patch } = msg as { project?: string; patch?: PolicyPatch };
         if (!project || !patch) {
-          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: 'project + patch required' } }));
+          ws.send(JSON.stringify({ type: 'pipeline-policy-error', payload: { message: 'project + patch required' } }));
+          break;
+        }
+        const validation = validatePolicyPatch(patch);
+        if (!validation.ok) {
+          ws.send(JSON.stringify({ type: 'pipeline-policy-error', payload: { message: validation.error } }));
           break;
         }
         try {
-          // Validation guards.
-          const cost = patch.cost ?? {};
-          if (cost.graceWindowSeconds !== undefined && (cost.graceWindowSeconds < 10 || cost.graceWindowSeconds > 600)) {
-            ws.send(JSON.stringify({ type: 'cost-error', payload: { message: 'graceWindowSeconds must be in [10, 600]' } }));
-            break;
-          }
-          if (cost.autoApproveBelow !== undefined && cost.autoApproveBelow < 0) {
-            ws.send(JSON.stringify({ type: 'cost-error', payload: { message: 'autoApproveBelow must be >= 0' } }));
-            break;
-          }
           const projDir = join(ANVIL_HOME, 'projects', project);
           if (!existsSync(projDir)) mkdirSync(projDir, { recursive: true });
           const overlayPath = join(projDir, 'pipeline-policy.overlay.json');
-          const existing = existsSync(overlayPath) ? JSON.parse(readFileSync(overlayPath, 'utf-8')) : {};
-          const merged = {
-            ...existing,
-            cost: {
-              ...(existing.cost ?? {}),
-              ...cost,
-              limits: { ...(existing.cost?.limits ?? {}), ...(cost.limits ?? {}) },
-            },
-          };
+          const existing: Record<string, unknown> = existsSync(overlayPath)
+            ? JSON.parse(readFileSync(overlayPath, 'utf-8'))
+            : {};
+          const merged = deepMergeOverlay(existing, patch);
           writeFileSync(overlayPath, JSON.stringify(merged, null, 2), 'utf-8');
-          ws.send(JSON.stringify({ type: 'pipeline-policy-updated', payload: { project, overlay: merged } }));
-          // Push fresh snapshot so any meters reading limits see new ceilings.
+          const effective = loadPolicy(project, ANVIL_HOME);
+          // Reply to caller.
+          ws.send(JSON.stringify({ type: 'pipeline-policy-updated', payload: { project, overlay: merged, effective } }));
+          // Broadcast so other open dashboard tabs refresh their /policy view.
+          broadcast({ type: 'pipeline-policy-saved', payload: { project, overlay: merged, effective } } as ServerMessage);
+          // Push fresh cost snapshot so meters reading limits see new ceilings.
           try { broadcastCostSnapshot(project); } catch { /* ok */ }
         } catch (err) {
-          ws.send(JSON.stringify({ type: 'cost-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
+          ws.send(JSON.stringify({ type: 'pipeline-policy-error', payload: { message: String(err instanceof Error ? err.message : err) } }));
         }
         break;
       }
