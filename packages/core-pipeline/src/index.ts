@@ -363,6 +363,12 @@ export {
   LeaseManager,
   tryTakeOverLease,
   findOrphanedRuns,
+  serializeAgentRunResult,
+  contentHash,
+  artifactIdempotencyKey,
+  seedStoreFromLog,
+  throwingSpy,
+  countingSpy,
 } from './durable/index.js';
 
 // — Agent invocation surface (canonical AgentRunner type)

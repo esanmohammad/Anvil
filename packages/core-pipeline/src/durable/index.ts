@@ -29,3 +29,6 @@ export { lintStepSource } from './lint.js';
 export type { LintViolation } from './lint.js';
 export { LeaseManager, tryTakeOverLease, findOrphanedRuns } from './lease-manager.js';
 export type { LeaseManagerOptions, LeaseManagerEvents } from './lease-manager.js';
+export { serializeAgentRunResult, contentHash, artifactIdempotencyKey } from './effect-helpers.js';
+export { seedStoreFromLog, throwingSpy, countingSpy } from './replay-equivalence.js';
+export type { CountingSpy } from './replay-equivalence.js';
