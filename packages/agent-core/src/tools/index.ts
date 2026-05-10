@@ -16,6 +16,7 @@ export {
 } from './domain-matcher.js';
 export {
   setCurrentStepContext,
+  withCurrentStepContext,
   getCurrentStepContext,
   type StepContextLike,
 } from './current-step-context.js';

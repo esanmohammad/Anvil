@@ -72,6 +72,10 @@ export interface BrowserSessionOpts {
   headless?: boolean;
   /** Soft session timeout in ms. Default 15 min. */
   timeoutMs?: number;
+  /** Path to a Playwright `storageState.json` (cookies + localStorage)
+   *  to load on context creation. Used by `browser_attach_context` so
+   *  the session starts authenticated against a saved login. */
+  storageStatePath?: string;
 }
 
 export class BrowserSession {

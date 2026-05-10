@@ -22,6 +22,7 @@ import { ContextStore } from '../browser/contexts.js';
 import { NoProgressDetector, RateLimiter, RateLimitError } from '../browser/no-progress-detector.js';
 import { createHash } from 'node:crypto';
 import type { ComputerRunnerFactory, ComputerRunner } from '../computer-use/docker-runner.js';
+import { getCurrentStepContext } from '@esankhan3/anvil-agent-core';
 
 export interface WebToolBridgeOpts {
   /** Pinned search provider; auto-detected when omitted. */
@@ -46,8 +47,13 @@ export interface WebToolBridgeOpts {
   /** Project slug for context attachment. Default `'default'`. */
   projectSlug?: string;
   /** Per-project context allow-list (overlay's
-   *  `tools.browseHeadless.contexts`). */
+   *  `tools.browseHeadless.contexts`). Static fallback when
+   *  `getAllowedContexts` isn't supplied. */
   allowedContexts?: readonly string[];
+  /** Per-project allow-list resolver — invoked at call time with the
+   *  project slug derived from the active step context. Production
+   *  wires `loadPolicy(slug).tools?.browseHeadless?.contexts ?? []`. */
+  getAllowedContexts?: (projectSlug: string) => readonly string[] | undefined;
   /** Tier 3 — Docker-backed computer-use runner factory. When omitted,
    *  Tier 3 tools aren't advertised. */
   computerRunnerFactory?: ComputerRunnerFactory;
@@ -98,6 +104,34 @@ export function createWebToolBridge(opts: WebToolBridgeOpts = {}): WebToolBacken
 interface BrowserBackendCtx {
   runId?: string;
   sessionId?: string;
+  /** Canonical Anvil project slug. Resolved from the active step
+   *  context at call time when omitted by the caller. */
+  projectSlug?: string;
+}
+
+/**
+ * Enrich the executor-supplied ExecCtx with `runId` / `sessionId` /
+ * `projectSlug` from the active step context. Without this,
+ * `WebToolExecutor` invokes backends with no run identity, collapsing
+ * every Tier 2 session into a single shared one.
+ */
+function enrichCtx<T extends BrowserBackendCtx>(ctx: T): T {
+  if (ctx.runId && ctx.sessionId && ctx.projectSlug) return ctx;
+  const stepCtx = getCurrentStepContext() as
+    | { runId?: string; project?: string; sessionId?: string }
+    | undefined;
+  return {
+    ...ctx,
+    runId: ctx.runId ?? stepCtx?.runId ?? 'standalone',
+    sessionId: ctx.sessionId ?? stepCtx?.sessionId ?? `s-${stepCtx?.runId ?? 'global'}`,
+    projectSlug: ctx.projectSlug ?? stepCtx?.project,
+  };
+}
+
+function resolveProjectSlug(ctx: BrowserBackendCtx): string {
+  if (ctx.projectSlug) return ctx.projectSlug;
+  const stepCtx = getCurrentStepContext() as { project?: string } | undefined;
+  return stepCtx?.project ?? 'default';
 }
 
 function createComputerBackend(opts: WebToolBridgeOpts) {
@@ -114,6 +148,7 @@ function createComputerBackend(opts: WebToolBridgeOpts) {
   return {
     async do(action: unknown, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       const a = action as { action?: string };
+      const enriched = enrichCtx(ctx);
       // Phase H8 — every Tier 3 action goes through the confirm gate.
       await confirmGate.confirm({
         tool: 'computer_use',
@@ -121,8 +156,7 @@ function createComputerBackend(opts: WebToolBridgeOpts) {
         risk: 'high',
         payload: action,
       });
-      const runId = ctx.runId ?? 'standalone';
-      const runner = await ensure(runId);
+      const runner = await ensure(enriched.runId!);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return runner.do(action as any);
     },
@@ -181,8 +215,9 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
   }
 
   function acquire(ctx: BrowserBackendCtx) {
-    const runId = ctx.runId ?? 'standalone';
-    const sessionId = ctx.sessionId ?? `s-${randomUUID()}`;
+    const enriched = enrichCtx(ctx);
+    const runId = enriched.runId!;
+    const sessionId = enriched.sessionId!;
     const userDataDir = join(homedir(), '.anvil', 'browser', runId, sessionId);
     return registry.acquire({ runId, sessionId, userDataDir, headless: true });
   }
@@ -219,10 +254,11 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
     },
     async done(_args: import('@esankhan3/anvil-core-pipeline').BrowserDoneArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       void _args;
-      const runId = ctx.runId ?? 'standalone';
-      const sessionId = ctx.sessionId ?? '';
-      if (sessionId) await registry.release(runId, sessionId);
-      clearSessionState(ctx);
+      const enriched = enrichCtx(ctx);
+      const runId = enriched.runId!;
+      const sessionId = enriched.sessionId!;
+      await registry.release(runId, sessionId);
+      clearSessionState(enriched);
     },
     async screenshot(args: import('@esankhan3/anvil-core-pipeline').BrowserScreenshotArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       screenshotLimitFor(ctx).consume();
@@ -245,21 +281,37 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
     },
     async attachContext(args: { name: string }, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
       // Phase H6 — confirm + per-project allow-list check.
-      contextStore.assertAllowed(args.name, opts.allowedContexts);
+      // Allow-list resolution (H10-followup #4):
+      //   1. Caller-supplied callback `getAllowedContexts(projectSlug)`
+      //      — dashboard reads project policy at runtime.
+      //   2. Static `allowedContexts` from the bridge constructor.
+      //   3. None — assertAllowed throws.
+      const proj = resolveProjectSlug(ctx);
+      const allowed = opts.getAllowedContexts?.(proj) ?? opts.allowedContexts;
+      contextStore.assertAllowed(args.name, allowed);
       await confirmGate.confirm({
         tool: 'browser_attach_context',
         description: `Attach saved auth context "${args.name}" to the running session.`,
         risk: 'medium',
         payload: { name: args.name },
       });
-      const meta = contextStore.read(projectSlug, args.name);
+      const meta = contextStore.read(proj, args.name);
       if (!meta) {
         throw new Error(`browser context "${args.name}" not found. Run \`anvil browser login ${args.name} <url>\`.`);
       }
-      const session = acquire(ctx);
-      // Snapshot to surface current state; actual cookie injection is
-      // Playwright-runner-specific and lands when the runner gains a
-      // `loadStorageState` method (deferred).
+      // H10-followup #1 — actually load the cookies. Close the current
+      // session and acquire a new one with `storageStatePath` set so
+      // the next navigate() lands authenticated. The agent must call
+      // attach_context BEFORE the meaningful navigation.
+      const runId = ctx.runId ?? 'standalone';
+      const sessionId = ctx.sessionId ?? `s-${randomUUID()}`;
+      await registry.release(runId, sessionId);
+      clearSessionState(ctx);
+      const userDataDir = join(homedir(), '.anvil', 'browser', runId, sessionId);
+      const session = registry.acquire({
+        runId, sessionId, userDataDir, headless: true,
+        storageStatePath: contextStore.storageStatePath(proj, args.name),
+      });
       return session.navigate({ url: meta.url });
     },
     async searchPage(args: import('@esankhan3/anvil-core-pipeline').BrowserSearchPageArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {

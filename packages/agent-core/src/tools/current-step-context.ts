@@ -1,33 +1,54 @@
 /**
- * Process-level slot for the active `StepContext` so deep-stack tool
- * calls (the agent loop dispatching `web_search`/`web_fetch`/etc. via
- * the `WebToolExecutor`) can opt into durable wrapping without
- * threading the context through every layer.
+ * Active `StepContext` slot for deep-stack tool calls (web_search /
+ * web_fetch / browser_* / computer_use via the `WebToolExecutor`).
  *
- * The dashboard's pipeline-stages layer sets this slot at the start of
- * each spawn that needs durable web/browser effects, and clears it on
- * exit. The web tool executor reads it in `execute()` and wraps the
- * tool call in `ctx.effect(...)` when present.
+ * Backed by `AsyncLocalStorage` so per-repo fanout — stages running
+ * concurrently — each see their own ctx without trampling the global.
+ * Falls back to a synchronous global when callers use the legacy
+ * `setCurrentStepContext` pattern (set on entry, clear on exit).
  *
- * Storage is intentionally a plain global (not AsyncLocalStorage) —
- * stages are serial within one process, and the tool executor's
- * promise chain rides one tick of the event loop. AsyncLocalStorage
- * is overkill for the actual concurrency profile and would force
- * every adapter through a context.run() wrapper.
+ * Resolution order:
+ *   1. ALS store (preferred — concurrency-safe).
+ *   2. Synchronous global (legacy `setCurrentStepContext`).
+ *   3. `undefined` — non-durable mode.
  */
+
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 // Loose typing — agent-core can't import core-pipeline (circular). The
 // dashboard supplies the full StepContext shape; the executor accesses
-// `effect` only. Cast at the call site.
+// `effect` / `runId` only. Cast at the call site.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type StepContextLike = any;
 
-let _ctx: StepContextLike | undefined;
+const als = new AsyncLocalStorage<StepContextLike>();
+let _legacyCtx: StepContextLike | undefined;
 
+/**
+ * Run `fn` with `ctx` as the active step context for the duration of
+ * the async chain. Preferred over `setCurrentStepContext` for
+ * concurrent stages (per-repo fanout).
+ */
+export function withCurrentStepContext<T>(ctx: StepContextLike, fn: () => Promise<T>): Promise<T> {
+  return als.run(ctx, fn);
+}
+
+/**
+ * @deprecated Use `withCurrentStepContext` for new code.
+ *
+ * Synchronous setter retained for the legacy `runOneStage` set/clear
+ * pattern. Doesn't propagate across `await` boundaries the way ALS
+ * does, but works fine for serial pipeline stages.
+ */
 export function setCurrentStepContext(ctx: StepContextLike | undefined): void {
-  _ctx = ctx;
+  _legacyCtx = ctx;
+  if (ctx !== undefined) {
+    // Best-effort: register on the current async chain so synchronous
+    // descendants pick it up alongside the ALS-aware path.
+    als.enterWith(ctx);
+  }
 }
 
 export function getCurrentStepContext(): StepContextLike | undefined {
-  return _ctx;
+  return als.getStore() ?? _legacyCtx;
 }

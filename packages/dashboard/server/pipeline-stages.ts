@@ -44,7 +44,7 @@
 import { join } from 'node:path';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
-import { setCurrentStepContext } from '@esankhan3/anvil-agent-core';
+import { setCurrentStepContext, withCurrentStepContext } from '@esankhan3/anvil-agent-core';
 import {
   runWithChainFallback,
   combinePerRepoArtifacts,
@@ -1002,13 +1002,37 @@ export async function runOneStage(
   rewindTo?: number;
   prevArtifact: string;
 }> {
+  // Phase H3 — register the current StepContext so the WebToolExecutor
+  // can wrap web_search/web_fetch in `ctx.effect(...)`. Wrapping the
+  // body in `withCurrentStepContext(ctx, fn)` propagates via
+  // AsyncLocalStorage so concurrent per-repo fanout doesn't trample
+  // the global. Falls through to the raw body when ctx is undefined.
+  if (ctx) {
+    return withCurrentStepContext(ctx, () =>
+      runOneStageBody(deps, i, isResume, resumeStage, prevArtifactIn, ctx),
+    );
+  }
+  return runOneStageBody(deps, i, isResume, resumeStage, prevArtifactIn, ctx);
+}
+
+async function runOneStageBody(
+  deps: StageOpsDeps,
+  i: number,
+  isResume: boolean,
+  resumeStage: number,
+  prevArtifactIn: string,
+  ctx?: StepContext<string>,
+): Promise<{
+  control: 'continue' | 'next' | 'cancelled' | 'fail-early-return' | 'rewind';
+  rewindTo?: number;
+  prevArtifact: string;
+}> {
   let prevArtifact = prevArtifactIn;
   if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
   const stage = STAGES[i];
 
-  // Phase H3 — register the current StepContext so the WebToolExecutor
-  // can wrap web_search/web_fetch in `ctx.effect(...)`. Cleared in the
-  // outer `finally`. No-op when ctx is undefined (legacy/test paths).
+  // Synchronous global as well — covers the legacy callers + any
+  // third-party adapter that doesn't await through the ALS chain.
   if (ctx) setCurrentStepContext(ctx);
 
   try {

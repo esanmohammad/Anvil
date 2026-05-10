@@ -35,7 +35,10 @@ export async function createPlaywrightRunner(opts: BrowserSessionOpts): Promise<
   const browser = await playwright.chromium.launch({ headless: opts.headless ?? true });
   const context = await browser.newContext({
     userAgent: 'Anvil/1.0 (Tier-2 browser)',
-    storageState: opts.persistContext === false ? undefined : undefined,
+    // H10-followup #1 — load a saved auth context if one is wired
+    // (browser_attach_context flow). Falls through to a fresh context
+    // when undefined.
+    storageState: opts.storageStatePath,
   });
   const page = await context.newPage();
   let nextElementId = 0;

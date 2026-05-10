@@ -919,6 +919,17 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   // surface without each call site threading it.
   setWebToolBackends(createWebToolBridge({
     summarizerInvoker: createDefaultSummarizerInvoker(),
+    // H10-followup #4 — resolve allowedContexts per-project at call time.
+    getAllowedContexts: (slug) => {
+      try {
+        const policy = loadPolicy(slug, ANVIL_HOME);
+        const contexts = (policy as unknown as { tools?: { browseHeadless?: { contexts?: string[] } } })
+          .tools?.browseHeadless?.contexts;
+        return contexts;
+      } catch {
+        return undefined;
+      }
+    },
   }));
   const memoryStore = new MemoryStore();
   const kbManager = new KnowledgeBaseManager(projectLoader);
