@@ -1769,6 +1769,31 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         break;
       }
 
+      case 'get-durable-timeline': {
+        // Phase D5: durable execution timeline. Returns the
+        // run row + every event so the UI can render the
+        // step-by-step + effect-by-effect log without a
+        // separate HTTP round-trip.
+        const runId = typeof msg.runId === 'string' ? msg.runId : null;
+        if (!runId) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'runId is required' } }));
+          break;
+        }
+        const store = getDurableStore();
+        if (!store) {
+          ws.send(JSON.stringify({ type: 'durable-timeline', payload: { runId, run: null, events: [] } }));
+          break;
+        }
+        try {
+          const run = await store.getRun(runId);
+          const events = run ? await store.readEvents(runId) : [];
+          ws.send(JSON.stringify({ type: 'durable-timeline', payload: { runId, run, events } }));
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `durable-timeline failed: ${err instanceof Error ? err.message : err}` } }));
+        }
+        break;
+      }
+
       case 'run-pipeline': {
         if (!msg.project || !msg.feature) {
           ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and feature are required' } }));

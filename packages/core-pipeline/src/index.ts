@@ -350,6 +350,7 @@ export type {
   DurableStore,
   VacuumStats,
   SQLiteDurableStoreOptions,
+  LintViolation,
 } from './durable/index.js';
 export {
   DeterminismViolationError,
@@ -358,6 +359,7 @@ export {
   Pattern1MigrationError,
   InMemoryDurableStore,
   SQLiteDurableStore,
+  lintStepSource,
 } from './durable/index.js';
 
 // — Agent invocation surface (canonical AgentRunner type)

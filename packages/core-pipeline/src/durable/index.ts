@@ -25,3 +25,5 @@ export type { DurableStore, VacuumStats } from './store.js';
 export { InMemoryDurableStore } from './in-memory-store.js';
 export { SQLiteDurableStore } from './sqlite-store.js';
 export type { SQLiteDurableStoreOptions } from './sqlite-store.js';
+export { lintStepSource } from './lint.js';
+export type { LintViolation } from './lint.js';

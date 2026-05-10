@@ -6,6 +6,7 @@ import { registerGlobalFlags } from './flags.js';
 import { initCommand } from './commands/init.js';
 import { doctorCommand } from './commands/doctor.js';
 import { dashboardCommand } from './commands/dashboard.js';
+import { runReplayCommand } from './commands/run-replay.js';
 
 const program = new Command();
 
@@ -20,6 +21,7 @@ registerGlobalFlags(program);
 program.addCommand(initCommand);
 program.addCommand(doctorCommand);
 program.addCommand(dashboardCommand);
+program.addCommand(runReplayCommand);
 
 // Default action — launch dashboard
 if (process.argv.length <= 2) {
