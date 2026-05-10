@@ -10,9 +10,6 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { AgentManager } from '@esankhan3/anvil-agent-core';
 import { ProjectLoader } from './project-loader.js';
 import type { ProjectInfo } from './project-loader.js';
@@ -27,9 +24,9 @@ import { ReviewerControl } from './reviewer-control.js';
 import { PromptContextCache } from './prompt-context-cache.js';
 import {
   PlanRiskCache,
-  populateManifestFromPlan as populateManifestFromPlanBridge,
   type ManifestBridgeDeps,
 } from './manifest-bridge.js';
+import { prepareRun, resolveWorkspaceDir } from './runner-prep.js';
 import {
   resolveModelForStage as resolveModelForStageBridge,
   allowedToolsForCurrentStage as allowedToolsForCurrentStageBridge,
@@ -46,24 +43,16 @@ import {
 } from './runner-telemetry.js';
 import {
   setupWorkspace as setupWorkspaceFn,
-  detectRepos as detectReposFn,
-  pullLatestMain as pullLatestMainFn,
   getBaseBranch as getBaseBranchFn,
   type BootstrapDeps,
 } from './pipeline-bootstrap.js';
 import {
-  loadPriorArtifacts as loadPriorArtifactsFn,
-  loadStageArtifact as loadStageArtifactFn,
   loadRepoArtifacts as loadRepoArtifactsFn,
   loadHighLevelRequirements as loadHighLevelRequirementsFn,
   writeStageArtifact as writeStageArtifactFn,
-  writeRepoArtifact as writeRepoArtifactFn,
   type ArtifactIODeps,
 } from './artifact-io.js';
-import {
-  runOneStage as runOneStageFn,
-  type StageOpsDeps,
-} from './pipeline-stages.js';
+import { type StageOpsDeps } from './pipeline-stages.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -143,27 +132,12 @@ export class PipelineRunner extends EventEmitter {
   private projectInfo: ProjectInfo | null = null;
   private repoPaths: Record<string, string> = {};
   private cancelled = false;
-  /**
-   * Models that hit a retryable UpstreamError this run (429 quota,
-   * rate-limit, 5xx). Skipped by the chain walker on subsequent
-   * resolves so we don't keep hammering a model whose upstream is
-   * out of capacity. Reset only by starting a new run.
-   */
+  /** Retryable-upstream-burn set; chain walker skips these after a fail. */
   private runtimeBurnedModels = new Set<string>();
-  /** Event bus used by the Pipeline.run()-driven dispatcher (G7). */
   private readonly pipelineBus = new InMemoryEventBus();
-  /**
-   * Per-stage de-dupe so the proactive liveness fallback nudge fires
-   * once per (stage, original→fallback) pair instead of on every
-   * `resolveModelForStage` call.
-   */
+  /** De-dupe so proactive liveness fallback notices fire once per pair. */
   private livenessFallbackNotified = new Set<string>();
-  /**
-   * Walker tunables loaded from `~/.anvil/models.yaml`'s top-level
-   * `walker:` block (with compiled-in defaults for missing keys). Cached
-   * once at run start by `prefetchProviderLiveness` so chain-walking +
-   * retry policy don't re-read the yaml on every stage entry.
-   */
+  /** Walker block from `~/.anvil/models.yaml`; loaded by prefetchProviderLiveness. */
   private walkerConfig: WalkerConfig = { ...DEFAULT_WALKER_CONFIG };
   private memoryStore: MemoryStore;
   private kbManager: KnowledgeBaseManager | null;
@@ -171,22 +145,13 @@ export class PipelineRunner extends EventEmitter {
 
   setAfterStageHook(hook: AfterStageHook | null): void { this.afterStageHook = hook; }
 
-  // Reviewer-control state (note slot, artifact override, rerun-from /
-  // iterate-with-note) lives in a sibling helper. The runner owns the
-  // FS / state-mutation side effects of those actions; this helper owns
-  // the pure state machine.
   private reviewer = new ReviewerControl();
 
   setReviewNote(note: string | null): void {
     this.reviewer.setReviewNote(note);
   }
 
-  /**
-   * Replace the just-completed stage's artifact with reviewer-edited
-   * markdown. Updates in-memory state, the on-disk artifact, broadcasts
-   * the change, and arms the override so the next stage's `prevArtifact`
-   * is the edited body.
-   */
+  /** Replace the just-completed stage's artifact with reviewer-edited markdown. */
   applyArtifactEdit(stageIndex: number, editedArtifact: string): void {
     const stage = STAGES[stageIndex];
     if (!stage) return;
@@ -194,7 +159,7 @@ export class PipelineRunner extends EventEmitter {
       this.state.stages[stageIndex].artifact = editedArtifact;
     }
     try {
-      this.writeStageArtifact(stageIndex, stage, editedArtifact);
+      writeStageArtifactFn(this.depsForArtifactIO(), stage, editedArtifact);
     } catch (err) {
       console.warn(`[pipeline] applyArtifactEdit: writeStageArtifact failed: ${err instanceof Error ? err.message : err}`);
     }
@@ -211,18 +176,9 @@ export class PipelineRunner extends EventEmitter {
     this.reviewer.iterateCurrentStageWithNote(currentStageIndex, STAGES.length, note);
   }
 
-  /** Per-run plan risk cache (lazy compute, share across stages). */
   private planRisk = new PlanRiskCache();
-
-  // ── Phase 1 cache-stability memoization ─────────────────────────────
-  //
-  // PromptContextCache owns memoised inputs to the system prompt
-  // (memory block, conventions, project YAML slice, KB block, manifest).
-  // Constructed in the runner constructor with the small dep set the
-  // cache needs.
   private promptCache!: PromptContextCache;
 
-  /** Bundle the manifest-bridge dep set. One-time per call; lazy refs. */
   private depsForManifest(): ManifestBridgeDeps {
     return {
       project: this.config.project,
@@ -259,33 +215,7 @@ export class PipelineRunner extends EventEmitter {
     this.memoryStore = memoryStore ?? new MemoryStore();
     this.kbManager = kbManager ?? null;
 
-    // Resolve workspace: prefer factory.yaml config, then env var, then default
-    const anvilHome = process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil');
-    const configCandidates = [
-      join(anvilHome, 'projects', config.project, 'factory.yaml'),
-      join(anvilHome, 'projects', config.project, 'project.yaml'),
-    ];
-    let resolvedWs: string | null = null;
-    for (const cp of configCandidates) {
-      if (existsSync(cp)) {
-        try {
-          const raw = readFileSync(cp, 'utf-8');
-          const wsMatch = raw.match(/^workspace:\s+(.+)$/m);
-          if (wsMatch) {
-            resolvedWs = wsMatch[1].replace(/^["']|["']$/g, '').trim().replace(/^~/, homedir());
-            break;
-          }
-        } catch { /* ignore */ }
-      }
-    }
-    if (resolvedWs && existsSync(resolvedWs)) {
-      this.workspaceDir = resolvedWs;
-    } else {
-      const wsRoot = process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace');
-      this.workspaceDir = join(wsRoot, config.project);
-    }
-
-    // Load project YAML for context
+    this.workspaceDir = resolveWorkspaceDir(config.project);
     this.projectYaml = this.projectLoader.getProjectYamlRaw(config.project);
 
     this.promptCache = new PromptContextCache({
@@ -363,24 +293,13 @@ export class PipelineRunner extends EventEmitter {
     this.walkerConfig = await prefetchProviderLivenessBridge();
   }
 
-  /**
-   * Soft guardrail (P12): warn if a system prompt exceeds 60KB. Caching
-   * efficiency degrades when prefixes balloon, so this fires a project-event
-   * to flag regressions before they pile up. Pure telemetry — does not trim.
-   */
-  /**
-   * Build the bundled-dependency snapshot the lifted prompt-builders
-   * (Phase 4f.7) consume. Closes over PipelineRunner state so the cache
-   * stability invariants (P1 — byte-identical bytes across stages of one
-   * run) flow through unchanged.
-   */
   private getPromptContext(): PromptBuilderContext {
     return {
       project: this.config.project,
       feature: this.config.feature,
       model: this.config.model,
       workspaceDir: this.workspaceDir,
-      baseBranch: this.getBaseBranch(),
+      baseBranch: getBaseBranchFn(this.config),
       failureContext: this.config.failureContext,
       // Surfaced for the immediate next stage only — pipeline loop arms
       // it on stage entry and clears it on stage exit, so per-repo fanout
@@ -398,8 +317,8 @@ export class PipelineRunner extends EventEmitter {
       getStableKbBlock: (tier, repoName) => this.promptCache.getStableKbBlock(tier, repoName),
       getStableManifestBlock: () => this.promptCache.getStableManifestBlock(),
       getLockedKbTier: (stage) => this.promptCache.getLockedKbTier(stage as StageDefinition),
-      loadRepoArtifacts: (repoName) => this.loadRepoArtifacts(repoName),
-      loadHighLevelRequirements: () => this.loadHighLevelRequirements(),
+      loadRepoArtifacts: (repoName) => loadRepoArtifactsFn(this.depsForArtifactIO(), repoName),
+      loadHighLevelRequirements: () => loadHighLevelRequirementsFn(this.depsForArtifactIO()),
       kbManager: this.kbManager,
       emit: (event, payload) => this.emit(event, payload),
     };
@@ -472,8 +391,7 @@ export class PipelineRunner extends EventEmitter {
 
   async run(): Promise<PipelineRunState> {
     try {
-      // Phase 0: Ensure workspace exists
-      await this.setupWorkspace();
+      await setupWorkspaceFn(this.depsForBootstrap());
 
       // Pre-warm provider liveness so the sync resolver chain walker
       // (called per stage) reads fresh data. Wired via
@@ -483,81 +401,22 @@ export class PipelineRunner extends EventEmitter {
       // failure mode preserved: probe errors are caught by the hook
       // and surfaced via onError, never fail the run.
 
-      // Pre-warm conventions block — extracts on first run if missing,
-      // then loads the markdown into the run-scoped cache so every
-      // stage prompt's {{conventions}} slot is populated identically.
       await this.promptCache.warmConventions().catch((err: unknown) => {
         console.warn('[pipeline] convention warm failed:', err);
       });
 
-      // Create or resume feature record
-      const isResume = this.config.resumeFromStage != null && this.config.featureSlug;
-      let featureRecord;
-      if (isResume) {
-        featureRecord = this.featureStore.getFeature(this.config.project, this.config.featureSlug!);
-        if (!featureRecord) {
-          // Fallback: create new
-          featureRecord = this.featureStore.createFeature(this.config.project, this.config.feature, this.config.model);
-        }
-        this.state.featureSlug = this.config.featureSlug!;
-      } else {
-        featureRecord = this.featureStore.createFeature(this.config.project, this.config.feature, this.config.model);
-        this.state.featureSlug = featureRecord.slug;
-      }
+      const { isResume, resumeStage, prevArtifact } = await prepareRun({
+        config: this.config,
+        state: this.state,
+        featureStore: this.featureStore,
+        manifestStore: this.manifestStore,
+        kbManager: this.kbManager,
+        depsForManifest: () => this.depsForManifest(),
+        depsForArtifactIO: () => this.depsForArtifactIO(),
+        emit: (event, payload) => this.emit(event, payload),
+      });
 
-      // Phase 2: ensure a manifest exists for the feature, then pre-fill from
-      // the plan seed when present so stage 5 (build) sees acceptanceCriteria,
-      // affectedRepos, filesPlanned, and testBehaviors as `final`.
-      this.manifestStore.ensure(this.config.project, this.state.featureSlug, this.config.feature);
-      if (this.config.planSeed?.plan) {
-        try {
-          populateManifestFromPlanBridge(this.depsForManifest(), this.config.planSeed.plan);
-        } catch (err) {
-          console.warn('[pipeline] populateManifestFromPlan failed:', err);
-        }
-      }
-
-      // Load prior artifacts if resuming
-      let prevArtifact = '';
-      const resumeStage = this.config.resumeFromStage ?? 0;
-
-      if (isResume) {
-        prevArtifact = this.loadPriorArtifacts(resumeStage);
-        console.log(`[pipeline] Resuming from stage ${resumeStage} (${STAGES[resumeStage]?.name}), loaded ${prevArtifact.length} chars of prior context`);
-      }
-
-      // Prefetch hybrid-retriever context once per run. Sync prompt
-      // builders can then read it from the KBManager cache without an
-      // await on the hot path; if the LanceDB store is empty/missing,
-      // the cache stays empty and the legacy keyword path takes over.
-      try {
-        await this.kbManager?.prefetchHybridContext(this.config.project, this.config.feature);
-      } catch (err) {
-        console.warn(`[pipeline] prefetchHybridContext failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-
-      // Check knowledge base status — agents will explore from scratch if not built (slower + costlier)
-      const kbCheck = this.kbManager?.getIndexForPrompt(this.config.project) || this.kbManager?.getAllGraphReports(this.config.project) || '';
-      if (!kbCheck) {
-        console.warn(`[pipeline] WARNING: No knowledge base for "${this.config.project}" — agents will explore codebase manually. Build the KB from the dashboard for faster, cheaper runs.`);
-        this.emit('warning', {
-          message: `Knowledge base not built for "${this.config.project}". Agents will explore the codebase manually, which is slower and more expensive. Build the KB from the Knowledge Graph page for better results.`,
-        });
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `No Knowledge Base found for "${this.config.project}" — agents will explore codebase manually (slower + costlier). Build the KB from the Knowledge Graph page.`,
-          level: 'warn',
-        });
-      } else {
-        this.emit('project-event', {
-          source: 'knowledge-base',
-          message: `Knowledge Base ready for "${this.config.project}" (${kbCheck.length} chars) — will inject into agent prompts for faster, cheaper runs`,
-        });
-      }
-
-      // Bus subscriptions (audit, cost, stream, checkpoint, rollup,
-      // liveness) live in `pipeline-hooks`; the rewind-aware
-      // `Pipeline.run()` driver lives in `pipeline-loop`.
+      // Hooks + Pipeline.run() loop live in `pipeline-hooks` + `pipeline-loop`.
       const hooksHandle = attachPipelineHooks({
         bus: this.pipelineBus,
         state: this.state,
@@ -573,7 +432,7 @@ export class PipelineRunner extends EventEmitter {
           workspaceDir: this.workspaceDir,
           repoPaths: () => this.repoPaths,
           config: this.config,
-          isResume: !!isResume,
+          isResume,
           resumeStage,
           initialPrevArtifact: prevArtifact,
           isCancelled: () => this.cancelled,
@@ -581,7 +440,6 @@ export class PipelineRunner extends EventEmitter {
       } finally {
         hooksHandle.detach();
       }
-      prevArtifact = loopResult.prevArtifact;
       if (loopResult.pipelineEarlyReturn) return this.state;
 
       if (!this.cancelled) {
@@ -622,22 +480,6 @@ export class PipelineRunner extends EventEmitter {
       checkpoint: () => this.checkpoint(),
     };
   }
-
-  private setupWorkspace(): Promise<void> {
-    return setupWorkspaceFn(this.depsForBootstrap());
-  }
-
-  private getBaseBranch(): string {
-    return getBaseBranchFn(this.config);
-  }
-
-  private pullLatestMain(): Promise<void> {
-    return pullLatestMainFn(this.depsForBootstrap());
-  }
-
-  // runOneStage + 6 sub-functions + makeAgentRunner + makeAgentSession
-  // live in `./pipeline-stages.ts`. The runner exposes a thin
-  // `runOneStage` wrapper that bundles the dep set on each call.
 
   /** Per-run fix-loop session refs, threaded into the validate→fix loop. */
   private fixLoopAgentByRepo: Map<string, string> = new Map();
@@ -693,21 +535,6 @@ export class PipelineRunner extends EventEmitter {
     };
   }
 
-  private runOneStage(
-    i: number,
-    isResume: boolean,
-    resumeStage: number,
-    prevArtifactIn: string,
-  ): Promise<{
-    control: "continue" | "next" | "cancelled" | "fail-early-return" | "rewind";
-    rewindTo?: number;
-    prevArtifact: string;
-  }> {
-    return runOneStageFn(this.depsForStageOps(), i, isResume, resumeStage, prevArtifactIn);
-  }
-
-  // ── Artifact + repo I/O — delegate to siblings ─────────────────────
-
   /** Bundle the artifact-io dep set. */
   private depsForArtifactIO(): ArtifactIODeps {
     return {
@@ -716,34 +543,6 @@ export class PipelineRunner extends EventEmitter {
       featureStore: this.featureStore,
       emit: (event, payload) => this.emit(event, payload),
     };
-  }
-
-  private loadPriorArtifacts(_upToStage: number): string {
-    return loadPriorArtifactsFn(this.depsForArtifactIO());
-  }
-
-  private loadStageArtifact(stage: StageDefinition): string {
-    return loadStageArtifactFn(this.depsForArtifactIO(), stage);
-  }
-
-  private detectRepos(_requirementsArtifact: string): void {
-    detectReposFn(this.depsForBootstrap());
-  }
-
-  private writeStageArtifact(_index: number, stage: StageDefinition, artifact: string): void {
-    writeStageArtifactFn(this.depsForArtifactIO(), stage, artifact);
-  }
-
-  private writeRepoArtifact(stage: StageDefinition, repoName: string, artifact: string): void {
-    writeRepoArtifactFn(this.depsForArtifactIO(), stage, repoName, artifact);
-  }
-
-  private loadRepoArtifacts(repoName: string): { requirements: string; specs: string; tasks: string; build: string } {
-    return loadRepoArtifactsFn(this.depsForArtifactIO(), repoName);
-  }
-
-  private loadHighLevelRequirements(): string {
-    return loadHighLevelRequirementsFn(this.depsForArtifactIO());
   }
 
   private broadcastState(): void {
