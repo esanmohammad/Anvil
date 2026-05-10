@@ -40,6 +40,8 @@ import { PipelineRunner } from './pipeline-runner.js';
 import { getDurableStore } from './durable-store-singleton.js';
 import { runDurableMigration } from './durable-migration.js';
 import { scheduleDurableVacuum } from './durable-vacuum.js';
+import { dispatchTakenOverRuns } from './durable-resume-queue.js';
+import { STAGES as RUNNER_STAGES } from './pipeline-runner.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import type { PipelineRunState } from './pipeline-runner.js';
@@ -7397,6 +7399,9 @@ Findings array may be empty. No prose outside the JSON block.`;
   // crashed-peer runs whose lease has expired (orphan takeover).
   // Auto-takeover acquires the lease so a resume orchestrator can
   // continue the run from its durable cursor. No artifacts touched.
+  // Phase G1: capture taken-over runIds so we can dispatch them
+  // through startPipeline once it's in scope (later in boot).
+  const takenOverRunIds: string[] = [];
   try {
     const durableStore = getDurableStore();
     const migrationStats = await runDurableMigration(durableStore, {
@@ -7404,9 +7409,7 @@ Findings array may be empty. No prose outside the JSON block.`;
         console.log(
           `[dashboard] auto-takeover: claimed ${runIds.length} orphaned run(s) — ${runIds.join(', ')}`,
         );
-        // The auto-replay queue (loaded later in boot) will pick up
-        // these runIds via its own scanner; we don't trigger
-        // Pipeline.run here to keep boot non-blocking.
+        takenOverRunIds.push(...runIds);
       },
     });
     if (
@@ -7420,6 +7423,32 @@ Findings array may be empty. No prose outside the JSON block.`;
     }
   } catch (err) {
     console.warn(`[dashboard] durable migration skipped: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Phase G1: dispatch auto-takeover runs through startPipeline.
+  // Fire-and-forget so boot doesn't block on the pipeline runner.
+  // Runs serially (startPipeline cancels the active runner before
+  // starting a new one) — first reclaimed run wins; subsequent ones
+  // queue at the dashboard layer via the user's reclaim UX. Disable
+  // with ANVIL_DURABLE_AUTO_RESUME=0 to keep F4's "claim only"
+  // behaviour.
+  if (takenOverRunIds.length > 0) {
+    const stagesByName: Record<string, number> = {};
+    for (let i = 0; i < RUNNER_STAGES.length; i++) stagesByName[RUNNER_STAGES[i].name] = i;
+    void dispatchTakenOverRuns(
+      getDurableStore(),
+      takenOverRunIds,
+      (project, feature, options) => {
+        startPipeline(project, feature, options);
+      },
+      stagesByName,
+    ).then((stats) => {
+      if (stats.dispatched > 0 || stats.errors > 0) {
+        console.log(
+          `[dashboard] auto-resume: attempted=${stats.attempted} dispatched=${stats.dispatched} skipped=${stats.skipped} errors=${stats.errors}`,
+        );
+      }
+    });
   }
 
   // Phase F3: durable-store vacuum. Runs once at boot then daily
