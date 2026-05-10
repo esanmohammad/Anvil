@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { RotateCcw, Undo2 } from 'lucide-react';
 import { RunTimeline } from './RunTimeline.js';
+import { DurableTimeline } from './DurableTimeline.js';
 import { Badge } from '../ui/Badge.js';
 import { MarkdownRenderer } from '../output/MarkdownRenderer.js';
 import type { RunSummary } from './RunRow.js';
@@ -249,6 +250,16 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
           progress: s.status === 'completed' ? 100 : 0,
         }))} />
       </div>
+
+      {/* Durable timeline (Phase F8) */}
+      <details style={{ marginTop: 'var(--space-md)' }}>
+        <summary style={{ cursor: 'pointer', fontSize: 'var(--text-sm)', fontWeight: 500, marginBottom: 'var(--space-xs)' }}>
+          Durable execution log
+        </summary>
+        <div style={{ marginTop: 'var(--space-xs)' }}>
+          <DurableTimeline runId={run.id} ws={ws} />
+        </div>
+      </details>
 
       {/* Repositories */}
       {run.repos.length > 0 && (
