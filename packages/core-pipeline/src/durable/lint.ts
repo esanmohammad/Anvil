@@ -39,40 +39,44 @@ interface RuleSpec {
   suggestion: string;
 }
 
+// Negative lookbehind `(?<![.\w])` ensures we match bare calls
+// (e.g. `exec("ls")`) and not method calls (e.g. `regex.exec(text)`)
+// or property access on words (e.g. `someExec(`). Two-char lookbehind
+// covers the common cases without needing variable-length groups.
 const RULES: RuleSpec[] = [
   {
     rule: 'no-direct-date-now',
-    pattern: /\bDate\.now\s*\(/g,
+    pattern: /(?<![.\w])Date\.now\s*\(/g,
     suggestion: 'await ctx.now()',
   },
   {
     rule: 'no-direct-math-random',
-    pattern: /\bMath\.random\s*\(/g,
+    pattern: /(?<![.\w])Math\.random\s*\(/g,
     suggestion: 'await ctx.random()',
   },
   {
     rule: 'no-direct-crypto-uuid',
-    pattern: /\b(?:randomUUID|crypto\.randomUUID)\s*\(/g,
+    pattern: /(?<![.\w])(?:randomUUID|crypto\.randomUUID)\s*\(/g,
     suggestion: 'await ctx.uuid()',
   },
   {
     rule: 'no-direct-fs-write',
-    pattern: /\b(writeFile(?:Sync)?|appendFile(?:Sync)?)\s*\(/g,
+    pattern: /(?<![.\w])(writeFile(?:Sync)?|appendFile(?:Sync)?)\s*\(/g,
     suggestion: 'wrap in ctx.effect(\'<name>\', () => writeFile(...))',
   },
   {
     rule: 'no-direct-fs-read',
-    pattern: /\b(readFile(?:Sync)?)\s*\(/g,
+    pattern: /(?<![.\w])(readFile(?:Sync)?)\s*\(/g,
     suggestion: 'wrap in ctx.effect(\'<name>\', () => readFile(...))',
   },
   {
     rule: 'no-direct-exec',
-    pattern: /\b(exec(?:Sync|File|FileSync)?|spawn(?:Sync)?)\s*\(/g,
+    pattern: /(?<![.\w])(exec(?:Sync|File|FileSync)?|spawn(?:Sync)?)\s*\(/g,
     suggestion: 'wrap in ctx.effect(\'<name>\', () => exec(...))',
   },
   {
     rule: 'no-direct-setTimeout',
-    pattern: /\bsetTimeout\s*\(/g,
+    pattern: /(?<![.\w])setTimeout\s*\(/g,
     suggestion: 'await ctx.sleep(ms)',
   },
 ];

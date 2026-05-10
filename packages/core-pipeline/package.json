@@ -22,7 +22,8 @@
   "scripts": {
     "build": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; true",
     "dev": "tsc -b --watch",
-    "test": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; node --test dist/__tests__/*.test.js"
+    "test": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; node --test dist/__tests__/*.test.js",
+    "lint:stages": "tsc -b && node scripts/lint-stages.js"
   },
   "dependencies": {
     "@esankhan3/anvil-agent-core": "^0.1.1",

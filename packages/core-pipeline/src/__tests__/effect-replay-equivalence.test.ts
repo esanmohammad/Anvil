@@ -90,9 +90,12 @@ describe('Replay equivalence — single-stage spawn', () => {
     await store2.createRun({ runId: RUN, project: 'p', feature: 'f', featureSlug: 'f' });
     await seedStoreFromLog(store2, log);
     const ctx2 = await newCtx('requirements', store2);
-    const out2 = await ctx2.effect('requirements:spawn-agent', async () => {
-      throw new Error('outbound call should have been replayed');
-    });
+    const out2 = await ctx2.effect<{ output: string; costUsd: number; tokenEstimate: number }>(
+      'requirements:spawn-agent',
+      async () => {
+        throw new Error('outbound call should have been replayed');
+      },
+    );
     assert.equal(out2.output, 'requirements body');
     assert.equal(out2.costUsd, 0.05);
     assert.equal(live, 1); // still only the pass-1 invocation
@@ -138,9 +141,12 @@ describe('Replay equivalence — per-repo fanout', () => {
     const outputs2: Record<string, string> = {};
     for (const repo of repos) {
       const ctx = await newCtx('specs', store2, repo);
-      const r = await ctx.effect(`specs:spawn-${repo}`, async () => {
-        throw new Error('replay should not invoke spawn');
-      });
+      const r = await ctx.effect<{ output: string; costUsd: number; tokenEstimate: number }>(
+        `specs:spawn-${repo}`,
+        async () => {
+          throw new Error('replay should not invoke spawn');
+        },
+      );
       outputs2[repo] = r.output;
       await ctx.effect(
         `specs:write-${repo}`,
@@ -222,11 +228,12 @@ describe('Replay equivalence — Q&A multi-turn', () => {
     await store2.createRun({ runId: RUN, project: 'p', feature: 'f', featureSlug: 'f' });
     await seedStoreFromLog(store2, log);
     const ctx2 = await newCtx('requirements', store2);
-    const first2 = await ctx2.effect('requirements:session-start', async () => {
+    type SessionResult = { sessionId: string; output: string; costUsd: number; tokenEstimate: number };
+    const first2 = await ctx2.effect<SessionResult>('requirements:session-start', async () => {
       throw new Error('replay should not invoke session start');
     });
     const answer2 = await ctx2.waitForSignal<string>('stage-answer-1');
-    const second2 = await ctx2.effect('requirements:session-resume', async () => {
+    const second2 = await ctx2.effect<SessionResult>('requirements:session-resume', async () => {
       throw new Error('replay should not invoke session resume');
     });
     assert.equal(first2.output, first.output);
