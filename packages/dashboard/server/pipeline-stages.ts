@@ -568,6 +568,17 @@ async function runBuildForRepo(
   const repoArtifacts = loadRepoArtifactsFn(deps.depsForArtifactIO(), repoName);
 
   const runner = makeAgentRunner(deps, stage.name);
+  // Phase F2: per-task wrapper threads ctx.effect into the
+  // dependency-graph scheduler so each task spawn is its own
+  // recorded effect. The wrapper closes over ctx + repoName
+  // so the effect name disambiguates per-(repo, task).
+  const wrapTaskRun = ctx
+    ? <R>(taskId: string, fn: () => Promise<R>) => ctx.effect(
+        `build:spawn-task-${repoName}-${taskId}`,
+        async () => serializeAgentRunResult(await fn() as unknown as Record<string, unknown>) as unknown as R,
+        { idempotencyKey: `${ctx.runId}:${repoName}:${taskId}` },
+      )
+    : undefined;
   const buildOpts = {
     runner,
     project: deps.config.project,
@@ -586,6 +597,7 @@ async function runBuildForRepo(
     onProjectEvent: (level: 'info' | 'warn' | 'error', message: string) => {
       deps.emit('project-event', { source: 'pipeline', message, level });
     },
+    ...(wrapTaskRun ? { wrapTaskRun } : {}),
   };
   // Phase E5: durable wrap for per-repo build. Idempotency key
   // includes the runId + repo to scope replay to this run.
