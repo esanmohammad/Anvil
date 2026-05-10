@@ -27,11 +27,7 @@ import { ReviewerControl } from './reviewer-control.js';
 import { PromptContextCache } from './prompt-context-cache.js';
 import {
   PlanRiskCache,
-  manifestGetTouchedFiles,
   populateManifestFromPlan as populateManifestFromPlanBridge,
-  renderPlanDerivedArtifact as renderPlanDerivedArtifactBridge,
-  extractAndUpdateManifest as extractAndUpdateManifestBridge,
-  clearManifestFieldsForStages as clearManifestFieldsForStagesBridge,
   type ManifestBridgeDeps,
 } from './manifest-bridge.js';
 import {
@@ -85,7 +81,6 @@ import type {
 } from './pipeline-runner-types.js';
 import {
   STAGES,
-  PLAN_DERIVED_STAGES,
   STAGE_OUTPUT_LIMITS,
   STAGE_OUTPUT_LIMIT_FALLBACK,
   maxOutputTokensForStage,
@@ -115,18 +110,9 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import { buildStandardStepRegistry } from '@esankhan3/anvil-core-pipeline';
-import {
-  Pipeline,
-  InMemoryEventBus,
-  attachAuditLogHook,
-  attachCostTrackerHook,
-  attachStreamHook,
-  attachCheckpointHook,
-  createFileCheckpointStore,
-  attachLivenessPrefetchHook,
-  attachDashboardStateRollupHook,
-} from '@esankhan3/anvil-core-pipeline';
+import { InMemoryEventBus } from '@esankhan3/anvil-core-pipeline';
+import { attachPipelineHooks } from './pipeline-hooks.js';
+import { runPipelineLoop } from './pipeline-loop.js';
 import { DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
 import { type PromptBuilderContext } from '@esankhan3/anvil-core-pipeline';
@@ -569,222 +555,34 @@ export class PipelineRunner extends EventEmitter {
         });
       }
 
-      // Walker — drives `Pipeline.run()` from core-pipeline over an
-      // `InMemoryStepRegistry` built from the canonical STAGES list.
-      // Each Step's `run()` calls `runOneStage(i)` (which encodes the
-      // legacy for-loop body) and translates the returned control flag:
-      //   - 'continue' / 'next'           → return the next prevArtifact
-      //   - 'cancelled'                    → throw RewindOrAbortError to
-      //                                      abort Pipeline.run cleanly
-      //   - 'fail-early-return'            → throw FailEarlyReturnError
-      //                                      so the outer try captures
-      //                                      and returns this.state
-      //   - 'rewind' (reviewer-triggered)  → throw RewindError carrying
-      //                                      target index; outer loop
-      //                                      catches and re-runs
-      //                                      Pipeline.run with
-      //                                      completedSteps trimmed.
-      const stageState = { prevArtifact, isResume: !!isResume, resumeStage };
-      let pipelineEarlyReturn = false;
-
-      // Attach the canonical lifecycle hooks from core-pipeline. They
-      // subscribe to `step:*` and `pipeline:*` events fired by
-      // Pipeline.run() and persist a forensic audit trail + accumulate
-      // cost. The dashboard's existing inline state-file persistence
-      // and broadcastState() calls remain — these hooks are additive
-      // observation, not replacement.
-      const auditLogPath = join(
-        process.env.ANVIL_HOME ?? process.env.FF_HOME ?? join(homedir(), '.anvil'),
-        'runs',
-        this.state.runId,
-        'audit.jsonl',
-      );
-      const auditLogHandle = attachAuditLogHook(this.pipelineBus, { path: auditLogPath });
-      const costTrackerHandle = attachCostTrackerHook(this.pipelineBus);
-      // Phase C1 — debounced WS broadcast driven by step:* lifecycle
-      // events. Coalesces the burst of mutations inside a stage into a
-      // single broadcast per ~100ms window. Existing inline
-      // broadcastState() calls remain for now (events the bus doesn't
-      // carry today: reviewer edits, mid-stage progress, repo discovery,
-      // etc.); subsequent C-tasks migrate those one by one.
-      const streamHandle = attachStreamHook(this.pipelineBus, {
-        onSnapshot: () => this.broadcastState(),
-        debounceMs: 100,
-      });
-      // Phase C2 — bus-driven forensic checkpoint at
-      // ~/.anvil/runs/<runId>/checkpoint.json. Lives alongside the
-      // dashboard's pipeline-state.json (which has a richer shape and
-      // is read by resume-from-stage). Once reviewer rewind moves to
-      // Pipeline.run({ rewindTo }) (Phase C5), the existing
-      // checkpoint()/clearCheckpoint() pair retires in favor of this.
-      const checkpointHandle = attachCheckpointHook(this.pipelineBus, {
-        store: createFileCheckpointStore(),
-        runId: this.state.runId,
-        keepOnSuccess: true,
-        getShared: () => ({
-          project: this.state.project,
-          feature: this.state.feature,
-          featureSlug: this.state.featureSlug,
-          totalCost: this.state.totalCost,
-          repoNames: this.state.repoNames,
-        }),
-      });
-      // Step 1 of pipeline-runner slimming — rollup hook subscribes to
-      // `pipeline:*` / `step:*` / `stage:repo-progress` / `stage:cost-update`
-      // / `stage:fix-attempt` / `reviewer:note` and mutates `this.state`
-      // in place. Existing inline state mutations remain for the moment;
-      // each can be replaced with a `bus.emit(...)` call site-by-site
-      // without breaking the WS event vocabulary (the rollup hook also
-      // calls `broadcastState` so consumers see no behavior change).
-      // Dashboard's RepoAgentState.error is `string | null`; the canonical
-      // DashboardRollupRepoState uses `string | undefined`. Both shapes are
-      // structurally compatible at the assignment sites the hook actually
-      // touches (the hook only writes `string` or deletes the field).
-      // Cast through `unknown` to bridge the nullable difference.
-      const rollupHandle = attachDashboardStateRollupHook(this.pipelineBus, {
-        state: this.state as unknown as Parameters<typeof attachDashboardStateRollupHook>[1]['state'],
+      // Bus subscriptions (audit, cost, stream, checkpoint, rollup,
+      // liveness) live in `pipeline-hooks`; the rewind-aware
+      // `Pipeline.run()` driver lives in `pipeline-loop`.
+      const hooksHandle = attachPipelineHooks({
+        bus: this.pipelineBus,
+        state: this.state,
         broadcast: () => this.broadcastState(),
-        debounceMs: 50,
+        prefetchProviderLiveness: () => this.prefetchProviderLiveness(),
       });
-      // Phase C4 — provider liveness probe wired via the bus. Runs
-      // once on `pipeline:started`, BEFORE stage 0 spawns (await:true).
-      // Replaces the inline `await this.prefetchProviderLiveness()`
-      // call; same fire-and-tolerant semantics — probe failures are
-      // caught and never fail the pipeline.
-      const livenessHandle = attachLivenessPrefetchHook(this.pipelineBus, {
-        probe: () => this.prefetchProviderLiveness(),
-        await: true,
-      });
-      // Phase D1 — when the walker skips a plan-derived stage via
-      // skipIfByStage, render the artifact + mutate state here.
-      // Listener is awaited inside bus.emit so the next step's
-      // input threading sees the rendered artifact.
-      const planSkipUnsub = this.pipelineBus.on('step:skipped', async (event) => {
-        if (event.payload && (event.payload as { reason?: string }).reason !== 'skipIf') return;
-        if (!event.stepId || !PLAN_DERIVED_STAGES.includes(event.stepId)) return;
-        const stageIdx = STAGES.findIndex((s) => s.name === event.stepId);
-        if (stageIdx < 0) return;
-        await renderPlanDerivedArtifactBridge(this.depsForManifest(), event.stepId, stageIdx);
-        // Thread the rendered artifact into stageState so subsequent
-        // non-skipped stages see it as their prevArtifact.
-        const rendered = this.state.stages[stageIdx]?.artifact;
-        if (rendered) stageState.prevArtifact = rendered;
-      });
-
-      // Outer loop handles rewind. The walker drives forward; on
-      // reviewer rewind we set `rewindToStep` and Pipeline.run handles
-      // the prefix-skip + suffix-rerun automatically (Phase A2 +
-      // Phase C5 — replaces the manual `completedStepIds` trim that
-      // never actually populated, since no `step:completed` listener
-      // was wired). The runOneStage internal short-circuit on
-      // `state.stages[i].status === 'completed'` keeps the rewind
-      // economical even when the walker re-fires every prior step.
-      let rewindToStep: string | undefined;
-      while (true) {
-        if (this.cancelled) break;
-        const stagePipelineRegistry = buildStandardStepRegistry({
-          // Phase D1 — plan-derived stages skip when a planSeed is
-          // present. The skipIf predicate is pure (just a config
-          // read); the rendering side effects live in the
-          // `step:skipped` listener attached above.
-          skipIfByStage: {
-            requirements: () => this.config.planSeed != null,
-            'repo-requirements': () => this.config.planSeed != null,
-            specs: () => this.config.planSeed != null,
-            tasks: () => this.config.planSeed != null,
-          },
-          runStage: async (stageName, _prevForStep) => {
-            // Map name → index. STAGES is the canonical ordering.
-            const idx = STAGES.findIndex((s) => s.name === stageName);
-            if (idx < 0) throw new Error(`Unknown stage in registry: ${stageName}`);
-            const ctrl = await this.runOneStage(idx, stageState.isResume, stageState.resumeStage, stageState.prevArtifact);
-            stageState.prevArtifact = ctrl.prevArtifact;
-            if (ctrl.control === 'cancelled') {
-              const err = new Error('cancelled');
-              (err as Error & { __anvilCancel: boolean }).__anvilCancel = true;
-              throw err;
-            }
-            if (ctrl.control === 'fail-early-return') {
-              // Embed the originating stage error in the sentinel message so
-              // the audit log and pipeline:failed payload show the real cause
-              // (e.g. "claude 503: Claude CLI exited 0...") instead of just
-              // the bare sentinel string.
-              const stageErr = this.state.stages[idx]?.error ?? 'unknown';
-              const err = new Error(`fail-early-return: ${stageErr}`);
-              (err as Error & { __anvilFailReturn: boolean }).__anvilFailReturn = true;
-              throw err;
-            }
-            if (ctrl.control === 'rewind' && ctrl.rewindTo !== undefined) {
-              const err = new Error('rewind');
-              (err as Error & { __anvilRewind: number }).__anvilRewind = ctrl.rewindTo;
-              throw err;
-            }
-            // 'continue' or 'next' — record completion and return artifact
-            // so the next Step receives it as ctx.input.
-            return { artifact: stageState.prevArtifact, cost: 0 };
-          },
+      let loopResult;
+      try {
+        loopResult = await runPipelineLoop({
+          stageOps: this.depsForStageOps(),
+          bus: this.pipelineBus,
+          runId: this.state.runId,
+          workspaceDir: this.workspaceDir,
+          repoPaths: () => this.repoPaths,
+          config: this.config,
+          isResume: !!isResume,
+          resumeStage,
+          initialPrevArtifact: prevArtifact,
+          isCancelled: () => this.cancelled,
         });
-        try {
-          const pipeline = new Pipeline({
-            registry: stagePipelineRegistry,
-            bus: this.pipelineBus,
-            runId: this.state.runId,
-            workspaceDir: this.workspaceDir,
-            initialInput: stageState.prevArtifact,
-            repoPaths: this.repoPaths,
-            ...(rewindToStep ? { rewindTo: rewindToStep } : {}),
-          });
-          await pipeline.run();
-          // No exceptions → walker ran cleanly to the end.
-          break;
-        } catch (err) {
-          const e = err as Error & {
-            __anvilCancel?: boolean;
-            __anvilFailReturn?: boolean;
-            __anvilRewind?: number;
-          };
-          // Pipeline wraps thrown errors — peek at message for our markers.
-          const msg = e?.message ?? String(err);
-          if (e.__anvilCancel || msg.includes('cancelled')) {
-            break;
-          }
-          if (e.__anvilFailReturn || msg.includes('fail-early-return')) {
-            pipelineEarlyReturn = true;
-            break;
-          }
-          if (e.__anvilRewind !== undefined || msg.includes('rewind')) {
-            // Phase C5 — translate the runOneStage rewind sentinel into
-            // a Pipeline.run({ rewindTo }) for the next iteration. The
-            // walker auto-handles the prefix skip + suffix re-run so
-            // we don't need to maintain a parallel completedStepIds set.
-            const target = e.__anvilRewind ?? -1;
-            if (target < 0) break;
-            const targetName = STAGES[target]?.name;
-            if (!targetName) break;
-            rewindToStep = targetName;
-            continue;
-          }
-          // Unexpected — re-throw so the outer try/catch handles it.
-          throw err;
-        }
+      } finally {
+        hooksHandle.detach();
       }
-      prevArtifact = stageState.prevArtifact;
-      // Persist the final cost rollup before unsubscribing the hooks. The
-      // dashboard's existing this.state.totalCost ledger is canonical;
-      // this is a parity check we can extend later.
-      const auditEntries = auditLogHandle.entryCount;
-      const costTotals = costTrackerHandle.totals();
-      void auditEntries; void costTotals;
-      auditLogHandle.unsubscribe();
-      costTrackerHandle.unsubscribe();
-      streamHandle.flush();
-      streamHandle.unsubscribe();
-      checkpointHandle.unsubscribe();
-      livenessHandle.unsubscribe();
-      rollupHandle.flush();
-      rollupHandle.unsubscribe();
-      planSkipUnsub();
-      if (pipelineEarlyReturn) return this.state;
+      prevArtifact = loopResult.prevArtifact;
+      if (loopResult.pipelineEarlyReturn) return this.state;
 
       if (!this.cancelled) {
         this.state.status = 'completed';
