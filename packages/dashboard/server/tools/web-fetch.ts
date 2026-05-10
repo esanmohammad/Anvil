@@ -84,6 +84,7 @@ export class WebFetchAdapter implements WebFetchBackend {
     let answer: string;
     let summarizerModel = '';
     let hint: string | undefined;
+    let costUsd = 0;
 
     if (!ssr) {
       hint = 'Page appears to be a JS/SPA shell — use browser.navigate to render it.';
@@ -98,8 +99,11 @@ export class WebFetchAdapter implements WebFetchBackend {
       });
       answer = summarized.answer;
       summarizerModel = summarized.model;
+      costUsd = summarized.costUsd;
     }
 
+    // H10-followup #5 — annotate the result with measured cost so the
+    // durable event payload + ToolCostPanel reflect real spend.
     const result: WebFetchResult = {
       url: args.url,
       finalUrl: fetched.finalUrl,
@@ -109,6 +113,7 @@ export class WebFetchAdapter implements WebFetchBackend {
       summarizerModel,
       ssr,
       hint,
+      costUsd,
     };
 
     this.cache.set(cacheKey, { result, storedAt: Date.now() });

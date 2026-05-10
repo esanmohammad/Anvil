@@ -85,9 +85,16 @@ export function ToolCostPanel({ runId, ws }: ToolCostPanelProps) {
       if (!k) continue;
       const cur = out.get(k) ?? { calls: 0, usd: 0 };
       cur.calls += 1;
-      cur.usd += UNIT_USD[k];
+      // H10-followup #5 — read measured cost from the payload when
+      // present (web.fetch carries summarizer cost; computer.* will
+      // carry vision-token cost in a future round). Fall back to the
+      // §I unit estimate when the payload doesn't carry one.
+      const payload = e.payload as { costUsd?: number } | null;
+      const measured = typeof payload?.costUsd === 'number' ? payload.costUsd : undefined;
+      const usd = measured ?? UNIT_USD[k] ?? 0;
+      cur.usd += usd;
       out.set(k, cur);
-      total += UNIT_USD[k];
+      total += usd;
     }
     out.set('TOTAL', { calls: events.length, usd: total });
     return out;

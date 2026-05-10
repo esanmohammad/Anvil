@@ -14,7 +14,7 @@ import { runWithAgent } from '@esankhan3/anvil-agent-core';
 import type { SummarizerInvocation, SummarizerInvoker } from './summarizer.js';
 
 export function createDefaultSummarizerInvoker(): SummarizerInvoker {
-  return async (req: SummarizerInvocation): Promise<string> => {
+  return async (req: SummarizerInvocation) => {
     const result = await runWithAgent({
       name: 'web-summarizer',
       project: 'web-summarizer',
@@ -32,6 +32,13 @@ export function createDefaultSummarizerInvoker(): SummarizerInvoker {
       disallowedTools: ['*'],
       maxOutputTokens: req.maxOutputTokens,
     });
-    return result.output;
+    // H10-followup #5 — surface measured cost so the durable event
+    // payload + ToolCostPanel can show real spend instead of estimates.
+    return {
+      answer: result.output,
+      costUsd: result.cost?.totalUsd ?? 0,
+      inputTokens: result.cost?.inputTokens,
+      outputTokens: result.cost?.outputTokens,
+    };
   };
 }

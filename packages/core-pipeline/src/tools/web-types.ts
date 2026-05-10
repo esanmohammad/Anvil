@@ -46,6 +46,10 @@ export interface WebFetchResult {
   /** True if the page rendered substantive HTML (i.e. not an empty SPA shell). */
   ssr: boolean;
   hint?: string;
+  /** Measured summarizer cost (USD) — flows into the durable event
+   *  payload so the per-tool cost ledger shows real spend instead of
+   *  the §I unit estimates. */
+  costUsd?: number;
 }
 
 export interface BrowserNavigateArgs {

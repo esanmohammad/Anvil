@@ -64,7 +64,7 @@ export async function extract(
       },
     },
     async (model) => {
-      const out = await opts.invoke({
+      const raw = await opts.invoke({
         systemPrompt: SYSTEM_PROMPT,
         userPrompt,
         model,
@@ -72,7 +72,8 @@ export async function extract(
         maxOutputTokens: 4096,
         stage,
       });
-      return { answer: out.trim(), model };
+      const answer = typeof raw === 'string' ? raw : raw.answer;
+      return { answer: answer.trim(), model };
     },
   );
   void model;

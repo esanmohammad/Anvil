@@ -45,11 +45,32 @@ export interface SummarizerInvocation {
   stage: string;
 }
 
-export type SummarizerInvoker = (req: SummarizerInvocation) => Promise<string>;
+export interface SummarizerInvocationResult {
+  /** Final answer text. */
+  answer: string;
+  /** Measured cost (USD) reported by the underlying agent run. 0 when
+   *  the caller doesn't know (test stubs, etc.). */
+  costUsd?: number;
+  /** Token counts for telemetry. */
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+/**
+ * Two-shape invoker — for back-compat the function may return a plain
+ * string (legacy) OR `SummarizerInvocationResult`. The summarizer
+ * normalizes both.
+ */
+export type SummarizerInvoker = (
+  req: SummarizerInvocation,
+) => Promise<string | SummarizerInvocationResult>;
 
 export interface SummarizerResult {
   answer: string;
   model: string;
+  costUsd: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 const DEFAULT_MAX_BODY_CHARS = 100 * 1024;
@@ -92,7 +113,7 @@ export async function summarize(opts: SummarizerCallOpts): Promise<SummarizerRes
   const body = clampBody(opts.body, DEFAULT_MAX_BODY_CHARS);
   const userPrompt = buildUserPrompt(opts.url, opts.prompt, body);
 
-  const result = await runWithChainFallback<{ answer: string; model: string }>(
+  const result = await runWithChainFallback<SummarizerResult>(
     {
       stageName: stage,
       maxAttempts: 3,
@@ -105,7 +126,7 @@ export async function summarize(opts: SummarizerCallOpts): Promise<SummarizerRes
       },
     },
     async (model) => {
-      const answer = await opts.invoke({
+      const raw = await opts.invoke({
         systemPrompt: SYSTEM_PROMPT,
         userPrompt,
         model,
@@ -113,7 +134,14 @@ export async function summarize(opts: SummarizerCallOpts): Promise<SummarizerRes
         maxOutputTokens: 1024,
         stage,
       });
-      return { answer: answer.trim(), model };
+      const norm = typeof raw === 'string' ? { answer: raw } : raw;
+      return {
+        answer: norm.answer.trim(),
+        model,
+        costUsd: norm.costUsd ?? 0,
+        inputTokens: norm.inputTokens,
+        outputTokens: norm.outputTokens,
+      };
     },
   );
   return result;
