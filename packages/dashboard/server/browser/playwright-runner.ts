@@ -10,6 +10,7 @@
 
 import type { BrowserRunner, BrowserSessionOpts, RunnerNavigateArgs, RunnerSnapshot } from './session-manager.js';
 import type { DomNode } from './dom-serializer.js';
+import { ConsoleRecorder, NetworkRecorder } from './network-recorder.js';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type PlaywrightLike = any;
@@ -40,6 +41,48 @@ export async function createPlaywrightRunner(opts: BrowserSessionOpts): Promise<
   let nextElementId = 0;
   // Keep handle locator map across calls so click(index) hits the same element.
   const indexMap = new Map<number, string>(); // index → CSS selector
+
+  // Console + network ring buffers — H5.
+  const consoleRecorder = new ConsoleRecorder();
+  const networkRecorder = new NetworkRecorder();
+
+  page.on('console', (msg: PlaywrightLike) => {
+    consoleRecorder.record({
+      ts: new Date().toISOString(),
+      level: String(msg.type?.() ?? 'log'),
+      text: String(msg.text?.() ?? ''),
+      sourceUrl: msg.location?.()?.url,
+    });
+  });
+
+  // Track in-flight starts so we can compute durationMs on response.
+  const requestStarts = new WeakMap<PlaywrightLike, number>();
+  page.on('request', (req: PlaywrightLike) => {
+    requestStarts.set(req, Date.now());
+  });
+  page.on('response', (res: PlaywrightLike) => {
+    const req = res.request?.();
+    const start = req ? requestStarts.get(req) : undefined;
+    networkRecorder.record({
+      url: String(res.url?.() ?? ''),
+      status: Number(res.status?.() ?? 0),
+      method: String(req?.method?.() ?? 'GET'),
+      durationMs: start ? Date.now() - start : 0,
+      ts: new Date().toISOString(),
+      failed: false,
+    });
+  });
+  page.on('requestfailed', (req: PlaywrightLike) => {
+    const start = requestStarts.get(req);
+    networkRecorder.record({
+      url: String(req.url?.() ?? ''),
+      status: 0,
+      method: String(req.method?.() ?? 'GET'),
+      durationMs: start ? Date.now() - start : 0,
+      ts: new Date().toISOString(),
+      failed: true,
+    });
+  });
 
   const snapshot = async (): Promise<RunnerSnapshot> => {
     indexMap.clear();
@@ -133,8 +176,20 @@ export async function createPlaywrightRunner(opts: BrowserSessionOpts): Promise<
 
   return {
     navigate, click, input, scroll, snapshot,
-    async searchPage(): Promise<{ hits: Array<{ index: number; snippet: string; charOffset: number }> }> {
-      return { hits: [] };
+    async searchPage({ pattern, regex, caseSensitive, contextChars = 150, maxResults = 25 }): Promise<{ hits: Array<{ index: number; snippet: string; charOffset: number }> }> {
+      const text = await page.evaluate(() => document.body.innerText ?? '');
+      const flags = caseSensitive ? 'g' : 'gi';
+      const re = regex ? new RegExp(pattern, flags) : new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+      const hits: Array<{ index: number; snippet: string; charOffset: number }> = [];
+      let m: RegExpExecArray | null;
+      let i = 0;
+      while ((m = re.exec(text)) !== null && hits.length < maxResults) {
+        const start = Math.max(0, m.index - contextChars);
+        const end = Math.min(text.length, m.index + m[0].length + contextChars);
+        hits.push({ index: i, snippet: text.slice(start, end), charOffset: m.index });
+        i += 1;
+      }
+      return { hits };
     },
     async screenshot(): Promise<{ imageBase64: string; width: number; height: number }> {
       const buf = await page.screenshot({ fullPage: false });
@@ -149,11 +204,11 @@ export async function createPlaywrightRunner(opts: BrowserSessionOpts): Promise<
         return { result: err instanceof Error ? err.message : String(err), resolved: false };
       }
     },
-    async consoleMessages(): Promise<{ messages: never[]; nextCursor?: string }> {
-      return { messages: [] };
+    async consoleMessages(args) {
+      return consoleRecorder.query(args);
     },
-    async networkRequests(): Promise<{ requests: never[]; nextCursor?: string }> {
-      return { requests: [] };
+    async networkRequests(args) {
+      return networkRecorder.query(args);
     },
     async newTab(): Promise<RunnerSnapshot> {
       return snapshot();

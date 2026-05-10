@@ -37,7 +37,7 @@ export interface BrowserRunner {
   input(args: { index: number; text: string; clear?: boolean }): Promise<RunnerSnapshot>;
   scroll(args: { down?: boolean; pages?: number; index?: number }): Promise<RunnerSnapshot>;
   snapshot(): Promise<RunnerSnapshot>;
-  searchPage(args: { pattern: string; regex?: boolean; caseSensitive?: boolean; cssScope?: string }): Promise<{
+  searchPage(args: { pattern: string; regex?: boolean; caseSensitive?: boolean; cssScope?: string; contextChars?: number; maxResults?: number }): Promise<{
     hits: Array<{ index: number; snippet: string; charOffset: number }>;
   }>;
   screenshot(args: { fullPage?: boolean; selector?: string }): Promise<{

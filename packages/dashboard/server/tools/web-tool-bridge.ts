@@ -128,8 +128,61 @@ function createBrowserBackend(opts: WebToolBridgeOpts) {
       const runner = await session.getRunner();
       return runner.evaluate(args);
     },
-    // searchPage / extract / consoleMessages / networkRequests / tabs land in
-    // Phase H5+. They're advertised on the executor; missing implementations
-    // produce a friendly "not implemented" response.
+    async searchPage(args: import('@esankhan3/anvil-core-pipeline').BrowserSearchPageArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      const session = acquire(ctx);
+      const runner = await session.getRunner();
+      return runner.searchPage(args);
+    },
+    async extract(args: import('@esankhan3/anvil-core-pipeline').BrowserExtractArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      if (!opts.summarizerInvoker) {
+        throw new Error('browser_extract: extractor invoker not wired. Set summarizerInvoker on createWebToolBridge.');
+      }
+      const session = acquire(ctx);
+      const runner = await session.getRunner();
+      const snap = await runner.snapshot();
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { serializeDom } = await import('../browser/dom-serializer.js');
+      const ser = serializeDom(snap.domRoot);
+      const { extract } = await import('../browser/extractor.js');
+      return extract(args, { pageText: ser.domText, invoke: opts.summarizerInvoker });
+    },
+    async consoleMessages(args: import('@esankhan3/anvil-core-pipeline').BrowserConsoleArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      const session = acquire(ctx);
+      const runner = await session.getRunner();
+      return runner.consoleMessages(args);
+    },
+    async networkRequests(args: import('@esankhan3/anvil-core-pipeline').BrowserNetworkArgs, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      const session = acquire(ctx);
+      const runner = await session.getRunner();
+      return runner.networkRequests(args);
+    },
+    async newTab(args: { url?: string }, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      const session = acquire(ctx);
+      const runner = await session.getRunner();
+      const snap = await runner.newTab(args);
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { serializeDom } = await import('../browser/dom-serializer.js');
+      return {
+        url: snap.url, title: snap.title,
+        domText: serializeDom(snap.domRoot).domText, axText: snap.axText ?? '',
+        tabs: snap.tabs, scroll: snap.scroll, effectIdx: 0,
+      };
+    },
+    async closeTab(args: { tabId: string }, ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      const session = acquire(ctx);
+      const runner = await session.getRunner();
+      const snap = await runner.closeTab(args);
+      const { serializeDom } = await import('../browser/dom-serializer.js');
+      return {
+        url: snap.url, title: snap.title,
+        domText: serializeDom(snap.domRoot).domText, axText: snap.axText ?? '',
+        tabs: snap.tabs, scroll: snap.scroll, effectIdx: 0,
+      };
+    },
+    async tabs(ctx: { workingDir: string; abortSignal: AbortSignal } & BrowserBackendCtx) {
+      const session = acquire(ctx);
+      const runner = await session.getRunner();
+      return runner.tabs();
+    },
   };
 }
