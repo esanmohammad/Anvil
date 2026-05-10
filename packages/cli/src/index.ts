@@ -7,6 +7,7 @@ import { initCommand } from './commands/init.js';
 import { doctorCommand } from './commands/doctor.js';
 import { dashboardCommand } from './commands/dashboard.js';
 import { runReplayCommand } from './commands/run-replay.js';
+import { resumeDurableCommand } from './commands/resume-durable.js';
 
 const program = new Command();
 
@@ -22,6 +23,7 @@ program.addCommand(initCommand);
 program.addCommand(doctorCommand);
 program.addCommand(dashboardCommand);
 program.addCommand(runReplayCommand);
+program.addCommand(resumeDurableCommand);
 
 // Default action — launch dashboard
 if (process.argv.length <= 2) {
