@@ -42,6 +42,7 @@ import { runDurableMigration } from './durable-migration.js';
 import { scheduleDurableVacuum } from './durable-vacuum.js';
 import { dispatchTakenOverRuns } from './durable-resume-queue.js';
 import { STAGES as RUNNER_STAGES } from './pipeline-runner.js';
+import type { ResumeDecision } from './pipeline-pause-types.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import type { PipelineRunState } from './pipeline-runner.js';
@@ -5321,10 +5322,38 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
             }
           }, 1000);
         });
+        let signalPayload: unknown = null;
         if (info.waitForReviewerDecision) {
-          await Promise.race([info.waitForReviewerDecision(channel), polling]);
+          const signalP = info.waitForReviewerDecision(channel).then((p) => {
+            signalPayload = p;
+          });
+          await Promise.race([signalP, polling]);
         } else {
           await polling;
+        }
+
+        // Phase G4: pauseStore-as-projection sync. When the durable
+        // signal landed first (e.g. on replay where the recorded
+        // decision returns instantly, or when the producer enqueued
+        // the signal but pauseStore wasn't aware), sync pauseStore
+        // from the signal payload so the UI reflects the resolved
+        // state. Best-effort — if pauseStore is already resumed via
+        // a different code path, the resume() call's "not awaiting
+        // user" guard makes this a no-op.
+        if (signalPayload) {
+          try {
+            const decision = signalPayload as { action?: string; note?: string; editedArtifact?: string; rerunFromStage?: number };
+            const current = pauseStore.get(info.runId);
+            if (current?.status === 'paused-awaiting-user' && decision.action) {
+              if (decision.action === 'cancel') {
+                pauseStore.cancel(info.runId, 'durable-replay');
+              } else {
+                pauseStore.resume(info.runId, decision as ResumeDecision, 'durable-replay');
+              }
+            }
+          } catch (err) {
+            console.warn(`[dashboard] pauseStore projection sync failed: ${err instanceof Error ? err.message : err}`);
+          }
         }
 
         const final = pauseStore.get(info.runId);
