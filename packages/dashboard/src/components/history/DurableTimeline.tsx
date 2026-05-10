@@ -41,7 +41,7 @@ interface DurableRun {
   workflowVer: number;
 }
 
-type Filter = 'all' | 'steps' | 'effects' | 'signals';
+type Filter = 'all' | 'steps' | 'effects' | 'signals' | 'web' | 'browser' | 'computer';
 
 const KIND_COLORS: Record<string, string> = {
   'step:started': 'var(--color-primary, #0066ff)',
@@ -55,11 +55,30 @@ const KIND_COLORS: Record<string, string> = {
   'reviewer:decision': 'var(--color-warning, #ffaa00)',
 };
 
-function summarisePayload(payload: unknown): string {
+function summarisePayload(payload: unknown, effectKey: string | null = null): string {
   if (payload === null || payload === undefined) return '';
   if (typeof payload === 'string') return payload.slice(0, 80);
   if (typeof payload !== 'object') return String(payload);
   const obj = payload as Record<string, unknown>;
+  // Phase H9 — surface web/browser/computer summaries up front.
+  if (effectKey?.startsWith('web:search')) {
+    if (typeof obj.query === 'string') return `q="${obj.query.slice(0, 60)}"`;
+  }
+  if (effectKey?.startsWith('web:fetch')) {
+    if (typeof obj.url === 'string') return obj.url.slice(0, 80);
+  }
+  if (effectKey?.startsWith('browser:navigate')) {
+    if (typeof obj.url === 'string') return obj.url.slice(0, 80);
+  }
+  if (effectKey?.startsWith('browser:click')) {
+    if (typeof obj.index === 'number') return `[${obj.index}]`;
+  }
+  if (effectKey?.startsWith('browser:screenshot')) {
+    return `(thumbnail)`;
+  }
+  if (effectKey?.startsWith('computer:action')) {
+    if (typeof obj.action === 'string') return obj.action;
+  }
   if (typeof obj.message === 'string') return obj.message.slice(0, 80);
   if (typeof obj.idempotencyKey === 'string') return `key=${obj.idempotencyKey}`;
   if (typeof obj.version === 'number') return `v${obj.version}`;
@@ -130,6 +149,11 @@ export function DurableTimeline({ runId, ws }: DurableTimelineProps) {
       if (filter === 'steps') return e.kind.startsWith('step:');
       if (filter === 'effects') return e.kind.startsWith('effect:');
       if (filter === 'signals') return e.kind.startsWith('signal:') || e.kind === 'reviewer:decision';
+      // Phase H9 — web/browser/computer filter chips. effectKey shape is
+      // `<namespace>:<verb>:...` (see core-pipeline browser-web-tools §J).
+      if (filter === 'web') return (e.effectKey ?? '').startsWith('web:');
+      if (filter === 'browser') return (e.effectKey ?? '').startsWith('browser:');
+      if (filter === 'computer') return (e.effectKey ?? '').startsWith('computer:');
       return true;
     });
   }, [events, filter]);
@@ -161,7 +185,7 @@ export function DurableTimeline({ runId, ws }: DurableTimelineProps) {
         </div>
       </div>
       <div style={styles.filters}>
-        {(['all', 'steps', 'effects', 'signals'] as const).map((f) => (
+        {(['all', 'steps', 'effects', 'signals', 'web', 'browser', 'computer'] as const).map((f) => (
           <button
             key={f}
             type="button"
@@ -194,7 +218,7 @@ export function DurableTimeline({ runId, ws }: DurableTimelineProps) {
                   </span>
                 ) : null}
               </div>
-              <div style={styles.summary}>{summarisePayload(e.payload)}</div>
+              <div style={styles.summary}>{summarisePayload(e.payload, e.effectKey)}</div>
             </div>
           ))
         )}
