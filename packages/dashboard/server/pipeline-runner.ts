@@ -28,6 +28,15 @@ import {
 } from './pipeline-checkpoint.js';
 import { ReviewerControl } from './reviewer-control.js';
 import { PromptContextCache } from './prompt-context-cache.js';
+import {
+  PlanRiskCache,
+  manifestGetTouchedFiles,
+  populateManifestFromPlan as populateManifestFromPlanBridge,
+  renderPlanDerivedArtifact as renderPlanDerivedArtifactBridge,
+  extractAndUpdateManifest as extractAndUpdateManifestBridge,
+  clearManifestFieldsForStages as clearManifestFieldsForStagesBridge,
+  type ManifestBridgeDeps,
+} from './manifest-bridge.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -108,12 +117,7 @@ import type { ModelRegistry, ProviderName, WalkerConfig } from '@esankhan3/anvil
 import { parseTasks, bundleFiles, type ParsedTask } from '@esankhan3/anvil-core-pipeline';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { enforceBudget, type PromptSection } from '@esankhan3/anvil-core-pipeline';
-import { scorePlan, computeRiskTier } from '@esankhan3/anvil-core-pipeline';
-import {
-  FeatureManifestStore,
-  type PlannedFile,
-  type TestBehavior,
-} from './feature-manifest.js';
+import { FeatureManifestStore } from './feature-manifest.js';
 import {
   combinePerRepoArtifacts,
   disallowedToolsForPersona,
@@ -137,17 +141,6 @@ import {
   deployProject,
   createFeatureBranches as createFeatureBranchesHelper,
 } from './steps/workspace-ops.js';
-import {
-  extractAcceptanceCriteria,
-  extractAffectedRepos,
-  extractApiEndpoints,
-  extractChangeBrief,
-  extractFilesPlanned,
-  extractOpenQuestions,
-  extractTablesTouched,
-  extractTestBehaviors,
-  type ManifestExtractor,
-} from '@esankhan3/anvil-core-pipeline';
 
 // ── Claude CLI binary ────────────────────────────────────────────────
 
@@ -329,80 +322,8 @@ export class PipelineRunner extends EventEmitter {
     }
   }
 
-  /**
-   * Wipe manifest fields written by stages [fromIndex .. toIndex] so the
-   * "do not re-derive" prefix doesn't carry stale claims into the rerun.
-   */
-  private clearManifestFieldsForStages(fromIndex: number, toIndex: number): void {
-    const stageFields: Record<string, ReadonlyArray<string>> = {
-      requirements: ['acceptanceCriteria', 'affectedRepos'],
-      specs: ['apiEndpoints', 'tablesTouched', 'testBehaviors'],
-      tasks: ['filesPlanned'],
-      build: ['changeBrief'],
-      validate: ['openQuestions'],
-    };
-    for (let j = fromIndex; j <= toIndex; j++) {
-      const stage = STAGES[j];
-      const fields = stageFields[stage.name];
-      if (!fields) continue;
-      for (const f of fields) {
-        try {
-          this.manifestStore.patchField(
-            this.config.project, this.state.featureSlug,
-            f as never, 'unset', null as never, `rerun-from-${stage.name}`,
-          );
-        } catch { /* best-effort — extractor may not have run */ }
-      }
-    }
-    this.promptCache.invalidateManifestBlock();
-  }
-
-  /**
-   * Best-effort list of files modified by this run so far, prefixed with the
-   * repo name so policy globs like `backend/internal/db/**` can match across
-   * a multi-repo workspace. Uses `git status --porcelain` per repo and
-   * silently skips repos that error.
-   */
-  private getTouchedFiles(): string[] {
-    const files: string[] = [];
-    for (const [repoName, repoPath] of Object.entries(this.repoPaths)) {
-      if (!repoPath) continue;
-      try {
-        const out = execSync('git status --porcelain', {
-          cwd: repoPath, encoding: 'utf-8', timeout: 10_000,
-        });
-        for (const line of out.split('\n')) {
-          if (line.length < 4) continue;
-          const path = (line.slice(3).trim().split(' -> ').pop() ?? '').trim();
-          if (path) files.push(`${repoName}/${path}`);
-        }
-      } catch { /* per-repo best-effort */ }
-    }
-    return files;
-  }
-
-  /**
-   * Risk tier + confidence from the plan seed (when present). Computed once
-   * at runtime so every stage sees the same numbers; undefined when no plan
-   * is available (the policy evaluator falls back to defaults).
-   */
-  private cachedRisk: { tier: 'low' | 'med' | 'high'; confidence: number } | null = null;
-  private getPlanRisk(): { tier?: 'low' | 'med' | 'high'; confidence?: number } {
-    if (this.cachedRisk) return this.cachedRisk;
-    const seed = this.config.planSeed;
-    if (!seed?.plan) return {};
-    try {
-      const score = scorePlan(seed.plan);
-      const confidence = (seed.plan as unknown as { confidence?: number }).confidence;
-      this.cachedRisk = {
-        tier: computeRiskTier(score.overall),
-        confidence: typeof confidence === 'number' ? confidence : 0.5,
-      };
-      return this.cachedRisk;
-    } catch {
-      return {};
-    }
-  }
+  /** Per-run plan risk cache (lazy compute, share across stages). */
+  private planRisk = new PlanRiskCache();
 
   // ── Phase 1 cache-stability memoization ─────────────────────────────
   //
@@ -412,172 +333,21 @@ export class PipelineRunner extends EventEmitter {
   // cache needs.
   private promptCache!: PromptContextCache;
 
-  /**
-   * Pre-fill the manifest from a plan seed. Called before stage 5 (build)
-   * runs so engineers see acceptance criteria, repo impact, planned files,
-   * and test behaviors as `final` and don't re-derive them. Plans don't
-   * always have explicit API/table sections, so those are left `unset`.
-   */
-  private populateManifestFromPlan(plan: import('@esankhan3/anvil-core-pipeline').Plan): void {
-    const project = this.config.project;
-    const slug = this.state.featureSlug;
-    this.manifestStore.ensure(project, slug, this.config.feature);
-
-    const writer = 'plan-seed';
-
-    // Acceptance criteria — derived from the plan's in-scope list when present.
-    if (plan.scope?.inScope?.length) {
-      this.manifestStore.patchField(
-        project, slug, 'acceptanceCriteria', 'final',
-        plan.scope.inScope.slice(),
-        writer,
-      );
-    }
-
-    // Affected repos — directly from plan.repos[].name.
-    const repoNames = (plan.repos ?? []).map((r) => r.name).filter((n): n is string => !!n);
-    if (repoNames.length > 0) {
-      this.manifestStore.patchField(
-        project, slug, 'affectedRepos', 'final',
-        repoNames,
-        writer,
-      );
-    }
-
-    // Files planned — flatten plan.repos[].files into PlannedFile entries.
-    // Plans don't track create/modify/delete kinds, so default to 'modify'.
-    const filesPlanned: PlannedFile[] = [];
-    for (const repo of plan.repos ?? []) {
-      for (const file of repo.files ?? []) {
-        filesPlanned.push({ repo: repo.name, path: file, kind: 'modify' });
-      }
-    }
-    if (filesPlanned.length > 0) {
-      this.manifestStore.patchField(
-        project, slug, 'filesPlanned', 'final',
-        filesPlanned,
-        writer,
-      );
-    }
-
-    // Test behaviors — synthesize from plan.tests buckets.
-    const testBehaviors: TestBehavior[] = [];
-    for (const desc of plan.tests?.unit ?? []) testBehaviors.push({ description: desc });
-    for (const desc of plan.tests?.integration ?? []) testBehaviors.push({ description: desc });
-    for (const desc of plan.tests?.manual ?? []) testBehaviors.push({ description: desc });
-    if (testBehaviors.length > 0) {
-      this.manifestStore.patchField(
-        project, slug, 'testBehaviors', 'final',
-        testBehaviors,
-        writer,
-      );
-    }
-
-    this.promptCache.invalidateManifestBlock();
-  }
-
-  /**
-   * Render plan-derived artifacts for stages that the walker skipped via
-   * `skipIfByStage`. Mutates `this.state.stages[i]` and writes the
-   * artifact through `featureStore` — same side effects the legacy
-   * runOneStage branch did, just driven by the bus listener instead
-   * of the inline `if (planSeed && PLAN_DERIVED_STAGES.includes(...))`.
-   *
-   * Phase D1. Idempotent — calling for a stage already populated does
-   * the same writes again, which the featureStore tolerates.
-   */
-  private async renderPlanDerivedArtifact(stageName: string, stageIndex: number): Promise<void> {
-    const seed = this.config.planSeed;
-    if (!seed) return;
-    const { plan } = seed;
-    const { renderRequirements, renderRepoRequirements, renderRepoSpecs, renderRepoTasks }
-      = await import('@esankhan3/anvil-core-pipeline');
-
-    const project = this.config.project;
-    const slug = this.state.featureSlug;
-    const i = stageIndex;
-    if (i < 0 || !this.state.stages[i]) return;
-
-    if (stageName === 'requirements') {
-      const artifact = renderRequirements(plan);
-      this.state.stages[i].status = 'skipped';
-      this.state.stages[i].artifact = artifact;
-      try { this.featureStore.writeArtifact(project, slug, 'REQUIREMENTS.md', artifact); } catch { /* non-fatal */ }
-    } else {
-      const filenameByStage: Record<string, string> = {
-        'repo-requirements': 'REQUIREMENTS.md',
-        specs: 'SPECS.md',
-        tasks: 'TASKS.md',
-      };
-      const rendererByStage: Record<string, (p: typeof plan, r: string) => string> = {
-        'repo-requirements': renderRepoRequirements,
-        specs: renderRepoSpecs,
-        tasks: renderRepoTasks,
-      };
-      const filename = filenameByStage[stageName];
-      const renderer = rendererByStage[stageName];
-      if (!filename || !renderer) return;
-
-      const combined: string[] = [];
-      this.state.stages[i].repos = this.state.repoNames.map((repoName) => {
-        const artifact = renderer(plan, repoName);
-        try {
-          this.featureStore.writeArtifact(project, slug, `repos/${repoName}/${filename}`, artifact);
-        } catch { /* non-fatal */ }
-        combined.push(`## ${repoName}\n${artifact}`);
-        return {
-          repoName,
-          agentId: null,
-          status: 'completed' as const,
-          cost: 0,
-          artifact,
-          error: null,
-        };
-      });
-
-      this.state.stages[i].status = 'skipped';
-      this.state.stages[i].artifact = combined.join('\n\n');
-    }
-
-    this.state.stages[i].completedAt = new Date().toISOString();
-    this.broadcastState();
-    this.checkpoint();
-  }
-
-  /**
-   * After a stage's artifact lands, extract structured fields and patch the
-   * manifest. Uses a heuristic deterministic parser today — the cheap-model
-   * extraction call is wired through later phases so we avoid an extra spawn
-   * per stage while still capturing the obvious wins from plan-seeded runs
-   * and from artifacts that already use predictable headings.
-   */
-  private async extractAndUpdateManifest(stage: StageDefinition, artifact: string): Promise<void> {
-    const fieldsForStage: Partial<Record<string, ManifestExtractor[]>> = {
-      requirements: [extractAcceptanceCriteria, extractAffectedRepos],
-      specs: [extractApiEndpoints, extractTablesTouched, extractTestBehaviors],
-      tasks: [extractFilesPlanned],
-      build: [extractChangeBrief],
-      validate: [extractOpenQuestions],
+  /** Bundle the manifest-bridge dep set. One-time per call; lazy refs. */
+  private depsForManifest(): ManifestBridgeDeps {
+    return {
+      project: this.config.project,
+      feature: this.config.feature,
+      featureSlug: () => this.state.featureSlug,
+      manifestStore: this.manifestStore,
+      featureStore: this.featureStore,
+      state: this.state,
+      config: this.config,
+      repoPaths: () => this.repoPaths,
+      invalidateManifestCache: () => this.promptCache.invalidateManifestBlock(),
+      broadcast: () => this.broadcastState(),
+      checkpoint: () => this.checkpoint(),
     };
-    const extractors = fieldsForStage[stage.name];
-    if (!extractors || extractors.length === 0) return;
-
-    let mutated = false;
-    for (const extractor of extractors) {
-      try {
-        const result = extractor(artifact);
-        if (!result) continue;
-        this.manifestStore.patchField(
-          this.config.project, this.state.featureSlug,
-          result.field, result.status, result.value as never,
-          stage.name,
-        );
-        mutated = true;
-      } catch (err) {
-        console.warn(`[pipeline] manifest extractor ${stage.name} failed:`, err);
-      }
-    }
-    if (mutated) this.promptCache.invalidateManifestBlock();
   }
 
   // For interactive clarify — resolves when user provides input
@@ -994,7 +764,7 @@ export class PipelineRunner extends EventEmitter {
       this.manifestStore.ensure(this.config.project, this.state.featureSlug, this.config.feature);
       if (this.config.planSeed?.plan) {
         try {
-          this.populateManifestFromPlan(this.config.planSeed.plan);
+          populateManifestFromPlanBridge(this.depsForManifest(), this.config.planSeed.plan);
         } catch (err) {
           console.warn('[pipeline] populateManifestFromPlan failed:', err);
         }
@@ -1133,7 +903,7 @@ export class PipelineRunner extends EventEmitter {
         if (!event.stepId || !PLAN_DERIVED_STAGES.includes(event.stepId)) return;
         const stageIdx = STAGES.findIndex((s) => s.name === event.stepId);
         if (stageIdx < 0) return;
-        await this.renderPlanDerivedArtifact(event.stepId, stageIdx);
+        await renderPlanDerivedArtifactBridge(this.depsForManifest(), event.stepId, stageIdx);
         // Thread the rendered artifact into stageState so subsequent
         // non-skipped stages see it as their prevArtifact.
         const rendered = this.state.stages[stageIdx]?.artifact;
@@ -1435,7 +1205,7 @@ export class PipelineRunner extends EventEmitter {
             + `skipIf path should have fired earlier. Falling through to `
             + `legacy renderer for safety.`,
         );
-        await this.renderPlanDerivedArtifact(stage.name, i);
+        await renderPlanDerivedArtifactBridge(this.depsForManifest(), stage.name, i);
         prevArtifact = this.state.stages[i].artifact ?? prevArtifact;
         return { control: 'continue', prevArtifact };
       }
@@ -1541,7 +1311,7 @@ export class PipelineRunner extends EventEmitter {
 
         if (this.afterStageHook) {
           try {
-            const risk = this.getPlanRisk();
+            const risk = this.planRisk.get(this.config.planSeed);
             await this.afterStageHook({
               runId: this.state.runId,
               project: this.config.project,
@@ -1550,7 +1320,7 @@ export class PipelineRunner extends EventEmitter {
               artifact: result.artifact,
               cost: result.cost,
               totalCost: this.state.totalCost,
-              touchedFiles: this.getTouchedFiles(),
+              touchedFiles: manifestGetTouchedFiles(this.depsForManifest()),
               riskTier: risk.tier,
               confidence: risk.confidence,
             });
@@ -1572,7 +1342,7 @@ export class PipelineRunner extends EventEmitter {
             console.log(`[pipeline] Iterate requested → re-running stage ${target} (${STAGES[target].name}) with reviewer feedback`);
           } else {
             this.resetStagesForRerun(target, i);
-            this.clearManifestFieldsForStages(target, i);
+            clearManifestFieldsForStagesBridge(this.depsForManifest(), target, i);
             if (rerun.note) {
               this.config.failureContext =
                 `Rerun requested by reviewer at stage "${STAGES[target].name}":\n${rerun.note}`;
@@ -1595,7 +1365,7 @@ export class PipelineRunner extends EventEmitter {
         }
 
         try {
-          await this.extractAndUpdateManifest(stage, result.artifact);
+          await extractAndUpdateManifestBridge(this.depsForManifest(), stage, result.artifact);
         } catch (err) {
           console.warn(`[pipeline] manifest extraction at ${stage.name} failed:`, err);
         }
