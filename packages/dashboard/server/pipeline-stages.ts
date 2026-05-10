@@ -13,6 +13,33 @@
  * orchestration. Each function takes a `StageOpsDeps` opts bag that
  * bundles the runner's state, config, helpers, and side-effect hooks
  * — no FS state of its own; no module-level cache.
+ *
+ * # Durable execution boundary (Phases E1–E10)
+ *
+ * Each step-body function accepts an optional `ctx?: StepContext<string>`.
+ * When provided (durable mode), every external touch — agent spawn,
+ * artifact write, fix-loop attempt, deploy — flows through
+ * `ctx.effect(...)` so a process crash mid-stage resumes from the
+ * last completed effect on the next process. When `ctx` is undefined
+ * (legacy callers / tests / non-durable mode), calls fire directly
+ * — the contract is a transparent superset.
+ *
+ * **What is NOT wrapped:** state-mutation projections (e.g.
+ * `state.stages[i].startedAt = new Date().toISOString()`) stay direct.
+ * These are observable side effects on the dashboard's in-memory state
+ * + state.json projection — re-writing them on replay is harmless +
+ * intentional (the replay process IS live; the user expects to see
+ * fresh timestamps as the run progresses through replay-completed
+ * steps). The durable log is the workflow record; state.json is a
+ * projection.
+ *
+ * **What stays outside the durable log on purpose:**
+ *   - Telemetry (`writePerRepoTelemetry`) — JSONL appenders, idempotent.
+ *   - Cost ledger writes — JSONL, replay re-records cleanly.
+ *   - State broadcasts (`deps.broadcast()`) — recompute from state.
+ *
+ * See `docs/durable-effect-conversion-plan.md` for the full
+ * conversion catalog.
  */
 import { join } from 'node:path';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
