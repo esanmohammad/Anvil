@@ -13,6 +13,8 @@
  * future loosening or tightening is a deliberate, traceable change.
  */
 
+import { allowedWebToolsForStage } from '../tools/web-tool-registry.js';
+
 export type ToolClass = 'read' | 'write' | 'exec';
 
 const ALL_TOOLS_BY_CLASS: Readonly<Record<ToolClass, readonly string[]>> = {
@@ -61,6 +63,9 @@ export const STAGE_TOOL_PERMISSIONS: Readonly<Record<string, readonly ToolClass[
 /**
  * Resolve the list of tool names allowed for a given stage. Unknown
  * stages fall back to read-only — fail-closed by default.
+ *
+ * Includes web/browser tools when the stage opts into the web permission
+ * classes (`network` / `browse-headless` / `browse-eval` / `browse-pixel`).
  */
 export function allowedToolsForStage(stage: string): string[] {
   const classes = STAGE_TOOL_PERMISSIONS[stage] ?? ['read'];
@@ -68,6 +73,7 @@ export function allowedToolsForStage(stage: string): string[] {
   for (const cls of classes) {
     for (const t of ALL_TOOLS_BY_CLASS[cls]) tools.add(t);
   }
+  for (const t of allowedWebToolsForStage(stage)) tools.add(t);
   return [...tools].sort();
 }
 

@@ -31,6 +31,43 @@ export interface CostPolicy {
   graceWindowSeconds?: number;         // keep agents running while asking
   onBreach?: 'ask' | 'auto-approve' | 'auto-reject';
   autoApproveBelow?: number;           // USD delta that never asks
+  /** Per-tool budget caps (Phase H — browser/web tools). */
+  tools?: ToolCostLimits;
+}
+
+export interface ToolCostLimits {
+  /** Hard cap on tool spend per run (USD). */
+  perRunUsd?: number;
+  /** Per-stage cap (USD). */
+  perStageUsd?: number;
+  /** Ceiling per single tool invocation (USD). */
+  perToolPerCallUsd?: number;
+}
+
+/**
+ * Browser/web tool surface policy. Each block opts a stage into the
+ * matching permission class (network / browseHeadless / browseEval /
+ * browsePixel) on top of the built-in stage defaults in core-pipeline's
+ * `STAGE_WEB_PERMISSIONS`. Empty/absent block = use built-in defaults.
+ */
+export interface ToolsPolicy {
+  network?: WebToolBlock;
+  browseHeadless?: WebToolBlock;
+  browseEval?: WebToolBlock;
+  browsePixel?: WebToolBlock;
+}
+
+export interface WebToolBlock {
+  /** Master switch — set false to disable this class for the project. */
+  enabled?: boolean;
+  /** Override the per-stage allow-list (replaces built-in defaults). */
+  stages?: string[];
+  /** Glob patterns of allowed domains (e.g. "*.docs.example.com"). */
+  allowedDomains?: string[];
+  /** Glob patterns of always-blocked domains. */
+  blockedDomains?: string[];
+  /** Named contexts (e.g. authenticated docs portal cookie jars). */
+  contexts?: string[];
 }
 
 export interface PolicyDefaults {
@@ -57,6 +94,8 @@ export interface PipelinePolicy {
   reviewers?: Array<{ match: string; users: string[] }>;
   /** Agent Q&A controls — applies to clarify/requirements/repo-requirements/specs stages. */
   qa?: AgentQuestionPolicy;
+  /** Browser/web tool gating overlay (Phase H). */
+  tools?: ToolsPolicy;
 }
 
 export interface PolicyEvaluationInput {

@@ -34,6 +34,11 @@ export interface PolicyPatch {
       perProjectDaily?: number;
       perStage?: Partial<Record<PipelineStage, number>>;
     };
+    tools?: {
+      perRunUsd?: number;
+      perStageUsd?: number;
+      perToolPerCallUsd?: number;
+    };
   };
   notifications?: {
     slack?: boolean;
@@ -44,6 +49,20 @@ export interface PolicyPatch {
     enabled?: boolean;
     maxQuestionsPerStage?: number;
   };
+  tools?: {
+    network?: WebToolPatch;
+    browseHeadless?: WebToolPatch;
+    browseEval?: WebToolPatch;
+    browsePixel?: WebToolPatch;
+  };
+}
+
+export interface WebToolPatch {
+  enabled?: boolean;
+  stages?: string[];
+  allowedDomains?: string[];
+  blockedDomains?: string[];
+  contexts?: string[];
 }
 
 export type ValidationResult = { ok: true } | { ok: false; error: string };
@@ -169,6 +188,53 @@ export function validatePolicyPatch(patch: unknown): ValidationResult {
     }
   }
 
+  if (p.cost?.tools !== undefined) {
+    const t = p.cost.tools;
+    if (t === null || typeof t !== 'object') {
+      return { ok: false, error: 'cost.tools must be an object' };
+    }
+    for (const key of ['perRunUsd', 'perStageUsd', 'perToolPerCallUsd'] as const) {
+      const v = t[key];
+      if (v !== undefined && (typeof v !== 'number' || v < 0 || Number.isNaN(v))) {
+        return { ok: false, error: `cost.tools.${key} must be >= 0` };
+      }
+    }
+  }
+
+  if (p.tools !== undefined) {
+    if (p.tools === null || typeof p.tools !== 'object') {
+      return { ok: false, error: 'tools must be an object' };
+    }
+    for (const key of ['network', 'browseHeadless', 'browseEval', 'browsePixel'] as const) {
+      const block = p.tools[key];
+      if (block === undefined) continue;
+      if (block === null || typeof block !== 'object') {
+        return { ok: false, error: `tools.${key} must be an object` };
+      }
+      const r = validateWebToolBlock(block, `tools.${key}`);
+      if (!r.ok) return r;
+    }
+  }
+
+  return { ok: true };
+}
+
+function validateWebToolBlock(block: WebToolPatch, prefix: string): ValidationResult {
+  if (block.enabled !== undefined && typeof block.enabled !== 'boolean') {
+    return { ok: false, error: `${prefix}.enabled must be boolean` };
+  }
+  for (const arrKey of ['stages', 'allowedDomains', 'blockedDomains', 'contexts'] as const) {
+    const v = block[arrKey];
+    if (v === undefined) continue;
+    if (!Array.isArray(v)) {
+      return { ok: false, error: `${prefix}.${arrKey} must be an array of strings` };
+    }
+    for (const s of v) {
+      if (typeof s !== 'string' || s.length === 0) {
+        return { ok: false, error: `${prefix}.${arrKey} entries must be non-empty strings` };
+      }
+    }
+  }
   return { ok: true };
 }
 
@@ -222,6 +288,18 @@ export function deepMergeOverlay(
       ...((existing.qa as Record<string, unknown> | undefined) ?? {}),
       ...patch.qa,
     };
+  }
+
+  if (patch.tools !== undefined) {
+    const baseTools = (existing.tools as Record<string, unknown> | undefined) ?? {};
+    const merged: Record<string, unknown> = { ...baseTools };
+    for (const key of ['network', 'browseHeadless', 'browseEval', 'browsePixel'] as const) {
+      const patchBlock = patch.tools[key];
+      if (patchBlock === undefined) continue;
+      const baseBlock = (baseTools[key] as Record<string, unknown> | undefined) ?? {};
+      merged[key] = { ...baseBlock, ...patchBlock };
+    }
+    out.tools = merged;
   }
 
   return out;

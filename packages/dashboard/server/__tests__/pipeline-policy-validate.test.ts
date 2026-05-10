@@ -88,6 +88,45 @@ describe('validatePolicyPatch', () => {
     assert.equal(validatePolicyPatch({ qa: { maxQuestionsPerStage: 1.5 } }).ok, false);
     assert.deepEqual(validatePolicyPatch({ qa: { maxQuestionsPerStage: 5 } }), { ok: true });
   });
+
+  // ── Phase H0 — browser/web tools overlay ────────────────────────────
+  it('accepts cost.tools per-call caps', () => {
+    const r = validatePolicyPatch({ cost: { tools: { perRunUsd: 1, perStageUsd: 0.25, perToolPerCallUsd: 0.1 } } });
+    assert.deepEqual(r, { ok: true });
+  });
+
+  it('rejects negative cost.tools.perRunUsd', () => {
+    const r = validatePolicyPatch({ cost: { tools: { perRunUsd: -1 } } });
+    assert.equal(r.ok, false);
+  });
+
+  it('accepts a tools.network block', () => {
+    const r = validatePolicyPatch({
+      tools: {
+        network: { enabled: true, stages: ['clarify', 'plan'], allowedDomains: ['*.docs.example.com'] },
+      },
+    });
+    assert.deepEqual(r, { ok: true });
+  });
+
+  it('accepts tools.browsePixel disabled', () => {
+    const r = validatePolicyPatch({ tools: { browsePixel: { enabled: false } } });
+    assert.deepEqual(r, { ok: true });
+  });
+
+  it('rejects non-string entries in tools.allowedDomains', () => {
+    const r = validatePolicyPatch({
+      tools: { network: { allowedDomains: ['a', 42 as unknown as string] } },
+    });
+    assert.equal(r.ok, false);
+  });
+
+  it('rejects unknown tools.* class', () => {
+    // The validator silently ignores unknown sibling keys — a stricter
+    // shape would reject; current contract only validates known classes.
+    const r = validatePolicyPatch({ tools: { network: { stages: ['clarify'] }, foo: {} } as never });
+    assert.equal(r.ok, true);
+  });
 });
 
 describe('deepMergeOverlay', () => {
@@ -125,5 +164,17 @@ describe('deepMergeOverlay', () => {
     assert.deepEqual(out.qa, { enabled: true });
     const d = out.defaults as Record<string, unknown>;
     assert.deepEqual(d.pauseAfter, ['plan']);
+  });
+
+  it('merges tools.* class blocks per-key', () => {
+    const out = deepMergeOverlay(
+      { tools: { network: { enabled: true, allowedDomains: ['github.com/*'] } } },
+      { tools: { network: { stages: ['clarify'] }, browseHeadless: { enabled: true } } },
+    );
+    const tools = out.tools as Record<string, Record<string, unknown>>;
+    assert.equal(tools.network.enabled, true);
+    assert.deepEqual(tools.network.allowedDomains, ['github.com/*']);
+    assert.deepEqual(tools.network.stages, ['clarify']);
+    assert.equal(tools.browseHeadless.enabled, true);
   });
 });

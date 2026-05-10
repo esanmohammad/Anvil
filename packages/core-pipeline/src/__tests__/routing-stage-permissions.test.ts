@@ -13,8 +13,19 @@ import {
   permissionClassesForStage,
 } from '../routing/stage-permissions.js';
 
-const READ_ONLY = ['glob', 'grep', 'list', 'read_file'];
-const FULL = ['bash', 'edit', 'glob', 'grep', 'list', 'read_file', 'write_file'];
+// Read-only stages (clarify/research/plan/etc.) carry the basic file
+// surface; some stages (clarify/research/plan) also gain network tools
+// from the web-permission overlay. Tests that assert "read-only" use
+// these helpers to keep both surfaces in sync.
+const READ_FS = ['glob', 'grep', 'list', 'read_file'];
+const FULL_FS = ['bash', 'edit', 'glob', 'grep', 'list', 'read_file', 'write_file'];
+
+function sortMerge(...lists: readonly string[][]): string[] {
+  return [...new Set(lists.flat())].sort();
+}
+
+const READ_PLUS_NETWORK = sortMerge(READ_FS, ['web_fetch', 'web_search']);
+const READ_FS_ONLY = READ_FS;
 
 describe('STAGE_TOOL_PERMISSIONS — canonical pipeline stages', () => {
   it('clarify is read-only', () => {
@@ -46,15 +57,18 @@ describe('STAGE_TOOL_PERMISSIONS — ad-hoc commands', () => {
 });
 
 describe('allowedToolsForStage', () => {
-  it('returns deduped sorted tool list for read-only stages', () => {
-    assert.deepEqual(allowedToolsForStage('clarify'), READ_ONLY);
-    assert.deepEqual(allowedToolsForStage('research'), READ_ONLY);
+  it('returns deduped sorted tool list for read-only stages (with network classes layered on)', () => {
+    // clarify and research both opt into the `network` web-permission class
+    // (see core-pipeline/src/tools/web-tool-registry.ts), so their resolved
+    // surface is read FS + web.* tools.
+    assert.deepEqual(allowedToolsForStage('clarify'), READ_PLUS_NETWORK);
+    assert.deepEqual(allowedToolsForStage('research'), READ_PLUS_NETWORK);
   });
-  it('returns full set for build', () => {
-    assert.deepEqual(allowedToolsForStage('build'), FULL);
+  it('returns full FS set for build (no network — build is network-blocked)', () => {
+    assert.deepEqual(allowedToolsForStage('build'), FULL_FS);
   });
-  it('falls back to read-only for unknown stage (fail-closed)', () => {
-    assert.deepEqual(allowedToolsForStage('not-a-real-stage'), READ_ONLY);
+  it('falls back to read-only for unknown stage (fail-closed) — no web tools either', () => {
+    assert.deepEqual(allowedToolsForStage('not-a-real-stage'), READ_FS_ONLY);
   });
 });
 

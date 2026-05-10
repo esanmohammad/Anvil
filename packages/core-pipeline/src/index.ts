@@ -457,6 +457,50 @@ export {
   permissionClassesForStage,
 } from './routing/stage-permissions.js';
 export type { ToolClass } from './routing/stage-permissions.js';
+
+// — Web/browser tool surface (Phase H0+)
+export type {
+  WebSearchArgs,
+  WebSearchHit,
+  WebSearchResult,
+  WebFetchArgs,
+  WebFetchResult,
+  WebToolClass,
+  BrowserNavigateArgs,
+  BrowserClickArgs,
+  BrowserInputArgs,
+  BrowserScrollArgs,
+  BrowserSearchPageArgs,
+  BrowserSearchPageResult,
+  BrowserExtractArgs,
+  BrowserExtractResult,
+  BrowserScreenshotArgs,
+  BrowserScreenshotResult,
+  BrowserEvaluateArgs,
+  BrowserEvaluateResult,
+  BrowserConsoleArgs,
+  BrowserConsoleMessage,
+  BrowserConsoleResult,
+  BrowserNetworkArgs,
+  BrowserNetworkRecord,
+  BrowserNetworkResult,
+  BrowserTab,
+  BrowserDoneArgs,
+  BrowserState,
+  ComputerAction,
+  ComputerActionResult,
+} from './tools/web-types.js';
+export {
+  WEB_TOOLS_BY_CLASS,
+  ALL_WEB_TOOL_NAMES,
+  webToolClassForName,
+} from './tools/web-types.js';
+export {
+  STAGE_WEB_PERMISSIONS,
+  allowedWebToolsForStage,
+  webPermissionClassesForStage,
+  stageMayInvokeWebTool,
+} from './tools/web-tool-registry.js';
 export {
   resolveModelForTask,
   orderTasksForDispatch,

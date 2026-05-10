@@ -25,7 +25,12 @@ function ctx(workingDir: string) {
 }
 
 describe('stage → permissions → executor — full chain', () => {
-  it('clarify stage exposes only read tools to the model', () => {
+  it('clarify stage exposes only read tools to the model (built-in FS surface)', () => {
+    // clarify resolves to the read_file/grep/glob/list FS surface plus the
+    // network web tools (web_search/web_fetch). BuiltinToolExecutor only
+    // advertises the FS tools it knows about; the web-tool surface is
+    // advertised by a separate executor (Phase H1+). Assert the FS subset
+    // here.
     const allowed = allowedToolsForStage('clarify');
     const exec = new BuiltinToolExecutor({ allowedTools: allowed });
     const names = exec.listSchemas().map((s) => s.name).sort();
@@ -78,14 +83,21 @@ describe('stage → permissions → executor — full chain', () => {
     }
   });
 
-  it('permissionClassesForStage maps to the same tool set listSchemas advertises', () => {
+  it('permissionClassesForStage maps to a subset of advertised schemas', () => {
+    // allowedToolsForStage now layers the web-tool surface on top of FS
+    // tools (Phase H0). BuiltinToolExecutor still advertises only its own
+    // 7 built-ins; the assertion is that EVERY advertised name is one of
+    // the requested tools (no leakage), and at least one classes entry
+    // exists.
     const stages = ['clarify', 'requirements', 'build', 'validate', 'review', 'research'];
+    const FS_TOOLS = new Set(['read_file', 'write_file', 'edit', 'bash', 'grep', 'glob', 'list']);
     for (const stage of stages) {
       const tools = allowedToolsForStage(stage);
       const classes = permissionClassesForStage(stage);
       const exec = new BuiltinToolExecutor({ allowedTools: tools });
       const advertised = exec.listSchemas().map((s) => s.name).sort();
-      assert.deepEqual(advertised, tools, `${stage}: schemas mismatch`);
+      const expectedFs = tools.filter((t) => FS_TOOLS.has(t)).sort();
+      assert.deepEqual(advertised, expectedFs, `${stage}: schemas mismatch`);
       assert.ok(classes.length > 0, `${stage}: should map to at least one class`);
     }
   });
