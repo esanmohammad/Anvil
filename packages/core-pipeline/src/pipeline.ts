@@ -596,12 +596,22 @@ export class Pipeline {
 
     if (durableStore) {
       const recorded = await durableStore.readEffectEvents(runId, step.id);
+      // Phase F6: per-repo scope filter. When the walker is in
+      // per-repo fanout mode, parallel runtimes share `step.id`
+      // but each effect key embeds the repo name (e.g.
+      // `specs:spawn-service-a`). Each runtime sees only the
+      // effects matching its repoName so the per-step idx
+      // counter stays in sync across replays.
+      const repoName = fanoutOpts?.repoName;
       const runtime = new EffectRuntime({
         store: durableStore,
         runId,
         stepId: step.id,
         recordedEffects: recorded,
         signal: sig,
+        ...(repoName
+          ? { effectFilter: (pair) => effectKeyMatchesScope(pair.started.effectKey, repoName) }
+          : {}),
       });
       effectFn = (name, fn, opts) => runtime.effect(name, fn, opts);
       nowFn = () => runtime.now();
@@ -686,6 +696,41 @@ export function makePipelineEvent<P>(
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Phase F6 — match an effectKey against a per-repo scope token.
+ * Effect keys produced by the dashboard's pipeline-stages embed the
+ * repo name as a `-` / `:`-delimited token, e.g.
+ *   specs:spawn-service-a            → matches scope "service-a"
+ *   build:write-service-a            → matches "service-a"
+ *   build:spawn-task-service-a-T1    → matches "service-a" (followed by "-T1")
+ *   build:repo-data                  → matches "data" but NOT "data-x"
+ *
+ * We use boundary-aware substring matching: the scope must appear
+ * surrounded by `-`, `:`, or string boundaries on both sides so
+ * "a" doesn't spuriously match "service-a", and "data" doesn't
+ * match "metadata".
+ *
+ * System primitives (`__anvil_*`) and signals (`__signal:*`) are
+ * scope-shared — they ride along on whichever per-repo runtime
+ * happens to call them.
+ */
+function effectKeyMatchesScope(key: string | null | undefined, scope: string): boolean {
+  if (!key) return false;
+  if (key.startsWith('__anvil_')) return true;
+  if (key.startsWith('__signal:')) return true;
+  // Find scope token at any position with delimited boundaries.
+  let idx = key.indexOf(scope);
+  while (idx >= 0) {
+    const before = idx === 0 ? '' : key[idx - 1];
+    const afterIdx = idx + scope.length;
+    const after = afterIdx >= key.length ? '' : key[afterIdx];
+    const isBoundary = (c: string) => c === '' || c === '-' || c === ':';
+    if (isBoundary(before) && isBoundary(after)) return true;
+    idx = key.indexOf(scope, idx + 1);
+  }
+  return false;
 }
 
 // ── Non-durable mode passthroughs (Phase D2) ──────────────────────

@@ -49,6 +49,18 @@ export interface EffectRuntimeDeps {
   stepId: string;
   /** Pre-loaded effect events for this step. Populated on construction. */
   recordedEffects: EffectEventPair[];
+  /**
+   * Optional predicate restricting which recordedEffects this runtime
+   * will replay. Used by per-repo fanout: the walker constructs one
+   * EffectRuntime per repo iteration with the *same* events array
+   * (all repos share `stepId`), but each runtime needs to see only
+   * its own repo's effects to keep the per-step `idx` counter in
+   * sync. Default: pass-all.
+   *
+   * Phase F6 — fixes a per-repo replay bug where parallel runtimes
+   * cross-pollinated each other's recorded effect cursor.
+   */
+  effectFilter?: (pair: EffectEventPair) => boolean;
   /** Real wall clock — used to derive a timestamp for live effects. */
   realNow?: () => number;
   /** Test seam — replace `setTimeout`. */
@@ -58,14 +70,19 @@ export interface EffectRuntimeDeps {
 
 export class EffectRuntime {
   private idx = 0;
-  /** Position in `recordedEffects` we are about to replay (inclusive). */
+  /** Position in `filtered` we are about to replay (inclusive). */
   private cursor = 0;
+  /** Filtered view of recordedEffects, scoped via deps.effectFilter. */
+  private readonly filtered: EffectEventPair[];
   private readonly realNow: () => number;
   private readonly realSleep: (ms: number) => Promise<void>;
 
   constructor(private readonly deps: EffectRuntimeDeps) {
     this.realNow = deps.realNow ?? Date.now;
     this.realSleep = deps.realSleep ?? defaultSleep;
+    this.filtered = deps.effectFilter
+      ? deps.recordedEffects.filter(deps.effectFilter)
+      : deps.recordedEffects;
   }
 
   async effect<T>(name: string, fn: () => Promise<T>, opts: EffectOptions = {}): Promise<T> {
@@ -101,8 +118,8 @@ export class EffectRuntime {
     // signal queue (live). Recording a `signal:received` event marks
     // the consumption point.
     const idx = this.idx++;
-    if (this.cursor < this.deps.recordedEffects.length) {
-      const next = this.deps.recordedEffects[this.cursor];
+    if (this.cursor < this.filtered.length) {
+      const next = this.filtered[this.cursor];
       const expectedKey = `__signal:${channel}`;
       if (next.started.effectKey === expectedKey && next.started.effectIdx === idx) {
         this.cursor++;
@@ -159,8 +176,8 @@ export class EffectRuntime {
     const idx = this.idx++;
 
     // Replay path — does the log already have this call?
-    if (this.cursor < this.deps.recordedEffects.length) {
-      const next = this.deps.recordedEffects[this.cursor];
+    if (this.cursor < this.filtered.length) {
+      const next = this.filtered[this.cursor];
       if (next.started.effectIdx !== idx) {
         throw new DeterminismViolationError(
           this.deps.runId,
