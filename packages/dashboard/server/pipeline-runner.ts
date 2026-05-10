@@ -13,7 +13,6 @@ import { EventEmitter } from 'node:events';
 import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { execSync, spawn as cpSpawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { AgentManager } from '@esankhan3/anvil-agent-core';
 import { ProjectLoader } from './project-loader.js';
@@ -42,6 +41,14 @@ import {
   prefetchProviderLiveness as prefetchProviderLivenessBridge,
   type ModelResolutionDeps,
 } from './model-resolution.js';
+import {
+  ensureAuth as ensureAuthBridge,
+  writePerRepoTelemetry as writePerRepoTelemetryFn,
+  handleOutputTruncation as handleOutputTruncationFn,
+  aggregateRunTokens as aggregateRunTokensFn,
+  logCacheTelemetry as logCacheTelemetryFn,
+  type RunnerTelemetryDeps,
+} from './runner-telemetry.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -90,11 +97,7 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import {
-  runWithChainFallback,
-  writePerRepoTelemetry as writePerRepoTelemetryShared,
-  formatTelemetrySummary,
-} from '@esankhan3/anvil-core-pipeline';
+import { runWithChainFallback } from '@esankhan3/anvil-core-pipeline';
 import { AgentManagerRunner } from './runners/agent-manager-runner.js';
 import { AgentManagerSession } from './runners/agent-manager-session.js';
 import { buildStandardStepRegistry } from '@esankhan3/anvil-core-pipeline';
@@ -139,66 +142,8 @@ import {
   createFeatureBranches as createFeatureBranchesHelper,
 } from './steps/workspace-ops.js';
 
-// ── Claude CLI binary ────────────────────────────────────────────────
-
-const CLAUDE_BIN = process.env.ANVIL_AGENT_CMD ?? process.env.FF_AGENT_CMD ?? process.env.CLAUDE_BIN ?? 'claude';
-
-// ── Auth helpers ─────────────────────────────────────────────────────
-
-/**
- * Check if the Claude CLI is authenticated.
- * Returns true if logged in, false otherwise.
- */
-function checkClaudeAuth(): boolean {
-  try {
-    const out = execSync(`${CLAUDE_BIN} auth status --json`, { timeout: 10_000, stdio: ['pipe', 'pipe', 'pipe'] });
-    const status = JSON.parse(out.toString());
-    return status.loggedIn === true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Trigger an automatic re-login via `claude auth login`.
- * Opens the browser for OAuth and polls until auth succeeds or times out.
- * Returns true if re-auth succeeded.
- */
-function refreshClaudeAuth(timeoutMs = 120_000): Promise<boolean> {
-  return new Promise((resolve) => {
-    // Spawn login process — opens browser automatically
-    const loginProc = cpSpawn(CLAUDE_BIN, ['auth', 'login'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    const deadline = Date.now() + timeoutMs;
-
-    // Poll auth status until it succeeds or we time out
-    const poll = () => {
-      if (Date.now() > deadline) {
-        loginProc.kill();
-        resolve(false);
-        return;
-      }
-      if (checkClaudeAuth()) {
-        loginProc.kill();
-        resolve(true);
-        return;
-      }
-      setTimeout(poll, 2000);
-    };
-
-    // Give the browser a moment to open before polling
-    setTimeout(poll, 3000);
-
-    loginProc.on('exit', () => {
-      // Check one final time after login process exits
-      setTimeout(() => resolve(checkClaudeAuth()), 500);
-    });
-
-    loginProc.on('error', () => resolve(false));
-  });
-}
+// Claude auth helpers live in `./claude-auth.ts`; the runner consumes
+// them indirectly through `runner-telemetry.ensureAuth`.
 
 // Phase 4f.7: Persona prompt loader + injectTemplateVars now live in
 // `./steps/prompt-builders.ts` so the lifted prompt-builder functions can
@@ -1821,74 +1766,21 @@ export class PipelineRunner extends EventEmitter {
    *   4. Opens the login flow automatically
    *   5. Polls until auth succeeds, then resumes
    */
-  private async ensureAuth(stageName: string): Promise<void> {
-    // Only relevant for Claude CLI models
-    const model = this.resolveModelForStage(stageName);
-    if (!model.startsWith('claude-') && model !== 'claude') return;
-
-    if (checkClaudeAuth()) return; // Still valid
-
-    console.warn(`[pipeline] Auth expired before "${stageName}" — pausing for re-login...`);
-
-    // Checkpoint so the pipeline can be resumed even if the server restarts
-    this.checkpoint();
-
-    // Update pipeline state to reflect auth-waiting status
-    this.state.status = 'waiting';
-    this.state.waitingForInput = true;
-    this.broadcastState();
-
-    // Emit events — dashboard-server will broadcast to frontend for notification
-    this.emit('auth-required', {
-      stageName,
-      message: `Authentication expired before "${stageName}" stage. Opening browser for re-login — pipeline will resume automatically.`,
-    });
-
-    this.emit('project-event', {
-      source: 'auth',
-      message: `Authentication expired — opening browser for re-login. Pipeline will resume automatically once logged in.`,
-      level: 'warn',
-    });
-
-    // Auto-open the login flow and poll until it succeeds
-    const ok = await refreshClaudeAuth(600_000); // 10 min timeout
-
-    if (!ok) {
-      // Checkpoint as failed so user can resume later
-      this.state.status = 'failed';
-      this.state.waitingForInput = false;
-      this.broadcastState();
-      this.checkpoint();
-      throw new Error(
-        `Authentication expired and automatic re-login timed out after 10 minutes. ` +
-        `Run "claude auth login" manually, then resume the pipeline from the "${stageName}" stage.`
-      );
-    }
-
-    // Auth restored — resume pipeline
-    console.log(`[pipeline] Re-authentication successful — resuming "${stageName}"`);
-    this.state.status = 'running';
-    this.state.waitingForInput = false;
-    this.broadcastState();
-
-    this.emit('project-event', {
-      source: 'auth',
-      message: `Re-authentication successful — resuming pipeline.`,
-    });
+  /** Bundle the runner-telemetry dep set. Lazy refs; one-time per call. */
+  private depsForTelemetry(): RunnerTelemetryDeps {
+    return {
+      state: this.state,
+      broadcast: () => this.broadcastState(),
+      checkpoint: () => this.checkpoint(),
+      emit: (event, payload) => this.emit(event as 'auth-required' | 'project-event', payload as never),
+      resolveModel: (stageName) => this.resolveModelForStage(stageName),
+    };
   }
 
-  /**
-   * Phase 3 — Output-truncation telemetry hook. Called when an agent's
-   * stop_reason indicates the max-tokens ceiling was reached. Surfaces a
-   * warning so users can raise the per-stage limit in STAGE_OUTPUT_LIMITS
-   * if a stage repeatedly hits its cap. No-op when no stopReason is set.
-   */
-  /**
-   * Persist per-repo agent stats next to the run record so silent-empty
-   * artifacts (status: 'completed', cost: 0, error: null) leave a
-   * forensic trail. File format is JSONL — appended once per repo per
-   * stage. Failures are non-fatal so a write hiccup never breaks a run.
-   */
+  private ensureAuth(stageName: string): Promise<void> {
+    return ensureAuthBridge(this.depsForTelemetry(), stageName);
+  }
+
   private writePerRepoTelemetry(
     stageName: string,
     repoName: string,
@@ -1901,88 +1793,19 @@ export class PipelineRunner extends EventEmitter {
       costUsd: number;
     },
   ): void {
-    // Delegates to the canonical writer in core-pipeline. The on-record
-    // callback turns the JSONL line into a project-event so the dashboard
-    // activity log surfaces silent-empty failures without grepping disk.
-    writePerRepoTelemetryShared(
-      {
-        runId: this.state.runId,
-        onRecord: (record) => {
-          this.emit('project-event', {
-            source: 'pipeline',
-            message: formatTelemetrySummary(record),
-          });
-        },
-      },
-      { stage: stageName, repo: repoName, ...stats },
-    );
+    writePerRepoTelemetryFn(this.depsForTelemetry(), stageName, repoName, stats);
   }
 
   private handleOutputTruncation(agentName: string, outputTokens: number): void {
-    const message = `[pipeline] Output truncated for ${agentName} at ${outputTokens} tokens (max_tokens reached). Consider raising STAGE_OUTPUT_LIMITS.`;
-    if (process.env.ANVIL_LOG_OUTPUT_TRUNCATIONS === '1') {
-      console.warn(message);
-    }
-    try {
-      this.emit('project-event', {
-        source: 'pipeline',
-        message,
-      });
-    } catch {
-      /* defensive — emit must never break the run */
-    }
+    handleOutputTruncationFn(this.depsForTelemetry(), agentName, outputTokens);
   }
 
-  // ── Token / cache telemetry (Phase 1 of TOKEN-OPTIMIZATION-PLAN) ──────
-
-  /**
-   * Roll a single stage's token totals into the run-level aggregate. The
-   * cache-hit ratio is computed against the BILLABLE side (input tokens
-   * sent fresh + cache reads) — output and cache writes are excluded since
-   * they don't represent prompt-cache opportunities.
-   */
   private aggregateRunTokens(t: StageTokenStats): void {
-    const prev = this.state.tokens ?? {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      cacheWriteTokens: 0,
-      cacheHitRatio: 0,
-    };
-    const inputTokens = prev.inputTokens + t.inputTokens;
-    const outputTokens = prev.outputTokens + t.outputTokens;
-    const cacheReadTokens = prev.cacheReadTokens + t.cacheReadTokens;
-    const cacheWriteTokens = prev.cacheWriteTokens + t.cacheWriteTokens;
-    const denom = inputTokens + cacheReadTokens;
-    this.state.tokens = {
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheWriteTokens,
-      cacheHitRatio: denom > 0 ? cacheReadTokens / denom : 0,
-    };
+    aggregateRunTokensFn(this.depsForTelemetry(), t);
   }
 
-  /**
-   * Log the cache-hit ratio for one stage. The denominator is the billable
-   * input side (input + cache reads); cache writes pay one full price the
-   * first call and amortise for `cacheTtlSeconds` after, so we surface
-   * them but don't include them in the ratio.
-   */
   private logCacheTelemetry(stageName: string, t: StageTokenStats): void {
-    const denom = t.inputTokens + t.cacheReadTokens;
-    const ratio = denom > 0 ? t.cacheReadTokens / denom : 0;
-    const pct = (ratio * 100).toFixed(1);
-    console.log(
-      `[cache] stage=${stageName} hit=${t.cacheReadTokens}/${denom} (${pct}%)`
-      + ` write=${t.cacheWriteTokens} input=${t.inputTokens} output=${t.outputTokens}`,
-    );
-    try {
-      this.emit('project-event', {
-        source: 'cache',
-        message: `Stage "${stageName}" cache hit ${pct}% (${t.cacheReadTokens.toLocaleString()} of ${denom.toLocaleString()} input-side tokens served from cache)`,
-      });
-    } catch { /* defensive */ }
+    logCacheTelemetryFn(this.depsForTelemetry(), stageName, t);
   }
 
   /**
