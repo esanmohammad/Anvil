@@ -291,6 +291,7 @@ export {
   PR_URL_REGEX,
   attachLivenessPrefetchHook,
   migrateLegacyCheckpoint,
+  attachDurableLogHook,
 } from './hooks/index.js';
 export type {
   AuditLogHookOptions,
@@ -331,6 +332,8 @@ export type {
   LivenessPrefetchHookHandle,
   LegacyPipelineCheckpoint,
   MigratedCheckpointShared,
+  DurableLogHookOptions,
+  DurableLogHookHandle,
 } from './hooks/index.js';
 export { VERSION } from './version.js';
 

@@ -37,6 +37,8 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 import { AgentManager, type AgentState } from '@esankhan3/anvil-agent-core';
 import { PipelineRunner } from './pipeline-runner.js';
+import { getDurableStore } from './durable-store-singleton.js';
+import { runDurableMigration } from './durable-migration.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import type { PipelineRunState } from './pipeline-runner.js';
@@ -7324,6 +7326,21 @@ Findings array may be empty. No prose outside the JSON block.`;
     sleeptimeTimer = setInterval(runSleeptime, sleeptimeIntervalMs);
     sleeptimeTimer.unref?.();
     console.log(`[dashboard] sleeptime consolidation every ${Math.round(sleeptimeIntervalMs / 60_000)}m`);
+  }
+
+  // Phase D3: Pattern-1 → Pattern-2 migration. Scan for in-flight
+  // runs that lack a row in the durable store and mark them as
+  // failed so the user knows to rerun. No artifacts are touched.
+  try {
+    const durableStore = getDurableStore();
+    const migrationStats = await runDurableMigration(durableStore);
+    if (migrationStats.scanned > 0) {
+      console.log(
+        `[dashboard] durable migration: scanned=${migrationStats.scanned} migrated=${migrationStats.migrated} errors=${migrationStats.errors}`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[dashboard] durable migration skipped: ${err instanceof Error ? err.message : err}`);
   }
 
   return new Promise(() => {

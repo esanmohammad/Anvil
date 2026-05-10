@@ -99,9 +99,10 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper } from '@esankhan3/anvil-core-pipeline';
+import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper, attachDurableLogHook } from '@esankhan3/anvil-core-pipeline';
 import { attachPipelineHooks } from './pipeline-hooks.js';
 import { runPipelineLoop } from './pipeline-loop.js';
+import { getDurableStore, durableHolderId } from './durable-store-singleton.js';
 import { DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
 import { type PromptBuilderContext } from '@esankhan3/anvil-core-pipeline';
@@ -495,6 +496,37 @@ export class PipelineRunner extends EventEmitter {
         broadcast: () => this.broadcastState(),
         prefetchProviderLiveness: () => this.prefetchProviderLiveness(),
       });
+
+      // Phase D3: durable store integration. Open the singleton,
+      // create/upsert a `runs` row for this runId, attach the
+      // durable-log hook so step:* events are persisted, and
+      // pass the store down to the Pipeline walker so step
+      // bodies that opt into ctx.effect get checkpointed.
+      const durableStore = getDurableStore();
+      const durableHolder = durableHolderId();
+      let durableHookHandle: { unsubscribe(): void } | null = null;
+      if (durableStore) {
+        try {
+          await durableStore.createRun({
+            runId: this.state.runId,
+            project: this.config.project,
+            feature: this.config.feature,
+            featureSlug: this.state.featureSlug,
+          });
+          await durableStore.acquireLease(this.state.runId, durableHolder, 60_000);
+          await durableStore.updateRunStatus(this.state.runId, 'running', null);
+          durableHookHandle = attachDurableLogHook(
+            this.pipelineBus,
+            durableStore,
+            this.state.runId,
+          );
+        } catch (err) {
+          console.warn(
+            `[pipeline-runner] Durable store wiring failed; continuing in non-durable mode: ${err instanceof Error ? err.message : err}`,
+          );
+        }
+      }
+
       let loopResult;
       try {
         loopResult = await runPipelineLoop({
@@ -508,11 +540,29 @@ export class PipelineRunner extends EventEmitter {
           resumeStage,
           initialPrevArtifact: prevArtifact,
           isCancelled: () => this.cancelled,
+          ...(durableStore ? { durableStore, durableHolder } : {}),
         });
       } finally {
         hooksHandle.detach();
+        durableHookHandle?.unsubscribe();
+        if (durableStore) {
+          try {
+            await durableStore.releaseLease(this.state.runId, durableHolder);
+          } catch {
+            /* swallow — best-effort release */
+          }
+        }
       }
-      if (loopResult.pipelineEarlyReturn) return this.state;
+      if (loopResult.pipelineEarlyReturn) {
+        if (durableStore) {
+          try {
+            await durableStore.updateRunStatus(this.state.runId, 'failed');
+          } catch {
+            /* swallow */
+          }
+        }
+        return this.state;
+      }
 
       if (!this.cancelled) {
         this.state.status = 'completed';
@@ -523,6 +573,19 @@ export class PipelineRunner extends EventEmitter {
           status: 'completed',
           totalCost: this.state.totalCost,
         });
+        if (durableStore) {
+          try {
+            await durableStore.updateRunStatus(this.state.runId, 'completed');
+          } catch {
+            /* swallow */
+          }
+        }
+      } else if (durableStore) {
+        try {
+          await durableStore.updateRunStatus(this.state.runId, 'cancelled');
+        } catch {
+          /* swallow */
+        }
       }
     } catch (err) {
       console.error('[pipeline-runner] Fatal error:', err);
@@ -530,6 +593,14 @@ export class PipelineRunner extends EventEmitter {
       this.broadcastState();
       this.checkpoint(); // Save: fatal failure
       this.emit('pipeline-fail', this.state);
+      const fallbackStore = getDurableStore();
+      if (fallbackStore) {
+        try {
+          await fallbackStore.updateRunStatus(this.state.runId, 'failed');
+        } catch {
+          /* swallow */
+        }
+      }
     }
 
     return this.state;

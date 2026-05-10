@@ -11,6 +11,7 @@ import {
   Pipeline,
   buildStandardStepRegistry,
   type EventBus,
+  type DurableStore,
 } from '@esankhan3/anvil-core-pipeline';
 import { runOneStage as runOneStageFn, type StageOpsDeps } from './pipeline-stages.js';
 import { renderPlanDerivedArtifact as renderPlanDerivedArtifactBridge } from './manifest-bridge.js';
@@ -31,6 +32,14 @@ export interface PipelineLoopOpts {
   resumeStage: number;
   initialPrevArtifact: string;
   isCancelled: () => boolean;
+  /**
+   * Optional durable store — when supplied, every Pipeline.run() in
+   * the loop checkpoints step + effect events and the runner can
+   * resume cross-process. Phase D3 of the durable execution rollout.
+   */
+  durableStore?: DurableStore;
+  /** Lease holder identity (e.g. `${pid}@${hostname}`). Required when durableStore is set. */
+  durableHolder?: string;
 }
 
 export interface PipelineLoopResult {
@@ -105,6 +114,7 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
         initialInput: stageState.prevArtifact,
         repoPaths: opts.repoPaths(),
         ...(rewindToStep ? { rewindTo: rewindToStep } : {}),
+        ...(opts.durableStore ? { durableStore: opts.durableStore, durableHolder: opts.durableHolder } : {}),
       });
       await pipeline.run();
       break;

@@ -146,8 +146,8 @@ describe('Pipeline + DurableStore — crash recovery', () => {
 
 describe('Pipeline + DurableStore — non-durable mode is unchanged', () => {
   it('runs without a store and step bodies still work', async () => {
-    const counters: Counters = { step1: 0, step2: 0, step3: 0, effectA: 0, effectB: 0 };
-    const reg = makeRegistry(counters, /* throwOnEffectB */ false);
+    const counters: Counters = { step1: 0, step2: 0, step3: 0, effectA1: 0, effectA2: 0, effectB: 0 };
+    const reg = makeRegistry(counters, /* throwAfterEffectA */ false);
     const bus = new InMemoryEventBus();
     const pipeline = new Pipeline({
       registry: reg,
