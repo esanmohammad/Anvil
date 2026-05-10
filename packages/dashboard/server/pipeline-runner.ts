@@ -21,7 +21,6 @@ import type { ProjectInfo } from './project-loader.js';
 import { FeatureStore } from './feature-store.js';
 import { MemoryStore } from './memory-store.js';
 import { KnowledgeBaseManager } from './knowledge-base-manager.js';
-import { resolveModelByTier } from '@esankhan3/anvil-agent-core';
 import {
   writePipelineCheckpoint,
   clearPipelineCheckpoint,
@@ -37,6 +36,12 @@ import {
   clearManifestFieldsForStages as clearManifestFieldsForStagesBridge,
   type ManifestBridgeDeps,
 } from './manifest-bridge.js';
+import {
+  resolveModelForStage as resolveModelForStageBridge,
+  allowedToolsForCurrentStage as allowedToolsForCurrentStageBridge,
+  prefetchProviderLiveness as prefetchProviderLivenessBridge,
+  type ModelResolutionDeps,
+} from './model-resolution.js';
 // Type declarations + module-level constants live in a sibling file
 // so this orchestrator stays focused on logic. Re-exported below for
 // back-compat with consumers that import these from `./pipeline-runner.js`.
@@ -59,8 +64,6 @@ import {
   STAGE_OUTPUT_LIMIT_FALLBACK,
   maxOutputTokensForStage,
   listStageNames,
-  LOCAL_TIER_STAGES,
-  providerOfModelId,
   zeroTokenStats,
   sumTokenStats,
   readCheckpoint,
@@ -88,11 +91,6 @@ export {
   findInterruptedPipelines,
 };
 import {
-  resolveModelForStage as registryResolveStage,
-  ModelResolutionError,
-  UnknownStageError,
-  allowedToolsForStage,
-  permissionClassesForStage,
   runWithChainFallback,
   writePerRepoTelemetry as writePerRepoTelemetryShared,
   formatTelemetrySummary,
@@ -111,9 +109,8 @@ import {
   attachLivenessPrefetchHook,
   attachDashboardStateRollupHook,
 } from '@esankhan3/anvil-core-pipeline';
-import { pickAliveModelFromChainSync, prefetchLiveness, setLivenessTtlMs } from './provider-liveness.js';
-import { loadModelRegistry, DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
-import type { ModelRegistry, ProviderName, WalkerConfig } from '@esankhan3/anvil-agent-core';
+import { DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
+import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
 import { parseTasks, bundleFiles, type ParsedTask } from '@esankhan3/anvil-core-pipeline';
 import { sliceSpecForRefs } from '@esankhan3/anvil-core-pipeline';
 import { enforceBudget, type PromptSection } from '@esankhan3/anvil-core-pipeline';
@@ -449,171 +446,29 @@ export class PipelineRunner extends EventEmitter {
     return this.state;
   }
 
-  /**
-   * Resolve which model to use for a given stage.
-   * Priority: factory.yaml per-stage override → tier-based dynamic routing → single model fallback.
-   *
-   * Tier routing resolves model IDs from the provider registry at runtime,
-   * so new models are picked up automatically without code changes.
-   */
+  /** Bundle the model-resolution dep set. Lazy refs; one-time per call. */
+  private depsForResolution(): ModelResolutionDeps {
+    return {
+      config: this.config,
+      projectLoader: this.projectLoader,
+      state: this.state,
+      runtimeBurnedModels: this.runtimeBurnedModels,
+      livenessFallbackNotified: this.livenessFallbackNotified,
+      emitProjectEvent: (payload) => this.emit('project-event', payload),
+      broadcast: () => this.broadcastState(),
+    };
+  }
+
   private resolveModelForStage(stageName: string): string {
-    const picked = this.pickModelForStage(stageName);
-    this.recordResolvedStageState(stageName, picked);
-    return picked;
+    return resolveModelForStageBridge(this.depsForResolution(), stageName);
   }
 
-  /**
-   * Pure resolution chain — no state mutation. Extracted so the public
-   * resolver can layer on the state-recording side effect for UI surfacing.
-   */
-  private pickModelForStage(stageName: string): string {
-    // 1. factory.yaml per-stage override always wins (project-specific
-    //    pinning beats every other rule).
-    const yamlModels = this.projectLoader.getConfig(this.config.project)?.pipeline?.models;
-    if (yamlModels?.[stageName]) return yamlModels[stageName];
-
-    // 2. Registry-driven resolver — reads stage-policy.yaml +
-    //    ~/.anvil/models.yaml and picks the cheapest model that meets
-    //    the stage's capability/complexity bar. This is where local
-    //    routing finally kicks in for clarify/build/etc when Ollama
-    //    is up; falls through to legacy paths if the registry is
-    //    missing or doesn't cover the stage.
-    try {
-      const resolved = registryResolveStage(stageName);
-      // Phase 11 — walk the resolved chain via the liveness cache,
-      // skipping models burned earlier this run (retryable upstream
-      // failures). When the primary's provider is dead OR its model
-      // is burned, we fall to the next live tier instead of letting
-      // the adapter throw mid-stage. The cache is pre-warmed at
-      // run start; the burn-set is mutated by runStageWithFallback.
-      const picked = pickAliveModelFromChainSync(
-        resolved,
-        providerOfModelId,
-        this.runtimeBurnedModels,
-      );
-      if (picked.fellBackFrom) {
-        console.warn(
-          `[pipeline] ${stageName}: ${picked.fellBackFrom} skipped; falling back to ${picked.model}`,
-        );
-        const key = `${stageName}|${picked.fellBackFrom}->${picked.model}`;
-        if (!this.livenessFallbackNotified.has(key)) {
-          this.livenessFallbackNotified.add(key);
-          this.emit('project-event', {
-            source: 'routing',
-            message: `${picked.fellBackFrom} unavailable for ${stageName} (provider auth/liveness); falling back to ${picked.model}`,
-            level: 'warn',
-          });
-        }
-      }
-      return picked.model;
-    } catch (err) {
-      if (err instanceof UnknownStageError) {
-        // Stage not declared in policy yaml — drop to legacy paths.
-      } else if (err instanceof ModelResolutionError) {
-        // Policy declares it but no model satisfies — log + fall through.
-        console.warn(`[pipeline] resolver: ${err.message}; falling back to legacy chain`);
-      } else {
-        console.warn(`[pipeline] resolver crashed:`, err);
-      }
-    }
-
-    // 3. ANVIL_LOCAL_MODEL legacy override — kept for deterministic
-    //    local runs that bypass the registry entirely. Stays off by
-    //    default; only fires when the env var is explicitly set.
-    const localModel = process.env.ANVIL_LOCAL_MODEL?.trim();
-    if (localModel && LOCAL_TIER_STAGES.has(stageName)) {
-      return localModel;
-    }
-
-    // 4. If no tier selected, use the single model from the UI dropdown
-    const tier = this.config.modelTier;
-    if (!tier) return this.config.model;
-
-    // 5. Tier-based legacy routing — last resort
-    return resolveModelByTier(tier, stageName, this.config.model);
-  }
-
-  /**
-   * Per-stage tool-permission set, populated into SpawnConfig.allowedTools
-   * so the agent-core LanguageModelBridge can construct a properly-scoped
-   * BuiltinToolExecutor for non-Claude providers. Claude CLI uses its own
-   * tool allow/deny list (driven by persona); for Claude paths this
-   * supplies the same intent but is harmless when Claude ignores it.
-   *
-   * Resolution: stage-policy default → factory.yaml allow extends →
-   * factory.yaml deny strips. Empty result falls back to read-only so a
-   * misconfigured deny list can't accidentally silence the agent.
-   */
   private allowedToolsForCurrentStage(stageName: string): string[] {
-    const base = new Set(allowedToolsForStage(stageName));
-    const overrides = this.projectLoader
-      .getConfig(this.config.project)?.pipeline?.permissions?.[stageName];
-    if (overrides?.allow_tools) for (const t of overrides.allow_tools) base.add(t);
-    if (overrides?.deny_tools) for (const t of overrides.deny_tools) base.delete(t);
-    if (base.size === 0) return ['read_file', 'grep', 'glob', 'list'];
-    return [...base].sort();
+    return allowedToolsForCurrentStageBridge(this.depsForResolution(), stageName);
   }
 
-  /**
-   * Pre-warm the provider-liveness cache so the sync resolver chain
-   * walker has fresh data. Called once at pipeline start. Probes run
-   * in parallel; failures are non-fatal.
-   */
   protected async prefetchProviderLiveness(): Promise<void> {
-    // Load the walker block from ~/.anvil/models.yaml + apply its TTL
-    // override before any cache writes happen. Failures are non-fatal —
-    // if the registry can't be read we keep the compiled-in defaults.
-    let registry: ModelRegistry | null = null;
-    try {
-      registry = loadModelRegistry();
-      this.walkerConfig = registry.walker;
-      setLivenessTtlMs(this.walkerConfig.liveness_ttl_ms);
-    } catch (err) {
-      console.warn(`[pipeline] walker: registry load failed, using defaults: ${(err as Error).message}`);
-      this.walkerConfig = { ...DEFAULT_WALKER_CONFIG };
-    }
-
-    // Auto-derive the prefetch list from registry providers. Falls back
-    // to the canonical superset when the registry is empty so probes
-    // still light up for clean installs.
-    const providers = registry && registry.models.length > 0
-      ? Array.from(new Set(registry.models.map((m) => m.provider)))
-      : ['ollama', 'claude', 'openai', 'openrouter', 'gemini', 'gemini-cli', 'opencode', 'adk'] as ProviderName[];
-    await prefetchLiveness(providers);
-  }
-
-  /**
-   * Wrap a stage spawn with chain-fallback on retryable upstream
-   * errors. When the inner attempt throws an UpstreamError-shape with
-   * `retryable === true` (429 quota, rate-limit, 5xx), the failed
-   * model is added to `runtimeBurnedModels` and the stage is retried
-   * with the next chain entry. Caps at MAX_FALLBACK_ATTEMPTS so a
-   * fully-broken chain surfaces quickly instead of looping forever.
-   *
-   * Non-retryable errors (auth, 400 bad request, the user's own
-   * cancel) propagate unchanged — those need a config fix, not a
-   * retry.
-   */
-  // runStageWithFallback removed — clarify + fix-loop now call
-  // runWithChainFallback (from core-pipeline) directly with their own
-  // resolver + onBurn closures.
-
-  /**
-   * Stamp the per-stage state with the resolved model + permission set
-   * the moment the resolver is consulted. Called from resolveModelForStage
-   * which fires once per stage entry, so the UI sees the routing
-   * decision in real time.
-   */
-  private recordResolvedStageState(stageName: string, model: string): void {
-    const stageIdx = this.state.stages.findIndex((s) => s.name === stageName);
-    if (stageIdx === -1) return;
-    const stage = this.state.stages[stageIdx];
-    // Don't clobber an explicit override that's already been recorded
-    // (e.g. by an earlier per-task call within the same stage).
-    if (stage.resolvedModel && stage.resolvedModel === model) return;
-    stage.resolvedModel = model;
-    stage.permissionClasses = permissionClassesForStage(stageName);
-    this.broadcastState();
+    this.walkerConfig = await prefetchProviderLivenessBridge();
   }
 
   /**
