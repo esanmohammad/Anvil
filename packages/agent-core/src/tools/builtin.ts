@@ -197,6 +197,26 @@ type Handler = (args: Record<string, unknown>, ctx: ExecCtx) => Promise<ToolResu
 const HANDLERS: Record<string, Handler> = {
   read_file: async (args, ctx) => {
     const path = requireString(args.path, 'path');
+    // Phase P2 — sandbox dispatch first. The handle's read() resolves
+    // paths inside the sandbox workdir and refuses ../ escapes
+    // (identical guard to resolveSafe).
+    const handle = getCurrentSandboxHandle();
+    if (handle && typeof handle.read === 'function') {
+      try {
+        const offset = optionalInteger(args.offset, 'offset');
+        const limit = optionalInteger(args.limit, 'limit');
+        const readOpts: { offset?: number; limit?: number } = {};
+        if (offset !== undefined) readOpts.offset = offset;
+        if (limit !== undefined) readOpts.limit = limit;
+        const content = await handle.read(path, readOpts);
+        if (content.length > MAX_READ_BYTES) {
+          return { isError: false, content: content.slice(0, MAX_READ_BYTES) + `\n\n[truncated — ${content.length - MAX_READ_BYTES} more bytes]` };
+        }
+        return { isError: false, content };
+      } catch (err) {
+        return { isError: true, content: errorMessage(err) };
+      }
+    }
     const safe = resolveSafe(path, ctx.workingDir);
     const stat = statSync(safe);
     if (!stat.isFile()) return { isError: true, content: `"${path}" is not a regular file.` };
@@ -225,6 +245,16 @@ const HANDLERS: Record<string, Handler> = {
   write_file: async (args, ctx) => {
     const path = requireString(args.path, 'path');
     const content = requireString(args.content, 'content', { allowEmpty: true });
+    // Phase P2 — sandbox dispatch.
+    const handle = getCurrentSandboxHandle();
+    if (handle && typeof handle.write === 'function') {
+      try {
+        await handle.write(path, content);
+        return { isError: false, content: `Wrote ${content.length} bytes to ${path}` };
+      } catch (err) {
+        return { isError: true, content: errorMessage(err) };
+      }
+    }
     const safe = resolveSafe(path, ctx.workingDir);
     mkdirSync(dirname(safe), { recursive: true });
     writeFileSync(safe, content, 'utf8');
@@ -236,6 +266,20 @@ const HANDLERS: Record<string, Handler> = {
     const oldString = requireString(args.old_string, 'old_string', { allowEmpty: true });
     const newString = requireString(args.new_string, 'new_string', { allowEmpty: true });
     const replaceAll = args.replace_all === true;
+
+    // Phase P2 — sandbox dispatch.
+    const handle = getCurrentSandboxHandle();
+    if (handle && typeof handle.edit === 'function') {
+      if (oldString === '') {
+        return { isError: true, content: 'old_string must not be empty for edit; use write_file to create new content.' };
+      }
+      try {
+        await handle.edit(path, oldString, newString, replaceAll);
+        return { isError: false, content: `Edited ${path}` };
+      } catch (err) {
+        return { isError: true, content: errorMessage(err) };
+      }
+    }
 
     const safe = resolveSafe(path, ctx.workingDir);
     if (!existsSync(safe)) return { isError: true, content: `File not found: ${path}` };
@@ -274,6 +318,21 @@ const HANDLERS: Record<string, Handler> = {
 
   grep: async (args, ctx) => {
     const pattern = requireString(args.pattern, 'pattern');
+    // Phase P2 — sandbox dispatch.
+    const handle = getCurrentSandboxHandle();
+    if (handle && typeof handle.grep === 'function') {
+      try {
+        const pathArg = optionalString(args.path, 'path');
+        const globArg = optionalString(args.glob, 'glob');
+        const opts: { path?: string; glob?: string } = {};
+        if (pathArg !== undefined) opts.path = pathArg;
+        if (globArg !== undefined) opts.glob = globArg;
+        const stdout = await handle.grep(pattern, opts);
+        return { isError: false, content: stdout || '(no matches)' };
+      } catch (err) {
+        return { isError: true, content: errorMessage(err) };
+      }
+    }
     const target = args.path !== undefined ? resolveSafe(requireString(args.path, 'path'), ctx.workingDir) : ctx.workingDir;
     const globArg = optionalString(args.glob, 'glob');
     const argv = ['--no-heading', '--line-number', '--color=never', '-e', pattern];
@@ -284,6 +343,19 @@ const HANDLERS: Record<string, Handler> = {
 
   glob: async (args, ctx) => {
     const pattern = requireString(args.pattern, 'pattern');
+    // Phase P2 — sandbox dispatch.
+    const handle = getCurrentSandboxHandle();
+    if (handle && typeof handle.glob === 'function') {
+      try {
+        const pathArg = optionalString(args.path, 'path');
+        const opts: { path?: string } = {};
+        if (pathArg !== undefined) opts.path = pathArg;
+        const stdout = await handle.glob(pattern, opts);
+        return { isError: false, content: stdout || '(no matches)' };
+      } catch (err) {
+        return { isError: true, content: errorMessage(err) };
+      }
+    }
     const target = args.path !== undefined ? resolveSafe(requireString(args.path, 'path'), ctx.workingDir) : ctx.workingDir;
     // ripgrep's `--files --glob` is a portable globber that respects .gitignore.
     return runProcess('rg', ['--files', '--glob', pattern, target], ctx, DEFAULT_BASH_TIMEOUT_MS);

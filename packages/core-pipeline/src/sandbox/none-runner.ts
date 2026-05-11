@@ -93,6 +93,25 @@ export class NoneSandboxHandle implements SandboxHandle {
     await fsp.writeFile(abs, content.split(oldString).join(newString));
   }
 
+  async grep(pattern: string, opts?: { path?: string; glob?: string }): Promise<string> {
+    const targetRel = opts?.path ?? '.';
+    const targetAbs = this.resolveSafe(targetRel);
+    const argv = ['--no-heading', '--line-number', '--color=never', '-e', pattern];
+    if (opts?.glob) argv.push('--glob', opts.glob);
+    argv.push(targetAbs);
+    const r = await runHost({ command: ['rg', ...argv.map(shellQuoteIfNeeded)].join(' ') }, this.workdir, this.limits);
+    return r.stdout;
+  }
+
+  async glob(pattern: string, opts?: { path?: string }): Promise<string> {
+    const targetRel = opts?.path ?? '.';
+    const targetAbs = this.resolveSafe(targetRel);
+    const r = await runHost({
+      command: ['rg', '--files', '--glob', shellQuoteIfNeeded(pattern), targetAbs].join(' '),
+    }, this.workdir, this.limits);
+    return r.stdout;
+  }
+
   async syncToHost(_opts?: { mode?: 'merge' | 'replace' }): Promise<SandboxSyncResult> {
     void _opts;
     // Bind-mode equivalent — host IS the sandbox.
@@ -262,6 +281,12 @@ async function runHost(
       resolve(result);
     });
   });
+}
+
+function shellQuoteIfNeeded(s: string): string {
+  if (s.length === 0) return "''";
+  if (/^[A-Za-z0-9_./*-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 function pickTimeoutMs(args: SandboxExecArgs, limits: SandboxLimits): number {

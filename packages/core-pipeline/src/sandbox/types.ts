@@ -133,6 +133,22 @@ export interface SandboxHandle {
   edit(path: string, oldString: string, newString: string, replaceAll?: boolean): Promise<void>;
 
   /**
+   * Phase P2 — ripgrep dispatched inside the sandbox. Returns
+   * stdout from `rg --no-heading --line-number --color=never -e
+   * <pattern> <path>` (or workdir when path is omitted).
+   * Implementations cap output at 64 KiB to mirror the builtin
+   * runProcess behavior.
+   */
+  grep?(pattern: string, opts?: { path?: string; glob?: string }): Promise<string>;
+
+  /**
+   * Phase P2 — glob via `rg --files --glob <pattern> <path>` inside
+   * the sandbox. Returns one path per line, relative to the sandbox
+   * workdir.
+   */
+  glob?(pattern: string, opts?: { path?: string }): Promise<string>;
+
+  /**
    * Sync the sandbox's workdir back to the host workdir. Modes vary:
    *   - `'overlay'`: copy-on-write diff propagation.
    *   - `'bind'`: no-op — already shared.

@@ -170,6 +170,32 @@ export class DockerSandboxHandle implements SandboxHandle {
     await this.write(filePath, content.split(oldString).join(newString));
   }
 
+  async grep(pattern: string, opts?: { path?: string; glob?: string }): Promise<string> {
+    if (this.closed) throw new Error(`sandbox ${this.id} already closed`);
+    const target = opts?.path ? sandboxRelative(opts.path) : '.';
+    const globFlag = opts?.glob ? `--glob ${shellQuote(opts.glob)} ` : '';
+    const cmd = `rg --no-heading --line-number --color=never -e ${shellQuote(pattern)} ${globFlag}${shellQuote(target)}`;
+    const r = await this.runner.execInsideContainer(this.containerName, { command: cmd }, this.limits);
+    // ripgrep exits 1 when no matches; treat as empty result, not error.
+    if (r.exitCode === 1 && !r.stderr) return '';
+    if (r.exitCode !== 0 && r.exitCode !== 1) {
+      throw new Error(`sandbox grep failed (exit ${r.exitCode}): ${r.stderr}`);
+    }
+    return r.stdout;
+  }
+
+  async glob(pattern: string, opts?: { path?: string }): Promise<string> {
+    if (this.closed) throw new Error(`sandbox ${this.id} already closed`);
+    const target = opts?.path ? sandboxRelative(opts.path) : '.';
+    const cmd = `rg --files --glob ${shellQuote(pattern)} ${shellQuote(target)}`;
+    const r = await this.runner.execInsideContainer(this.containerName, { command: cmd }, this.limits);
+    if (r.exitCode === 1 && !r.stderr) return '';
+    if (r.exitCode !== 0 && r.exitCode !== 1) {
+      throw new Error(`sandbox glob failed (exit ${r.exitCode}): ${r.stderr}`);
+    }
+    return r.stdout;
+  }
+
   async syncToHost(opts?: { mode?: 'merge' | 'replace' }): Promise<SandboxSyncResult> {
     void opts;
     if (this.fsMode === 'bind' || this.fsMode === 'none') {
