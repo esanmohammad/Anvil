@@ -101,6 +101,12 @@ describe('DockerSandboxRunner — stub spawn', () => {
       if (typeof process.getuid === 'function') {
         assert.ok(runCall!.argv.includes('--user'));
       }
+      // P1 — default fsMode='overlay' (no explicit override) triggers
+      // the lower/upper/work triple. Assert lower bind is present.
+      assert.ok(
+        runCall!.argv.some((a) => a.includes('/workspace.lower')),
+        'expected /workspace.lower in default overlay mode',
+      );
     } finally {
       await fsp.rm(tempRoot, { recursive: true, force: true });
     }

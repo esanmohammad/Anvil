@@ -79,6 +79,13 @@ export class DockerSandboxHandle implements SandboxHandle {
   /** Baseline mtimes captured at acquire — used by overlay sync to
    *  detect host edits during the sandbox lifetime. */
   baselineMtimes: Map<string, number> | null = null;
+  /** Host-side path to the upper tmpdir (real overlay mode). The
+   *  container sees this at /workspace.upper. syncToHost walks this
+   *  tree to apply the diff. */
+  upperDir: string | null = null;
+  /** Host-side path to the work tmpdir (overlay requires it; we don't
+   *  read it, just clean up at close). */
+  workDir: string | null = null;
   busy = false;
   closed = false;
 
@@ -163,24 +170,36 @@ export class DockerSandboxHandle implements SandboxHandle {
     await this.write(filePath, content.split(oldString).join(newString));
   }
 
-  async syncToHost(_opts?: { mode?: 'merge' | 'replace' }): Promise<SandboxSyncResult> {
-    void _opts;
+  async syncToHost(opts?: { mode?: 'merge' | 'replace' }): Promise<SandboxSyncResult> {
+    void opts;
     if (this.fsMode === 'bind' || this.fsMode === 'none') {
       // Host already sees every write; nothing to propagate.
       return { added: [], modified: [], removed: [], conflictResolution: 'merged' };
     }
-    // F3 — overlay mode. The current implementation still uses a
-    // bind mount for the workdir (real overlayfs requires a tmpfs
-    // upper layer; that's a follow-up). Until then, applyOverlay
-    // surfaces post-hoc conflicts: scan the host workdir for
-    // baseline-drifted files and flag them via the conflicts list.
+    // P1 — real overlay. When upperDir is set, walk it for the diff
+    // and apply onto hostWorkdir via applyOverlay.
+    if (this.upperDir) {
+      const r = await applyOverlay(this.upperDir, this.hostWorkdir, {
+        ...(this.baselineMtimes ? { baselineMtimes: this.baselineMtimes } : {}),
+      }).catch((err) => {
+        // syncToHost should never throw — log and return empty.
+        // Future: surface via state broadcast.
+        void err;
+        return null;
+      });
+      if (!r) return { added: [], modified: [], removed: [], conflictResolution: 'merged' };
+      return {
+        added: r.added,
+        modified: r.modified,
+        removed: r.removed,
+        conflictResolution: r.conflictResolution,
+      };
+    }
+    // Overlay disabled (ANVIL_SANDBOX_REAL_OVERLAY=0) — fall back
+    // to F3 behavior: detect conflicts via baseline mtimes only.
     if (!this.baselineMtimes) {
       return { added: [], modified: [], removed: [], conflictResolution: 'merged' };
     }
-    // No upper directory yet — call applyOverlay on a "mirror of
-    // self" so it produces the conflict report without writing.
-    // When real overlay arrives, the upperRoot path comes from the
-    // tmpfs mount.
     const r = await applyOverlay(this.hostWorkdir, this.hostWorkdir, {
       dryRun: true,
       baselineMtimes: this.baselineMtimes,
@@ -219,6 +238,13 @@ export class DockerSandboxHandle implements SandboxHandle {
     if (this.closed) return;
     this.closed = true;
     await this.runner.removeContainer(this.containerName).catch(() => { /* best-effort */ });
+    // P1 — clean up host-side overlay tmpdirs unless the user opted
+    // out for debugging. The parent sandbox-state/<runId>/<stage>/<uuid>
+    // dir holds both upper + work; nuke the uuid level.
+    if (process.env.ANVIL_SANDBOX_KEEP_UPPER !== '1' && this.upperDir) {
+      const parent = path.dirname(this.upperDir);
+      await fsp.rm(parent, { recursive: true, force: true }).catch(() => { /* best-effort */ });
+    }
   }
 }
 
@@ -250,6 +276,24 @@ export class DockerSandboxRunner implements SandboxRunner {
       throw new Error(`hostWorkdir does not exist: ${hostWorkdir}`);
     });
 
+    const fsMode = opts.fsMode ?? 'overlay';
+
+    // P1 — when fsMode='overlay', materialize host-side upper + work
+    // tmpdirs that the container mounts via fuse-overlayfs. Path lives
+    // under the sandbox-state root so a crashed dashboard can find
+    // (and gc) orphaned upper trees later.
+    let upperDir: string | null = null;
+    let workDir: string | null = null;
+    if (fsMode === 'overlay' && process.env.ANVIL_SANDBOX_REAL_OVERLAY !== '0') {
+      const stateRoot = process.env.ANVIL_SANDBOX_STATE_ROOT
+        ?? path.join(process.env.HOME ?? '/tmp', '.anvil', 'sandbox-state');
+      const sandboxStateDir = path.join(stateRoot, opts.runId, opts.stage, randomUUID().slice(0, 8));
+      upperDir = path.join(sandboxStateDir, 'upper');
+      workDir = path.join(sandboxStateDir, 'work');
+      await fsp.mkdir(upperDir, { recursive: true });
+      await fsp.mkdir(workDir, { recursive: true });
+    }
+
     const cacheMounts = buildCacheMounts({
       defaultMode: this.opts.cacheMode,
     });
@@ -271,14 +315,33 @@ export class DockerSandboxRunner implements SandboxRunner {
           projectOverlay: undefined,
         })
       : null;
+    // P1 — overlay mount triple. When fsMode='overlay' AND the runner
+    // materialized upper/work tmpdirs, the entrypoint script
+    // (`anvil-init-overlay`) mounts fuse-overlayfs across them.
+    // Otherwise the legacy bind-mount path runs unchanged.
+    const overlayMounts: string[] = (upperDir && workDir)
+      ? [
+          '--mount', `type=bind,src=${hostWorkdir},dst=/workspace.lower,readonly`,
+          '--mount', `type=bind,src=${upperDir},dst=/workspace.upper`,
+          '--mount', `type=bind,src=${workDir},dst=/workspace.work`,
+          // fuse-overlayfs needs /dev/fuse access. macOS Docker Desktop
+          // exposes it via the underlying Linux VM.
+          '--device', '/dev/fuse',
+          // AppArmor on some hosts blocks fuse mounts without this.
+          '--security-opt', 'apparmor=unconfined',
+        ]
+      : [
+          // Legacy bind-mode — host = sandbox at /workspace.
+          '--mount', `type=bind,src=${hostWorkdir},dst=${SANDBOX_WORKDIR}`,
+        ];
+
     const args = [
       'run',
       '-d',                           // detached
       '--name', containerName,
       '--workdir', SANDBOX_WORKDIR,
       ...this.userArgs(),
-      // S2: bind-mount only. Overlay arrives in S3.
-      '--mount', `type=bind,src=${hostWorkdir},dst=${SANDBOX_WORKDIR}`,
+      ...overlayMounts,
       // S5: per-stage resource limits — memory, cpus, pids, disk.
       ...dockerRunLimitArgs(opts.limits),
       // S8: read-only package-manager cache mounts.
@@ -301,7 +364,6 @@ export class DockerSandboxRunner implements SandboxRunner {
       );
     }
 
-    const fsMode = opts.fsMode ?? 'overlay';
     const handle = new DockerSandboxHandle(this, {
       id: containerName,
       containerName,
@@ -310,6 +372,8 @@ export class DockerSandboxRunner implements SandboxRunner {
       limits: opts.limits ?? {},
       fsMode,
     });
+    if (upperDir) handle.upperDir = upperDir;
+    if (workDir) handle.workDir = workDir;
     if (fsMode === 'overlay') {
       // F3 — capture baseline mtimes so syncToHost can detect host
       // edits during the sandbox lifetime. Best-effort; failures

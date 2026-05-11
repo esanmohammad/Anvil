@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     dnsutils \
+    fuse-overlayfs \
     git \
     gnupg \
     jq \
@@ -35,6 +36,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     xz-utils \
   && rm -rf /var/lib/apt/lists/*
+
+# Copy the overlay init script. Runs as PID 1 (via tini) when the runner
+# passes the overlay mount triple; falls through to a plain shell when
+# the legacy bind-mount is detected (no /workspace.lower present).
+COPY init-overlay.sh /usr/local/bin/anvil-init-overlay
+RUN chmod +x /usr/local/bin/anvil-init-overlay
 
 # Node.js 22 (LTS) — matches the package.json engines for Anvil itself.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
@@ -57,5 +64,8 @@ WORKDIR /workspace
 USER anvil
 
 # `tini` is PID 1 so signals reach the user's process group cleanly.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# init-overlay.sh sets up fuse-overlayfs when the runner mounts a
+# `/workspace.lower` + `/workspace.upper` + `/workspace.work` triple;
+# otherwise it's a no-op and the container falls through to the CMD.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/anvil-init-overlay"]
 CMD ["sh", "-c", "tail -f /dev/null"]
