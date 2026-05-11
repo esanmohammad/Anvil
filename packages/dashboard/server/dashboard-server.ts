@@ -52,6 +52,7 @@ import {
 } from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import { registerSandboxRunnersAtBoot } from './sandbox/register-at-boot.js';
+import { installSandboxExecWrapper } from './sandbox/install-exec-wrapper.js';
 import type { PipelineRunState } from './pipeline-runner.js';
 import { ProjectLoader } from './project-loader.js';
 import type { ProjectRepo } from './project-loader.js';
@@ -945,6 +946,9 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   // registration entirely (Phase S follow-up #4) so users without
   // Docker installed don't see "not registered" errors.
   await registerSandboxRunnersAtBoot();
+  // Phase P3 — install the exec-wrapper that bridges agent-core's
+  // bash dispatch to core-pipeline's wrapSandboxExec + state hasher.
+  installSandboxExecWrapper();
   const memoryStore = new MemoryStore();
   const kbManager = new KnowledgeBaseManager(projectLoader);
   const planStore = new PlanStore(ANVIL_HOME);

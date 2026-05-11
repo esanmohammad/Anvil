@@ -15,6 +15,12 @@
 
 import { spawn } from 'node:child_process';
 import { getCurrentSandboxHandle } from './current-sandbox-handle.js';
+import { getCurrentStepContext } from './current-step-context.js';
+import { getSandboxExecWrapper } from './current-sandbox-wrapper.js';
+
+/** Monotonic counter for per-stage sandbox exec idx. Reset when no
+ *  ctx is set (so test runs don't accumulate). */
+let _execIdx = 0;
 import { mkdirSync, readFileSync, statSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 
@@ -394,11 +400,25 @@ async function runBash(command: string, ctx: ExecCtx, timeoutMs: number): Promis
   const handle = getCurrentSandboxHandle();
   if (handle && typeof handle.exec === 'function') {
     try {
-      const r = await handle.exec({
+      const execArgs = {
         command,
         timeoutMs,
         signal: ctx.abortSignal,
-      });
+      };
+      const stepCtx = getCurrentStepContext();
+      const wrapper = getSandboxExecWrapper();
+      // P3 — when both ctx + wrapper are present, route through the
+      // durable seam so the exec records under a state-hash-bounded
+      // idempotency key. Falls through to direct exec otherwise.
+      const r = (stepCtx && wrapper)
+        ? await wrapper({
+            ctx: stepCtx,
+            handle,
+            execArgs,
+            idx: _execIdx++,
+            fn: () => handle.exec(execArgs),
+          })
+        : await handle.exec(execArgs);
       const tail = r.stdout + (r.stderr ? `\n\n[stderr]\n${r.stderr}` : '');
       const body = tail || '(no output)';
       const limitNote = r.killedByLimit ? `\n\n[killed by ${r.killedByLimit}]` : '';

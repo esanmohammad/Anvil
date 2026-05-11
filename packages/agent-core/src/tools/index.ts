@@ -26,3 +26,8 @@ export {
   getCurrentSandboxHandle,
   type SandboxHandleLike,
 } from './current-sandbox-handle.js';
+export {
+  setSandboxExecWrapper,
+  getSandboxExecWrapper,
+  type SandboxExecWrapper,
+} from './current-sandbox-wrapper.js';
