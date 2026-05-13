@@ -1,12 +1,14 @@
 /**
- * `buildAgentToolset` — merge built-in tools with MCP-discovered tools into a
- * single `ToolSchema[]` registered with the LLM provider, plus a dispatch
- * map from namespaced tool name → owning MCP client.
+ * `buildAgentToolset` — legacy helper that merges built-in tool schemas with
+ * MCP-discovered tools into a single `ToolSchema[]` plus a dispatch map.
  *
- * Per ADR §H7, the provider doesn't know MCP exists; the agent layer routes
- * tool calls based on whether the name is in `mcpDispatch`.
+ * Superseded by `MergedToolExecutor` for live agent paths — that class is
+ * what the bridge wires into `ModelAdapterConfig.toolExecutor`. This
+ * helper remains for callers that want the flat tools+dispatch shape (and
+ * for backward compat with the existing test surface).
+ *
+ * Naming convention is `mcp__<server>__<tool>` (Claude Code convention).
  */
-
 import type { ToolSchema } from '../types.js';
 import type { McpAgentClient } from './client.js';
 
@@ -26,25 +28,25 @@ export async function buildAgentToolset(
   const seen = new Set(builtIn.map((t) => t.name));
 
   for (const client of mcpClients) {
-    let mcpTools: ToolSchema[];
+    let mcpDescriptors;
     try {
-      mcpTools = await client.listTools();
+      mcpDescriptors = await client.listTools();
     } catch (err) {
       process.stderr.write(
         `[anvil-mcp] WARN: server "${client.config.name}" listTools failed: ${(err as Error).message}\n`,
       );
       continue;
     }
-    for (const t of mcpTools) {
-      if (seen.has(t.name)) {
+    for (const desc of mcpDescriptors) {
+      if (seen.has(desc.name)) {
         process.stderr.write(
-          `[anvil-mcp] WARN: tool name collision "${t.name}"; ignoring duplicate from "${client.config.name}"\n`,
+          `[anvil-mcp] WARN: tool name collision "${desc.name}"; ignoring duplicate from "${client.config.name}"\n`,
         );
         continue;
       }
-      tools.push(t);
-      mcpDispatch.set(t.name, client);
-      seen.add(t.name);
+      tools.push(desc.schema);
+      mcpDispatch.set(desc.name, client);
+      seen.add(desc.name);
     }
   }
   return { tools, mcpDispatch };

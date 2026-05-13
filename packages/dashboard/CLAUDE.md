@@ -143,6 +143,34 @@ walker prefetch gap. Do NOT move the registration back down — the
 late-broadcast bug was the canonical "I clicked Build and nothing
 happened" symptom.
 
+### MCP for non-Claude adapters
+
+Every spawned agent — Claude OR non-Claude — now sees MCP-server tools
+when `mcp.json` is configured for the workspace. Naming follows Claude
+Code's convention: `mcp__<server>__<tool>`.
+
+- **Claude path**: unchanged. `defaultAdapterFactory` resolves the
+  `mcp.json` path and forwards it to `claude-cli` via `--mcp-config`,
+  which loads its own connections.
+- **Non-Claude path** (ollama, openrouter, opencode, openai, gemini,
+  adk, gemini-cli): `AgentProcess` constructs a session-scoped
+  `McpClientPool` lazily on first `start()`, attaches it to
+  `AdapterRequest.mcpPool`, and `LanguageModelBridge` wraps it together
+  with the builtin executor in a `MergedToolExecutor`. Resume turns
+  (`sendInput`) reuse the same pool — no reconnect cost. `kill()`
+  cancels in-flight MCP calls (via `notifications/cancelled`) and
+  closes the pool.
+- **Per-stage allowlist** (`core-pipeline/src/routing/stage-permissions.ts`):
+  `STAGE_MCP_ALLOW` declares which MCP tool ids each stage may call.
+  `mcp__*` is a shortcut that the merged executor expands to per-server
+  globs when the pool reports its server set. Destructive MCP tools
+  (annotated `destructiveHint: true`) are hidden from the model unless
+  the stage's allowlist names them exactly — opt-in per-tool, not
+  per-server.
+- **Failure isolation**: one server failing to connect doesn't fail the
+  spawn. The pool records `{ server, reason }` in `failures[]`; the
+  agent still runs with the other servers + the builtins.
+
 ### Stopping a build — broadcast first, kill chain after
 
 `stop-run` flips `run.status='failed'` and emits the

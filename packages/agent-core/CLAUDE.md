@@ -78,16 +78,33 @@ belong in ADRs, not here.
 - Skills loader (`src/skills/`) — Anthropic-OpenAI SKILL.md format.
   `composeSkillContext` returns system-prompt + reconciled allowed-tools.
 - MCP client (`src/mcp/`) — `loadMcpServers` + `McpAgentClient` +
-  `buildAgentToolset`. Config discovery walks `mcp.json` /
-  `.mcp/servers.json` / `.claude/mcp.json`.
+  `McpClientPool` + `MergedToolExecutor`. Config discovery walks
+  `mcp.json` / `.mcp/servers.json` / `.claude/mcp.json`. Tools surface as
+  `mcp__<server>__<tool>` (Claude Code convention) and are routed to
+  non-Claude agentic adapters via `MergedToolExecutor`, which wraps the
+  builtins + a session-scoped `McpClientPool`. Claude path unchanged —
+  claude-cli loads its own mcp.json via `--mcp-config`. Lifecycle owned
+  by `AgentProcess` (not the bridge): the pool is constructed once per
+  session, reused across resume turns, and torn down on `kill()`. Failures
+  to connect are isolated per server (pool stores them on `failures[]`)
+  so one sick MCP doesn't poison the run. Stdio servers' stderr is
+  captured to `~/.anvil/mcp-logs/<server>-<runId>.log`. Streamable-HTTP
+  transport is supported alongside stdio (deprecated SSE is not).
+  Cancellation: every in-flight tool call has its own `AbortController`;
+  `pool.cancelInFlight()` aborts them and sends `notifications/cancelled`
+  on the wire. Progress notifications surface to the agent's `activity`
+  stream so the dashboard's activity panel shows MCP work.
 - Built-in tool executor (`src/tools/`) — `BuiltinToolExecutor`,
   `resolveSafe`, OpenAI-tool-compatible JSON Schema for the seven
   built-ins (`read_file`, `write_file`, `edit`, `bash`, `grep`, `glob`,
-  `list`). Used by non-Claude agentic adapters (Ollama today; future
-  agentic OpenAI/Gemini paths). `LanguageModelBridge` constructs one
-  per spawn for non-Claude providers and threads it through
-  `ModelAdapterConfig.toolExecutor`. Path-guard rejects every escape
-  vector tested adversarially.
+  `list`). Used by non-Claude agentic adapters (Ollama, OpenRouter,
+  OpenCode, OpenAI, Gemini, ADK). For non-Claude paths
+  `LanguageModelBridge` wraps a `BuiltinToolExecutor` + the session's
+  `McpClientPool` into a `MergedToolExecutor` and threads that through
+  `ModelAdapterConfig.toolExecutor`. The merged executor enforces
+  per-stage `allowedTools` filtering for BOTH builtins and MCP
+  (`mcp__<server>__*` glob; destructive MCP tools require exact-name
+  allowance). Path-guard rejects every escape vector tested adversarially.
 - Eval trajectory collector (`src/agent/session/collect-trajectory.ts`) —
   spawns an `AgentProcess` via `defaultAdapterFactory`, listens to the
   5-event surface, and resolves with an Inspect-AI-shaped

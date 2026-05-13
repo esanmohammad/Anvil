@@ -298,9 +298,15 @@ class FakeMcpClient {
   ) {
     this.config = { name };
   }
-  async listTools(): Promise<ToolSchema[]> {
+  async listTools(): Promise<Array<{ name: string; bareName: string; serverName: string; schema: ToolSchema; annotations: Record<string, unknown> }>> {
     if (this.throwOnList) throw new Error('boom');
-    return this.tools;
+    return this.tools.map((t) => ({
+      name: t.name,
+      bareName: t.name.includes('__') ? t.name.split('__').slice(2).join('__') : t.name,
+      serverName: this.config.name,
+      schema: t,
+      annotations: {},
+    }));
   }
 }
 
@@ -314,16 +320,16 @@ describe('buildAgentToolset', () => {
       { name: 'fs.read', description: 'read', inputSchema: {} },
     ];
     const ghClient = new FakeMcpClient('github', [
-      { name: 'github/list_issues', description: 'list', inputSchema: {} },
+      { name: 'mcp__github__list_issues', description: 'list', inputSchema: {} },
     ]);
     const ts = await buildAgentToolset(builtIn, [asClient(ghClient)]);
     assert.equal(ts.tools.length, 2);
     assert.deepEqual(
       ts.tools.map((t) => t.name).sort(),
-      ['fs.read', 'github/list_issues'],
+      ['fs.read', 'mcp__github__list_issues'],
     );
     assert.equal(ts.mcpDispatch.size, 1);
-    assert.equal(ts.mcpDispatch.get('github/list_issues'), asClient(ghClient));
+    assert.equal(ts.mcpDispatch.get('mcp__github__list_issues'), asClient(ghClient));
     assert.equal(ts.mcpDispatch.has('fs.read'), false);
   });
 
@@ -333,27 +339,27 @@ describe('buildAgentToolset', () => {
     ];
     const dup = new FakeMcpClient('weird', [
       { name: 'fs.read', description: 'mcp dup', inputSchema: {} },
-      { name: 'weird/ok', description: 'fine', inputSchema: {} },
+      { name: 'mcp__weird__ok', description: 'fine', inputSchema: {} },
     ]);
     const { result, captured } = await captureStderrAsync(() =>
       buildAgentToolset(builtIn, [asClient(dup)]),
     );
     assert.equal(result.tools.length, 2);
     assert.equal(result.mcpDispatch.has('fs.read'), false);
-    assert.equal(result.mcpDispatch.has('weird/ok'), true);
+    assert.equal(result.mcpDispatch.has('mcp__weird__ok'), true);
     assert.ok(captured.includes('collision "fs.read"'));
   });
 
   it('isolates listTools failures: one bad server does not kill others', async () => {
     const good = new FakeMcpClient('good', [
-      { name: 'good/ping', description: 'p', inputSchema: {} },
+      { name: 'mcp__good__ping', description: 'p', inputSchema: {} },
     ]);
     const bad = new FakeMcpClient('bad', [], /* throwOnList */ true);
     const { result, captured } = await captureStderrAsync(() =>
       buildAgentToolset([], [asClient(bad), asClient(good)]),
     );
     assert.equal(result.tools.length, 1);
-    assert.equal(result.tools[0].name, 'good/ping');
+    assert.equal(result.tools[0].name, 'mcp__good__ping');
     assert.ok(captured.includes('"bad" listTools failed'));
   });
 });
@@ -393,7 +399,7 @@ describe('McpAgentClient routing', () => {
     (c as unknown as { connected: boolean }).connected = true;
   }
 
-  it('namespaces tools as `<server>/<tool>` in listTools()', async () => {
+  it('namespaces tools as `mcp__<server>__<tool>` in listTools()', async () => {
     const client = new McpAgentClient({ name: 'fs', transport: 'stdio', command: 'noop' });
     const fake = makeFakeSdkClient();
     injectFakeClient(client, fake);
@@ -401,19 +407,19 @@ describe('McpAgentClient routing', () => {
     const tools = await client.listTools();
     assert.deepEqual(
       tools.map((t) => t.name),
-      ['fs/read_file', 'fs/write_file'],
+      ['mcp__fs__read_file', 'mcp__fs__write_file'],
     );
-    // descriptions + inputSchema preserved, only name namespaced
-    assert.equal(tools[0].description, 'read');
-    assert.deepEqual(tools[0].inputSchema, { type: 'object' });
+    // descriptions decorated with server tag + read-only heuristic; schema preserved
+    assert.match(tools[0].schema.description, /\(via fs MCP/);
+    assert.deepEqual(tools[0].schema.inputSchema, { type: 'object' });
   });
 
-  it('callTool strips the `<server>/` prefix before forwarding to SDK', async () => {
+  it('callTool strips the namespacing prefix before forwarding to SDK', async () => {
     const client = new McpAgentClient({ name: 'gh', transport: 'stdio', command: 'noop' });
     const fake = makeFakeSdkClient();
     injectFakeClient(client, fake);
 
-    await client.callTool('gh/list_issues', { repo: 'owner/repo' });
+    await client.callTool('mcp__gh__list_issues', { repo: 'owner/repo' });
     assert.equal(fake.calls.length, 1);
     assert.equal((fake.calls[0].params as { name: string }).name, 'list_issues');
     assert.deepEqual(
