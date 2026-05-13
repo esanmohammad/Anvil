@@ -121,12 +121,22 @@ export function populateManifestFromPlan(deps: ManifestBridgeDeps, plan: Plan): 
 
   const writer = 'plan-seed';
 
+  // Plan v2: scope.inScope is now ScopeItem[]; surface acceptance criteria
+  // by flattening each item's `acceptance[]` into the manifest.
   if (plan.scope?.inScope?.length) {
-    deps.manifestStore.patchField(
-      project, slug, 'acceptanceCriteria', 'final',
-      plan.scope.inScope.slice(),
-      writer,
-    );
+    const acceptance: string[] = [];
+    for (const item of plan.scope.inScope) {
+      // Prefer explicit acceptance entries; fall back to the item description.
+      if (item.acceptance?.length) acceptance.push(...item.acceptance);
+      else if (item.description) acceptance.push(item.description);
+    }
+    if (acceptance.length > 0) {
+      deps.manifestStore.patchField(
+        project, slug, 'acceptanceCriteria', 'final',
+        acceptance,
+        writer,
+      );
+    }
   }
 
   const repoNames = (plan.repos ?? []).map((r) => r.name).filter((n): n is string => !!n);
@@ -138,10 +148,14 @@ export function populateManifestFromPlan(deps: ManifestBridgeDeps, plan: Plan): 
     );
   }
 
+  // Plan v2: mustTouch (modified) + mustExist (new) → flat PlannedFile[].
   const filesPlanned: PlannedFile[] = [];
   for (const repo of plan.repos ?? []) {
-    for (const file of repo.files ?? []) {
-      filesPlanned.push({ repo: repo.name, path: file, kind: 'modify' });
+    for (const claim of repo.mustTouch ?? []) {
+      if (claim.path) filesPlanned.push({ repo: repo.name, path: claim.path, kind: 'modify' });
+    }
+    for (const claim of repo.mustExist ?? []) {
+      if (claim.path) filesPlanned.push({ repo: repo.name, path: claim.path, kind: 'create' });
     }
   }
   if (filesPlanned.length > 0) {
@@ -152,10 +166,11 @@ export function populateManifestFromPlan(deps: ManifestBridgeDeps, plan: Plan): 
     );
   }
 
+  // Plan v2: tests are TestCaseSpec[] / ManualStep[] — fold to {description}.
   const testBehaviors: TestBehavior[] = [];
-  for (const desc of plan.tests?.unit ?? []) testBehaviors.push({ description: desc });
-  for (const desc of plan.tests?.integration ?? []) testBehaviors.push({ description: desc });
-  for (const desc of plan.tests?.manual ?? []) testBehaviors.push({ description: desc });
+  for (const t of plan.tests?.unit ?? []) testBehaviors.push({ description: t.then || t.name });
+  for (const t of plan.tests?.integration ?? []) testBehaviors.push({ description: t.then || t.name });
+  for (const m of plan.tests?.manual ?? []) testBehaviors.push({ description: m.description });
   if (testBehaviors.length > 0) {
     deps.manifestStore.patchField(
       project, slug, 'testBehaviors', 'final',

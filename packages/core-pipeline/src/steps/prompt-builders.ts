@@ -108,6 +108,14 @@ export interface PromptBuilderContext {
    */
   reviewNote?: string;
   actionType?: 'feature' | 'bugfix' | 'fix' | 'spike' | 'review';
+  /**
+   * Phase D + G — plan binding + compliance status. Threaded into the
+   * ship prompt so the PR body carries a plan stamp and compliance
+   * status (and so ship auto-drafts when compliance < 100%).
+   */
+  planRef?: { slug: string; version: number; hashShort: string };
+  buildCompliance?: { passed: number; total: number; summary: string };
+  validateCompliance?: { passed: number; total: number; summary: string };
 
   // ── State ─────────────────────────────────────────────────────────────
   repoNames: string[];
@@ -579,6 +587,9 @@ export function buildStagePrompt(
         workspaceDir: ctx.workspaceDir,
         actionType: ctx.actionType,
         baseBranch: ctx.baseBranch,
+        ...(ctx.planRef ? { planRef: ctx.planRef } : {}),
+        ...(ctx.buildCompliance ? { buildCompliance: ctx.buildCompliance } : {}),
+        ...(ctx.validateCompliance ? { validateCompliance: ctx.validateCompliance } : {}),
       });
       return `${shipPrompt}${reviewBlock}${prev}${resumeCtx}`;
     }
@@ -712,19 +723,47 @@ export function buildRepoStagePrompt(
         sections.push(`\n## Prior stage output\n${prevArtifact.slice(0, 8000)}`);
       }
 
-      sections.push(`\n## Validation Steps`);
-      sections.push(`You MUST ensure the code is fully clean before this stage completes:`);
-      sections.push(`1. Run the build (compile/type-check). Fix ALL errors.`);
-      sections.push(`2. Run the linter. Fix ALL lint warnings and errors.`);
-      sections.push(`3. Run the test suite. Fix ALL failing tests.`);
-      sections.push(`4. Repeat steps 1-3 until everything passes with zero errors.`);
-      sections.push(`5. Do NOT move on until build, lint, AND tests all pass.`);
-      sections.push(`\nIf you cannot fix an issue after 5 attempts, document it clearly as UNRESOLVED.`);
-      sections.push(`\nAt the end, output a clear verdict:`);
-      sections.push(`- VERDICT: PASS — if build, lint, and tests all pass`);
-      sections.push(`- VERDICT: FAIL — if any issues remain unresolved`);
-      sections.push(`\nDo NOT make git commits.`);
-      sections.push(`Do NOT ask for missing information. Use the codebase and context above to validate.`);
+      sections.push(`\n## Validation = run + FIX everything you find`);
+      sections.push(`You are NOT a reporter. You are responsible for **fixing** every test failure, lint warning, and type error before this stage ends. Failures left in the artifact mean ship will refuse the PR. Don't describe a failure — open the file and edit it.`);
+
+      sections.push(`\n### Workflow (repeat until clean)`);
+      sections.push(`For each gate below: run it → read the failing output → use Edit/Write to fix the offending source files → re-run. Loop until exit code 0. The fix-loop wrapper around this stage will resume you up to 3 more times if anything is still failing, but try to land it in this turn.`);
+
+      sections.push(`\n### 1. Build / type-check`);
+      sections.push(`- Run ONE bash command (e.g. \`go build ./...\`, \`npm run build\`, \`tsc -p .\`, \`cargo check\`).`);
+      sections.push(`- For every type error: open the file, fix the type. Don't downgrade types to \`any\` / \`interface{}\` to silence the compiler.`);
+
+      sections.push(`\n### 2. Lint`);
+      sections.push(`- Run the project's linter (e.g. \`go vet ./... && staticcheck ./...\`, \`npm run lint\`, \`ruff check\`).`);
+      sections.push(`- Fix EVERY warning that points at source you (or earlier stages) wrote. Don't add eslint-disable / nolint comments unless the underlying issue is legitimately a false positive — then add a one-line comment explaining why.`);
+
+      sections.push(`\n### 3. Tests`);
+      sections.push(`- Run the full test suite first (\`go test ./...\`, \`npm test\`, \`pytest\`), then drill into specific failures with focused commands (single file or test name).`);
+      sections.push(`- For every failure: read the assertion, decide whether the TEST is wrong (drifted expectation, stale fixture) or the CODE is wrong (real bug), and fix the right side. Never \`t.Skip\` / \`it.skip\` / \`xtest\` to make a failure go away unless the test is exercising deferred scope and you note WHY in a comment.`);
+      sections.push(`- For pre-existing tests unrelated to this feature: leave them alone if they pass; fix them only if they're broken by your changes.`);
+
+      sections.push(`\n### Bash discipline`);
+      sections.push(`- Pipe verbose output through \`tail -100\` so you don't burn output tokens on green-stack noise.`);
+      sections.push(`- Re-run only the failing test(s) after a fix, not the whole suite, until you're done — then run the full suite once at the end.`);
+      sections.push(`- Do NOT run \`go mod tidy\` / \`npm install\` / \`pip install\` here. Validate works against committed dependencies.`);
+
+      sections.push(`\n### When you genuinely cannot fix something`);
+      sections.push(`If after 5 fix attempts a failure remains AND you've established it's outside this feature's scope (e.g. a pre-existing flaky test, environment-only issue), document it explicitly:`);
+      sections.push(`\`\`\``);
+      sections.push(`UNRESOLVED: <test/file/rule> — <one-line reason> — <one-line owner or follow-up>`);
+      sections.push(`\`\`\``);
+      sections.push(`UNRESOLVED items still count as FAIL for the verdict; ship will draft-PR them.`);
+
+      sections.push(`\n## End-of-turn output`);
+      sections.push(`Emit a final block in this exact shape (the dashboard's compliance check + parser depend on it):`);
+      sections.push(`\`\`\``);
+      sections.push(`VERDICT: PASS  ← or FAIL`);
+      sections.push(`build: <pass|fail> · lint: <pass|fail> · tests: <N passed / M failed / K skipped>`);
+      sections.push(`UNRESOLVED:`);
+      sections.push(`- (list, or "none")`);
+      sections.push(`\`\`\``);
+      sections.push(`Do NOT make git commits — that's the ship stage.`);
+      sections.push(`Do NOT ask for clarification. Decide from the context above and proceed.`);
 
       if (reviewBlock) sections.push(reviewBlock);
       if (resumeCtx) sections.push(resumeCtx);

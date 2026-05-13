@@ -182,6 +182,12 @@ cost loader resolves the JSON via `fileURLToPath(import.meta.url)`.
   patterns (`rate_limit_error`, `RESOURCE_EXHAUSTED`, `Credit balance
   is too low`) to a synthetic HTTP status — so quota/rate-limit failures
   trigger the same chain-fallback path as HTTP-shaped failures.
+  `bodyLooksRetryable` also matches "model not found" / "not supported
+  for generateContent" / `model_not_found` / "no such model" — a
+  phantom id in `~/.anvil/models.yaml` (e.g. `adk:gemini-3-pro`) used
+  to fail the whole stage instead of burning that one chain entry.
+  Now the walker hops to the next rung; the bad id is still bad on the
+  next run, but the run completes.
 
 ### Telemetry
 

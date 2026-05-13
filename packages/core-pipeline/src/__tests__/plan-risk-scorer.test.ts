@@ -1,8 +1,7 @@
 /**
- * Tests for plan-risk-scorer.
- *
- * Phase F10 — moved from packages/dashboard/server/__tests__/ when the
- * scorer was promoted into core-pipeline/utils. Coverage preserved.
+ * Plan v2 risk-scorer tests. Fixtures use the migrator so we exercise
+ * the v1→v2 conversion + read the structured `mustTouch[].path` shape
+ * the scorer now consumes.
  */
 
 import { describe, it } from 'node:test';
@@ -10,32 +9,20 @@ import assert from 'node:assert/strict';
 
 import { scorePlan, computeRiskTier } from '../utils/plan-risk-scorer.js';
 import type { Plan } from '../utils/plan-types.js';
+import { migratePlanJsonToV2 } from '../plan/migrate.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function basePlan(overrides: Partial<Plan> = {}): Plan {
-  const now = new Date().toISOString();
-  const plan: Plan = {
+function basePlan(overrides: Record<string, unknown> = {}): Plan {
+  return migratePlanJsonToV2({
     version: 1,
     slug: 'test-plan',
     project: 'proj',
     title: 'Test',
-    problem: 'n/a',
-    scope: { inScope: [], outOfScope: [] },
-    repos: [],
-    contracts: [],
-    architecture: { mermaid: '', notes: '' },
-    risks: [],
-    rollout: { strategy: '', flags: [], order: [], rollback: '' },
-    tests: { unit: [], integration: [], manual: [] },
-    estimate: { usd: 0, minutes: 0, prs: 0 },
-    model: 'test-model',
     feature: 'test-feature',
-    createdAt: now,
-    updatedAt: now,
+    model: 'test-model',
     ...overrides,
-  };
-  return plan;
+  });
 }
 
 function planWithFiles(files: string[], extra: Record<string, unknown> = {}): Plan {
@@ -44,12 +31,12 @@ function planWithFiles(files: string[], extra: Record<string, unknown> = {}): Pl
       {
         name: 'repo',
         changes: '',
+        // migrator promotes string[] → mustTouch[].path
         files,
         symbols: [],
       },
     ],
   });
-  // Attach optional fields the scorer reads (confidence, scopeBoundaryRisks).
   return Object.assign(plan, extra) as Plan;
 }
 
@@ -68,7 +55,6 @@ describe('computeRiskTier', () => {
 
 describe('scorePlan', () => {
   it('empty plan scores ~0 and is tier low', () => {
-    // Default confidence is 0.5 => confidence-inverse = 0.25 (kept, but <0.3).
     const score = scorePlan(basePlan());
     assert.equal(score.tier, 'low');
     assert.ok(score.overall < 0.3, `expected <0.3, got ${score.overall}`);
@@ -114,25 +100,22 @@ describe('scorePlan', () => {
 
   it('factors are ordered desc by weight and filter out <=0.1', () => {
     const files = [
-      'src/auth/login.ts',           // sensitive-paths high
-      'package.json',                // new-dependency 0.6
+      'src/auth/login.ts',
+      'package.json',
       'services/a/index.ts',
       'services/b/index.ts',
-      'services/c/index.ts',         // cross-package
+      'services/c/index.ts',
     ];
     const score = scorePlan(planWithFiles(files, { confidence: 0.95 }));
-    // Sorted descending
     for (let i = 1; i < score.factors.length; i++) {
       assert.ok(
         score.factors[i - 1].weight >= score.factors[i].weight,
         `factor[${i - 1}] (${score.factors[i - 1].weight}) should be >= factor[${i}] (${score.factors[i].weight})`,
       );
     }
-    // All kept factors must be > 0.1
     for (const f of score.factors) {
       assert.ok(f.weight > 0.1, `factor ${f.key} has weight ${f.weight} <= 0.1`);
     }
-    // High confidence (0.95) means confidence-inverse would be ~0.025 -> filtered out.
     assert.ok(!score.factors.find((f) => f.key === 'confidence-inverse'));
   });
 });

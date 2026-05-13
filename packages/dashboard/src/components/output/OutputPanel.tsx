@@ -91,6 +91,15 @@ export function OutputPanel({
     });
   }, []);
 
+  // Count of *unique* files touched, for the Changes tab label. The raw
+  // `changes` array has one entry per tool call, so a 25-tool-call run
+  // that edits 10 files shows `Changes (10)` not `Changes (25)`.
+  const uniqueFileCount = useMemo(() => {
+    const seen = new Set<string>();
+    for (const ch of changes) seen.add(`${ch.repo ?? ''}:${ch.file}`);
+    return seen.size;
+  }, [changes]);
+
   // Save/restore scroll position per agent
   useEffect(() => {
     if (prevAgentId.current && scrollRef.current) {
@@ -282,13 +291,36 @@ export function OutputPanel({
             </div>
           ) : (
             <div style={{ padding: '4px 0' }}>
-              {changes.map((ch, i) => {
+              {(() => {
+                // Dedupe by (repo, file): per-stage agents emit one
+                // Change per tool call, so iterating a 25-edit run leaves
+                // the same file repeated 5+ times. Collapse to one row
+                // per unique path, keep the LATEST diff (most recent edit
+                // is what the user wants to inspect), and surface the
+                // edit count so it's clear when a file was touched
+                // multiple times. `A` (Write) wins over `M` (Edit) for
+                // the status badge if the file was newly created at any
+                // point in the run.
+                const byKey = new Map<string, { change: ChangeEntry; count: number; everWrite: boolean }>();
+                for (const ch of changes) {
+                  const key = `${ch.repo ?? ''}:${ch.file}`;
+                  const prev = byKey.get(key);
+                  byKey.set(key, {
+                    change: ch,
+                    count: (prev?.count ?? 0) + 1,
+                    everWrite: (prev?.everWrite ?? false) || ch.tool === 'Write',
+                  });
+                }
+                return Array.from(byKey.values());
+              })().map(({ change: ch, count, everWrite }, i) => {
                 const isExpanded = expandedIds.has(-(i + 1));
                 const hasDiff = !!ch.diff;
                 const shortPath = ch.file.replace(/.*\/workspace\/[^/]+\/[^/]+\//, '');
                 const diffLines = hasDiff ? ch.diff!.split('\n') : [];
                 const additions = diffLines.filter((l) => l.startsWith('+') && !l.startsWith('+++')).length;
                 const deletions = diffLines.filter((l) => l.startsWith('-') && !l.startsWith('---')).length;
+                const statusIcon = everWrite ? 'A' : 'M';
+                const statusColor = everWrite ? 'var(--color-success)' : 'var(--color-warning)';
 
                 return (
                   <div key={i} style={{
@@ -323,9 +355,9 @@ export function OutputPanel({
                       {/* File status icon */}
                       <span style={{
                         fontSize: 11, fontWeight: 600, flexShrink: 0,
-                        color: ch.tool === 'Write' ? 'var(--color-success)' : 'var(--color-warning)',
+                        color: statusColor,
                       }}>
-                        {ch.tool === 'Write' ? 'A' : 'M'}
+                        {statusIcon}
                       </span>
 
                       {/* Repo badge */}
@@ -344,6 +376,21 @@ export function OutputPanel({
                       <span style={{ flex: 1, color: 'var(--text-primary)' }}>
                         {shortPath || ch.file}
                       </span>
+
+                      {/* Edit-count badge — only when the file was touched > 1 time */}
+                      {count > 1 && (
+                        <span
+                          title={`${count} edits — showing latest diff`}
+                          style={{
+                            fontSize: 10, padding: '1px 5px',
+                            borderRadius: 'var(--radius-xs)',
+                            background: 'var(--bg-elevated-3)', color: 'var(--text-tertiary)',
+                            fontFamily: 'var(--font-mono)', flexShrink: 0,
+                          }}
+                        >
+                          ×{count}
+                        </span>
+                      )}
 
                       {/* +/- stats */}
                       {hasDiff && (
@@ -565,7 +612,7 @@ export function OutputPanel({
               textTransform: 'capitalize' as const,
             }}
           >
-            {mode === 'changes' ? `Changes (${changes.length})` : mode === 'raw' ? 'Raw' : 'Activity'}
+            {mode === 'changes' ? `Changes (${uniqueFileCount})` : mode === 'raw' ? 'Raw' : 'Activity'}
           </button>
         ))}
 

@@ -18,7 +18,7 @@ import { AdkAdapter } from './adk-adapter.js';
 import { OpenCodeAdapter } from './opencode-adapter.js';
 import { instrumentModelAdapter } from './telemetry/instrument.js';
 
-const AGENTIC_STAGES = new Set(['build', 'validate', 'ship']);
+export const AGENTIC_STAGES: ReadonlySet<string> = new Set(['build', 'validate', 'ship']);
 
 export class ProviderRegistry {
   private adapters = new Map<ProviderName, ModelAdapter>();

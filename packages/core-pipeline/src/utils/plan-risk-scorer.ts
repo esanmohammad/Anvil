@@ -55,14 +55,17 @@ function readOptional(plan: Plan): OptionalPlanFields {
   return plan as unknown as OptionalPlanFields;
 }
 
-/** Union of all files touched, dedup'd. Falls back to plan.repos[].files. */
+/** Union of all files touched, dedup'd. Plan v2: mustTouch + mustExist paths. */
 function collectTouchedFiles(plan: Plan): string[] {
   const opt = readOptional(plan);
   const fromOpt = isStringArray(opt.touchedFiles) ? opt.touchedFiles : [];
   const fromRepos: string[] = [];
   for (const r of plan.repos ?? []) {
-    for (const f of r.files ?? []) {
-      if (typeof f === 'string') fromRepos.push(f);
+    for (const claim of r.mustTouch ?? []) {
+      if (claim?.path) fromRepos.push(claim.path);
+    }
+    for (const claim of r.mustExist ?? []) {
+      if (claim?.path) fromRepos.push(claim.path);
     }
   }
   return Array.from(new Set([...fromOpt, ...fromRepos]));

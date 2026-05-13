@@ -14,6 +14,28 @@ export interface ShipPromptInput {
   workspaceDir: string;
   actionType?: 'feature' | 'bugfix' | 'fix' | 'spike' | 'review';
   baseBranch?: string;
+  /**
+   * Phase D + G — plan binding for the run + compliance status. When
+   * present, ship stamps `plan: <slug>@v<version> hash:<short>` on the
+   * PR body and force-drafts when compliance < 100%.
+   */
+  planRef?: {
+    slug: string;
+    version: number;
+    hashShort: string;
+  };
+  /** Pass-count / total / report-markdown for the build compliance check. */
+  buildCompliance?: {
+    passed: number;
+    total: number;
+    summary: string;
+  };
+  /** Same shape for the validate compliance check. */
+  validateCompliance?: {
+    passed: number;
+    total: number;
+    summary: string;
+  };
 }
 
 const PR_URL_PATTERN = /https:\/\/github\.com\/[^\s"')]+\/pull\/\d+/g;
@@ -36,23 +58,46 @@ export function buildShipUserPrompt(input: ShipPromptInput): string {
   else prLabels.push('enhancement');
   const labelFlags = prLabels.map((l) => `--label "${l}"`).join(' ');
 
+  // Phase G — force-draft when compliance < 100%. The ship agent reads
+  // these directives + stamps the plan ref into the PR body.
+  const buildPass = input.buildCompliance ? input.buildCompliance.passed === input.buildCompliance.total : true;
+  const validatePass = input.validateCompliance ? input.validateCompliance.passed === input.validateCompliance.total : true;
+  const requireDraft = !buildPass || !validatePass;
+
+  const planStamp = input.planRef
+    ? `plan: ${input.planRef.slug}@v${input.planRef.version} (hash: ${input.planRef.hashShort})`
+    : '';
+  const buildCompLine = input.buildCompliance
+    ? `build compliance: ${input.buildCompliance.passed}/${input.buildCompliance.total}`
+    : '';
+  const validateCompLine = input.validateCompliance
+    ? `validate compliance: ${input.validateCompliance.passed}/${input.validateCompliance.total}`
+    : '';
+  const prBodyHeader = [planStamp, buildCompLine, validateCompLine].filter(Boolean).join(' · ');
+
+  const draftClause = requireDraft
+    ? '5. Open a DRAFT PR — compliance is < 100%; use `--draft`. Add a "## Plan compliance" section to the body listing the unmet claims (paste BUILD_COMPLIANCE.md and PLAN_COMPLIANCE.md from the feature dir if present).'
+    : `5. Open a PR — \`gh pr create --base "${baseBranch}" --head "${branch}" ${labelFlags}\`.\n   - If step 1 failed: add \`--draft\` and include "## Known Issues" in the body.\n   - Otherwise create a regular PR.`;
+
   return `Feature: "${input.feature}"
 Repositories: ${repoListStr}
-
+${prBodyHeader ? `\n${prBodyHeader}\n` : ''}
 ## Push feature branch + open PR
 
-The code is on feature branch "${branch}". The build, lint, and tests have run.
+The code is on feature branch "${branch}". The build, lint, and tests have already run in earlier stages.
+
+DO NOT explore the codebase. DO NOT \`read_file\` source files. DO NOT \`grep\` or \`find\` to "understand" the code. Your only job is the 5 git/gh commands below. Each numbered step is a single shell command. EXECUTE the commands via the Bash tool — do NOT print them as text.
 
 For each repo with changes:
-1. Run a final quick check: build and lint to confirm everything is clean.
-2. If ANY errors remain, fix them before proceeding.
-3. Stage and commit — \`git add -A && git commit -m "[anvil] ${input.feature}"\`. Skip if nothing to commit.
-4. Push the feature branch — \`git push -u origin "${branch}"\`. REQUIRED.
-5. Open a PR — \`gh pr create --base "${baseBranch}" --head "${branch}" ${labelFlags}\`.
-   - If prior stages reported errors, mark the PR as DRAFT (\`--draft\`) with a "## Known Issues" section.
-   - Otherwise create a regular PR.
+1. Final sanity build + lint — ONE bash command (e.g. \`go build ./... && go vet ./...\` or \`npm run build && npm run lint\`). Do not inspect output beyond exit code.
+2. If step 1 failed, abort that repo (mark the eventual PR --draft with the failure in the body). Do NOT try to fix code here — fix happens in earlier stages.
+3. Stage and commit — \`git add -A && git commit -m "[anvil] ${input.feature}${planStamp ? `\\n\\n${planStamp}` : ''}"\`. Skip if \`git status --porcelain\` is empty.
+4. Push the feature branch — \`git push -u origin "${branch}"\`. REQUIRED — no exceptions.
+${draftClause}
 
-Non-negotiable: every repo with a feature branch ends with a pushed branch and an open PR. Do NOT merge to ${baseBranch}.`;
+When writing the PR body, ALWAYS include the line "${prBodyHeader || '[anvil]'}" at the top.
+
+Non-negotiable: every repo with a feature branch ends with a pushed branch and an open PR (URL in your output). Do NOT merge to ${baseBranch}. Do NOT skip step 4 or 5 — the run is a failure without the \`gh pr create\` URL in your output.`;
 }
 
 /** Pull GitHub PR URLs out of the agent's output. */

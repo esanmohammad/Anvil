@@ -37,6 +37,8 @@ export interface ModelResolutionDeps {
   projectLoader: ProjectLoader;
   state: PipelineRunState;
   runtimeBurnedModels: Set<string>;
+  /** model id → reason burned (HTTP 429 / stage / etc). Optional for back-compat. */
+  burnedModelReasons?: Map<string, string>;
   livenessFallbackNotified: Set<string>;
   emitProjectEvent: (payload: { source: string; message: string; level: 'info' | 'warn' }) => void;
   broadcast: () => void;
@@ -74,15 +76,29 @@ export function pickModelForStage(deps: ModelResolutionDeps, stageName: string):
       deps.runtimeBurnedModels,
     );
     if (picked.fellBackFrom) {
+      // Show the FULL chain walk + the actual burn reason for each
+      // skipped model. The walker's `skipped[]` carries 'burned' vs
+      // 'liveness-dead'; for burned models we also look up the
+      // recorded reason ("HTTP 429 (clarify stage)" etc.) so the
+      // user can see WHY at a glance instead of just THAT.
+      const skipList = picked.skipped ?? [];
+      const reasonFor = (s: { model: string; reason: string }): string => {
+        if (s.reason !== 'burned') return s.reason;
+        const recorded = deps.burnedModelReasons?.get(s.model);
+        return recorded ? `burned: ${recorded}` : 'burned';
+      };
+      const skipDetail = skipList.length > 0
+        ? skipList.map((s) => `${s.model} [${reasonFor(s)}]`).join(' → ')
+        : `${picked.fellBackFrom} [unknown]`;
       console.warn(
-        `[pipeline] ${stageName}: ${picked.fellBackFrom} skipped; falling back to ${picked.model}`,
+        `[pipeline] ${stageName}: chain walked ${skipDetail} → ${picked.model}`,
       );
       const key = `${stageName}|${picked.fellBackFrom}->${picked.model}`;
       if (!deps.livenessFallbackNotified.has(key)) {
         deps.livenessFallbackNotified.add(key);
         deps.emitProjectEvent({
           source: 'routing',
-          message: `${picked.fellBackFrom} unavailable for ${stageName} (provider auth/liveness); falling back to ${picked.model}`,
+          message: `${stageName}: walked ${skipDetail} → ${picked.model}`,
           level: 'warn',
         });
       }

@@ -37,7 +37,14 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 import { AgentManager, type AgentState } from '@esankhan3/anvil-agent-core';
 import { PipelineRunner } from './pipeline-runner.js';
-import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
+import {
+  disallowedToolsForPersona,
+  planAllTouchedPaths,
+  planContentHash,
+  migratePlanJsonToV2,
+  bindPlan,
+  type PlanBinding,
+} from '@esankhan3/anvil-core-pipeline';
 import { runFixFlow, type FixFlowStageEvent } from './fix-flow.js';
 import type { PipelineRunState } from './pipeline-runner.js';
 import { ProjectLoader } from './project-loader.js';
@@ -905,6 +912,9 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
   const kbManager = new KnowledgeBaseManager(projectLoader);
   const planStore = new PlanStore(ANVIL_HOME);
   const planValidator = new PlanValidator(projectLoader);
+  // ── Plan lifecycle walker (pure state machine in core-pipeline) ──────
+  // One context per (project, slug). Keyed by `${project}:${slug}`.
+  const planLifecycle = new Map<string, import('@esankhan3/anvil-core-pipeline').LifecycleContext>();
   const reviewStore = new ReviewStore(ANVIL_HOME);
   const testSpecStore = new TestSpecStore(ANVIL_HOME);
   const testCaseStore = new TestCaseStore(ANVIL_HOME);
@@ -1465,6 +1475,79 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     outputBuffer.push(errorEntry);
     broadcast({ type: 'agent-output', payload: { entries: [errorEntry] } });
     broadcast({ type: 'agent-error', payload: { agentId, error } });
+
+    // Reap the failed agent's activeRuns / agentToRunId entries. Without
+    // this, plan agents (and any other one-shot spawn) that hit
+    // agent-error leave a permanent `status: 'running'` row in the UI.
+    // agent-done would have done this at line ~1448, but error-exit
+    // routes through agent-error only (see session-registry's proc.exit
+    // branch: status='error' → emit('agent-error'), else 'agent-done').
+    // Skip cleanup for pipeline `build`-type runs — those are owned by
+    // the pipeline runner's own lifecycle (matches the agent-done early
+    // return above) and reaping here would orphan the overall pipeline.
+    const failedRunId = agentToRunId.get(agentId);
+    if (failedRunId) {
+      const failedRun = activeRuns.get(failedRunId);
+      const isPipelineBuild = failedRun?.type === 'build' && activePipelineRunner;
+      if (failedRun && !isPipelineBuild) {
+        failedRun.status = 'failed';
+        const runRecord = {
+          id: failedRun.id,
+          project: failedRun.project,
+          feature: failedRun.description,
+          featureSlug: '',
+          status: 'failed' as const,
+          model: failedRun.model,
+          type: failedRun.type,
+          createdAt: new Date(failedRun.startedAt).toISOString(),
+          updatedAt: new Date().toISOString(),
+          durationMs: Date.now() - failedRun.startedAt,
+          totalCost: 0,
+          repoNames: [],
+          prUrls: [],
+          stages: [{
+            name: failedRun.type,
+            label: failedRun.type,
+            status: 'failed' as const,
+            cost: 0,
+            startedAt: new Date(failedRun.startedAt).toISOString(),
+            completedAt: new Date().toISOString(),
+            error: String(error).slice(0, 500),
+            repos: [],
+          }],
+          output: '',
+        };
+        try {
+          if (!existsSync(RUNS_DIR)) mkdirSync(RUNS_DIR, { recursive: true });
+          appendFileSync(RUNS_INDEX, JSON.stringify(runRecord) + '\n', 'utf-8');
+        } catch { /* history is best-effort */ }
+        broadcastRuns();
+      }
+      if (!isPipelineBuild) {
+        activeRuns.delete(failedRunId);
+        agentToRunId.delete(agentId);
+        broadcastActiveRuns();
+      }
+    }
+
+    // Plan-agent chain-walker: if this errored agent was a plan agent
+    // (silent-empty, 429 stall, upstream 5xx), try the next sibling model
+    // in the user's chain before surfacing the failure. Mirrors the
+    // pipeline runner's `runWithChainFallback` semantics, applied at the
+    // event level since plan agents don't go through the awaitable
+    // `spawnAndWait` path.
+    const planCtx = planAgentContext.get(agentId);
+    if (planCtx) {
+      planAgentContext.delete(agentId);
+      void retryPlanAgentWithNextModel(planCtx, `agent-error: ${String(error).slice(0, 120)}`).then((retried) => {
+        if (!retried) {
+          broadcast({
+            type: 'plan-error',
+            payload: { project: planCtx.project, message: `Plan agent failed: ${String(error).slice(0, 200)}` },
+          });
+        }
+      });
+    }
   });
 
   // Resolve which repo an agent belongs to (from pipeline state)
@@ -1994,22 +2077,33 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
         const run = activeRuns.get(runId);
         if (run) {
-          // Kill the agent(s) for this run
-          if (run.agentId) {
-            agentManager.kill(run.agentId);
-          }
-          // For build runs, also cancel the pipeline runner
+          // 1. Flip status + broadcast IMMEDIATELY so the UI reflects the
+          //    stop before the kill chain unwinds (HTTP aborts + child
+          //    processes can take a few seconds).
+          run.status = 'failed';
+          broadcast({ type: 'run-stopped', payload: { runId } });
+          broadcastActiveRuns();
+
+          // 2. Cancel the runner first — flips the cancelled flag so the
+          //    pipeline loop short-circuits at the next await boundary.
           if (run.type === 'build' && activePipelineRunner) {
-            activePipelineRunner.cancel();
-          }
-          // Kill any agents mapped to this run
-          for (const [agentId, rid] of agentToRunId.entries()) {
-            if (rid === runId) {
-              agentManager.kill(agentId);
-            }
+            try { activePipelineRunner.cancel(); } catch { /* ok */ }
           }
 
-          run.status = 'failed';
+          // 3. Kill every spawned agent mapped to this run. The kill
+          //    propagates through AgentProcess → LanguageModelBridge →
+          //    adapter.kill() → per-call AbortController, severing
+          //    in-flight HTTP requests (Ollama / OpenRouter / OpenCode)
+          //    and SIGTERM-ing CLI subprocesses (Claude / Gemini-CLI).
+          const toKill = new Set<string>();
+          if (run.agentId) toKill.add(run.agentId);
+          for (const [agentId, rid] of agentToRunId.entries()) {
+            if (rid === runId) toKill.add(agentId);
+          }
+          for (const agentId of toKill) {
+            try { agentManager.kill(agentId); } catch { /* already dead */ }
+            agentToRunId.delete(agentId);
+          }
 
           // Persist the stopped run so it can be resumed later
           if (run.type !== 'build') {
@@ -2040,7 +2134,6 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           activeRuns.delete(runId);
           broadcastActiveRuns();
           broadcastRuns();
-          broadcast({ type: 'run-stopped', payload: { runId } });
         }
         break;
       }
@@ -2577,10 +2670,29 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         try {
           const approval = planStore.addApproval(msg.project, msg.planSlug, user, note);
           broadcast({ type: 'plan-approved', payload: { planSlug: msg.planSlug, approval } });
+          // Lifecycle — approval doesn't auto-execute but the snapshot
+          // surfaces "approved" so the UI can unlock the Execute button.
+          void dispatchLifecycle(msg.project, msg.planSlug, { kind: 'approve' });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           ws.send(JSON.stringify({ type: 'error', payload: { message } }));
         }
+        break;
+      }
+
+      // Lifecycle snapshot fetch — UI subscribes via this on mount.
+      case 'get-plan-lifecycle': {
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
+          return;
+        }
+        const ctx = planLifecycle.get(`${msg.project}:${msg.planSlug}`);
+        if (!ctx) {
+          ws.send(JSON.stringify({ type: 'plan-lifecycle', payload: null }));
+          break;
+        }
+        const { snapshotLifecycle } = await import('@esankhan3/anvil-core-pipeline');
+        ws.send(JSON.stringify({ type: 'plan-lifecycle', payload: snapshotLifecycle(ctx) }));
         break;
       }
 
@@ -2827,7 +2939,7 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
             title: `Tests for ${plan.title || plan.slug}`,
             source: {
               plan: { slug: plan.slug, version: plan.version },
-              files: plan.repos.flatMap((r) => r.files ?? []),
+              files: planAllTouchedPaths(plan),
             },
             behaviors: resolvedBehaviors,
             conventions,
@@ -3605,6 +3717,16 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           const validation = planValidator.validate(next);
           planStore.writeValidation(msg.project, msg.planSlug, validation);
           ws.send(JSON.stringify({ type: 'plan-updated', payload: { plan: next, validation } }));
+          // Lifecycle — user edit resets refine budget + invalidates approval.
+          // Settle into post-verify so the badge reflects the new validation.
+          const editedSections = Object.keys(msg.plan as Record<string, unknown>).join(', ') || 'unknown';
+          void dispatchLifecycle(msg.project, msg.planSlug, { kind: 'edit', reason: `user edit (${editedSections})` });
+          void dispatchLifecycle(msg.project, msg.planSlug, {
+            kind: 'verify-complete',
+            errors: validation.counts.errors,
+            autoFixableCount: validation.issues.filter((i) => i.autoFixable).length,
+            canTargetedRegen: validation.issues.some((i) => i.hint),
+          });
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           ws.send(JSON.stringify({ type: 'error', payload: { message: `Failed to save plan: ${message}` } }));
@@ -3700,6 +3822,86 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
         break;
       }
 
+      // Plan v2 — lineage popover backing.
+      case 'get-plan-lineage': {
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
+          return;
+        }
+        const versions = planStore.listVersions(msg.project, msg.planSlug);
+        const lineage = versions.map((n) => {
+          const p = planStore.readVersion(msg.project!, msg.planSlug!, n);
+          if (!p) return { version: n, updatedAt: '', createdBy: undefined };
+          return {
+            version: p.version,
+            updatedAt: p.updatedAt,
+            createdBy: p.createdBy,
+            parentVersion: p.parentVersion,
+            contentHash: p.contentHash,
+          };
+        });
+        ws.send(JSON.stringify({
+          type: 'plan-lineage',
+          payload: { planSlug: msg.planSlug, versions: lineage },
+        }));
+        break;
+      }
+
+      // Phase I — user-triggered auto-refine: applies deterministic
+      // patches first, then targeted regens for remaining issues.
+      // Routed through the lifecycle walker so a single pass is
+      // bounded by maxRefineAttempts + maxRefineUsd.
+      //
+      // CRITICAL: this is the ONLY path that mutates a plan during
+      // auto-refine. The lifecycle dispatcher does NOT auto-fire
+      // refine; the user must click. Once the user clicks, the
+      // refine pass is bounded internally and won't re-arm itself.
+      case 'auto-refine-plan': {
+        if (!msg.project || !msg.planSlug) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
+          return;
+        }
+        const plan = planStore.readCurrent(msg.project, msg.planSlug);
+        if (!plan) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: `Plan ${msg.project}/${msg.planSlug} not found` } }));
+          break;
+        }
+        try {
+          // Validate first so we know whether refine has anything to do.
+          const validation = planValidator.validate(plan);
+          if (validation.counts.errors === 0) {
+            ws.send(JSON.stringify({
+              type: 'auto-refine-progress',
+              payload: { summary: 'Nothing to refine — plan is clean.' },
+            }));
+            break;
+          }
+          // Transition into `refining` so the UI badge updates. The
+          // state machine reaches `refining` via verify-complete; the
+          // refine action is COMPUTED but not auto-fired (dispatcher
+          // change). We invoke executeLifecycleRefine explicitly below
+          // so the user click is the only trigger.
+          await dispatchLifecycle(msg.project, msg.planSlug, {
+            kind: 'verify-complete',
+            errors: validation.counts.errors,
+            autoFixableCount: validation.issues.filter((i) => i.autoFixable).length,
+            canTargetedRegen: validation.issues.some((i) => i.hint),
+          });
+          // Run the single bounded refine pass. When done, the helper
+          // dispatches `refine-complete` and the lifecycle transitions
+          // back to `verifying`. Verify settles in awaiting_approval or
+          // stays in verifying with errors surfaced — the user is in
+          // control of whether to click Auto-refine again.
+          await executeLifecycleRefine(msg.project, msg.planSlug);
+        } catch (err) {
+          ws.send(JSON.stringify({
+            type: 'plan-error',
+            payload: { message: `Auto-refine failed: ${err instanceof Error ? err.message : String(err)}` },
+          }));
+        }
+        break;
+      }
+
       case 'execute-plan': {
         if (!msg.project || !msg.planSlug) {
           ws.send(JSON.stringify({ type: 'error', payload: { message: 'project and planSlug are required' } }));
@@ -3710,29 +3912,52 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           ws.send(JSON.stringify({ type: 'error', payload: { message: `Plan ${msg.project}/${msg.planSlug} not found` } }));
           break;
         }
-        // Block execution if the plan has errors. Warnings/infos are OK.
+        // Phase C: gate execution on validation + approval.
         const validation = planValidator.validate(plan);
         planStore.writeValidation(msg.project, msg.planSlug, validation);
-        if (validation.counts.errors > 0 && !msg.force) {
+        const force = !!(msg as { force?: boolean }).force;
+        if (validation.counts.errors > 0 && !force) {
           ws.send(JSON.stringify({
             type: 'plan-validation',
             payload: {
               validation,
               planSlug: msg.planSlug,
               blocked: true,
+              reason: 'errors',
               message: `Plan has ${validation.counts.errors} error(s). Fix them or pass force=true to execute anyway.`,
             },
           }));
           break;
         }
+        // Approval gate — refuse to execute unless the active approval
+        // record is pinned to the current content hash. `force=true`
+        // bypasses for the operator-knows-best path (e.g. resuming a
+        // run after a workspace rebase).
+        const approvalValid = !!plan.approval
+          && plan.approval.planHash === plan.contentHash;
+        if (!approvalValid && !force) {
+          ws.send(JSON.stringify({
+            type: 'plan-validation',
+            payload: {
+              validation,
+              planSlug: msg.planSlug,
+              blocked: true,
+              reason: plan.approval ? 'approval-stale' : 'unapproved',
+              message: plan.approval
+                ? `Plan was approved against hash ${plan.approval.planHash.slice(0, 12)} but is now ${plan.contentHash.slice(0, 12)}. Re-approve or pass force=true.`
+                : 'Plan must be approved before execute. Click "Approve plan" or pass force=true.',
+            },
+          }));
+          break;
+        }
 
-        // A validated plan replaces stages 0–4. Short feature string (for UI/commits),
-        // plan content seeds Clarify, planSeed lets the runner derive Requirements/
-        // Repo-reqs/Specs/Tasks deterministically — pipeline jumps straight to Build.
+        // Phase D — bind the plan to the run. planBinding carries the
+        // content-hash so downstream stages can stamp it onto PR bodies
+        // + telemetry. (Set on ctx.shared by the runner.)
+        const planBinding = bindPlan(plan);
+
+        // A validated plan replaces stages 0–4.
         const planMarkdown = planStore.renderMarkdown(plan);
-        // Hard cap the pipeline title at 120 chars — the pipeline's `feature`
-        // ends up in UI headers, commit messages, and active-run rows where
-        // long strings distort layout. The full plan content rides in planSeed.
         const rawShort = (plan.title && plan.title.trim()) || plan.feature || 'Plan execution';
         const shortFeature = rawShort.length > 120
           ? rawShort.slice(0, 117).trimEnd() + '…'
@@ -3743,21 +3968,28 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           baseBranch: msg.options?.baseBranch,
           skipClarify: true,
           clarifySeedArtifact:
-            `<!-- Generated from Anvil Plan v${plan.version} (${plan.slug}) -->\n\n${planMarkdown}`,
+            `<!-- Generated from Anvil Plan v${plan.version} (${plan.slug}) hash:${planBinding.hashShort} -->\n\n${planMarkdown}`,
           planSeed: {
             project: plan.project,
             slug: plan.slug,
             version: plan.version,
             plan,
           },
-        });
+          // Phase D — threaded into ctx.shared.planBinding by the runner.
+          planBinding,
+        } as Parameters<typeof startPipeline>[2]);
         ws.send(JSON.stringify({
           type: 'plan-execute-started',
           payload: {
             planSlug: msg.planSlug,
+            planVersion: plan.version,
+            planHash: planBinding.hash,
+            forced: force && (validation.counts.errors > 0 || !approvalValid),
             stagesSkipped: ['clarify', 'requirements', 'repo-requirements', 'specs', 'tasks'],
           },
         }));
+        // Lifecycle — pipeline starting; tag for execute-complete/fail later.
+        void dispatchLifecycle(msg.project, msg.planSlug, { kind: 'execute-started' });
         break;
       }
 
@@ -5099,6 +5331,39 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
     if (activeChild) { activeChild.kill('SIGTERM'); activeChild = null; }
     outputBuffer = [];
 
+    // Register the run + broadcast BEFORE any setup work. Without this the
+    // user clicks Build and sees Active Runs stay stale for a beat while
+    // the runner constructs hooks. Visible activity ID is the same one we
+    // pass to activeRuns.set later (replaced rather than re-registered).
+    const pipelineRunId = `build-${Date.now().toString(36)}`;
+    const pipelineActivities: typeof outputBuffer = [];
+    // Seed an initial activity so the per-stage panel isn't blank while
+    // the runner spins up (workspace bootstrap + manifest load + walker
+    // prefetch). Without this the dashboard renders "No output for this
+    // stage yet" for the first few seconds even though work is happening.
+    const seedEntry = {
+      timestamp: Date.now(),
+      stage: 'clarify',
+      type: 'stdout' as const,
+      content: 'Initialising pipeline — workspace + provider liveness…',
+      kind: 'project' as const,
+    };
+    pipelineActivities.push(seedEntry);
+    outputBuffer.push(seedEntry);
+    activeRuns.set(pipelineRunId, {
+      id: pipelineRunId,
+      type: 'build',
+      project,
+      description: feature,
+      model: options?.model ?? 'sonnet',
+      status: 'running',
+      startedAt: Date.now(),
+      activities: pipelineActivities,
+      prUrls: new Set(),
+    });
+    broadcastActiveRuns();
+    broadcast({ type: 'agent-output', payload: { entries: [seedEntry], runId: pipelineRunId } });
+
     const runner = new PipelineRunner(agentManager, projectLoader, featureStore, {
       project,
       feature,
@@ -5431,21 +5696,6 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
 
     activePipelineRunner = runner;
 
-    // Register as active run — use own array, not shared outputBuffer
-    const pipelineRunId = `build-${Date.now().toString(36)}`;
-    const pipelineActivities: typeof outputBuffer = [];
-    activeRuns.set(pipelineRunId, {
-      id: pipelineRunId,
-      type: 'build',
-      project,
-      description: feature,
-      model: options?.model ?? 'sonnet',
-      status: 'running',
-      startedAt: Date.now(),
-      activities: pipelineActivities,
-      prUrls: new Set(),
-    });
-
     // Map all pipeline agents to this run ID as they're spawned
     const originalSpawn = agentManager.spawn.bind(agentManager);
     agentManager.spawn = (config: any) => {
@@ -5453,8 +5703,6 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       agentToRunId.set(agent.id, pipelineRunId);
       return agent;
     };
-
-    broadcastActiveRuns();
 
     // Broadcast pipeline state changes
     runner.on('state-change', (pipelineState: PipelineRunState) => {
@@ -5636,25 +5884,41 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
           console.warn('[pipeline] test-spec broadcast failed:', err);
         }
       }
+      // Two kinds of `artifact-written` flow through here:
+      //   1. Real artifacts (REQUIREMENTS.md / SPECS.md / BUILD.md / …)
+      //      → data.file is set, summary may be present.
+      //   2. Pre-spawn prep progress (auth probe / git branches / lint
+      //      guards / "spawning agent…") → data.file is '', data.summary
+      //      carries the user-visible status. These light up the
+      //      Activity panel during the otherwise-silent setup gap.
+      // For (1) we keep the old "Artifact: <file>" label so the existing
+      // UI tooltip + Changes-panel wiring stays untouched. For (2) we
+      // surface `summary` as the activity content + skip the change entry
+      // (no file means nothing to render in Changes).
+      const isPrepEvent = !data.file && !!data.summary;
       const entry = {
         timestamp: Date.now(),
         stage: data.stage,
         type: 'stdout' as const,
-        content: `Artifact: ${data.file}`,
-        kind: 'artifact',
+        content: isPrepEvent
+          ? data.summary
+          : `Artifact: ${data.file}${data.summary ? ` — ${data.summary}` : ''}`,
+        kind: isPrepEvent ? ('project' as const) : ('artifact' as const),
         repo: data.repo,
       };
       pipelineActivities.push(entry);
       outputBuffer.push(entry);
       broadcast({ type: 'agent-output', payload: { entries: [entry], runId: pipelineRunId } });
-      // Also broadcast as a change entry
-      broadcast({ type: 'artifact', payload: {
-        file: data.file,
-        stage: data.stage,
-        summary: data.summary,
-        repo: data.repo,
-        timestamp: Date.now(),
-      }});
+      // Only fan out to Changes panel when an actual file was written.
+      if (data.file) {
+        broadcast({ type: 'artifact', payload: {
+          file: data.file,
+          stage: data.stage,
+          summary: data.summary,
+          repo: data.repo,
+          timestamp: Date.now(),
+        }});
+      }
     });
 
     runner.on('pipeline-complete', (pipelineState: PipelineRunState) => {
@@ -5679,6 +5943,12 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       if (completedRun) completedRun.status = 'completed';
       activeRuns.delete(pipelineRunId);
       detachBus();
+      // Lifecycle — pipeline success flips into reconciling → complete.
+      if (options?.planSeed) {
+        void dispatchLifecycle(project, options.planSeed.slug, { kind: 'execute-complete' });
+        // Reconcile is a no-op stub today; advance the state machine.
+        void dispatchLifecycle(project, options.planSeed.slug, { kind: 'reconcile-complete' });
+      }
       broadcastActiveRuns();
       broadcastRuns();
     });
@@ -5692,6 +5962,12 @@ export async function startDashboardServer(opts: DashboardServerOptions): Promis
       if (failedRun) failedRun.status = 'failed';
       // Keep failed runs in activeRuns — they are resumable and should stay visible
       detachBus();
+      // Lifecycle — pipeline failure is terminal for the plan-seeded run.
+      if (options?.planSeed) {
+        const reason = pipelineState.stages.find((s) => s.error)?.error
+          ?? `pipeline failed at stage ${pipelineState.currentStage}`;
+        void dispatchLifecycle(project, options.planSeed.slug, { kind: 'execute-failed', reason });
+      }
       broadcastActiveRuns();
       broadcastRuns();
     });
@@ -5985,7 +6261,24 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
 
   // ── Plan agent: structured Plan generation ─────────────────────────
 
-  /** Map planAgentId → { project, feature, model, section?, variant? } for post-run JSON extraction. */
+  /**
+   * Map planAgentId → context for post-run JSON extraction + chain-walker
+   * retry. When `finalizePlanAgent` finds no JSON or `agentManager` emits
+   * `agent-error`, the runtime burns the model into `burned`, picks the
+   * next sibling in the same tier from `~/.anvil/models.yaml`, and
+   * re-spawns up to `attemptsRemaining` times — same agnostic chain-walk
+   * the pipeline runner uses for stage upstream errors.
+   */
+  // 6 attempts ≈ cheap (2) → premium (3) → local-tier opencode (1)
+  // before giving up. Was 3; cheap-only exhaustion was the failure mode
+  // users hit when haiku + adk:gemini-flash both fumble JSON output.
+  const PLAN_AGENT_MAX_ATTEMPTS = 6;
+  // In-session correction attempts: when the agent finishes but its output
+  // doesn't parse as JSON, ask the SAME agent (via `sendInput`) to fix it
+  // before tearing down and respawning on a different model. Cheaper, keeps
+  // the agent's tool history / KB context warm, and most JSON-shape errors
+  // are fixable in a single corrective turn.
+  const PLAN_AGENT_SAME_AGENT_RETRIES = 2;
   const planAgentContext = new Map<string, {
     project: string;
     feature: string;
@@ -5993,28 +6286,442 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
     existingSlug?: string;        // if present, bump a version; otherwise create
     section?: PlanSection;        // if present, merge only this section of the plan
     variant?: { batchId: string; index: number; label: string };  // A/B variant generation
+    variantPrompt?: string;       // saved prompt-hint so retry preserves variant shape
+    burned: Set<string>;          // models exhausted this attempt-chain
+    attemptsRemaining: number;    // hits 0 → broadcast plan-error
+    sameAgentRetriesRemaining: number;  // same-agent corrective turns left
   }>();
 
-  /** Extract the last fenced ```json ... ``` block from streamed agent output. */
+  /**
+   * Tracks regens spawned by a single auto-refine pass. The lifecycle
+   * walker stays in `refining` until `count` hits 0; only then does
+   * it fire `refine-complete` with the accumulated USD. Prevents the
+   * infinite verify ↔ refine loop where the lifecycle fires
+   * refine-complete immediately, sees the same errors against a plan
+   * still being mutated by async regens, and triggers another refine.
+   */
+  const outstandingRefineRegens = new Map<string, {
+    count: number;
+    spentUsd: number;
+    timeoutHandle: NodeJS.Timeout;
+  }>();
+  const REFINE_PASS_TIMEOUT_MS = 120_000;
+  const PER_REGEN_USD_ESTIMATE = 0.10;
+
+  function isPartOfActiveRefine(project: string, slug: string): boolean {
+    return outstandingRefineRegens.has(`${project}:${slug}`);
+  }
+
+  function noteRefineRegenCompleted(project: string, slug: string): void {
+    const key = `${project}:${slug}`;
+    const entry = outstandingRefineRegens.get(key);
+    if (!entry) return;
+    entry.count--;
+    entry.spentUsd += PER_REGEN_USD_ESTIMATE;
+    if (entry.count <= 0) {
+      clearTimeout(entry.timeoutHandle);
+      outstandingRefineRegens.delete(key);
+      void (async () => {
+        await dispatchLifecycle(project, slug, { kind: 'refine-complete', spentUsd: entry.spentUsd });
+        // Settle the lifecycle by running verify once against the new
+        // plan version. We do NOT auto-fire another refine — the user
+        // controls whether to click Auto-refine again.
+        const plan = planStore.readCurrent(project, slug);
+        if (!plan) return;
+        const validation = planValidator.validate(plan);
+        planStore.writeValidation(project, slug, validation);
+        broadcast({ type: 'plan-validation', payload: { validation, planSlug: slug } });
+        await dispatchLifecycle(project, slug, {
+          kind: 'verify-complete',
+          errors: validation.counts.errors,
+          autoFixableCount: validation.issues.filter((i) => i.autoFixable).length,
+          canTargetedRegen: validation.issues.some((i) => i.hint),
+        });
+      })();
+    }
+  }
+
+  /**
+   * Resolve the model for the plan stage from `~/.anvil/models.yaml` +
+   * stage-policy.yaml. Honors an explicit user pick (anything that's
+   * not the legacy `'sonnet'` sentinel) and otherwise lets the
+   * resolver pick the first model in the chain (kimi → glm → fallbacks
+   * when models.yaml is opencode-first).
+   *
+   * Why this exists: the UI's `availableModels.defaultModel` is
+   * hardcoded to `'sonnet'` (see provider-registry.ts) when Claude CLI
+   * is installed — that pre-dates stage-policy and bypasses it. Without
+   * this guard, every plan agent would spawn Claude regardless of the
+   * user's models.yaml.
+   */
+  function resolveStageModel(stage: string, userPick?: string): string {
+    // Explicit user pick that's NOT the legacy default → trust it.
+    if (userPick && userPick !== 'sonnet' && userPick !== 'auto') {
+      return userPick;
+    }
+    try {
+      const chain = registryResolveStage(stage);
+      return chain.primary;
+    } catch (err) {
+      if (err instanceof ModelResolutionError || err instanceof UnknownStageError) {
+        // Stage-policy didn't resolve — fall back to whatever the user
+        // (or UI) suggested, defaulting to 'sonnet' as a last resort so
+        // we don't crash the spawn.
+        return userPick || 'sonnet';
+      }
+      throw err;
+    }
+  }
+
+  function resolvePlanStageModel(userPick?: string): string {
+    return resolveStageModel('plan', userPick);
+  }
+
+  // ── Plan lifecycle walker — dispatcher + side-effect runners ────────
+  //
+  // The pure state machine lives in core-pipeline (`plan/lifecycle.ts`).
+  // The dispatcher below wires it into the dashboard's effects:
+  //   • `verify` action → run rule engine + dispatch verify-complete
+  //   • `refine` action → run auto-refine pass + dispatch refine-complete
+  // Other actions (wait-for-user / execute / reconcile / noop) are
+  // resolved by existing WS handlers that observe the state transition.
+  function lifecycleKey(project: string, slug: string): string {
+    return `${project}:${slug}`;
+  }
+
+  function broadcastPlanLifecycle(snap: import('@esankhan3/anvil-core-pipeline').LifecycleSnapshot): void {
+    broadcast({ type: 'plan-lifecycle', payload: snap });
+  }
+
+  /**
+   * Lifecycle dispatcher — drives the state machine and broadcasts the
+   * snapshot. Side effects (`verify`, `refine`) are NOT auto-fired:
+   *
+   *   - `verify` runs synchronously inside the handler that triggered
+   *     the transition (e.g. finalizePlanAgent already validates and
+   *     broadcasts plan-validation before calling dispatchLifecycle).
+   *   - `refine` runs only when the user clicks Auto-refine, via the
+   *     `auto-refine-plan` WS handler which calls executeLifecycleRefine
+   *     directly. The refine pass itself loops verify → refine internally
+   *     (bounded by maxRefineAttempts + maxRefineUsd), but a single user
+   *     click is the only thing that can START a refine pass.
+   *
+   * This is intentional: the lifecycle is a STATE TRACKER, not an
+   * automation engine. The plan only mutates when the user explicitly
+   * asks for it (Generate Plan, Regen section, Auto-refine, Save, etc.).
+   */
+  async function dispatchLifecycle(
+    project: string,
+    slug: string,
+    event: import('@esankhan3/anvil-core-pipeline').LifecycleEvent,
+  ): Promise<import('@esankhan3/anvil-core-pipeline').LifecycleSnapshot> {
+    const { initLifecycle, transitionLifecycle, snapshotLifecycle } =
+      await import('@esankhan3/anvil-core-pipeline');
+    const key = lifecycleKey(project, slug);
+    let ctx = planLifecycle.get(key);
+    if (!ctx) {
+      ctx = initLifecycle({ project, slug });
+      planLifecycle.set(key, ctx);
+    }
+    const { next } = transitionLifecycle(ctx, event);
+    planLifecycle.set(key, next);
+    const snap = snapshotLifecycle(next);
+    broadcastPlanLifecycle(snap);
+    return snap;
+  }
+
+  async function executeLifecycleVerify(project: string, slug: string): Promise<void> {
+    try {
+      const plan = planStore.readCurrent(project, slug);
+      if (!plan) return;
+      const validation = planValidator.validate(plan);
+      planStore.writeValidation(project, slug, validation);
+      const autoFixableCount = validation.issues.filter((i) => i.autoFixable).length;
+      const canTargetedRegen = validation.issues.some((i) => i.hint);
+      broadcast({ type: 'plan-validation', payload: { validation, planSlug: slug } });
+      await dispatchLifecycle(project, slug, {
+        kind: 'verify-complete',
+        errors: validation.counts.errors,
+        autoFixableCount,
+        canTargetedRegen,
+      });
+    } catch (err) {
+      console.warn('[lifecycle] verify failed:', err);
+    }
+  }
+
+  async function executeLifecycleRefine(project: string, slug: string): Promise<void> {
+    try {
+      // Refuse to enter a fresh refine pass if one's already in flight.
+      // Prevents the runaway where verify-complete keeps firing refine
+      // against a plan that's still being mutated by async regens.
+      if (isPartOfActiveRefine(project, slug)) {
+        return;
+      }
+      const result = await runAutoRefinePass(project, slug);
+      // result === null → regens were scheduled; refine-complete will
+      // fire from noteRefineRegenCompleted when the last regen lands.
+      if (result === null) return;
+      await dispatchLifecycle(project, slug, { kind: 'refine-complete', spentUsd: result });
+      // Settle the lifecycle by running verify once. We do NOT loop
+      // back into refine — the user controls whether to click again.
+      const plan = planStore.readCurrent(project, slug);
+      if (!plan) return;
+      const validation = planValidator.validate(plan);
+      planStore.writeValidation(project, slug, validation);
+      broadcast({ type: 'plan-validation', payload: { validation, planSlug: slug } });
+      await dispatchLifecycle(project, slug, {
+        kind: 'verify-complete',
+        errors: validation.counts.errors,
+        autoFixableCount: validation.issues.filter((i) => i.autoFixable).length,
+        canTargetedRegen: validation.issues.some((i) => i.hint),
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await dispatchLifecycle(project, slug, { kind: 'refine-failed', reason });
+    }
+  }
+
+  /**
+   * Runs the deterministic patches + targeted regen dispatch for a
+   * plan.
+   *
+   * Return value:
+   *   - `number` → all work synchronous, refine-complete should fire now
+   *   - `null`   → async regens scheduled; refine-complete will fire when
+   *     `noteRefineRegenCompleted` decrements the outstanding count to 0
+   */
+  async function runAutoRefinePass(project: string, slug: string): Promise<number | null> {
+    const plan = planStore.readCurrent(project, slug);
+    if (!plan) return 0;
+    const { autoRefinePlan, runPlanRules } = await import('@esankhan3/anvil-core-pipeline');
+    const ruleCtx = {
+      project: plan.project,
+      projectRepos: (() => {
+        try { return Object.keys(projectLoader.getRepoLocalPaths(plan.project)); } catch { return []; }
+      })(),
+      kbFiles: {} as Record<string, Set<string>>,
+      kbSymbols: {} as Record<string, Set<string>>,
+    };
+    const ruleReport = runPlanRules(plan, ruleCtx);
+    const outcome = autoRefinePlan(plan, ruleReport);
+    let nextPlan = outcome.plan;
+    if (outcome.changes > 0) {
+      nextPlan = planStore.bumpVersion(plan.project, plan.slug, {
+        ...outcome.plan,
+        approval: undefined,
+      });
+      const reval = planValidator.validate(nextPlan);
+      planStore.writeValidation(plan.project, plan.slug, reval);
+      broadcast({ type: 'plan-updated', payload: { plan: nextPlan, validation: reval } });
+      broadcast({
+        type: 'auto-refine-progress',
+        payload: { summary: `${outcome.changes} deterministic patch${outcome.changes === 1 ? '' : 'es'} applied. ${outcome.remaining.length} issue${outcome.remaining.length === 1 ? '' : 's'} remain.` },
+      });
+    }
+    const PLAN_SECTIONS_BY_PREFIX: Record<string, PlanSection> = {
+      problem: 'problem', scope: 'scope', repos: 'repos', contracts: 'contracts',
+      data: 'data', observability: 'observability', architecture: 'architecture',
+      risks: 'risks', rollout: 'rollout', tests: 'tests', estimate: 'estimate',
+    };
+    const sectionsToRegen = new Map<PlanSection, string[]>();
+    for (const issue of outcome.remaining) {
+      if (!issue.fixHint) continue;
+      const prefix = issue.path.split(/[[.]/)[0];
+      const section = PLAN_SECTIONS_BY_PREFIX[prefix];
+      if (!section) continue;
+      const hints = sectionsToRegen.get(section) ?? [];
+      hints.push(`${issue.ruleId}: ${issue.fixHint}`);
+      sectionsToRegen.set(section, hints);
+    }
+    // Hard cap on regens per pass. Even if the rule engine surfaces 20
+    // sections needing fixes, we only spawn 4 — the bound prevents a
+    // single Auto-refine click from queuing dozens of agents.
+    const MAX_REGENS_PER_PASS = 4;
+    const cappedSections = [...sectionsToRegen.entries()].slice(0, MAX_REGENS_PER_PASS);
+    if (cappedSections.length === 0) {
+      // No regens — synchronous refine; lifecycle dispatches refine-complete now.
+      return 0;
+    }
+    // Register an outstanding-refine entry so the lifecycle stays in
+    // `refining` until every regen returns. The timeout is a safety
+    // valve: if a regen hangs forever, the lifecycle won't deadlock.
+    const key = `${project}:${slug}`;
+    // If an entry already exists (shouldn't, given executeLifecycleRefine
+    // guards), clear its timer to avoid leaking handles.
+    const existing = outstandingRefineRegens.get(key);
+    if (existing) clearTimeout(existing.timeoutHandle);
+    const timeoutHandle = setTimeout(() => {
+      const entry = outstandingRefineRegens.get(key);
+      if (entry && entry.count > 0) {
+        outstandingRefineRegens.delete(key);
+        void dispatchLifecycle(project, slug, { kind: 'refine-failed', reason: `regen timeout (${cappedSections.length} pending)` });
+      }
+    }, REFINE_PASS_TIMEOUT_MS);
+    outstandingRefineRegens.set(key, {
+      count: cappedSections.length,
+      spentUsd: 0,
+      timeoutHandle,
+    });
+    let idx = 0;
+    for (const [section, hints] of cappedSections) {
+      const correction = hints.slice(0, 5).join('\n- ');
+      const fixPrompt = `Apply these corrections to the "${section}" section:\n- ${correction}`;
+      setTimeout(() => {
+        try {
+          spawnPlanSectionRegen(
+            planStore.readCurrent(plan.project, plan.slug) ?? nextPlan,
+            section,
+            undefined,
+            undefined,
+            fixPrompt,
+          );
+        } catch (err) {
+          console.warn(`[auto-refine] regen for ${section} failed:`, err);
+          // Decrement the outstanding count so a failed-to-spawn regen
+          // doesn't keep the lifecycle hung.
+          noteRefineRegenCompleted(project, slug);
+        }
+      }, idx * 3000);
+      idx++;
+    }
+    // null = "regens in flight; refine-complete will fire when count == 0"
+    return null;
+  }
+
+  /**
+   * Pick the next plan-stage model from ~/.anvil/models.yaml. Walks
+   * unburned candidates in this order:
+   *   1. Same tier as the failing model (cheap → cheap siblings).
+   *   2. Then escalate one rung: cheap → premium, premium → cheap.
+   *   3. Then local-tier opencode entries (subscription-backed, cheap).
+   * Excludes utility models (those `consumed_by: knowledge-core` like
+   * bge-m3 / qwen3:0.6b) since those are embed/rerank, not chat.
+   * Returns null when nothing's left.
+   */
+  async function pickNextPlanModel(
+    currentModel: string,
+    burned: ReadonlySet<string>,
+  ): Promise<string | null> {
+    try {
+      const { loadModelRegistry } = await import('@esankhan3/anvil-agent-core');
+      const registry = loadModelRegistry({});
+      const current = registry.models.find((m) => m.id === currentModel);
+      if (!current) return null;
+
+      const isChatCandidate = (m: { id: string; capabilities?: string[]; consumed_by?: string }) =>
+        m.id !== currentModel &&
+        !burned.has(m.id) &&
+        !m.consumed_by &&
+        (m.capabilities?.includes('code') || m.capabilities?.includes('reasoning'));
+
+      // Tier order: current tier first, then the opposite of cheap/premium,
+      // then local (opencode) as a last-mile fallback.
+      const tierOrder: string[] = current.tier === 'cheap'
+        ? ['cheap', 'premium', 'local']
+        : current.tier === 'premium'
+          ? ['premium', 'cheap', 'local']
+          : [current.tier, 'cheap', 'premium', 'local'];
+
+      for (const tier of tierOrder) {
+        const inTier = registry.models.filter(
+          (m) => m.tier === tier && isChatCandidate(m),
+        );
+        if (inTier[0]) return inTier[0].id;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Extract JSON from streamed agent output. Tries (in order):
+   *   1. Direct parse of the trimmed output.
+   *   2. Every fenced ```json / ``` block, longest first.
+   *   3. Largest balanced `{...}` slice.
+   *   4. Largest balanced `[...]` slice (for section regen of repos /
+   *      contracts / risks where the section is an array).
+   *   5. Same passes after stripping trailing commas, JS-style comments,
+   *      smart quotes — common LLM artifacts that break strict JSON.parse.
+   * Returns `unknown` (object / array / primitive parsed from JSON), or
+   * `null` when every strategy fails.
+   */
   function extractJsonBlock(text: string): unknown | null {
-    // Match fenced blocks first
-    const fenceRe = /```json\s*([\s\S]*?)```/gi;
-    let match: RegExpExecArray | null;
-    let last: string | null = null;
-    while ((match = fenceRe.exec(text)) !== null) {
-      last = match[1];
+    const tryParse = (s: string): unknown | null => {
+      try { return JSON.parse(s); } catch { return null; }
+    };
+    const sanitize = (s: string): string => s
+      .replace(/[\u201C\u201D]/g, '"')           // smart double quotes → "
+      .replace(/[\u2018\u2019]/g, "'")           // smart single quotes → '
+      .replace(/\/\/[^\n]*/g, '')                 // // line comments
+      .replace(/\/\*[\s\S]*?\*\//g, '')           // /* block comments */
+      .replace(/,(\s*[}\]])/g, '$1');             // trailing commas
+    const candidates: string[] = [];
+    // Strategy 1: full text.
+    candidates.push(text.trim());
+    // Strategy 2: every fenced block (json or untyped), longest first.
+    const fences: string[] = [];
+    const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+    let m: RegExpExecArray | null;
+    while ((m = fenceRe.exec(text)) !== null) fences.push(m[1].trim());
+    fences.sort((a, b) => b.length - a.length);
+    candidates.push(...fences);
+    // Strategy 3: largest balanced {...}.
+    const objSpan = largestBalancedSpan(text, '{', '}');
+    if (objSpan) candidates.push(objSpan);
+    // Strategy 4: largest balanced [...].
+    const arrSpan = largestBalancedSpan(text, '[', ']');
+    if (arrSpan) candidates.push(arrSpan);
+    // Pass 1: parse as-is. Pass 2: parse after sanitising LLM artifacts.
+    for (const c of candidates) {
+      const direct = tryParse(c);
+      if (direct !== null && direct !== undefined) return direct;
     }
-    if (last) {
-      try { return JSON.parse(last.trim()); } catch { /* fall through */ }
-    }
-    // Fallback: find the largest top-level {...} block
-    const braceStart = text.indexOf('{');
-    const braceEnd = text.lastIndexOf('}');
-    if (braceStart >= 0 && braceEnd > braceStart) {
-      const candidate = text.slice(braceStart, braceEnd + 1);
-      try { return JSON.parse(candidate); } catch { /* give up */ }
+    for (const c of candidates) {
+      const repaired = tryParse(sanitize(c));
+      if (repaired !== null && repaired !== undefined) return repaired;
     }
     return null;
+  }
+
+  /**
+   * Walk the string finding the widest balanced span between `open` and
+   * `close`. String contents (including escaped quotes) are skipped so
+   * braces inside strings don't break balance counting.
+   */
+  function largestBalancedSpan(text: string, open: string, close: string): string | null {
+    let bestStart = -1;
+    let bestLen = 0;
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escape) { escape = false; continue; }
+        if (ch === '\\') { escape = true; continue; }
+        if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === open) {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (ch === close && depth > 0) {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          const len = i - start + 1;
+          if (len > bestLen) {
+            bestLen = len;
+            bestStart = start;
+          }
+          start = -1;
+        }
+      }
+    }
+    return bestLen > 0 ? text.slice(bestStart, bestStart + bestLen) : null;
   }
 
   function buildPlanPrompt(
@@ -6067,27 +6774,44 @@ You have ${repoNames.length} repos: ${repoNames.join(', ')}. Stay within these d
       'Do NOT modify any files. This is planning only.',
     ].filter(Boolean).join('\n');
 
+    // Output contract repeated at top AND bottom so smaller models don't
+    // drift into prose after a long schema block. Empty response or any
+    // non-JSON output triggers a chain-walker retry on the server.
+    const outputContract = `## OUTPUT CONTRACT (read first, obey strictly)
+
+Your ENTIRE response MUST be a single fenced \`\`\`json ... \`\`\` block. No prose
+before it. No prose after it. No commentary inside. No additional fences.
+If you cannot fully satisfy the schema, emit your best-effort JSON anyway —
+the server validates and asks for fixes; prose is rejected.`;
+
     if (mode === 'full') {
-      return `${rules}
+      return `${outputContract}
+
+${rules}
 
 ## Feature to plan
 
 ${feature}
 
-## Required output
+## Schema
 
-Output EXACTLY one fenced \`\`\`json ... \`\`\` block containing a JSON object matching this schema:
+The JSON object must match this schema:
 
 \`\`\`json
 ${schema}
 \`\`\`
 
-No prose outside the JSON block. All string fields must be non-empty where the schema has no "optional" qualifier.`;
+## Reminder
+
+Reply with ONLY a fenced \`\`\`json ... \`\`\` block. No prose. No markdown. All
+string fields must be non-empty where the schema has no "optional" qualifier.`;
     }
 
     // Section regen
     const planJson = existingPlan ? JSON.stringify(existingPlan, null, 2) : '{}';
-    return `${rules}
+    return `${outputContract}
+
+${rules}
 
 ## Existing plan (regenerate one section only)
 
@@ -6099,13 +6823,20 @@ ${planJson}
 
 Regenerate the **"${mode}"** section of the plan based on the existing context and any new information you gather.
 
-Output EXACTLY one fenced \`\`\`json ... \`\`\` block containing ONLY the updated section value (matching that section's schema — an object for scope/architecture/rollout/tests/estimate, or an array for repos/contracts/risks, or a string for problem).
+## Reminder
 
-No prose outside the JSON block.`;
+Reply with ONLY a fenced \`\`\`json ... \`\`\` block containing the updated section value (matching that section's schema — an object for scope/architecture/rollout/tests/estimate, an array for repos/contracts/risks, or a string for problem). No prose.`;
   }
 
-  function spawnPlanAgent(project: string, feature: string, modelId?: string): void {
-    outputBuffer = [];
+  function spawnPlanAgent(
+    project: string,
+    feature: string,
+    modelId?: string,
+    retryState?: { burned: Set<string>; attemptsRemaining: number },
+  ): void {
+    // Don't clobber outputBuffer on retry — the user wants to see the
+    // burned-model history in the activity panel.
+    if (!retryState) outputBuffer = [];
 
     const configWorkspace = getWorkspaceFromConfig(project);
     const cwd = configWorkspace && existsSync(configWorkspace)
@@ -6113,7 +6844,10 @@ No prose outside the JSON block.`;
       : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), project);
 
     const runId = `plan-${Date.now().toString(36)}`;
-    const model = modelId ?? 'sonnet';
+    // When no explicit model passed (or `auto` sentinel from the UI), defer
+    // to stage-policy so models.yaml is the source of truth. Falls back to
+    // 'sonnet' only if both the resolver throws AND the user hasn't picked.
+    const model = resolvePlanStageModel(modelId);
 
     // Load KB for context
     let kbReport = '';
@@ -6164,7 +6898,14 @@ No prose outside the JSON block.`;
       disallowedTools: disallowedToolsForPersona('architect'),
     });
 
-    planAgentContext.set(agent.id, { project, feature, model });
+    planAgentContext.set(agent.id, {
+      project,
+      feature,
+      model,
+      burned: retryState?.burned ?? new Set<string>(),
+      attemptsRemaining: retryState?.attemptsRemaining ?? PLAN_AGENT_MAX_ATTEMPTS,
+      sameAgentRetriesRemaining: PLAN_AGENT_SAME_AGENT_RETRIES,
+    });
 
     activeRuns.set(runId, {
       id: runId,
@@ -6184,13 +6925,119 @@ No prose outside the JSON block.`;
     broadcast({ type: 'agent-spawned', payload: { ...agent, runId } });
   }
 
+  /**
+   * Inner helper for variants — spawns ONE variant. Used both by the
+   * `spawnPlanVariants` batch entry and the chain-walker retry path.
+   * Keeps `batchId` / `index` / `label` stable so retries land back in
+   * the same UI column.
+   */
+  function spawnOnePlanVariant(
+    project: string,
+    feature: string,
+    variant: { label: string; prompt?: string },
+    batchId: string,
+    index: number,
+    model: string,
+    retryState?: { burned: Set<string>; attemptsRemaining: number },
+  ): void {
+    const configWorkspace = getWorkspaceFromConfig(project);
+    const cwd = configWorkspace && existsSync(configWorkspace)
+      ? configWorkspace
+      : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), project);
+
+    let kbReport = '';
+    const indexPrompt = kbManager.getIndexForPrompt(project);
+    if (indexPrompt) {
+      const queryContext = kbManager.getQueryContextForPrompt(project, feature);
+      kbReport = `${indexPrompt}\n\n---\n\n${queryContext}`;
+    } else {
+      kbReport = kbManager.getAllGraphReports(project);
+    }
+
+    const repoInfo = projectLoader.getRepoLocalPaths(project);
+    const repoNames = Object.keys(repoInfo);
+    const repoPaths = Object.entries(repoInfo).map(([n, p]) => `- ${n}: ${p}`).join('\n');
+
+    const variantHint = variant.prompt
+      ? `This variant is approach "${variant.label}". ${variant.prompt}`
+      : `This variant is approach "${variant.label}". Bias your plan toward that approach (${variant.label.toLowerCase()} — e.g. smallest change, cleanest refactor, or a greenfield rewrite).`;
+
+    const projectPromptParts: string[] = [
+      `You are a senior engineer planning work in the "${project}" project.`,
+      `\n## Variant\n${variantHint}`,
+      `\n## Project Repos\n${repoNames.length} repositories:\n${repoPaths}`,
+    ];
+    if (kbReport) {
+      projectPromptParts.push(`\n## Codebase Knowledge Base\n${kbReport}`);
+    }
+    const projectMemory = memoryStore.formatForPrompt(project, 'memory');
+    const userProfile = memoryStore.formatForPrompt(project, 'user');
+    if (projectMemory || userProfile) {
+      projectPromptParts.push(`\n## Memories\n${[projectMemory, userProfile].filter(Boolean).join('\n\n')}`);
+    }
+    const projectPrompt = projectPromptParts.join('\n');
+
+    const prompt = buildPlanPrompt(project, feature, repoNames, kbReport, 'full');
+
+    const agent = agentManager.spawn({
+      name: `plan-variant-${variant.label}-${project}`,
+      persona: 'architect',
+      project,
+      stage: `plan-variant:${variant.label}`,
+      prompt,
+      projectPrompt,
+      model,
+      cwd,
+      permissionMode: 'bypassPermissions',
+      disallowedTools: disallowedToolsForPersona('architect'),
+    });
+
+    planAgentContext.set(agent.id, {
+      project,
+      feature,
+      model,
+      variant: { batchId, index, label: variant.label },
+      variantPrompt: variant.prompt,
+      burned: retryState?.burned ?? new Set<string>(),
+      attemptsRemaining: retryState?.attemptsRemaining ?? PLAN_AGENT_MAX_ATTEMPTS,
+      sameAgentRetriesRemaining: PLAN_AGENT_SAME_AGENT_RETRIES,
+    });
+
+    const runId = `plan-var-${batchId}-${index}`;
+    activeRuns.set(runId, {
+      id: runId,
+      type: 'plan',
+      project,
+      description: `[variant:${variant.label}] ${feature}`,
+      model,
+      status: 'running',
+      startedAt: Date.now(),
+      agentId: agent.id,
+      activities: [],
+      prUrls: new Set(),
+    });
+    agentToRunId.set(agent.id, runId);
+
+    broadcast({ type: 'agent-spawned', payload: { ...agent, runId, variant: { batchId, index, label: variant.label } } });
+  }
+
+  /**
+   * Stagger between variant spawns. Spawning 3 sonnet plans simultaneously
+   * regularly hits Anthropic's per-account burst limit — one of them stalls
+   * mid-stream while the others finish. Spreading the start times by ~6s
+   * lets each call clear the initial token-burst window before the next
+   * fires. This is a defensive mitigation; the chain-walker on
+   * `agent-error` still catches stalls that get through.
+   */
+  const VARIANT_SPAWN_STAGGER_MS = 6000;
+
   function spawnPlanVariants(
     project: string,
     feature: string,
     variants: Array<{ label: string; prompt?: string }>,
     modelId?: string,
   ): void {
-    const model = modelId ?? 'sonnet';
+    const model = resolvePlanStageModel(modelId);
     const batchId = `variants-${Date.now().toString(36)}`;
 
     // Announce batch start so the UI can render N placeholder columns.
@@ -6205,96 +7052,33 @@ No prose outside the JSON block.`;
     });
 
     variants.forEach((variant, index) => {
-      // Each variant gets its own agent. We tag the planAgentContext with variant
-      // metadata so finalizePlanAgent knows to tag the resulting plan.
-      const configWorkspace = getWorkspaceFromConfig(project);
-      const cwd = configWorkspace && existsSync(configWorkspace)
-        ? configWorkspace
-        : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), project);
-
-      let kbReport = '';
-      const indexPrompt = kbManager.getIndexForPrompt(project);
-      if (indexPrompt) {
-        const queryContext = kbManager.getQueryContextForPrompt(project, feature);
-        kbReport = `${indexPrompt}\n\n---\n\n${queryContext}`;
+      const fire = () => spawnOnePlanVariant(project, feature, variant, batchId, index, model);
+      if (index === 0) {
+        fire();
       } else {
-        kbReport = kbManager.getAllGraphReports(project);
+        setTimeout(fire, index * VARIANT_SPAWN_STAGGER_MS);
       }
-
-      const repoInfo = projectLoader.getRepoLocalPaths(project);
-      const repoNames = Object.keys(repoInfo);
-      const repoPaths = Object.entries(repoInfo).map(([n, p]) => `- ${n}: ${p}`).join('\n');
-
-      const variantHint = variant.prompt
-        ? `This variant is approach "${variant.label}". ${variant.prompt}`
-        : `This variant is approach "${variant.label}". Bias your plan toward that approach (${variant.label.toLowerCase()} — e.g. smallest change, cleanest refactor, or a greenfield rewrite).`;
-
-      const projectPromptParts: string[] = [
-        `You are a senior engineer planning work in the "${project}" project.`,
-        `\n## Variant\n${variantHint}`,
-        `\n## Project Repos\n${repoNames.length} repositories:\n${repoPaths}`,
-      ];
-      if (kbReport) {
-        projectPromptParts.push(`\n## Codebase Knowledge Base\n${kbReport}`);
-      }
-      const projectMemory = memoryStore.formatForPrompt(project, 'memory');
-      const userProfile = memoryStore.formatForPrompt(project, 'user');
-      if (projectMemory || userProfile) {
-        projectPromptParts.push(`\n## Memories\n${[projectMemory, userProfile].filter(Boolean).join('\n\n')}`);
-      }
-      const projectPrompt = projectPromptParts.join('\n');
-
-      const prompt = buildPlanPrompt(project, feature, repoNames, kbReport, 'full');
-
-      const agent = agentManager.spawn({
-        name: `plan-variant-${variant.label}-${project}`,
-        persona: 'architect',
-        project,
-        stage: `plan-variant:${variant.label}`,
-        prompt,
-        projectPrompt,
-        model,
-        cwd,
-        permissionMode: 'bypassPermissions',
-        disallowedTools: disallowedToolsForPersona('architect'),
-      });
-
-      planAgentContext.set(agent.id, {
-        project,
-        feature,
-        model,
-        variant: { batchId, index, label: variant.label },
-      });
-
-      const runId = `plan-var-${batchId}-${index}`;
-      activeRuns.set(runId, {
-        id: runId,
-        type: 'plan',
-        project,
-        description: `[variant:${variant.label}] ${feature}`,
-        model,
-        status: 'running',
-        startedAt: Date.now(),
-        agentId: agent.id,
-        activities: [],
-        prUrls: new Set(),
-      });
-      agentToRunId.set(agent.id, runId);
-
-      broadcast({ type: 'agent-spawned', payload: { ...agent, runId, variant: { batchId, index, label: variant.label } } });
     });
 
     broadcastActiveRuns();
   }
 
-  function spawnPlanSectionRegen(existingPlan: Plan, section: PlanSection, modelId?: string): void {
+  function spawnPlanSectionRegen(
+    existingPlan: Plan,
+    section: PlanSection,
+    modelId?: string,
+    retryState?: { burned: Set<string>; attemptsRemaining: number },
+    fixPrompt?: string,
+  ): void {
     const configWorkspace = getWorkspaceFromConfig(existingPlan.project);
     const cwd = configWorkspace && existsSync(configWorkspace)
       ? configWorkspace
       : join(process.env.ANVIL_WORKSPACE_ROOT || process.env.FF_WORKSPACE_ROOT || join(homedir(), 'workspace'), existingPlan.project);
 
     const runId = `plan-${section}-${Date.now().toString(36)}`;
-    const model = modelId ?? existingPlan.model ?? 'sonnet';
+    // Use the existing plan's model as the user-pick hint; falls back to
+    // stage-policy when the existing model is the legacy `'sonnet'` default.
+    const model = resolvePlanStageModel(modelId ?? existingPlan.model);
 
     let kbReport = '';
     const indexPrompt = kbManager.getIndexForPrompt(existingPlan.project);
@@ -6308,7 +7092,12 @@ No prose outside the JSON block.`;
 
     const projectPrompt = `You are a senior engineer iterating on an existing plan for "${existingPlan.project}".\n\n## Repos\n${repoNames.map((n) => `- ${n}`).join('\n')}\n\n${kbReport ? `## Knowledge Base\n${kbReport}\n` : ''}`;
 
-    const prompt = buildPlanPrompt(existingPlan.project, existingPlan.feature, repoNames, kbReport, section, existingPlan);
+    const basePrompt = buildPlanPrompt(existingPlan.project, existingPlan.feature, repoNames, kbReport, section, existingPlan);
+    // Auto-refine path appends a corrective block so the agent knows
+    // exactly which rules fired and what to change.
+    const prompt = fixPrompt
+      ? `${basePrompt}\n\n## Auto-refine corrections\n${fixPrompt}\n\nApply the above corrections; keep every other field of the "${section}" section unchanged.`
+      : basePrompt;
 
     const agent = agentManager.spawn({
       name: `plan-${section}-${existingPlan.project}`,
@@ -6329,6 +7118,9 @@ No prose outside the JSON block.`;
       model,
       existingSlug: existingPlan.slug,
       section,
+      burned: retryState?.burned ?? new Set<string>(),
+      attemptsRemaining: retryState?.attemptsRemaining ?? PLAN_AGENT_MAX_ATTEMPTS,
+      sameAgentRetriesRemaining: PLAN_AGENT_SAME_AGENT_RETRIES,
     });
 
     activeRuns.set(runId, {
@@ -6350,26 +7142,165 @@ No prose outside the JSON block.`;
   }
 
   /**
+   * Re-spawn the same plan request on the next model in the user's chain.
+   * Called from `finalizePlanAgent` (no-JSON case) and the global
+   * `agent-error` handler (stalls / upstream errors). Returns true when a
+   * retry was kicked off — caller must NOT broadcast `plan-error` in that
+   * case. Returns false when the chain is exhausted or the context shape
+   * isn't recognised.
+   */
+  async function retryPlanAgentWithNextModel(
+    ctx: NonNullable<ReturnType<typeof planAgentContext.get>>,
+    reason: string,
+  ): Promise<boolean> {
+    if (ctx.attemptsRemaining <= 0) return false;
+    const nextModel = await pickNextPlanModel(ctx.model, ctx.burned);
+    if (!nextModel) return false;
+
+    const retryState = {
+      burned: new Set([...ctx.burned, ctx.model]),
+      attemptsRemaining: ctx.attemptsRemaining - 1,
+    };
+
+    const burnedList = [...retryState.burned].join(', ');
+    broadcast({
+      type: 'agent-output',
+      payload: { entries: [{
+        timestamp: Date.now(),
+        stage: 'plan',
+        type: 'stderr' as const,
+        kind: 'stderr',
+        content: `[plan] ${reason} — burning ${ctx.model}, retrying with ${nextModel} (burned: ${burnedList}; ${retryState.attemptsRemaining} attempt(s) left)`,
+      }] },
+    });
+
+    if (ctx.existingSlug && ctx.section) {
+      const current = planStore.readCurrent(ctx.project, ctx.existingSlug);
+      if (!current) return false;
+      spawnPlanSectionRegen(current, ctx.section, nextModel, retryState);
+      return true;
+    }
+    if (ctx.variant) {
+      spawnOnePlanVariant(
+        ctx.project,
+        ctx.feature,
+        { label: ctx.variant.label, prompt: ctx.variantPrompt },
+        ctx.variant.batchId,
+        ctx.variant.index,
+        nextModel,
+        retryState,
+      );
+      return true;
+    }
+    spawnPlanAgent(ctx.project, ctx.feature, nextModel, retryState);
+    return true;
+  }
+
+  /**
+   * Validate the shape the model returned matches what the dispatch path
+   * expects. Section `problem` is a plain string; every other section is
+   * an object or array — `typeof === 'object'` covers both since arrays
+   * are objects in JS.
+   */
+  function isValidParsedShape(parsed: unknown, section?: PlanSection): boolean {
+    if (section === 'problem') return typeof parsed === 'string' && parsed.length > 0;
+    return typeof parsed === 'object' && parsed !== null;
+  }
+
+  /**
+   * Build the corrective input we send to the SAME agent when its first
+   * output didn't parse. Quoting the bad output (truncated) helps the
+   * model see what it actually emitted.
+   */
+  function buildJsonCorrectionInput(badOutput: string, section?: PlanSection): string {
+    const expected = section === 'problem'
+      ? 'a single fenced ```json ... ``` block containing ONE JSON STRING (the problem statement)'
+      : section
+        ? `a single fenced \`\`\`json ... \`\`\` block containing ONLY the updated "${section}" value`
+        : 'a single fenced ```json ... ``` block containing the full plan object';
+    const sample = badOutput.slice(0, 600);
+    return [
+      'Your previous output was not extractable as JSON. Do not apologise, do not explain — just emit a corrected reply.',
+      '',
+      'Required reply shape:',
+      `  ${expected}`,
+      '  No prose before or after the fenced block. No additional code fences. No comments inside.',
+      '',
+      `For reference, the first 600 chars of your previous output were:\n${sample}`,
+      '',
+      'Reply now with ONLY the fenced JSON block.',
+    ].join('\n');
+  }
+
+  /**
    * Finalize a plan-agent run: parse JSON, persist, validate, broadcast.
-   * Called from the global agent-done handler when the agent was spawned by the plan flow.
+   * Called from the global agent-done handler when the agent was spawned
+   * by the plan flow.
+   *
+   * Recovery order on JSON failure:
+   *   1. Hardened `extractJsonBlock` already ran — multiple strategies +
+   *      sanitisation of common LLM artifacts (trailing commas, smart
+   *      quotes, JS-style comments).
+   *   2. Same-agent corrective turn via `agentManager.sendInput` —
+   *      cheaper than a respawn, keeps the agent's tool/KB context warm.
+   *      Most JSON-shape mistakes are a single corrective turn away from
+   *      fixed.
+   *   3. Chain-walker to the next model — last resort, after same-agent
+   *      retries exhaust.
    */
   function finalizePlanAgent(agentId: string, agentOutput: string): void {
     const ctx = planAgentContext.get(agentId);
     if (!ctx) return;
-    planAgentContext.delete(agentId);
 
     const parsed = extractJsonBlock(agentOutput);
-    if (parsed === null || typeof parsed !== 'object') {
-      broadcast({
-        type: 'plan-error',
-        payload: {
-          project: ctx.project,
-          message: 'Plan agent output did not contain valid JSON.',
-          raw: agentOutput.slice(0, 2000),
-        },
+    if (parsed === null || !isValidParsedShape(parsed, ctx.section)) {
+      if (ctx.sameAgentRetriesRemaining > 0) {
+        ctx.sameAgentRetriesRemaining -= 1;
+        broadcast({
+          type: 'agent-output',
+          payload: { entries: [{
+            timestamp: Date.now(),
+            stage: 'plan',
+            type: 'stderr' as const,
+            kind: 'stderr',
+            content: `[plan] output not parseable as JSON — asking ${ctx.model} to correct (${ctx.sameAgentRetriesRemaining} same-agent retry/retries left before chain-walk)`,
+          }] },
+        });
+        try {
+          agentManager.sendInput(agentId, buildJsonCorrectionInput(agentOutput, ctx.section));
+          // Context stays in the map; next agent-done re-enters this function.
+          return;
+        } catch (err) {
+          broadcast({
+            type: 'agent-output',
+            payload: { entries: [{
+              timestamp: Date.now(),
+              stage: 'plan',
+              type: 'stderr' as const,
+              kind: 'stderr',
+              content: `[plan] sendInput failed (${err instanceof Error ? err.message : String(err)}) — falling through to chain-walk`,
+            }] },
+          });
+          // fall through to chain-walk
+        }
+      }
+
+      planAgentContext.delete(agentId);
+      void retryPlanAgentWithNextModel(ctx, 'output did not contain valid JSON').then((retried) => {
+        if (retried) return;
+        broadcast({
+          type: 'plan-error',
+          payload: {
+            project: ctx.project,
+            message: `Plan failed after exhausting ${[...ctx.burned, ctx.model].length} model(s) and same-agent corrections — none produced valid JSON.`,
+            raw: agentOutput.slice(0, 2000),
+          },
+        });
       });
       return;
     }
+
+    planAgentContext.delete(agentId);
 
     try {
       if (ctx.existingSlug && ctx.section) {
@@ -6381,6 +7312,30 @@ No prose outside the JSON block.`;
         const validation = planValidator.validate(next);
         planStore.writeValidation(ctx.project, ctx.existingSlug, validation);
         broadcast({ type: 'plan-updated', payload: { plan: next, validation, section: ctx.section } });
+        // Lifecycle dispatch:
+        //   - When part of an active refine pass: decrement the
+        //     outstanding-regens counter. When count hits 0, the helper
+        //     fires `refine-complete` which transitions to verifying.
+        //     CRITICAL: do NOT dispatch `edit` here — that would reset
+        //     the refine budget and put us into a verify→refine loop
+        //     where each regen completion spawns a fresh refine pass.
+        //   - Otherwise (user clicked Regen on a single section): the
+        //     regen is a real edit and the lifecycle should re-verify
+        //     under a fresh budget.
+        if (isPartOfActiveRefine(ctx.project, ctx.existingSlug)) {
+          noteRefineRegenCompleted(ctx.project, ctx.existingSlug);
+        } else {
+          // User-initiated section regen: mark as edit (resets refine
+          // budget + invalidates approval), then settle verify so the
+          // badge reflects the new validation result.
+          void dispatchLifecycle(ctx.project, ctx.existingSlug, { kind: 'edit', reason: `regen of ${ctx.section}` });
+          void dispatchLifecycle(ctx.project, ctx.existingSlug, {
+            kind: 'verify-complete',
+            errors: validation.counts.errors,
+            autoFixableCount: validation.issues.filter((i) => i.autoFixable).length,
+            canTargetedRegen: validation.issues.some((i) => i.hint),
+          });
+        }
       } else if (ctx.variant) {
         // A/B variant: tag the plan title so it's easy to recognise.
         const seed = parsed as Partial<Plan>;
@@ -6392,6 +7347,16 @@ No prose outside the JSON block.`;
           type: 'plan-variant-created',
           payload: { plan, validation, variant: ctx.variant },
         });
+        // Lifecycle — variant draft complete, then settle to the
+        // post-verify state so the badge isn't stuck in `verifying`.
+        // No auto-refine: the user must click to mutate the plan.
+        void dispatchLifecycle(ctx.project, plan.slug, { kind: 'plan-draft-complete' });
+        void dispatchLifecycle(ctx.project, plan.slug, {
+          kind: 'verify-complete',
+          errors: validation.counts.errors,
+          autoFixableCount: validation.issues.filter((i) => i.autoFixable).length,
+          canTargetedRegen: validation.issues.some((i) => i.hint),
+        });
       } else {
         // Fresh plan
         const seed = parsed as Partial<Plan>;
@@ -6399,6 +7364,17 @@ No prose outside the JSON block.`;
         const validation = planValidator.validate(plan);
         planStore.writeValidation(ctx.project, plan.slug, validation);
         broadcast({ type: 'plan-created', payload: { plan, validation } });
+        // Lifecycle — fresh plan: draft → verify-complete settle.
+        // Validation runs above; we just hand the counts to the state
+        // machine so the badge reflects reality (awaiting_approval if
+        // clean, otherwise it sits in `verifying` waiting for the user).
+        void dispatchLifecycle(ctx.project, plan.slug, { kind: 'plan-draft-complete' });
+        void dispatchLifecycle(ctx.project, plan.slug, {
+          kind: 'verify-complete',
+          errors: validation.counts.errors,
+          autoFixableCount: validation.issues.filter((i) => i.autoFixable).length,
+          canTargetedRegen: validation.issues.some((i) => i.hint),
+        });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -6406,6 +7382,10 @@ No prose outside the JSON block.`;
         type: 'plan-error',
         payload: { project: ctx.project, message: `Failed to persist plan: ${message}` },
       });
+      // Lifecycle — terminal draft failure when we know the slug.
+      if (ctx.existingSlug) {
+        void dispatchLifecycle(ctx.project, ctx.existingSlug, { kind: 'plan-draft-failed', reason: message });
+      }
     }
   }
 

@@ -127,6 +127,35 @@ if (failedRepos.length > 0) throw new Error(`stage ${stage.name} failed for ${fa
 The earlier behavior — only halting when ALL repos failed — silently
 advanced with a half-written codebase.
 
+### Run-start visibility — register before any setup work
+
+`startPipeline()` calls `activeRuns.set(pipelineRunId, {...})` +
+`broadcastActiveRuns()` at the TOP of the function, before
+`new PipelineRunner(...)`, before any hook wiring (cost ledger,
+checkpoint cache, after-stage policy hook), and before
+`runner.run()` is scheduled. The hook chain is synchronous JS but
+still long enough that the Active Runs panel was visibly stale for a
+beat after Build was clicked. A seed `kind:'project'` activity
+(`"Initialising pipeline — workspace + provider liveness…"`) is
+pushed into the run's activity feed and broadcast on the same tick,
+so the per-stage Output panel isn't blank during the workspace +
+walker prefetch gap. Do NOT move the registration back down — the
+late-broadcast bug was the canonical "I clicked Build and nothing
+happened" symptom.
+
+### Stopping a build — broadcast first, kill chain after
+
+`stop-run` flips `run.status='failed'` and emits the
+`run-stopped` + `broadcastActiveRuns()` broadcasts FIRST, then calls
+`runner.cancel()` and walks `agentToRunId` to kill every spawned
+agent (deduped into a `Set` so a stage-tracked + map-tracked agent
+isn't killed twice). Map entries are cleaned up as we go. The kill
+chain (`AgentManager.kill` → `AgentProcess.kill` → `adapter.kill()`
+→ per-call `AbortController`) severs in-flight HTTP requests on
+Ollama/OpenRouter/OpenCode adapters and SIGTERM-s CLI subprocesses.
+The UI sees the run flip immediately even though the async kill
+unwind takes a few seconds for in-flight LLM calls.
+
 ### PR URL extraction from `tool_result`
 
 `gh pr create`'s URL appears in the agent's `tool_result` content,

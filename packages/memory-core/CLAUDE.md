@@ -102,6 +102,20 @@ Tests live at `src/__tests__/*.test.ts`. Runtime deps:
   `verifyCodeBindings(store, ns, opts)` defaults to `downweight` for
   `drifted` and `invalidate` for `missing` (a deleted file is a hard signal).
 
+### FTS5 query sanitization
+
+- `SqliteHotIndex.searchByText(query)` routes the input through
+  `toFtsQuery` (bottom of `src/storage/sqlite-store.ts`) before it
+  hits `MATCH`. FTS5 treats `column:term`, bareword `AND`/`OR`/`NOT`,
+  `*`, `^`, parens, and quotes as syntax — a raw memory body
+  containing `Failure:` blows up with `SqliteError: no such column: Failure`.
+  Sleeptime's dedupe path (`bm25Search` → `findNearestDuplicate`) was
+  the canonical trigger.
+- The sanitizer tokenizes on Unicode word chars, quotes each token as
+  an FTS5 phrase, ORs them, and caps to 32 tokens × 64 chars. New
+  callers that want substring search MUST go through `searchByText`,
+  not stage their own MATCH SQL.
+
 ### Bi-temporal queries
 
 - Default queries hide invalidated rows. Pass

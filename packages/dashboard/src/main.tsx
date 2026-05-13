@@ -1548,6 +1548,7 @@ function App() {
             key={currentProject?.name ?? '__no_project__'}
             project={currentProject?.name ?? null}
             ws={wsRef.current}
+            defaultModel={availableModels?.defaultModel}
           />
         </div>
         <div

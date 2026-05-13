@@ -134,6 +134,13 @@ export class PipelineRunner extends EventEmitter {
   private cancelled = false;
   /** Retryable-upstream-burn set; chain walker skips these after a fail. */
   private runtimeBurnedModels = new Set<string>();
+  /**
+   * model id → human-readable reason ("HTTP 429 from claude on
+   * requirements", etc.). Populated at the same call sites that add to
+   * `runtimeBurnedModels`. Surfaced by the chain-walker logger so the
+   * user sees WHY a model was burned, not just that it was.
+   */
+  private burnedModelReasons = new Map<string, string>();
   private readonly pipelineBus = new InMemoryEventBus();
   /** De-dupe so proactive liveness fallback notices fire once per pair. */
   private livenessFallbackNotified = new Set<string>();
@@ -275,6 +282,7 @@ export class PipelineRunner extends EventEmitter {
       projectLoader: this.projectLoader,
       state: this.state,
       runtimeBurnedModels: this.runtimeBurnedModels,
+      burnedModelReasons: this.burnedModelReasons,
       livenessFallbackNotified: this.livenessFallbackNotified,
       emitProjectEvent: (payload) => this.emit('project-event', payload),
       broadcast: () => this.broadcastState(),
@@ -505,6 +513,7 @@ export class PipelineRunner extends EventEmitter {
       repoPaths: () => this.repoPaths,
       walkerConfig: () => this.walkerConfig,
       runtimeBurnedModels: this.runtimeBurnedModels,
+      burnedModelReasons: this.burnedModelReasons,
       isCancelled: () => this.cancelled,
       setCancelled: () => { this.cancelled = true; },
       agentManager: this.agentManager,

@@ -13,6 +13,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ResolverTier } from '@esankhan3/anvil-agent-core';
 import type { ProviderName } from '@esankhan3/anvil-agent-core';
+import type { PlanBinding } from '@esankhan3/anvil-core-pipeline';
 
 /** Dashboard's local alias for agent-core's `ResolverTier`. */
 export type ModelTier = ResolverTier;
@@ -59,10 +60,22 @@ export const STAGE_OUTPUT_LIMITS: Record<string, number> = {
   'repo-requirements': 4000,
   specs: 6000,
   tasks: 8000,
-  build: 16000,
+  build: 20000,
   test: 12000,
-  validate: 4000,
-  ship: 2000,
+  // Validate now runs the full fix-loop inline: build → lint → tests,
+  // editing source files between gates until everything's green. The
+  // previous 8000-token cap starved the agent mid-fix — it would run
+  // tests, see 12 failures, start editing, and run out before
+  // re-running the suite. 20000 matches build (same shape of work:
+  // many Edit tool calls + interleaved Bash output) and gives room for
+  // the structured VERDICT block at the end.
+  validate: 20000,
+  // Ship runs 5 bash commands (build/lint, status, commit, push, gh pr
+  // create) + emits the PR URL. 2000 tokens routinely starved the agent
+  // before it reached `gh pr create`. 8000 leaves plenty of room for
+  // tool-call argument overhead + the PR URL response without
+  // re-introducing prose bloat.
+  ship: 8000,
 };
 export const STAGE_OUTPUT_LIMIT_FALLBACK = 8000;
 
@@ -214,6 +227,12 @@ export interface PipelineConfig {
   skipShip?: boolean;
   /** Deploy after shipping. */
   deploy?: 'local' | 'remote' | false;
+  /**
+   * Phase D — plan binding for the run. When present, every stage
+   * receives `ctx.shared.planBinding` so build / validate / ship can
+   * verify their output against the approved plan + stamp PR bodies.
+   */
+  planBinding?: PlanBinding;
   /** Explicit repo list (overrides auto-detection). */
   repos?: string[];
   // ── Resume support ────────────────────────────────────────────────────

@@ -83,6 +83,8 @@ export interface StageOpsDeps {
   repoPaths: () => Record<string, string>;
   walkerConfig: () => WalkerConfig;
   runtimeBurnedModels: Set<string>;
+  /** model id → reason burned (HTTP status + stage + ts). */
+  burnedModelReasons: Map<string, string>;
 
   // Cancellation
   isCancelled: () => boolean;
@@ -214,9 +216,10 @@ export function makeAgentRunner(deps: StageOpsDeps, stageName: string): AgentMan
     onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
     onBurn: ({ model, status }) => {
       deps.runtimeBurnedModels.add(model);
+      deps.burnedModelReasons.set(model, `HTTP ${status} (per-task stage)`);
       deps.emit('project-event', {
         source: 'routing',
-        message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
+        message: `${model} burned: HTTP ${status}; chain walker will skip on next call`,
         level: 'warn',
       });
     },
@@ -237,10 +240,11 @@ async function runClarifyStage(
       resolveModel: () => deps.resolveModelForStage('clarify'),
       onBurn: ({ model, status }) => {
         deps.runtimeBurnedModels.add(model);
-        console.warn(`[pipeline] clarify: ${model} hit ${status} (retryable); burning + falling back`);
+        deps.burnedModelReasons.set(model, `HTTP ${status} (clarify stage)`);
+        console.warn(`[pipeline] clarify: ${model} burned (HTTP ${status} retryable)`);
         deps.emit('project-event', {
           source: 'routing',
-          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
+          message: `${model} burned: HTTP ${status} during clarify; chain walker will skip on next call`,
           level: 'warn',
         });
       },
@@ -347,10 +351,29 @@ async function runPerRepoStage(
     if (deps.state.stages[index].repos[r]) {
       deps.state.stages[index].repos[r].status = 'running';
     }
+    // Broadcast on every repo status flip so the dashboard's per-repo
+    // chips light up immediately. Without this, all N repos stay
+    // grayed-out until each one completes silently — which can be
+    // minutes for a build fanning out across 4 repos.
+    deps.broadcast();
+    deps.emit('artifact-written', {
+      stage: stage.name,
+      repo: repoName,
+      file: '',
+      summary: `[${repoName}] Preparing ${stage.name}…`,
+      content: '',
+    });
 
     const projectPrompt = buildRepoProjectPromptHelper(deps.getPromptContext(), stage, repoName);
 
     if (stage.name === 'build' && stage.persona === 'engineer') {
+      deps.emit('artifact-written', {
+        stage: 'build',
+        repo: repoName,
+        file: '',
+        summary: `[${repoName}] Loading tasks + bundling files for engineer agent…`,
+        content: '',
+      });
       promises.push(
         runBuildForRepo(deps, index, repoIdx, stage, repoName, repoPath, projectPrompt)
           .then((res) => ({
@@ -489,6 +512,19 @@ async function runBuildForRepo(
   projectPrompt: string,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const repoArtifacts = loadRepoArtifactsFn(deps.depsForArtifactIO(), repoName);
+  // Tell the dashboard how many tasks we're about to dispatch + give
+  // it a chance to render before the first agent spawn (task bundling
+  // can itself take a second or two for a large task graph).
+  const taskCount = (repoArtifacts.tasks?.match(/^- \[ \]/gm) ?? []).length;
+  deps.emit('artifact-written', {
+    stage: 'build',
+    repo: repoName,
+    file: '',
+    summary: taskCount > 0
+      ? `[${repoName}] Dispatching ${taskCount} task(s) to engineer agent…`
+      : `[${repoName}] Spawning engineer agent…`,
+    content: '',
+  });
 
   const runner = makeAgentRunner(deps, stage.name);
   const result = await runBuildForOneRepo({
@@ -618,10 +654,11 @@ async function runFixLoop(
       resolveModel: () => deps.resolveModelForStage('fix-loop'),
       onBurn: ({ model, status }) => {
         deps.runtimeBurnedModels.add(model);
-        console.warn(`[pipeline] fix-loop: ${model} hit ${status} (retryable); burning + falling back`);
+        deps.burnedModelReasons.set(model, `HTTP ${status} (fix-loop stage)`);
+        console.warn(`[pipeline] fix-loop: ${model} burned (HTTP ${status} retryable)`);
         deps.emit('project-event', {
           source: 'routing',
-          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
+          message: `${model} burned: HTTP ${status} during fix-loop; chain walker will skip on next call`,
           level: 'warn',
         });
       },
@@ -762,12 +799,34 @@ export async function runOneStage(
 
     console.log(`[pipeline] Entering stage "${stage.name}" (${i + 1}/${STAGES.length})`);
 
+    // Flip stage to running IMMEDIATELY on entry so the dashboard chip
+    // lights up before the pre-spawn prep work (auth probe, feature
+    // branches, format/lint guards) runs. Without this, the chip sits
+    // grayed-out for ~30s while git + linters run silently — the user
+    // sees nothing happening on the dashboard.
+    deps.state.currentStage = i;
+    deps.state.stages[i].status = 'running';
+    deps.state.stages[i].startedAt = new Date().toISOString();
+    deps.broadcast();
+
     deps.reviewer.armForCurrentStage();
+    deps.emit('artifact-written', {
+      stage: stage.name,
+      file: '',
+      summary: `Checking ${stage.name} provider auth…`,
+      content: '',
+    });
     await deps.ensureAuth(stage.name);
 
     if (stage.name === 'build') {
       const branchName = `anvil/${deps.state.featureSlug}`;
       console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
+      deps.emit('artifact-written', {
+        stage: 'build',
+        file: '',
+        summary: `Creating feature branch "${branchName}" across ${deps.state.repoNames.length} repo(s)…`,
+        content: '',
+      });
       createFeatureBranchesHelper({
         featureSlug: deps.state.featureSlug,
         repoPaths: deps.repoPaths(),
@@ -781,6 +840,12 @@ export async function runOneStage(
     }
     if (stage.name === 'validate') {
       console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
+      deps.emit('artifact-written', {
+        stage: 'validate',
+        file: '',
+        summary: 'Running format + lint auto-fix guards…',
+        content: '',
+      });
       const reposForGuards = deps.state.repoNames.length > 0
         ? deps.state.repoNames.map((r) => ({ name: r, path: deps.repoPaths()[r] || join(deps.workspaceDir, r) }))
         : [{ name: deps.config.project, path: deps.workspaceDir }];
@@ -795,12 +860,16 @@ export async function runOneStage(
       console.log('[pipeline] Post-build guards complete.');
     }
 
-    deps.state.currentStage = i;
-    deps.state.stages[i].status = 'running';
-    deps.state.stages[i].startedAt = new Date().toISOString();
-    deps.broadcast();
+    // Stage is already flipped to running above (hoisted from here so
+    // the chip lights up during prep work). Persist + emit start now.
     deps.checkpoint();
     deps.emit('stage-start', i, '');
+    deps.emit('artifact-written', {
+      stage: stage.name,
+      file: '',
+      summary: `Spawning ${stage.persona} agent for ${stage.name}…`,
+      content: '',
+    });
 
     try {
       let result: { artifact: string; cost: number; tokens: StageTokenStats };
@@ -919,6 +988,41 @@ export async function runOneStage(
         } catch (err) {
           console.warn('[pipeline] Plan deviation capture failed:', err);
         }
+
+        // Phase E — deterministic build-compliance check.
+        // Stores the report on shared state so the ship stage can stamp
+        // PR bodies + auto-draft when compliance < 100%.
+        if (deps.config.planBinding) {
+          try {
+            const { runBuildCompliance, renderBuildComplianceMarkdown } =
+              await import('./plan-compliance-bridge.js');
+            const featureDir = deps.featureStore.getFeatureDir(deps.config.project, deps.state.featureSlug);
+            const repoLocalPaths: Record<string, string> = {};
+            for (const r of deps.state.repoNames) repoLocalPaths[r] = deps.repoPaths()[r] ?? '';
+            const report = runBuildCompliance({
+              binding: deps.config.planBinding,
+              repoLocalPaths,
+              reposChecked: deps.state.repoNames,
+              baseBranch: deps.config.baseBranch ?? 'main',
+            });
+            const md = renderBuildComplianceMarkdown(report);
+            const { writeFileSync } = await import('node:fs');
+            const { join } = await import('node:path');
+            writeFileSync(join(featureDir, 'BUILD_COMPLIANCE.md'), md, 'utf-8');
+            writeFileSync(join(featureDir, 'build-compliance.json'), JSON.stringify(report, null, 2), 'utf-8');
+            // Stash on the runner state so the ship stage can read it
+            // without re-running the check.
+            (deps.state as unknown as { __buildCompliance?: typeof report }).__buildCompliance = report;
+            deps.emit('artifact-written', {
+              stage: 'build',
+              file: `${featureDir}/BUILD_COMPLIANCE.md`,
+              summary: `Build compliance: ${report.passed}/${report.total}`,
+              content: md,
+            });
+          } catch (err) {
+            console.warn('[pipeline] Build compliance check failed:', err);
+          }
+        }
       }
 
       if (stage.name === 'ship' && deps.config.deploy && !deps.isCancelled()) {
@@ -974,6 +1078,57 @@ export async function runOneStage(
           console.log(`[pipeline] Validation recovered after ${fixAttempts} fix attempt(s)`);
         } else {
           console.log(`[pipeline] Validation clean — proceeding to Ship`);
+        }
+
+        // Phase F — plan-compliance pass after the test suite. Reads
+        // the validate stage's outcome to decide which tests
+        // passed/failed/skipped, then verifies every plan TestCaseSpec,
+        // contract reference, and migration file is honored. Stored on
+        // shared state for the ship stage's PR-body stamp.
+        if (deps.config.planBinding) {
+          try {
+            const { runValidateCompliance, renderValidateComplianceMarkdown } =
+              await import('./plan-compliance-bridge.js');
+            const repoLocalPaths: Record<string, string> = {};
+            for (const r of deps.state.repoNames) repoLocalPaths[r] = deps.repoPaths()[r] ?? '';
+            // Parse passing/failing/skipped tests out of the artifact
+            // text — Go's "--- FAIL: TestX" / "--- PASS: TestX", plus
+            // "--- SKIP:" lines. Conservative — empty sets keep the
+            // verifier from making false negative claims.
+            const passingTests = new Set<string>();
+            const failingTests = new Set<string>();
+            const skippedTests = new Set<string>();
+            const PASS_RE = /---\s+PASS:\s+(\S+)/g;
+            const FAIL_RE = /---\s+FAIL:\s+(\S+)/g;
+            const SKIP_RE = /---\s+SKIP:\s+(\S+)/g;
+            let m: RegExpExecArray | null;
+            while ((m = PASS_RE.exec(validateArtifact))) passingTests.add(m[1]);
+            while ((m = FAIL_RE.exec(validateArtifact))) failingTests.add(m[1]);
+            while ((m = SKIP_RE.exec(validateArtifact))) skippedTests.add(m[1]);
+
+            const report = runValidateCompliance({
+              binding: deps.config.planBinding,
+              repoLocalPaths,
+              passingTests,
+              failingTests,
+              skippedTests,
+            });
+            const md = renderValidateComplianceMarkdown(report);
+            const featureDir = deps.featureStore.getFeatureDir(deps.config.project, deps.state.featureSlug);
+            const { writeFileSync } = await import('node:fs');
+            const { join } = await import('node:path');
+            writeFileSync(join(featureDir, 'PLAN_COMPLIANCE.md'), md, 'utf-8');
+            writeFileSync(join(featureDir, 'plan-compliance.json'), JSON.stringify(report, null, 2), 'utf-8');
+            (deps.state as unknown as { __validateCompliance?: typeof report }).__validateCompliance = report;
+            deps.emit('artifact-written', {
+              stage: 'validate',
+              file: `${featureDir}/PLAN_COMPLIANCE.md`,
+              summary: `Plan compliance: ${report.passed}/${report.total}`,
+              content: md,
+            });
+          } catch (err) {
+            console.warn('[pipeline] Validate compliance check failed:', err);
+          }
         }
 
         prevArtifact = validateArtifact;

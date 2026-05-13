@@ -7,29 +7,143 @@ export interface PlanComparePageProps {
 
 // ── Types (mirrored from PlanPage.tsx) ─────────────────────────────────
 
-interface PlanRepoImpact { name: string; changes: string; files: string[]; symbols: string[] }
-interface PlanContract { kind: string; name: string; producer: string; consumers: string[]; description: string }
-interface PlanRisk { title: string; mitigation: string; severity: 'low' | 'med' | 'high' }
+// ── Plan v2 mirror — keep in sync with PlanPage.tsx + core-pipeline ─────
+
+interface FileClaim { path: string; kind: 'new' | 'modified'; reason: string }
+interface SymbolClaim { file: string; name: string; kind: string; signature?: string }
+interface PlanRepoImpact {
+  name: string;
+  changes: string;
+  mustExist: FileClaim[];
+  mustTouch: FileClaim[];
+  mustNotBreak: string[];
+  symbols: SymbolClaim[];
+}
+type PlanContract =
+  | { kind: 'http'; method: string; path: string; producer: string; consumers: string[]; status: number[] }
+  | { kind: 'kafka'; topic: string; producer: string; consumers: string[]; schemaRef: string }
+  | { kind: 'grpc'; service: string; method: string; producer: string; consumers: string[] }
+  | { kind: 'db'; table: string; producer: string; columns: Array<{ name: string; type: string }> };
+interface PlanRisk {
+  id: string; title: string; severity: 'low' | 'med' | 'high';
+  blastRadius: string; mitigation: string; detection: string;
+}
+interface ScopeItem { id: string; description: string; acceptance: string[] }
+interface TestCaseSpec { id: string; acceptanceRef: string; file: string; name: string; given: string; when: string; then: string }
+interface ManualStep { id: string; description: string; expected: string }
 
 interface Plan {
+  schema: 2;
   version: number;
+  parentVersion: number | null;
+  contentHash: string;
   slug: string;
   project: string;
   title: string;
-  problem: string;
-  scope: { inScope: string[]; outOfScope: string[] };
+  problem: { statement: string; why_now: string; success_signals: string[] };
+  scope: { inScope: ScopeItem[]; outOfScope: ScopeItem[] };
   repos: PlanRepoImpact[];
   contracts: PlanContract[];
+  data: Array<{ kind: string; repo: string; migrationFile: string; rollback: string }>;
+  observability: { signals: Array<{ kind: string; name: string; reason: string }> };
   architecture: { mermaid: string; notes: string };
   risks: PlanRisk[];
-  rollout: { strategy: string; flags: string[]; order: string[]; rollback: string };
-  tests: { unit: string[]; integration: string[]; manual: string[] };
-  estimate: { usd: number; minutes: number; prs: number };
+  rollout: { strategy: string; flags: string[]; order: string[]; rollback: { command: string; verify: string } };
+  tests: { unit: TestCaseSpec[]; integration: TestCaseSpec[]; manual: ManualStep[] };
+  estimate: { usd: number; minutes: number; prs: number; calibratedFrom: string[] };
   model: string;
   feature: string;
   createdAt: string;
   updatedAt: string;
+  createdBy?: { kind: 'model' | 'human'; model?: string };
+  approval?: { user: string; approvedAt: string; planHash: string; note?: string };
 }
+
+// ── Local helpers (v2 contract / repo display) ──────────────────────────
+
+function contractDisplay(c: PlanContract): string {
+  if (c.kind === 'http') return `${c.method} ${c.path}`;
+  if (c.kind === 'kafka') return c.topic;
+  if (c.kind === 'grpc') return `${c.service}.${c.method}`;
+  return c.table;
+}
+function contractConsumers(c: PlanContract): string[] {
+  return c.kind === 'db' ? [] : c.consumers;
+}
+function repoTouchedPaths(r: PlanRepoImpact): string[] {
+  const out = new Set<string>();
+  for (const f of r.mustTouch ?? []) if (f?.path) out.add(f.path);
+  for (const f of r.mustExist ?? []) if (f?.path) out.add(f.path);
+  return [...out];
+}
+
+// ── Phase H — Variant scoring ──────────────────────────────────────────
+
+interface VariantScore {
+  /** Lower is better. */
+  costUsd: number;
+  /** Count of risks weighted by severity (high=3, med=2, low=1). */
+  riskScore: number;
+  /** Repos with ≥ 1 mustTouch/mustExist file. */
+  reposTouched: number;
+  /** Total files claimed. */
+  filesClaimed: number;
+  /** Plan agent-reported PR count. */
+  prs: number;
+  /** Total acceptance criteria — more criteria = more thorough plan. */
+  acceptanceCount: number;
+}
+
+function computeVariantScore(plan: Plan): VariantScore {
+  const riskScore = plan.risks.reduce((s, r) => {
+    if (r.severity === 'high') return s + 3;
+    if (r.severity === 'med') return s + 2;
+    return s + 1;
+  }, 0);
+  const reposTouched = plan.repos.filter((r) => repoTouchedPaths(r).length > 0).length;
+  const filesClaimed = plan.repos.reduce((s, r) => s + repoTouchedPaths(r).length, 0);
+  const acceptanceCount = plan.scope.inScope.reduce((s, item) => s + item.acceptance.length, 0);
+  return {
+    costUsd: plan.estimate.usd,
+    riskScore,
+    reposTouched,
+    filesClaimed,
+    prs: plan.estimate.prs,
+    acceptanceCount,
+  };
+}
+
+/**
+ * Compute relative score badges across all variant slots so we can
+ * highlight the cheapest cost, the lowest-risk plan, etc. Returns a
+ * map from variant index → which badges this variant "wins".
+ */
+function computeRelativeBadges(variants: VariantSlot[]): Record<number, Set<string>> {
+  const scored = variants
+    .map((v) => v.plan ? { idx: v.index, score: computeVariantScore(v.plan) } : null)
+    .filter((x): x is { idx: number; score: VariantScore } => x !== null);
+  if (scored.length < 2) return {};
+  const badges: Record<number, Set<string>> = {};
+  const minBy = <K extends keyof VariantScore>(key: K): number =>
+    scored.reduce((acc, s) => (s.score[key] < acc.score[key] ? s : acc), scored[0]).idx;
+  const maxBy = <K extends keyof VariantScore>(key: K): number =>
+    scored.reduce((acc, s) => (s.score[key] > acc.score[key] ? s : acc), scored[0]).idx;
+  const stamp = (idx: number, badge: string) => {
+    (badges[idx] = badges[idx] ?? new Set()).add(badge);
+  };
+  stamp(minBy('costUsd'), 'cheapest');
+  stamp(minBy('riskScore'), 'safest');
+  stamp(minBy('filesClaimed'), 'smallest');
+  stamp(maxBy('acceptanceCount'), 'most-thorough');
+  return badges;
+}
+
+const BADGE_LABELS: Record<string, { label: string; color: string }> = {
+  cheapest: { label: '$ cheapest', color: 'var(--color-success, #22c55e)' },
+  safest: { label: '⛨ safest', color: 'var(--color-success, #22c55e)' },
+  smallest: { label: '◯ smallest', color: 'var(--accent)' },
+  'most-thorough': { label: '✓ most thorough', color: 'var(--accent)' },
+};
 
 interface VariantSlot {
   label: string;
@@ -74,36 +188,37 @@ function parseHashQuery(): Record<string, string> {
 function sectionText(plan: Plan, section: SectionId): string {
   switch (section) {
     case 'problem':
-      return plan.problem || '';
+      return [plan.problem.statement, plan.problem.why_now, ...plan.problem.success_signals]
+        .filter(Boolean).join(' | ');
     case 'scope':
       return [
-        'IN:', ...plan.scope.inScope,
-        'OUT:', ...plan.scope.outOfScope,
+        'IN:', ...plan.scope.inScope.map((s) => s.description),
+        'OUT:', ...plan.scope.outOfScope.map((s) => s.description),
       ].join(' ');
     case 'repos':
       return plan.repos
-        .map((r) => `${r.name} ${r.changes} files:${r.files.join(',')} symbols:${r.symbols.join(',')}`)
+        .map((r) => `${r.name} ${r.changes} touched:${repoTouchedPaths(r).join(',')} symbols:${r.symbols.map((s) => s.name).join(',')}`)
         .join(' | ');
     case 'contracts':
       return plan.contracts
-        .map((c) => `${c.kind} ${c.name} ${c.producer}->${c.consumers.join(',')} ${c.description}`)
+        .map((c) => `${c.kind} ${contractDisplay(c)} ${c.producer}->${contractConsumers(c).join(',')}`)
         .join(' | ');
     case 'architecture':
       return `${plan.architecture.notes || ''} ${plan.architecture.mermaid || ''}`.trim();
     case 'risks':
-      return plan.risks.map((r) => `[${r.severity}] ${r.title} — ${r.mitigation}`).join(' | ');
+      return plan.risks.map((r) => `[${r.severity}/${r.blastRadius}] ${r.title} — ${r.mitigation}`).join(' | ');
     case 'rollout':
       return [
         plan.rollout.strategy,
         `flags:${plan.rollout.flags.join(',')}`,
         `order:${plan.rollout.order.join('>')}`,
-        `rollback:${plan.rollout.rollback}`,
+        `rollback:${plan.rollout.rollback.command || ''}`,
       ].join(' ');
     case 'tests':
       return [
-        'unit:', ...plan.tests.unit,
-        'integration:', ...plan.tests.integration,
-        'manual:', ...plan.tests.manual,
+        'unit:', ...plan.tests.unit.map((t) => t.name || t.then),
+        'integration:', ...plan.tests.integration.map((t) => t.name || t.then),
+        'manual:', ...plan.tests.manual.map((m) => m.description),
       ].join(' ');
     case 'estimate':
       return `$${plan.estimate.usd} ${plan.estimate.minutes}min ${plan.estimate.prs}prs`;
@@ -214,20 +329,25 @@ function renderSection(plan: Plan, section: SectionId): React.ReactNode {
   switch (section) {
     case 'problem':
       return (
-        <p style={{ margin: 0, fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-          {plan.problem || '—'}
-        </p>
+        <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+          <p style={{ margin: 0 }}>{plan.problem.statement || '—'}</p>
+          {plan.problem.why_now && (
+            <p style={{ margin: '4px 0 0', fontSize: 11 }}>
+              <em style={{ color: 'var(--text-tertiary)' }}>Why now:</em> {plan.problem.why_now}
+            </p>
+          )}
+        </div>
       );
     case 'scope':
       return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 3 }}>IN SCOPE</div>
-            <Bullets items={plan.scope.inScope} />
+            <Bullets items={plan.scope.inScope.map((s) => `${s.id}: ${s.description}`)} />
           </div>
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 3 }}>OUT OF SCOPE</div>
-            <Bullets items={plan.scope.outOfScope} />
+            <Bullets items={plan.scope.outOfScope.map((s) => s.description)} />
           </div>
         </div>
       );
@@ -251,9 +371,9 @@ function renderSection(plan: Plan, section: SectionId): React.ReactNode {
               <p style={{ margin: '0 0 6px', fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.4 }}>
                 {r.changes}
               </p>
-              <ChipList items={r.files} />
+              <ChipList items={repoTouchedPaths(r)} />
               <div style={{ height: 4 }} />
-              <ChipList items={r.symbols} />
+              <ChipList items={r.symbols.map((s) => s.name)} />
             </div>
           ))}
         </div>
@@ -276,11 +396,10 @@ function renderSection(plan: Plan, section: SectionId): React.ReactNode {
               >
                 {c.kind}
               </span>
-              <strong style={{ color: 'var(--text-primary)' }}>{c.name}</strong>
+              <strong style={{ color: 'var(--text-primary)' }}>{contractDisplay(c)}</strong>
               <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2 }}>
-                {c.producer} → {c.consumers.join(', ') || '(none)'}
+                {c.producer}{contractConsumers(c).length ? ` → ${contractConsumers(c).join(', ')}` : ''}
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>{c.description}</div>
             </li>
           ))}
         </ul>
@@ -350,7 +469,10 @@ function renderSection(plan: Plan, section: SectionId): React.ReactNode {
           <div style={{ fontSize: 11 }}>
             <div><span style={{ color: 'var(--text-tertiary)' }}>Flags:</span> {plan.rollout.flags.join(', ') || '—'}</div>
             <div><span style={{ color: 'var(--text-tertiary)' }}>Order:</span> {plan.rollout.order.join(' → ') || '—'}</div>
-            <div><span style={{ color: 'var(--text-tertiary)' }}>Rollback:</span> {plan.rollout.rollback || '—'}</div>
+            <div><span style={{ color: 'var(--text-tertiary)' }}>Rollback:</span> {plan.rollout.rollback.command || '—'}</div>
+            {plan.rollout.rollback.verify && (
+              <div><span style={{ color: 'var(--text-tertiary)' }}>Verify:</span> {plan.rollout.rollback.verify}</div>
+            )}
           </div>
         </div>
       );
@@ -359,15 +481,15 @@ function renderSection(plan: Plan, section: SectionId): React.ReactNode {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 3 }}>UNIT</div>
-            <Bullets items={plan.tests.unit} />
+            <Bullets items={plan.tests.unit.map((t) => t.name || t.then)} />
           </div>
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 3 }}>INTEGRATION</div>
-            <Bullets items={plan.tests.integration} />
+            <Bullets items={plan.tests.integration.map((t) => t.name || t.then)} />
           </div>
           <div>
             <div style={{ fontSize: 10, color: 'var(--text-tertiary)', marginBottom: 3 }}>MANUAL</div>
-            <Bullets items={plan.tests.manual} />
+            <Bullets items={plan.tests.manual.map((m) => m.description)} />
           </div>
         </div>
       );
@@ -483,6 +605,8 @@ export function PlanCompare({ ws }: PlanComparePageProps) {
   }, [variants]);
 
   const columnWidth = Math.max(260, Math.floor(960 / Math.max(1, variants.length || 1)));
+
+  const relativeBadges = useMemo(() => computeRelativeBadges(variants), [variants]);
 
   return (
     <div
@@ -631,24 +755,76 @@ export function PlanCompare({ ws }: PlanComparePageProps) {
                 )}
               </div>
               {v.plan ? (
-                <button
-                  onClick={() => handleAdopt(v.plan as Plan)}
-                  disabled={adopting === v.plan.slug}
-                  aria-label={`Adopt variant ${v.label}`}
-                  style={{
-                    display: 'inline-flex', alignItems: 'center', gap: 6, justifyContent: 'center',
-                    height: 28, padding: '0 10px',
-                    fontSize: 12, fontWeight: 600,
-                    background: adopting === v.plan.slug ? 'var(--bg-elevated-3)' : 'var(--accent)',
-                    color: adopting === v.plan.slug ? 'var(--text-tertiary)' : 'var(--text-inverse)',
-                    border: 'none', borderRadius: 'var(--radius-sm)',
-                    cursor: adopting === v.plan.slug ? 'wait' : 'pointer',
-                    fontFamily: 'var(--font-sans)',
-                  }}
-                >
-                  <CheckCircle2 size={12} strokeWidth={1.75} aria-hidden="true" />
-                  {adopting === v.plan.slug ? 'Adopting…' : 'Adopt this variant'}
-                </button>
+                <>
+                  {/* Phase H — score row */}
+                  <div style={{
+                    display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)',
+                    gap: 4, fontSize: 11, color: 'var(--text-tertiary)',
+                  }}>
+                    {(() => {
+                      const sc = computeVariantScore(v.plan);
+                      return (
+                        <>
+                          <div title="Estimated cost">
+                            <span style={{ color: 'var(--text-secondary)' }}>${sc.costUsd.toFixed(2)}</span>
+                          </div>
+                          <div title="Risks (weighted: high=3, med=2, low=1)">
+                            <span style={{ color: 'var(--text-secondary)' }}>{sc.riskScore}</span> risk
+                          </div>
+                          <div title="Repos with files claimed">
+                            <span style={{ color: 'var(--text-secondary)' }}>{sc.reposTouched}</span> repos
+                          </div>
+                          <div title="Total files claimed (mustTouch + mustExist)">
+                            <span style={{ color: 'var(--text-secondary)' }}>{sc.filesClaimed}</span> files
+                          </div>
+                          <div title="Pull requests">
+                            <span style={{ color: 'var(--text-secondary)' }}>{sc.prs}</span> PR
+                          </div>
+                          <div title="Acceptance criteria">
+                            <span style={{ color: 'var(--text-secondary)' }}>{sc.acceptanceCount}</span> AC
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                  {relativeBadges[v.index] && relativeBadges[v.index].size > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {[...relativeBadges[v.index]].map((b) => (
+                        <span key={b} style={{
+                          fontSize: 10, padding: '1px 5px', borderRadius: 999,
+                          background: 'var(--bg-elevated-3)',
+                          color: BADGE_LABELS[b]?.color ?? 'var(--text-secondary)',
+                          border: `1px solid ${BADGE_LABELS[b]?.color ?? 'var(--separator)'}`,
+                        }}>
+                          {BADGE_LABELS[b]?.label ?? b}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <button
+                    onClick={() => {
+                      if (!v.plan) return;
+                      if (confirm(`Adopt "${v.label}"?\n\n• Cost ~$${computeVariantScore(v.plan).costUsd.toFixed(2)}\n• ${computeVariantScore(v.plan).reposTouched} repos · ${computeVariantScore(v.plan).filesClaimed} files\n• ${computeVariantScore(v.plan).riskScore} risk-pts\n\nThis bumps the active plan and invalidates approval.`)) {
+                        handleAdopt(v.plan);
+                      }
+                    }}
+                    disabled={adopting === v.plan.slug}
+                    aria-label={`Adopt variant ${v.label}`}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 6, justifyContent: 'center',
+                      height: 28, padding: '0 10px',
+                      fontSize: 12, fontWeight: 600,
+                      background: adopting === v.plan.slug ? 'var(--bg-elevated-3)' : 'var(--accent)',
+                      color: adopting === v.plan.slug ? 'var(--text-tertiary)' : 'var(--text-inverse)',
+                      border: 'none', borderRadius: 'var(--radius-sm)',
+                      cursor: adopting === v.plan.slug ? 'wait' : 'pointer',
+                      fontFamily: 'var(--font-sans)',
+                    }}
+                  >
+                    <CheckCircle2 size={12} strokeWidth={1.75} aria-hidden="true" />
+                    {adopting === v.plan.slug ? 'Adopting…' : 'Adopt this variant'}
+                  </button>
+                </>
               ) : (
                 <div
                   style={{

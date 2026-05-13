@@ -18,6 +18,7 @@ import { execSync } from 'node:child_process';
 
 import type { Step, StepContext } from '../types.js';
 import type { Plan } from '../utils/plan-types.js';
+import { planAllTouchedPaths } from '../utils/plan-types.js';
 
 // ── Injected dep types ───────────────────────────────────────────────
 
@@ -169,7 +170,7 @@ export async function runTestGenForProject(
       title: `Tests for ${plan.title || plan.slug}`,
       source: {
         plan: { slug: plan.slug, version: plan.version },
-        files: plan.repos.flatMap((r) => r.files ?? []),
+        files: planAllTouchedPaths(plan),
       },
       behaviors: resolvedBehaviors,
       conventions,

@@ -16,7 +16,7 @@
 
 import { execSync } from 'node:child_process';
 import { trace } from '@opentelemetry/api';
-import { ProviderRegistry } from '../../registry.js';
+import { AGENTIC_STAGES, ProviderRegistry } from '../../registry.js';
 import { loadModelRegistry, type ModelRegistry } from '../../router/model-registry.js';
 import type { ModelAdapter, ProviderName } from '../../types.js';
 import type {
@@ -135,7 +135,24 @@ function geminiCliAvailable(): boolean {
 export function defaultAdapterFactory(request: AdapterRequest): AgentAdapter {
   const registry = ProviderRegistry.getInstance();
   const provider = resolveProvider(request.model);
-  const resolved = resolveAdapterOrFallback(registry, provider);
+  let resolved = resolveAdapterOrFallback(registry, provider);
+
+  // Stage-aware tier promotion. Agentic stages (`build`/`validate`/`ship`)
+  // need an adapter that drives a real tool loop — the bare `gemini` HTTP
+  // adapter is `tier: 'function-calling'` which emits bash commands as
+  // markdown text instead of `Bash` tool calls (PRs never get created).
+  // The registry exposes `resolveForStage` for this guard but the spawn
+  // path doesn't call it; check tier here so user-declared
+  // `provider: gemini` in `models.yaml` still gets a working agent when
+  // the stage demands one. Prefer family-preserving alternatives
+  // (gemini → gemini-cli) over claude fallback.
+  if (request.stage && AGENTIC_STAGES.has(request.stage) && resolved.adapter.capabilities.tier !== 'agentic') {
+    const promoted = promoteToAgentic(registry, resolved.provider, request.model);
+    if (promoted) {
+      annotateSpanWithPromotion(resolved.provider, promoted.provider, request.stage);
+      resolved = promoted;
+    }
+  }
   // Default workspaceDir to cwd when the spawn caller didn't set one. This
   // makes skills + MCP first-class for every spawn site — dashboard, cli,
   // eval — without each caller having to opt in. Per AGENT-PROCESS-
@@ -252,4 +269,58 @@ function resolveAdapterOrFallback(
   throw new Error(
     `No agent-core adapter available for provider "${provider}" and no "claude" fallback registered.`,
   );
+}
+
+/**
+ * Promote a non-agentic adapter to an agentic one for build/validate/ship.
+ *
+ * Family-preserving rules:
+ *   - `gemini` (HTTP, function-calling tier) → `gemini-cli` (binary on PATH,
+ *     agentic) → `adk` (if API key set, agentic) → `claude`.
+ *   - Any other non-agentic provider → `claude`.
+ *
+ * Returns null when no agentic alternative is available (caller keeps the
+ * original adapter — the registry's own fallback path will surface this
+ * via a `provider not registered` error, or the run will surface
+ * tool-output-as-text symptoms downstream).
+ */
+function promoteToAgentic(
+  registry: ProviderRegistry,
+  fromProvider: ProviderName,
+  modelId: string,
+): { adapter: ModelAdapter; provider: ProviderName } | null {
+  const tryPick = (p: ProviderName): { adapter: ModelAdapter; provider: ProviderName } | null => {
+    const a = registry.get(p);
+    if (a && a.capabilities.tier === 'agentic') return { adapter: a, provider: p };
+    return null;
+  };
+
+  if (fromProvider === 'gemini') {
+    if (geminiCliAvailable()) {
+      const cli = tryPick('gemini-cli');
+      if (cli) return cli;
+    }
+    if (adkGeminiAvailable() && !modelId.toLowerCase().startsWith('adk:')) {
+      // ADK adapter strips the `adk:` prefix before handing to LLMRegistry —
+      // for bare `gemini-*` ids we can't transparently route through ADK
+      // without rewriting the model id, which would invalidate downstream
+      // cost / telemetry attribution. Skip ADK auto-promotion; users who
+      // want it should declare `adk:gemini-…` explicitly in models.yaml.
+    }
+    return tryPick('claude');
+  }
+
+  return tryPick('claude');
+}
+
+function adkGeminiAvailable(): boolean {
+  return !!(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GOOGLE_GENAI_API_KEY);
+}
+
+function annotateSpanWithPromotion(from: ProviderName, to: ProviderName, stage: string): void {
+  const span = trace.getActiveSpan();
+  if (!span) return;
+  span.setAttribute('anvil.adapter.promoted_from', from);
+  span.setAttribute('anvil.adapter.promoted_to', to);
+  span.setAttribute('anvil.adapter.promoted_stage', stage);
 }

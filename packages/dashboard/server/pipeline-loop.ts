@@ -97,6 +97,11 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
     });
 
     try {
+      // Phase D — seed ctx.shared.planBinding so downstream stages can
+      // verify build / validate / ship output against the approved plan.
+      const initialShared: Record<string, unknown> = {};
+      if (opts.config.planBinding) initialShared.planBinding = opts.config.planBinding;
+      if (opts.config.planSeed) initialShared.planSeed = opts.config.planSeed;
       const pipeline = new Pipeline({
         registry,
         bus: opts.bus,
@@ -104,6 +109,7 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
         workspaceDir: opts.workspaceDir,
         initialInput: stageState.prevArtifact,
         repoPaths: opts.repoPaths(),
+        initialShared,
         ...(rewindToStep ? { rewindTo: rewindToStep } : {}),
       });
       await pipeline.run();

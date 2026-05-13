@@ -239,11 +239,13 @@ export type {
   RunTasksOptions,
   RunTasksHooks,
   RiskSeverity,
+  RiskBlastRadius,
   ContractKind,
   PlanRepoImpact,
   PlanContract,
   PlanRisk,
   PlanRollout,
+  RolloutStrategy,
   PlanTests,
   PlanEstimate,
   Plan,
@@ -251,6 +253,24 @@ export type {
   PlanSection,
   PlanComment,
   PlanApproval,
+  // Plan v2 additions
+  PlanProblem,
+  PlanScope,
+  ScopeItem,
+  FileClaim,
+  FileClaimKind,
+  SymbolClaim,
+  SymbolKind,
+  DataChange,
+  DataChangeKind,
+  Observability,
+  ObservabilitySignal,
+  TestCaseSpec,
+  ManualStep,
+  ColumnSpec,
+  TypeRef,
+  PlanCreatedBy,
+  PlanApprovalRecord,
   RiskTier,
   RiskFactor,
   RiskScore,
@@ -267,6 +287,85 @@ export type {
   ExtractorResult,
   ManifestExtractor,
 } from './utils/index.js';
+export {
+  planRepoTouchedPaths,
+  planRepoTouchedCount,
+  planAllTestCases,
+  planAllTouchedPaths,
+  planContractDisplayName,
+  planContractDescription,
+  planContractConsumers,
+  planRepoSymbolNames,
+  planTestDescriptions,
+} from './utils/index.js';
+
+// — Plan v2 — schema migration, content-hash, verifier, plan-binding
+export {
+  migratePlanJsonToV2,
+  emptyPlanV2,
+  planContentHash,
+  planContentHashShort,
+  runPlanRules,
+  defaultRulePack,
+  bindPlan,
+} from './plan/index.js';
+export type {
+  Issue,
+  IssueSeverity,
+  RuleContext,
+  PlanRule,
+  AutoFixSuggestion,
+  PlanValidationReport,
+  PlanBinding,
+} from './plan/index.js';
+
+// — Plan v2 — compliance gates (Phases E, F, G)
+export {
+  checkBuildCompliance,
+  renderBuildComplianceMarkdown,
+  buildComplianceFixPrompt,
+  checkValidateCompliance,
+  renderValidateComplianceMarkdown,
+  reconcilePlan,
+} from './plan/index.js';
+export type {
+  BuildComplianceReport,
+  BuildComplianceProbes,
+  ComplianceGap,
+  GapKind,
+  ValidateComplianceReport,
+  ValidateComplianceProbes,
+  ValidateComplianceGap,
+  ValidateGapKind,
+  TestRunStatus,
+  PlanReconciliation,
+  ReconcileInput,
+} from './plan/index.js';
+
+// — Plan v2 — Phase I: cost policy + auto-refine
+export {
+  DEFAULT_COST_POLICY,
+  resolveCostPolicy,
+  CostBreachError,
+  autoRefinePlan,
+} from './plan/index.js';
+export type { CostPolicy, AutoRefineOutcome } from './plan/index.js';
+
+// — Plan v2 — lifecycle walker
+export {
+  initLifecycle,
+  transitionLifecycle,
+  snapshotLifecycle,
+} from './plan/index.js';
+export type {
+  LifecycleState,
+  LifecycleContext,
+  LifecycleEvent,
+  LifecycleAction,
+  LifecycleTransition,
+  LifecycleSnapshot,
+  TransitionResult,
+} from './plan/index.js';
 export { buildStandardStepRegistry } from './standard-registry.js';
 export type {
   RunStageResult,

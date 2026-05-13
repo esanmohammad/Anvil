@@ -96,37 +96,47 @@ function flattenPlan(plan: Plan): FlatStep[] {
   const steps: FlatStep[] = [];
 
   plan.scope.inScope.forEach((s, i) => {
-    steps.push({ stepId: `scope.inScope[${i}]`, description: s, keywords: tokenize(s) });
+    // Plan v2: scope items are structured; surface description + acceptance.
+    const desc = `${s.description}${s.acceptance.length ? ': ' + s.acceptance.join('; ') : ''}`;
+    steps.push({ stepId: `scope.inScope[${i}]`, description: desc, keywords: tokenize(desc) });
   });
 
   plan.repos.forEach((r, ri) => {
-    r.files.forEach((f, fi) => {
-      const desc = `${r.name}: ${f}`;
-      // File paths are load-bearing — fold the last few path segments as
-      // keywords (basename without extension, parent dir).
+    // Plan v2: iterate mustTouch + mustExist together so the comparator
+    // sees every claimed path.
+    const claims: { path: string; kind: 'modified' | 'new' }[] = [
+      ...r.mustTouch.map((c) => ({ path: c.path, kind: c.kind as 'modified' })),
+      ...r.mustExist.map((c) => ({ path: c.path, kind: 'new' as const })),
+    ];
+    claims.forEach((claim, fi) => {
+      if (!claim.path) return;
+      const desc = `${r.name}: ${claim.path}`;
       const pathTokens = new Set<string>();
-      const segs = f.split('/').filter(Boolean);
+      const segs = claim.path.split('/').filter(Boolean);
       for (const seg of segs.slice(-3)) {
         for (const tok of tokenize(seg.replace(/\.[a-z0-9]+$/i, ''))) pathTokens.add(tok);
       }
       const kws = tokenize(desc);
       pathTokens.forEach((t) => kws.add(t));
-      steps.push({ stepId: `repos[${ri}].files[${fi}]`, description: desc, keywords: kws });
+      steps.push({ stepId: `repos[${ri}].${claim.kind === 'new' ? 'mustExist' : 'mustTouch'}[${fi}]`, description: desc, keywords: kws });
     });
     r.symbols.forEach((sym, si) => {
+      const display = sym.name;
       steps.push({
         stepId: `repos[${ri}].symbols[${si}]`,
-        description: `${r.name}: ${sym}`,
-        keywords: tokenize(`${r.name} ${sym}`),
+        description: `${r.name}: ${display}`,
+        keywords: tokenize(`${r.name} ${display}`),
       });
     });
   });
 
   plan.tests.unit.forEach((t, i) => {
-    steps.push({ stepId: `tests.unit[${i}]`, description: t, keywords: tokenize(t) });
+    const desc = t.then || t.name;
+    steps.push({ stepId: `tests.unit[${i}]`, description: desc, keywords: tokenize(desc) });
   });
   plan.tests.integration.forEach((t, i) => {
-    steps.push({ stepId: `tests.integration[${i}]`, description: t, keywords: tokenize(t) });
+    const desc = t.then || t.name;
+    steps.push({ stepId: `tests.integration[${i}]`, description: desc, keywords: tokenize(desc) });
   });
 
   plan.rollout.order.forEach((o, i) => {

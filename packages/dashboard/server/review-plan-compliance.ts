@@ -53,27 +53,30 @@ export function buildPlanCompliance(input: ComplianceInput): ComplianceOutput {
 
   const allAddedFiles = deviation.repos.flatMap((r) => r.addedFiles);
 
-  // Contract coverage
+  // Contract coverage — Plan v2: contract display name varies by kind.
   const deliveredContracts: string[] = [];
   const missingContracts: string[] = [];
   for (const c of input.plan.contracts) {
-    const key = contractKey(c.name, c.kind);
-    if (diffMentionsContract(c.name, allAddedFiles)) deliveredContracts.push(key);
+    const display = c.kind === 'http'
+      ? `${c.method} ${c.path}`
+      : c.kind === 'kafka' ? c.topic
+      : c.kind === 'grpc' ? `${c.service}.${c.method}`
+      : c.table;
+    const key = contractKey(display, c.kind);
+    if (diffMentionsContract(display, allAddedFiles)) deliveredContracts.push(key);
     else missingContracts.push(key);
   }
 
-  // Symbol coverage — the plan's symbols vs what the diff touched.
-  // The existing deviation capture compares files only; for symbols we do a
-  // quick name-as-substring check against added-file content is too expensive,
-  // so we approximate: if the symbol's tail matches any added-file basename.
+  // Symbol coverage — Plan v2: symbols are SymbolClaim objects.
   const missedSymbols: string[] = [];
   for (const r of input.plan.repos) {
     for (const sym of r.symbols) {
-      const tail = sym.split(/[./:]/).pop()?.toLowerCase() ?? sym.toLowerCase();
+      const name = sym.name;
+      const tail = name.split(/[./:]/).pop()?.toLowerCase() ?? name.toLowerCase();
       const repoDev = deviation.repos.find((d) => d.repo === r.name);
       const files = [...(repoDev?.matchedFiles ?? []), ...(repoDev?.addedFiles ?? [])];
       const hit = files.some((f) => f.toLowerCase().includes(tail));
-      if (!hit) missedSymbols.push(`${r.name}::${sym}`);
+      if (!hit) missedSymbols.push(`${r.name}::${name}`);
     }
   }
 
