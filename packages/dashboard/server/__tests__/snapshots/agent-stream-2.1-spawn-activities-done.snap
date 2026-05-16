@@ -1,0 +1,42 @@
+[
+  {
+    "entries": [
+      {
+        "kind": "text",
+        "stage": "agent",
+        "tool": null,
+        "type": "stdout"
+      }
+    ],
+    "hasRunId": false,
+    "type": "agent-output"
+  },
+  {
+    "entries": [
+      {
+        "kind": "tool_use",
+        "stage": "agent",
+        "tool": "read_file",
+        "type": "stdout"
+      }
+    ],
+    "hasRunId": false,
+    "type": "agent-output"
+  },
+  {
+    "entries": [
+      {
+        "kind": "thinking",
+        "stage": "agent",
+        "tool": null,
+        "type": "stdout"
+      }
+    ],
+    "hasRunId": false,
+    "type": "agent-output"
+  },
+  {
+    "agentStatus": "done",
+    "type": "agent-done"
+  }
+]

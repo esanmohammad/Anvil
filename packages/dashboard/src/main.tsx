@@ -40,6 +40,7 @@ import { PlanReviewModal } from './components/pipeline/PlanReviewModal.js';
 import { usePausedRuns } from './components/pipeline/usePausedRuns.js';
 import { CostBreachHistoryPage } from './components/cost-breaches/CostBreachHistoryPage.js';
 import { MemoryPage } from './components/memory/MemoryPage.js';
+import { useDashboardSocket } from './hooks/useDashboardSocket.js';
 
 // ---------------------------------------------------------------------------
 // Raw content cleaner — strips JSON, tool inputs, commands from Claude's text
@@ -396,49 +397,20 @@ function App() {
   );
   const isWaitingForInput = rawPipeline?.waitingForInput === true;
 
-  // Connect to WebSocket with exponential backoff reconnection
+  // Phase 7: the hook owns the WS lifecycle (transport probe, reconnect,
+  // reducer dispatch). For Phase 7 we forward every wire message into the
+  // existing imperative handleServerMessage switch so the legacy setState
+  // pipeline keeps populating UI state unchanged. Future phases delete
+  // setState as reducer state replaces each slice.
+  const dashSocket = useDashboardSocket({
+    onWire: handleServerMessage,
+    wsRef,
+    retriesRef: reconnectAttempts,
+    maxRetries: MAX_RECONNECTS,
+  });
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ws`;
-    let ws: WebSocket;
-    let reconnectTimer: ReturnType<typeof setTimeout>;
-
-    function connect() {
-      ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-      ws.onopen = () => {
-        setWsConnected(true);
-        reconnectAttempts.current = 0;
-        // Re-request current state on reconnect to avoid stale/blank pipeline
-        ws.send(JSON.stringify({ action: 'get-state' }));
-      };
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data as string);
-          handleServerMessage(msg);
-        } catch { /* ignore */ }
-      };
-      ws.onclose = () => {
-        setWsConnected(false);
-        if (reconnectAttempts.current < MAX_RECONNECTS) {
-          const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempts.current), 30_000);
-          console.warn(`[ws] Connection closed, reconnecting in ${Math.round(delay / 1000)}s... (attempt ${reconnectAttempts.current + 1}/${MAX_RECONNECTS})`);
-          reconnectAttempts.current += 1;
-          reconnectTimer = setTimeout(connect, delay);
-        } else {
-          console.warn('[ws] Max reconnection attempts reached. Refresh the page to reconnect.');
-        }
-      };
-      ws.onerror = (err) => {
-        console.warn('[ws] Connection error:', err);
-        ws.close();
-      };
-    }
-
-    connect();
-    return () => { clearTimeout(reconnectTimer); ws?.close(); };
-  }, []);
+    setWsConnected(dashSocket.ready === 'connected');
+  }, [dashSocket.ready]);
 
   function handleServerMessage(msg: { type: string; payload: any }) {
     switch (msg.type) {
@@ -720,16 +692,35 @@ function App() {
 
       case 'artifact': {
         // Stage artifact written (REQUIREMENTS.md, SPECS.md, etc.)
-        const a = msg.payload;
-        if (a?.file) {
-          const shortPath = String(a.file).replace(/.*\.anvil\/features\//, '');
+        // Typed payload shape: { runId, stage, kind: 'file', value: {file,
+        // stage, summary, repo, timestamp} }. The `kind` discriminates
+        // artifact subtypes (file vs PR-url vs sandbox-url). Read the
+        // file fields out of `value`, not the top-level envelope —
+        // pre-typed-events code wrote them flat which is why this
+        // handler used to read `a.file` directly. With the wire shape
+        // following the typed event now, `value` is the nested payload.
+        const a = msg.payload as {
+          runId?: string;
+          stage?: string;
+          kind?: string;
+          value?: { file?: string; summary?: string; repo?: string; stage?: string; timestamp?: number };
+          // Tolerate legacy flat shape if/when it appears.
+          file?: string;
+          summary?: string;
+          repo?: string;
+          timestamp?: number;
+        } | undefined;
+        const v = a?.value ?? a;
+        const file = v?.file ?? a?.file;
+        if (file) {
+          const shortPath = String(file).replace(/.*\.anvil\/features\//, '');
           setChanges((prev) => [...prev, {
             file: shortPath,
             tool: 'Write' as const,
-            summary: a.summary || 'Artifact',
-            timestamp: a.timestamp || Date.now(),
-            repo: a.repo,
-            stage: a.stage,
+            summary: v?.summary || a?.summary || 'Artifact',
+            timestamp: v?.timestamp || a?.timestamp || Date.now(),
+            repo: v?.repo || a?.repo,
+            stage: v?.stage || a?.stage,
           }]);
         }
         break;

@@ -22,6 +22,7 @@ import {
   combinePerRepoArtifacts,
   runBuildForOneRepo,
   hasValidationFailures as hasValidationFailuresHelper,
+  extractRepoSection,
   buildProjectPrompt as buildProjectPromptHelper,
   buildRepoProjectPrompt as buildRepoProjectPromptHelper,
   buildClarifyExplorePrompt as buildClarifyExplorePromptHelper,
@@ -324,15 +325,50 @@ async function runClarifyStage(
 
 // ── Per-repo stage execution ───────────────────────────────────────
 
+/**
+ * Per-promise timeout (default 30 min) that fires if a single repo's
+ * runner never resolves. Without this, `Promise.all` waits forever on
+ * a hung agent, freezing the parent stage. Override via
+ * `ANVIL_REPO_STAGE_TIMEOUT_MS`. The timeout rejects the wait but
+ * does NOT kill the underlying agent — that requires plumbing
+ * `isCancelled` per-repo, deferred. Acceptable token leak in exchange
+ * for unblocking the parent.
+ */
+function repoStageTimeoutMs(): number {
+  const raw = parseInt(process.env.ANVIL_REPO_STAGE_TIMEOUT_MS ?? '', 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 30 * 60 * 1000;
+}
+
 async function runPerRepoStage(
   deps: StageOpsDeps,
   index: number,
   stage: StageDefinition,
   prevArtifact: string,
+  opts: { repoFilter?: ReadonlySet<string> } = {},
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-  const repos = deps.state.repoNames;
+  const allRepos = deps.state.repoNames;
+  const filter = opts.repoFilter;
+  const repos = filter ? allRepos.filter((r) => filter.has(r)) : allRepos;
 
   if (repos.length === 0) {
+    if (filter && allRepos.length > 0) {
+      // Filter eliminated every repo. Nothing to do this pass; preserve
+      // the prior per-repo artifacts so the combined output is the
+      // last-good state.
+      const carried = allRepos
+        .map((repoName) => {
+          const repoIdx = allRepos.indexOf(repoName);
+          const r = deps.state.stages[index].repos[repoIdx];
+          return { repoName, artifact: r?.artifact ?? '' };
+        })
+        .filter((r) => r.artifact);
+      return {
+        artifact: combinePerRepoArtifacts(carried),
+        cost: 0,
+        tokens: zeroTokenStats(),
+      };
+    }
     return runSingleStage(deps, index, stage, prevArtifact);
   }
 
@@ -346,10 +382,14 @@ async function runPerRepoStage(
   for (let r = 0; r < repos.length; r++) {
     const repoName = repos[r];
     const repoPath = deps.repoPaths()[repoName] || join(deps.workspaceDir, repoName);
-    const repoIdx = r;
+    // Map back to the canonical index in `state.stages[index].repos`
+    // — that array is keyed on `state.repoNames`, not the filtered
+    // subset, so writes to the wrong slot would clobber a different
+    // repo's state.
+    const repoIdx = allRepos.indexOf(repoName);
 
-    if (deps.state.stages[index].repos[r]) {
-      deps.state.stages[index].repos[r].status = 'running';
+    if (deps.state.stages[index].repos[repoIdx]) {
+      deps.state.stages[index].repos[repoIdx].status = 'running';
     }
     // Broadcast on every repo status flip so the dashboard's per-repo
     // chips light up immediately. Without this, all N repos stay
@@ -450,7 +490,12 @@ async function runPerRepoStage(
         const repoState = deps.state.stages[index].repos[repoIdx];
         if (repoState) {
           repoState.status = 'completed';
-          repoState.cost = result.costUsd ?? 0;
+          // Accumulate, don't overwrite — the validate→fix loop calls
+          // `runPerRepoStage` more than once per repo and the prior
+          // attempt's cost is real money already spent. Setting `=`
+          // here hides the first-pass cost the moment a revalidate
+          // overwrites it.
+          repoState.cost = (repoState.cost ?? 0) + (result.costUsd ?? 0);
           repoState.artifact = result.output;
         }
         deps.broadcast();
@@ -482,13 +527,65 @@ async function runPerRepoStage(
     );
   }
 
-  const results = await Promise.all(promises);
+  // Wrap each per-repo promise in `Promise.race` against a per-repo
+  // timeout. Without this, a hung runner (no resolve, no reject) leaves
+  // `Promise.all` waiting forever and wedges the parent stage. The
+  // timeout marks the repo's `repoState.status='failed'` so the
+  // `failedRepos.length > 0` check below throws cleanly. The underlying
+  // agent is NOT killed here — that requires per-repo plumbing of
+  // `isCancelled`, deferred.
+  const timeoutMs = repoStageTimeoutMs();
+  const timedPromises = promises.map((promise, idx) => {
+    const repoName = repos[idx];
+    const canonicalIdx = allRepos.indexOf(repoName);
+    return Promise.race<{
+      repoName: string;
+      artifact: string;
+      cost: number;
+      tokens: StageTokenStats;
+    }>([
+      promise,
+      new Promise((_resolve, reject) => {
+        const handle = setTimeout(() => {
+          const repoState = deps.state.stages[index].repos[canonicalIdx];
+          if (repoState && repoState.status === 'running') {
+            repoState.status = 'failed';
+            repoState.error = `Timed out after ${Math.round(timeoutMs / 60000)} min — agent never produced output. Underlying agent may still be running (token leak); cancel the run to reclaim.`;
+          }
+          deps.broadcast();
+          reject(new Error(`Per-repo stage "${stage.name}/${repoName}" timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        (handle as { unref?: () => void }).unref?.();
+      }),
+    ]).catch(() => ({
+      repoName,
+      artifact: '',
+      cost: 0,
+      tokens: zeroTokenStats(),
+    }));
+  });
+
+  const results = await Promise.all(timedPromises);
   const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
   const tokens = sumTokenStats(results.map((r) => r.tokens));
   const successResults = results.filter((r) => r.artifact);
   const failedRepos = results.filter((r) => !r.artifact).map((r) => r.repoName);
 
-  const combined = combinePerRepoArtifacts(successResults);
+  // When a filter is in effect (validate fix-loop revalidation), carry
+  // forward the artifacts of the repos we skipped this pass so the
+  // combined output is the full validate report, not just the
+  // re-validated subset.
+  const carriedResults: Array<{ repoName: string; artifact: string }> = [];
+  if (filter) {
+    for (const repoName of allRepos) {
+      if (filter.has(repoName)) continue;
+      const repoIdx = allRepos.indexOf(repoName);
+      const r = deps.state.stages[index].repos[repoIdx];
+      if (r?.artifact) carriedResults.push({ repoName, artifact: r.artifact });
+    }
+  }
+
+  const combined = combinePerRepoArtifacts([...carriedResults, ...successResults]);
 
   if (failedRepos.length > 0) {
     throw new Error(
@@ -550,7 +647,8 @@ async function runBuildForRepo(
   const repoStateDone = deps.state.stages[stageIndex].repos[repoIdx];
   if (repoStateDone) {
     repoStateDone.status = 'completed';
-    repoStateDone.cost = result.cost;
+    // Accumulate across passes (see same note in `runPerRepoStage`).
+    repoStateDone.cost = (repoStateDone.cost ?? 0) + (result.cost ?? 0);
     repoStateDone.artifact = result.artifact;
   }
   deps.broadcast();
@@ -1049,6 +1147,18 @@ export async function runOneStage(
         let fixAttempts = 0;
         const MAX_FIX_ATTEMPTS = 3;
 
+        // The 1st pass at line 887 set `state.stages[i].status='completed'`.
+        // If the artifact has failure markers we're about to re-open the
+        // stage via the fix-loop, so re-flip to 'running' here. Without
+        // this, the UI shows the stage as done even while the fix-loop
+        // churns through per-repo revalidate spawns. The post-loop block
+        // below re-flips back to 'completed'.
+        const reopened = hasValidationFailuresHelper(validateArtifact);
+        if (reopened) {
+          deps.state.stages[i].status = 'running';
+          deps.broadcast();
+        }
+
         while (fixAttempts < MAX_FIX_ATTEMPTS && hasValidationFailuresHelper(validateArtifact)) {
           fixAttempts++;
           console.log(`[pipeline] Validation failed — fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}`);
@@ -1060,7 +1170,30 @@ export async function runOneStage(
 
           if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
 
-          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact);
+          // Compute the subset of repos whose validate sections still
+          // contain failure markers. Pass that subset as a filter to
+          // `runPerRepoStage` so we only re-pay validation for repos
+          // that need it. Repos whose 1st-pass output was clean keep
+          // their `repoState.status='completed'` + prior cost. If we
+          // can't isolate per-repo failure (extractRepoSection returned
+          // empty for all repos), fall back to revalidating everyone.
+          const failingRepos = new Set<string>();
+          for (const repoName of deps.state.repoNames) {
+            const section = extractRepoSection(validateArtifact, repoName);
+            if (!section || hasValidationFailuresHelper(section)) {
+              failingRepos.add(repoName);
+            }
+          }
+          const repoFilter = failingRepos.size > 0 && failingRepos.size < deps.state.repoNames.length
+            ? failingRepos
+            : undefined;
+          if (repoFilter) {
+            console.log(
+              `[pipeline] Revalidating ${repoFilter.size}/${deps.state.repoNames.length} repo(s): ${[...repoFilter].join(', ')}`,
+            );
+          }
+
+          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact, { repoFilter });
           validateArtifact = revalidateResult.artifact;
           deps.state.stages[i].artifact = validateArtifact;
           deps.state.stages[i].cost += revalidateResult.cost;
@@ -1078,6 +1211,17 @@ export async function runOneStage(
           console.log(`[pipeline] Validation recovered after ${fixAttempts} fix attempt(s)`);
         } else {
           console.log(`[pipeline] Validation clean — proceeding to Ship`);
+        }
+
+        // Re-flip the parent stage to 'completed' once the fix-loop is
+        // truly done. Pairs with the 'running' flip above so the
+        // sidebar doesn't get stuck on a ghost-completed validate
+        // while children are still in flight.
+        if (reopened) {
+          deps.state.stages[i].status = 'completed';
+          deps.state.stages[i].completedAt = new Date().toISOString();
+          deps.broadcast();
+          deps.checkpoint();
         }
 
         // Phase F — plan-compliance pass after the test suite. Reads

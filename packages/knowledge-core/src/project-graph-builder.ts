@@ -64,7 +64,7 @@ function detectProvider(preferredProvider?: string): { provider: string; apiKey:
   }
 
   // Auto-detect in order of preference (CLI tools first, then API providers)
-  for (const p of ['claude-cli', 'gemini-cli', 'anthropic', 'openai', 'gemini', 'openrouter']) {
+  for (const p of ['claude-cli', 'gemini-cli', 'anthropic', 'openai', 'gemini', 'openrouter','opencode']) {
     const found = tryProvider(p);
     if (found) return found;
   }

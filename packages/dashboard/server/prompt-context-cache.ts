@@ -43,8 +43,16 @@ export interface PromptContextCacheOptions {
 /** Source label rendered into prompt comments + telemetry. */
 export type KbSourceLabel = 'none' | 'repo-focused' | 'index-only' | 'full-with-index' | 'full-blob';
 
-function formatContent(content: string): string {
-  return content.replace(/\s+/g, ' ').trim().slice(0, 280);
+function formatContent(content: unknown): string {
+  // Memory entries hold strings for narrative/episodic kinds but
+  // structured objects for `semantic:fix-pattern` (`{error, fix}`)
+  // and similar typed candidates from `reflectOnRun` /
+  // sleeptime consolidation. JSON-stringify the non-string cases so
+  // the BM25 retrieval block still renders something useful.
+  const text = typeof content === 'string'
+    ? content
+    : (() => { try { return JSON.stringify(content) ?? ''; } catch { return ''; } })();
+  return text.replace(/\s+/g, ' ').trim().slice(0, 280);
 }
 
 export class PromptContextCache {
@@ -202,8 +210,15 @@ export class PromptContextCache {
         if (content) sourceLabel = 'full-blob';
       }
     } else {
-      // Project-wide (non-repo) prompt path.
-      if (indexPrompt) {
+      // Project-wide (non-repo) prompt path. Honor the tier here too —
+      // previously this branch always emitted indexPrompt + queryContext
+      // regardless of tier, so `clarify` (locked to `index-only`)
+      // silently got the full hybrid-retrieval payload and the log line
+      // printed a misleading `tier=index-only, source=full-with-index`.
+      if (tier === 'index-only') {
+        content = indexPrompt;
+        if (content) sourceLabel = 'index-only';
+      } else if (indexPrompt) {
         const queryContext = this.opts.kbManager?.getQueryContextForPrompt(this.opts.project, this.opts.feature) || '';
         content = `${indexPrompt}\n\n---\n\n${queryContext}`;
         sourceLabel = 'full-with-index';

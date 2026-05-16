@@ -102,6 +102,27 @@ Tests live at `src/__tests__/*.test.ts`. Runtime deps:
   `verifyCodeBindings(store, ns, opts)` defaults to `downweight` for
   `drifted` and `invalidate` for `missing` (a deleted file is a hard signal).
 
+### `Memory.content` is `unknown`, not `string`
+
+- `narrative` / `episodic` entries carry strings, but typed candidates
+  (`semantic:fix-pattern` is `{error, fix}`, sleeptime proposals are
+  `{candidate, rationale}`, etc.) carry **objects**. The `content`
+  field's static type is `unknown` by design — `Memory<T>` parameterizes
+  the body, the storage layer is type-agnostic.
+- Callers that flatten content into a prompt string MUST guard against
+  non-string values:
+  ```ts
+  const text = typeof content === 'string'
+    ? content
+    : (() => { try { return JSON.stringify(content) ?? ''; } catch { return ''; } })();
+  ```
+  Calling `.replace()` / `.match()` directly on `content` blows up the
+  pipeline with `TypeError: content.replace is not a function`
+  (canonical site: dashboard's `prompt-context-cache.ts:formatContent`).
+- The BM25 retrieval block in the dashboard's system prompt is the
+  highest-volume consumer of mixed-content memories — that's where the
+  bug typically surfaces.
+
 ### FTS5 query sanitization
 
 - `SqliteHotIndex.searchByText(query)` routes the input through

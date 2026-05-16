@@ -112,7 +112,19 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
         initialShared,
         ...(rewindToStep ? { rewindTo: rewindToStep } : {}),
       });
-      await pipeline.run();
+      // Pipeline.run() returns `{status:'success'|'failed', ...}` and
+      // does NOT re-throw on step failure — it emits `pipeline:failed`,
+      // sets `status:'failed'` on its return value, and resolves
+      // normally. Without checking the return value here, the runner
+      // would fall through to its "set state.status = 'completed'"
+      // branch and the UI would show a green "Pipeline completed"
+      // sitting next to a red failed stage. Mirror the throw-based
+      // control-flow markers (`__anvilFailReturn`) by setting
+      // `pipelineEarlyReturn = true` on `status === 'failed'`.
+      const result = await pipeline.run();
+      if (result.status === 'failed') {
+        pipelineEarlyReturn = true;
+      }
       break;
     } catch (err) {
       const e = err as Error & {

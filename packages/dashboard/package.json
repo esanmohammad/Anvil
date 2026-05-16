@@ -30,27 +30,15 @@
   },
   "files": [
     "dist",
-    "server/*.js",
-    "server/*.d.ts",
-    "server/adapters/*.js",
-    "server/adapters/*.d.ts",
-    "server/plan-validator-rules/*.js",
-    "server/plan-validator-rules/*.d.ts",
-    "server/review-rules/*.js",
-    "server/review-rules/*.d.ts",
-    "server/review-checks/*.js",
-    "server/review-checks/*.d.ts",
-    "server/review-verifier-test-generators/*.js",
-    "server/review-verifier-test-generators/*.d.ts",
-    "server/incident-parsers/*.js",
-    "server/incident-parsers/*.d.ts",
-    "server/steps/*.js",
-    "server/steps/*.d.ts",
+    "server/**/*.js",
+    "server/**/*.d.ts",
+    "!server/out/**",
+    "!server/__tests__/**",
     "LICENSE"
   ],
   "scripts": {
     "dev": "vite",
-    "build": "vite build && tsc -p server/tsconfig.json && (cp server/out/*.js server/out/*.d.ts server/ 2>/dev/null; cp server/out/adapters/*.js server/out/adapters/*.d.ts server/adapters/ 2>/dev/null; mkdir -p server/plan-validator-rules && cp server/out/plan-validator-rules/*.js server/out/plan-validator-rules/*.d.ts server/plan-validator-rules/ 2>/dev/null; mkdir -p server/review-rules && cp server/out/review-rules/*.js server/out/review-rules/*.d.ts server/review-rules/ 2>/dev/null; mkdir -p server/review-checks && cp server/out/review-checks/*.js server/out/review-checks/*.d.ts server/review-checks/ 2>/dev/null; mkdir -p server/review-verifier-test-generators && cp server/out/review-verifier-test-generators/*.js server/out/review-verifier-test-generators/*.d.ts server/review-verifier-test-generators/ 2>/dev/null; mkdir -p server/incident-parsers && cp server/out/incident-parsers/*.js server/out/incident-parsers/*.d.ts server/incident-parsers/ 2>/dev/null; mkdir -p server/steps && cp server/out/steps/*.js server/out/steps/*.d.ts server/steps/ 2>/dev/null; mkdir -p server/runners && cp server/out/runners/*.js server/out/runners/*.d.ts server/runners/ 2>/dev/null; exit 0)",
+    "build": "vite build && tsc -p server/tsconfig.json && node ./scripts/copy-out.mjs",
     "preview": "vite preview",
     "test:server": "npx tsc -p server/tsconfig.json && node --test server/out/__tests__/*.test.js"
   },
@@ -64,12 +52,14 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-force-graph-2d": "1.29.1",
-    "ws": "^8.18.0"
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "ts-pattern": "^5.9.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",
-    "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.4.1",
     "tailwindcss": "^4.1.4",
     "vite": "^6.3.2"

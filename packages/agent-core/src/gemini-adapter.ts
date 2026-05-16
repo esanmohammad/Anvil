@@ -200,6 +200,22 @@ export class GeminiAdapter implements ModelAdapter {
     const durationMs = Date.now() - startMs;
     const costUsd = computeCost(model, inputTokens, outputTokens);
 
+    // Silent-empty defense: Gemini's HTTP API can close the SSE stream
+    // without emitting any text parts (safety filter, blocked content,
+    // upstream rate-limit returning 200 OK with an empty stream).
+    // Surface as a retryable UpstreamError so `runStageWithFallback`
+    // walks the chain to the next model instead of writing a 0-byte
+    // artifact. Mirrors openrouter / ollama / claude / adk contract.
+    // Honor caller-driven aborts — those stay raw and non-retryable.
+    if (!fullText.trim() && !this.abortController?.signal.aborted) {
+      this.abortController = null;
+      throw new UpstreamError(
+        503,
+        `gemini model "${model}" returned empty final text (outputTokens=${outputTokens})`,
+        { provider: 'gemini', retryable: true },
+      );
+    }
+
     emitResult(output, {
       text: fullText,
       costUsd,

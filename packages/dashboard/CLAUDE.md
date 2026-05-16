@@ -3,16 +3,324 @@
 Guidance for Claude Code when working inside `packages/dashboard/`. The
 dashboard is the WebSocket+HTTP server that drives Anvil's per-run
 pipeline orchestrator, plus the React UI rendered against it. Single
-process, single file orchestrator (`server/dashboard-server.ts`).
+process; the boot orchestrator (`server/dashboard-server.ts`) was
+decomposed from ~8,300 LOC to ~890 LOC over a 12-round refactor — the
+extracted modules live under `server/{setup,handlers,pipeline,http,runs,shared,sandbox,services,events,ws,dev,tools,browser,computer-use,steps,runners}/`. See `DASHBOARD-DECOMPOSITION-PLAN.md` for round-by-round history.
 
 ## What this package owns
 
-- **`server/dashboard-server.ts`** (~6000 LOC) — boots HTTP+WS, handles
-  ~50 WS message types, instantiates `AgentManager` /
-  `MemoryStore` / `PipelineRunner` / `PipelinePauseStore`, owns the
-  `prUrls` / `costLedger` / `runStore` rollups. Single-file by design
-  — splitting it has been deferred until the WS event vocabulary
-  (D10) is locked.
+- **`server/dashboard-server.ts`** (~890 LOC) — boot + lifecycle only:
+  loads env, builds the `DashboardStores` bundle, constructs services +
+  legacy bridge + socket.io mount, wires the handler registry, threads
+  the `HandlerExtras` closure bag, returns the `DashboardServerHandle`.
+  Top-of-file invokes `loadAnvilEnv(ANVIL_HOME)` /
+  `ensureQuietOtelLogs()` / `autoDetectTelemetry()`. WS event vocabulary
+  is typed (`DashboardEvent` union in `server/events/types.ts`).
+- **`server/setup/`** — boot-time wiring extracted out of
+  `dashboard-server.ts`:
+    - `load-env.ts` — `ALLOWED_ENV_KEYS` + `loadAnvilEnv(anvilHome)` +
+      `autoDetectTelemetry()` + `ensureQuietOtelLogs()`. Single source
+      of truth for the env-var write contract.
+    - `stores.ts` — `createDashboardStores(deps)` collapses ~26
+      `new XxxStore(ANVIL_HOME)` calls into one factory returning a
+      typed `DashboardStores` bundle (plan / review / test / incident /
+      KB / cost / pauses / manifest / memory / feature / runs /
+      ci-triage / reviewers / dismissals / learnings / regression /
+      replay / durable / approval / bound-tests / contract / browser /
+      flakiness / shared cost-pricing).
+    - `init-payload.ts` — `createInitSender(deps)` returns the
+      `SendInitFn` that pushes the projects/runs/state/models/repos
+      bootstrap blob on WS connect. Takes a `getOutputBuffer()` getter
+      so rebound `let outputBuffer = []` semantics survive.
+    - `model-discovery.ts` — `discoverAvailableModels()` walks
+      `~/.anvil/models.yaml` + provider env-var presence; returns the
+      typed `AvailableModelsResult` consumed by the Settings UI.
+    - `server-listen.ts` — terminal `listenAndReturnHandle(deps)` block
+      that mounts socket.io, builds the `fauxWsForSocket` adapter, and
+      drains `stopHandlers` with per-handler 2 s timeouts on
+      `handle.stop()`.
+    - `graceful-shutdown.ts` — SIGINT+SIGTERM hooks calling
+      `agentManager.killAll()` + 3 s force-exit watchdog.
+    - `auto-replay.ts` / `restore-incomplete.ts` / `sleeptime.ts` —
+      background daemons started at boot (replay queue, incomplete-run
+      restore sweep, memory-core sleeptime ratification).
+    - `ws-client.ts` — shared `WsClient` type + `WS_OPEN = 1`.
+- **`server/handlers/`** — WS client action handlers (one per
+  domain) dispatched via Recipe-7 handler registry:
+    - `registry.ts` + `route.ts` — typed dispatch over `ClientMessage`.
+      Each handler takes `(msg, extras: HandlerExtras)` and returns
+      `Promise<void>`. Unknown actions log + drop, never crash the
+      server.
+    - `extras-builder.ts` — `buildHandlerExtras(deps): HandlerExtras`
+      flattens 40+ deps into a typed bag. Mutable refs via
+      `getActivePipelineRunner` / `setActivePipelineRunner` /
+      `getActiveChild` callbacks. Spawn closures wrapped in thunks at
+      call site to handle declaration-order.
+    - One file per domain: `projects`, `runs-pipeline`, `plans` +
+      `plans-spawn`, `reviews` + `reviews-spawn`, `tests` +
+      `tests-pipeline`, `incidents` + `incidents-spawn`,
+      `contracts`, `pauses`, `cost`, `kb`, `project-graph`,
+      `learnings`, `ci-triage`, `settings`, `schemas` (Zod input
+      validation).
+- **`server/pipeline/`** — pipeline-side spawn / cancel / lifecycle
+  helpers extracted out of the runner + handlers:
+    - `start-pipeline.ts` — `startPipeline()` registers the run on
+      `activeRuns` + broadcasts BEFORE `new PipelineRunner(...)`;
+      seeds the activity feed with an "Initialising pipeline…" entry.
+    - `cancel-legacy.ts` — `createCancelLegacyPipeline(deps)` returns
+      the SIGTERM-then-state-flip canceller.
+    - `quick-action.ts` / `plan-spawn.ts` / `review-spawn.ts` —
+      one-shot agent spawns for ad-hoc commands.
+    - `post-run.ts` / `pr-tracking.ts` / `plan-lifecycle.ts` /
+      `cost-breach-router.ts` / `review-helpers.ts` /
+      `project-overview.ts` / `json-extract.ts`.
+- **`server/runs/io.ts`** — `loadRunsSync(runsIndex)` +
+  `readStateFile(stateFile)` as pure path-arg readers; the server
+  wraps them in `() => loadRunsSync(RUNS_INDEX)` thunks to preserve
+  the deps-fn shape downstream.
+- **`server/http/`** — non-WS HTTP surface:
+    - `static.ts` — `createStaticHandler(deps)` MIME-typed Vite
+      `dist/` server with directory-traversal protection.
+    - `webhook-routes.ts` — `POST /webhooks/incidents` /
+      `POST /webhooks/bound-tests` etc.
+- **`server/shared/`** — types + workspace helpers hoisted out of the
+  monolith:
+    - `server-types.ts` — `ProjectSummary`, `RunSummary`,
+      `DashboardStageState`, `DashboardPipeline`, `DashboardState`,
+      `ServerMessage`, `ClientMessage`, `DashboardServerOptions`,
+      `DashboardServerHandle`.
+    - `workspace.ts` — `getWorkspaceFromConfig(project)` +
+      `parseFixPatternContent(content)` pure helpers.
+- **`server/sandbox/`** — workload sandboxing (overlay-fs upper layer
+  + container runners). Used by `agent-core`'s `BuiltinToolExecutor`
+  when `SANDBOX_HANDLE` is threaded through the spawn config (see
+  recent commits 9d8e513 / c7ceb14 / e15334a):
+    - `docker-runner.ts` / `firecracker-runner.ts` / `gvisor-runner.ts`
+      — three substrate impls behind a shared interface.
+    - `overlay-fs.ts` — tmpfs upper layer + state-hash binding for
+      reproducible runBash invocations.
+    - `pool.ts` / `pooled-runner.ts` — warm-instance pool.
+    - `cache-mounts.ts` / `docker-image.ts` /
+      `install-exec-wrapper.ts` / `network-policy.ts` /
+      `resource-limits.ts` / `register-at-boot.ts`.
+- **`server/events/`** — typed event infrastructure (Phase 2–6 of the
+  WS extraction):
+    - `types.ts` — `DashboardEvent` discriminated union (~60 event
+      kinds across run lifecycle, agent stream, pipeline, plans,
+      reviews, tests, incidents, KB, cost, project-graph, bind,
+      artifact, system). `Topic` enum for socket.io room routing.
+      `envelope()` + `nextEventId()` helpers.
+    - `replay.ts` — `EventReplay` ring buffer per topic, bounded by
+      both event count (default 500) and bytes (default 1 MiB)
+      whichever-hits-first. Used by socket.io's `subscribe { since }`
+      backfill on reconnect.
+    - `topics.ts` — `roomsForEvent(ev)` map (ts-pattern exhaustive
+      switch). Adding a new event kind without a topic mapping is a
+      compile error.
+    - `bridge.ts` — `attachLegacyBridge` subscribes to every service's
+      `onAny` and translates each typed emission back to today's
+      `{type,payload}` wire shape via `broadcast()`. Keeps the React
+      frontend (still raw-WS) working unchanged during migration.
+    - `wire-translate.ts` — explicit per-kind unwrap of typed payloads
+      into the legacy wire shape (e.g. `run.active-snapshot` →
+      `payload: array` instead of `{runs}`). This divergence is the
+      reason `src/state/reducer.ts` accepts BOTH shapes per case.
+    - `services-bridge.ts` — sibling that fans typed events into
+      socket.io rooms via `io.to(rooms).emit`. Used only when
+      `mountSocketServer({ coexistWithRawWs: true })` is active
+      (env-gated by `ANVIL_SOCKET_IO=1`).
+    - `sync-emitter.ts` — synchronous typed pub/sub base class. Used
+      instead of Emittery because Emittery dispatches listeners on a
+      microtask, which would reorder typed emissions against any
+      sibling synchronous `broadcast()` calls and break wire ordering
+      (e.g. `stop-run` → `active-runs` → kill chain).
+- **`server/services/index.ts`** — domain-scoped event services (one
+  `SyncEmitter` subclass per domain): `RunService`, `AgentService`,
+  `PipelineService`, `ReviewService`, `PlanService`, `TestService`,
+  `BindService`, `IncidentService`, `KbService`, `CostService`,
+  `ProjectGraphService`, `SystemService`. `createServices()` returns
+  the full bundle; injected via `DashboardServerDeps.services`.
+- **`server/ws/socket-server.ts`** — `mountSocketServer({...})` boots
+  socket.io. Two modes:
+    - default: socket.io's `attach(server)` takes over the http
+      server's request listener. Suitable for isolated tests.
+    - `coexistWithRawWs: true`: socket.io uses `noServer: true` plus a
+      manual upgrade-router that filters `/socket.io/*` URLs and lets
+      the raw `WebSocketServer({ path: '/ws' })` keep owning `/ws`.
+      This is the production path until raw-WS is removed.
+- **`shared/events.ts`** — re-exports from `server/events/types.ts` so
+  both the Node server AND the Vite frontend import event types from a
+  single namespace.
+- **`src/state/reducer.ts`** — pure reducer over `DashboardEvent`.
+  Replaces the imperative `handleServerMessage` switch in
+  `main.tsx:443`. Includes `wireToEvent(wire)` adapter that converts
+  the legacy `{type,payload}` wire shape into a typed envelope so the
+  reducer can switch on `kind`. **Wire-shape divergence**: the bridge
+  unwraps some typed payloads (`run.active-snapshot` → array,
+  `runs.list` → array, `state` → state, `prs.updated` → array) so
+  every case that reads payload fields MUST accept both the typed
+  envelope (`{runs: [...]}`) and the unwrapped raw shape (`[...]`).
+  Don't add a case that only reads one shape — it'll crash with
+  `Cannot read properties of undefined (reading 'map')` for whichever
+  hop didn't unwrap. ts-pattern's `.exhaustive()` makes adding a new
+  event kind a compile error if the reducer doesn't handle it.
+- **`server/__tests__/_harness/`** — scenario-test infrastructure
+  (Phase 0.5):
+    - `boot.ts` — `bootDashboard()` boots a fresh dashboard on an
+      ephemeral port with a tmp ANVIL_HOME and an injected
+      `FakeAgentManager` (zero real LLM calls).
+    - `dashboard-client.ts` — `DashboardClient` abstraction with two
+      transport impls (`rawWsClient` / `socketIoClient`); scenario
+      tests are transport-agnostic.
+    - `fake-agent-manager.ts` — `FakeAgentManager extends AgentManager`
+      with scripted spawn/emit/done/error. Lets scenarios pin the
+      wire-level contract of agent lifecycle without real LLM
+      spawns.
+    - `strip-volatile.ts` + `snapshot-store.ts` — snapshot
+      normalization + file-based pinning (`__tests__/snapshots/*.snap`).
+- **`server/dev/ws-trace.ts`** — opt-in JSONL writer for `broadcast()`
+  emissions. When `ANVIL_WS_TRACE=1`, every legacy-shape broadcast
+  appends `{ts, type, callerHash}` to `$ANVIL_HOME/ws-trace.jsonl`.
+  Used during the migration to inventory event types; safe to keep
+  shipping since it no-ops when the env var is unset.
+- **`server/pipeline-runner.ts`** (~560 LOC) — per-run orchestrator.
+  Drives via `Pipeline.run()` from `core-pipeline` over an
+  `InMemoryStepRegistry` built from `STAGES` in core-pipeline; each
+  Step's `run` calls `runOneStage(i)` which contains the per-stage body
+  (resume skip, planSeed branch, dispatch to clarify/perRepo/single,
+  validate-fix loop, after-stage hook, ship deploy). Control-flow exits
+  (`continue` / `break` / early-return / reviewer rewind) translate to
+  thrown sentinel errors with `__anvilCancel` / `__anvilFailReturn` /
+  `__anvilRewind` markers; the outer try unwinds to the right exit.
+  Reviewer rewind is handled by trimming `completedSteps` and
+  re-invoking `Pipeline.run()` from the rewind target. The runner
+  emits to its own `EventEmitter` (`state-change`, `waiting-for-input`,
+  `clarify-question`, etc.); `dashboard-server.ts` subscribes via
+  `runner.on(...)` and translates each event to the appropriate
+  `services.<X>.emit(...)` typed call. Bus subscribers
+  (`attachAuditLogHook`, `attachCostTrackerHook` from core-pipeline)
+  are wired to the runner's `pipelineBus` for forensic audit + cost
+  rollup.
+- **`server/prompt-context-cache.ts`** — memoised system-prompt
+  inputs (memory block, conventions, project YAML slice, KB block,
+  manifest). `formatContent(content: unknown)` JSON-stringifies
+  non-string memory entries before `.replace()`-style normalization,
+  because `semantic:fix-pattern` memories from sleeptime store
+  `{error, fix}` objects, not strings. Previously crashed pipeline
+  start with `TypeError: content.replace is not a function` —
+  logged as `[pipeline] BM25 memory retrieval failed`.
+- **`server/steps/`** — Step factories + pure helpers extracted out
+  of `pipeline-runner.ts` over the Phase-4 series. See README §
+  "Pipeline runner shape (Phase 4)" for the full module table.
+- **`server/runners/`** — adapters that satisfy the canonical
+  `AgentRunner` / `AgentSession` interfaces (from `core-pipeline`)
+  over the dashboard's heavyweight `AgentManager`:
+    - `agent-manager-runner.ts` — `AgentManagerRunner` is the one-shot
+      runner. Wraps `spawnAndWait` + `runWithChainFallback`. Used by
+      `runOneStage`'s single-stage / per-repo / per-task delegations.
+    - `agent-manager-session.ts` — `AgentManagerSession` is the
+      multi-turn session. Wraps `agentManager.spawn` for `start()` and
+      `agentManager.sendInput + waitForAgent` for `sendInput()`. Used
+      by clarify (explore→Q&A→synthesize) and fix-loop (resume across
+      attempts).
+    - `pipeline-step-registry.ts` — `buildPipelineStepRegistry(opts)`
+      assembles the `InMemoryStepRegistry` driven by `Pipeline.run()`.
+- **`server/provider-registry.ts`** — discovery layer for the Settings
+  UI. Reports each provider's display name, env var, model list,
+  setup hint. Visibility toggles on env-var presence.
+- **`server/provider-liveness.ts`** — thin re-export shim over
+  `@esankhan3/anvil-agent-core`'s provider-liveness module. The
+  implementation moved to agent-core so cli + dashboard share one
+  module-scoped probe cache.
+- **`server/memory-store.ts`** — thin façade over
+  `@anvil/memory-core`'s `HybridMemoryStore`, with the dashboard's
+  legacy markdown-migration path on first read/write.
+- **`server/feature-store.ts`** — owns
+  `~/.anvil/features/<project>/<slug>/` artifacts (CLARIFICATION.md,
+  REQUIREMENTS.md, …).
+- **`server/knowledge-base-manager.ts`** — wraps the cli's `anvil index`
+  command so KB indexing runs out-of-process.
+- **`scripts/copy-out.mjs`** — post-`tsc` walker that mirrors
+  `server/out/**/*` into `server/**/*` recursively (excluding
+  `__tests__`). Replaces the previous hardcoded `cp` chain that broke
+  every time a new subdirectory was added. Filter: `.js` / `.d.ts` /
+  `.map`. Without it the cli bundle silently misses `services/`,
+  `setup/`, `handlers/`, `pipeline/`, `http/`, `runs/`, `shared/`,
+  `sandbox/` at import time.
+- **`src/`** — React + Vite frontend. Mounts on the WS server's port,
+  renders run history, change diffs, activity log, KB graph,
+  pipeline-policy editor, settings. Phase-4 pipeline event vocabulary
+  is rendered by `src/components/output/`.
+- **`server/events/`** — typed event infrastructure (Phase 2–6 of the
+  WS extraction):
+    - `types.ts` — `DashboardEvent` discriminated union (~60 event
+      kinds across run lifecycle, agent stream, pipeline, plans,
+      reviews, tests, incidents, KB, cost, project-graph, bind,
+      artifact, system). `Topic` enum for socket.io room routing.
+      `envelope()` + `nextEventId()` helpers.
+    - `replay.ts` — `EventReplay` ring buffer per topic, bounded by
+      both event count (default 500) and bytes (default 1 MiB)
+      whichever-hits-first. Used by socket.io's `subscribe { since }`
+      backfill on reconnect.
+    - `topics.ts` — `roomsForEvent(ev)` map (ts-pattern exhaustive
+      switch). Adding a new event kind without a topic mapping is a
+      compile error.
+    - `bridge.ts` — `attachLegacyBridge` subscribes to every service's
+      `onAny` and translates each typed emission back to today's
+      `{type,payload}` wire shape via `broadcast()`. Keeps the React
+      frontend (still raw-WS) working unchanged during migration.
+    - `services-bridge.ts` — sibling that fans typed events into
+      socket.io rooms via `io.to(rooms).emit`. Used only when
+      `mountSocketServer({ coexistWithRawWs: true })` is active
+      (env-gated by `ANVIL_SOCKET_IO=1`).
+    - `sync-emitter.ts` — synchronous typed pub/sub base class. Used
+      instead of Emittery because Emittery dispatches listeners on a
+      microtask, which would reorder typed emissions against any
+      sibling synchronous `broadcast()` calls and break wire ordering
+      (e.g. `stop-run` → `active-runs` → kill chain).
+- **`server/services/index.ts`** — domain-scoped event services (one
+  `SyncEmitter` subclass per domain): `RunService`, `AgentService`,
+  `PipelineService`, `ReviewService`, `PlanService`, `TestService`,
+  `BindService`, `IncidentService`, `KbService`, `CostService`,
+  `ProjectGraphService`, `SystemService`. `createServices()` returns
+  the full bundle; injected via `DashboardServerDeps.services`.
+- **`server/ws/socket-server.ts`** — `mountSocketServer({...})` boots
+  socket.io. Two modes:
+    - default: socket.io's `attach(server)` takes over the http
+      server's request listener. Suitable for isolated tests.
+    - `coexistWithRawWs: true`: socket.io uses `noServer: true` plus a
+      manual upgrade-router that filters `/socket.io/*` URLs and lets
+      the raw `WebSocketServer({ path: '/ws' })` keep owning `/ws`.
+      This is the production path until raw-WS is removed.
+- **`shared/events.ts`** — re-exports from `server/events/types.ts` so
+  both the Node server AND the Vite frontend import event types from a
+  single namespace.
+- **`src/state/reducer.ts`** — pure reducer over `DashboardEvent`.
+  Replaces the imperative `handleServerMessage` switch in
+  `main.tsx:443`. Includes `wireToEvent(wire)` adapter that converts
+  the legacy `{type,payload}` wire shape into a typed envelope so the
+  reducer can switch on `kind`. ts-pattern's `.exhaustive()` makes
+  adding a new event kind a compile error if the reducer doesn't
+  handle it.
+- **`server/__tests__/_harness/`** — scenario-test infrastructure
+  (Phase 0.5):
+    - `boot.ts` — `bootDashboard()` boots a fresh dashboard on an
+      ephemeral port with a tmp ANVIL_HOME and an injected
+      `FakeAgentManager` (zero real LLM calls).
+    - `dashboard-client.ts` — `DashboardClient` abstraction with two
+      transport impls (`rawWsClient` / `socketIoClient`); scenario
+      tests are transport-agnostic.
+    - `fake-agent-manager.ts` — `FakeAgentManager extends AgentManager`
+      with scripted spawn/emit/done/error. Lets scenarios pin the
+      wire-level contract of agent lifecycle without real LLM
+      spawns.
+    - `strip-volatile.ts` + `snapshot-store.ts` — snapshot
+      normalization + file-based pinning (`__tests__/snapshots/*.snap`).
+- **`server/dev/ws-trace.ts`** — opt-in JSONL writer for `broadcast()`
+  emissions. When `ANVIL_WS_TRACE=1`, every legacy-shape broadcast
+  appends `{ts, type, callerHash}` to `$ANVIL_HOME/ws-trace.jsonl`.
+  Used during the migration to inventory event types; safe to keep
+  shipping since it no-ops when the env var is unset.
 - **`server/pipeline-runner.ts`** — per-run orchestrator. Drives via
   `Pipeline.run()` from `core-pipeline` over an `InMemoryStepRegistry`
   built from `STAGES` in core-pipeline; each Step's `run` calls
@@ -23,11 +331,14 @@ process, single file orchestrator (`server/dashboard-server.ts`).
   thrown sentinel errors with `__anvilCancel` / `__anvilFailReturn` /
   `__anvilRewind` markers; the outer try unwinds to the right exit.
   Reviewer rewind is handled by trimming `completedSteps` and
-  re-invoking `Pipeline.run()` from the rewind target. WS broadcasts
-  + `broadcastState()` + `checkpoint()` calls remain inline today;
-  bus subscribers (`attachAuditLogHook`, `attachCostTrackerHook` from
-  core-pipeline) are wired to the runner's `pipelineBus` for forensic
-  audit + cost rollup.
+  re-invoking `Pipeline.run()` from the rewind target. The runner
+  emits to its own `EventEmitter` (`state-change`, `waiting-for-input`,
+  `clarify-question`, etc.); `dashboard-server.ts` subscribes via
+  `runner.on(...)` and translates each event to the appropriate
+  `services.<X>.emit(...)` typed call. Bus subscribers
+  (`attachAuditLogHook`, `attachCostTrackerHook` from core-pipeline)
+  are wired to the runner's `pipelineBus` for forensic audit + cost
+  rollup.
 - **`server/steps/`** — Step factories + pure helpers extracted out
   of `pipeline-runner.ts` over the Phase-4 series. See README §
   "Pipeline runner shape (Phase 4)" for the full module table.
@@ -73,12 +384,84 @@ npm -w @anvil-dev/dashboard run dev         # Vite frontend on 5173
 node packages/dashboard/server/dashboard-server.js   # WS+HTTP backend
 ```
 
-The build copies `server/` `.ts` to `server/out/` (TypeScript with
-NodeNext modules). Some `.js` sit in `server/` itself (committed
-artifacts for the cli to invoke via `dynamic import` without a
-build step on the user's machine).
+The build pipeline is `vite build && tsc -p server/tsconfig.json &&
+node ./scripts/copy-out.mjs`. `tsc` writes to `server/out/`;
+`copy-out.mjs` walks the tree recursively and mirrors every
+`.js` / `.d.ts` / `.map` (skipping `__tests__`) back into
+`server/**/` so the cli can `dynamic import` without a build step on
+the user's machine. **Adding a new server subdirectory requires no
+copy-out change** — the walker picks it up automatically. The
+`package.json` `files` field follows the same convention
+(`server/**/*.js`, `server/**/*.d.ts`).
+
+Vite is configured with `sourcemap: true` so a crashed stack trace
+in the browser shows the original `src/...` filename + line, not the
+minified bundle position. **Important**: never let a stale
+`vite.config.js` / `.js.map` / `.d.ts` from a previous `tsc` run sit
+alongside the `.ts` — Vite prefers the `.js` and silently ignores
+the `.ts` config (the canonical "sourcemaps not generated despite
+config change" symptom).
 
 ## Conventions
+
+### Typed event emission — never call `broadcast()` directly
+
+The WS extraction (Phases 0–6) replaced ~90+ inline `broadcast({ type, payload })`
+call sites with typed `services.<X>.emit(kind, payload)` emissions. Adding a
+new wire event MUST follow this recipe — bypassing it (i.e., calling
+`broadcast(...)` directly again) is the canonical regression because the
+new event won't appear in `EventReplay`, won't route correctly across
+socket.io rooms, and won't be exhaustively matched by the frontend reducer.
+
+**Adding a new event:**
+
+1. Add a new `EventEnvelope<'kind.subkind', PayloadType>` alias to
+   `server/events/types.ts` and add it to the `DashboardEvent` union.
+2. Add a `.with({ kind: 'kind.subkind' }, … )` clause to
+   `server/events/topics.ts` (ts-pattern errors if missing).
+3. Add a `.with({ kind: 'kind.subkind' }, e => ({ type: 'kind-subkind',
+   payload: e.payload }) as LegacyMessage)` clause to
+   `server/events/bridge.ts` (ts-pattern errors if missing).
+4. Add the kind to the appropriate service's `EventMap` interface in
+   `server/services/index.ts` so `services.<X>.emit('kind.subkind', ...)`
+   is typed.
+5. Emit at the call site: `services.<X>.emit('kind.subkind', payload)`.
+
+Both the legacy bridge (raw-WS → React frontend) and the socket.io
+bridge fan typed emissions to subscribers automatically. No further
+plumbing needed.
+
+**The synchronous-emit invariant.** Services extend `SyncEmitter`, not
+Emittery. Emittery dispatches every listener on a microtask, which
+would reorder bridge-driven `broadcast()` calls against sibling
+synchronous broadcasts (e.g. the `stop-run` handler must emit
+`run-stopped` BEFORE the kill-chain emits agent events — see the 1.3
+scenario in `__tests__/run-lifecycle.test.ts`). `SyncEmitter` calls
+listeners in-line during `emit()` so wire ordering is preserved.
+
+### socket.io coexists with raw WS, env-gated
+
+`mountSocketServer` runs in two modes; the dashboard always uses
+`coexistWithRawWs: true` to keep the React frontend working on raw WS
+during the Phase 5–6 transition. The socket.io mount itself is gated
+behind `ANVIL_SOCKET_IO=1`. Phase 7+ (frontend hook swap) will flip
+the gate on by default and Phase 8 cleanup will delete the raw-WS
+pipeline.
+
+**Why the gate exists.** socket.io's `Server.attach(httpServer)`
+replaces the http server's request listener, which can disrupt the
+raw `WebSocketServer({ path: '/ws' })`. `coexistWithRawWs: true` uses
+`noServer: true` + a manual upgrade router that filters `/socket.io/*`
+URLs so both transports coexist. Tested in isolation (no dashboard
+boot) by `__tests__/socket-io-smoke.test.ts`.
+
+### Scenario tests: transport-agnostic by design
+
+`DashboardClient` in `__tests__/_harness/dashboard-client.ts` is the
+abstraction tests speak to. The harness picks the underlying transport
+(`rawWsClient` today; can flip to `socketIoClient` for the same tests).
+This is what makes Phase 7's transport swap a one-file edit, not a
+test rewrite.
 
 ### Per-stage tool permissions
 
@@ -281,8 +664,19 @@ breaks reproducibility — only invalidate on explicit `clearCache()`.
   `new Pipeline().run()`. Each Step's `run()` calls
   `runOneStage(i)`. Cancellation / fail-early-return / reviewer rewind
   flow through thrown sentinel errors.
-- WS message vocabulary? Search for `case '<msg>'` in
-  `dashboard-server.ts`.
+- WS message vocabulary? `server/handlers/registry.ts` +
+  `server/handlers/route.ts` are the typed dispatch surface. One
+  handler file per domain under `server/handlers/<domain>.ts`. Don't
+  add a `case '<msg>'` switch to `dashboard-server.ts` — register
+  through the handler registry so it gets the typed `HandlerExtras`
+  bag.
+- Stage doing the wrong work (e.g. ship/validate editing source
+  code instead of opening a PR / running tests)? Check
+  `core-pipeline/src/routing/stage-permissions.ts` — `ship` and
+  `validate` are currently `['read', 'write', 'exec']` so the model
+  has `edit` + `write_file` even though the prompts forbid it. The
+  prompt is a soft constraint; permissions are the hard one. Tighten
+  perms before tightening prompts.
 - Settings UI doesn't show a provider? `server/provider-registry.ts`
   detects via env-var presence; the Settings panel reads
   `discover-providers`.

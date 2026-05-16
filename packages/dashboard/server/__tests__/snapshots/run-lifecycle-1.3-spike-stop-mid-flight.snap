@@ -1,0 +1,43 @@
+[
+  {
+    "isOurRun": true,
+    "type": "run-stopped"
+  },
+  {
+    "runCount": 1,
+    "runStatuses": [
+      {
+        "isOurRun": true,
+        "status": "failed",
+        "type": "spike"
+      }
+    ],
+    "type": "active-runs"
+  },
+  {
+    "entries": [
+      {
+        "kind": "stderr",
+        "tool": null
+      }
+    ],
+    "isOurRun": false,
+    "type": "agent-output"
+  },
+  {
+    "type": "agent-error"
+  },
+  {
+    "type": "runs"
+  },
+  {
+    "runCount": 0,
+    "runStatuses": [],
+    "type": "active-runs"
+  },
+  {
+    "agentStatus": "killed",
+    "idMatchesAgent": false,
+    "type": "agent-done"
+  }
+]
