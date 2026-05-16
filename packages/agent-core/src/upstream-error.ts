@@ -61,7 +61,17 @@ export function isRetryableStatus(status: number): boolean {
  */
 export function bodyLooksRetryable(body: string): boolean {
   if (!body) return false;
-  return /insufficient[\s_-]?quota|rate[\s_-]?limit|overloaded[\s_-]?error|resource[\s_-]?exhausted|quota[\s_-]?exceeded|server\s+(?:is\s+)?busy|temporarily\s+(?:un)?available|temporarily\s+rate-?limited|too\s+many\s+requests/i.test(body);
+  if (/insufficient[\s_-]?quota|rate[\s_-]?limit|overloaded[\s_-]?error|resource[\s_-]?exhausted|quota[\s_-]?exceeded|server\s+(?:is\s+)?busy|temporarily\s+(?:un)?available|temporarily\s+rate-?limited|too\s+many\s+requests/i.test(body)) {
+    return true;
+  }
+  // "Model not found / not supported" — a phantom model id in
+  // ~/.anvil/models.yaml (e.g. `adk:gemini-3-pro`). The whole stage
+  // would fail without a chain hop; burning this entry lets the walker
+  // move to the next rung instead.
+  if (/(?:model[^"']{0,40}(?:is\s+)?not\s+found|is\s+not\s+supported\s+for\s+generateContent|model_not_found|invalid_request_error.*model|no\s+such\s+model|unknown\s+model)/i.test(body)) {
+    return true;
+  }
+  return false;
 }
 
 /**

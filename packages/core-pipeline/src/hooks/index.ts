@@ -12,6 +12,16 @@ export type {
   DashboardStateSnapshot,
 } from './dashboard-state.hook.js';
 export {
+  attachDashboardStateRollupHook,
+} from './dashboard-state-rollup.hook.js';
+export type {
+  DashboardRollupState,
+  DashboardRollupStageState,
+  DashboardRollupRepoState,
+  DashboardStateRollupHookOptions,
+  DashboardStateRollupHookHandle,
+} from './dashboard-state-rollup.hook.js';
+export {
   attachCostTrackerHook,
 } from './cost-tracker.hook.js';
 export type { CostTrackerHookOptions, CostTrackerHookHandle } from './cost-tracker.hook.js';
@@ -44,3 +54,43 @@ export type {
   ApprovalGateHookOptions,
   ApprovalGateHookHandle,
 } from './approval-gate.hook.js';
+export {
+  attachStreamHook,
+} from './stream.hook.js';
+export type {
+  StreamSnapshot,
+  StreamHookOptions,
+  StreamHookHandle,
+} from './stream.hook.js';
+export {
+  attachCheckpointHook,
+  createFileCheckpointStore,
+} from './checkpoint.hook.js';
+export {
+  attachPrUrlHook,
+  PR_URL_REGEX,
+} from './pr-url.hook.js';
+export type {
+  PrUrlHookOptions,
+  PrUrlHookHandle,
+} from './pr-url.hook.js';
+export {
+  attachLivenessPrefetchHook,
+} from './liveness-prefetch.hook.js';
+export type {
+  LivenessPrefetchHookOptions,
+  LivenessPrefetchHookHandle,
+} from './liveness-prefetch.hook.js';
+export type {
+  CheckpointStatus,
+  CheckpointSnapshot,
+  CheckpointStore,
+  CheckpointHookOptions,
+  CheckpointHookHandle,
+  FileCheckpointStoreOptions,
+} from './checkpoint.hook.js';
+export { migrateLegacyCheckpoint } from './legacy-checkpoint-migration.js';
+export type {
+  LegacyPipelineCheckpoint,
+  MigratedCheckpointShared,
+} from './legacy-checkpoint-migration.js';

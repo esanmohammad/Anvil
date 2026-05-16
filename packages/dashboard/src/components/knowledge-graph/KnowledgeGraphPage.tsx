@@ -222,13 +222,62 @@ export function KnowledgeGraphPage({
     setGraphSearch('');
   }, []);
 
-  // No KB built for the current project — show empty state
-  if (!kbStatus || kbStatus.overallStatus === 'none' || repos.length === 0) {
+  // Three distinct pre-graph states — each used to silently fall through
+  // to the empty-state with `projectName === 'None'`, which read like a
+  // bug ("No knowledge base for None yet") during the WS round-trip.
+  const noProjectSelected = !projectName || projectName === 'None';
+  const kbStatusPending = !noProjectSelected && kbStatus == null;
+  const kbStatusEmpty = kbStatus != null && (kbStatus.overallStatus === 'none' || repos.length === 0);
+
+  // 1. No project picked yet — point user back to home.
+  if (noProjectSelected) {
     return (
       <div className="page-enter" style={{
         padding: 'var(--space-lg)', maxWidth: 900, margin: '0 auto', height: '100%',
       }}>
-        <PageHeader projectName={projectName || 'New'} />
+        <PageHeader projectName="" />
+        <div style={{
+          padding: 24, background: 'var(--bg-elevated-2)', border: '1px solid var(--separator)',
+          borderRadius: 'var(--radius-md)', textAlign: 'center',
+          color: 'var(--text-tertiary)', fontSize: 13,
+        }}>
+          <Database size={32} style={{ color: 'var(--text-tertiary)', marginBottom: 12 }} />
+          Select a project from the home page to view its knowledge graph.
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Project selected but kb-status hasn't arrived — proper loader so
+  //    the user doesn't briefly see "No knowledge base yet" before the
+  //    real status lands.
+  if (kbStatusPending) {
+    return (
+      <div className="page-enter" style={{
+        padding: 'var(--space-lg)', maxWidth: 900, margin: '0 auto', height: '100%',
+      }}>
+        <PageHeader projectName={projectName} />
+        <div style={{
+          padding: 24, background: 'var(--bg-elevated-2)', border: '1px solid var(--separator)',
+          borderRadius: 'var(--radius-md)',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12,
+        }}>
+          <div className="status-dot-spin" style={{ width: 24, height: 24 }} />
+          <div style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>
+            Loading {projectName} knowledge base...
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 3. Status loaded, no KB built — show the build CTA.
+  if (kbStatusEmpty) {
+    return (
+      <div className="page-enter" style={{
+        padding: 'var(--space-lg)', maxWidth: 900, margin: '0 auto', height: '100%',
+      }}>
+        <PageHeader projectName={projectName} />
         <div style={{
           padding: 24, background: 'var(--bg-elevated-2)', border: '1px solid var(--separator)',
           borderRadius: 'var(--radius-md)', textAlign: 'center',
@@ -250,6 +299,11 @@ export function KnowledgeGraphPage({
       </div>
     );
   }
+
+  // After this point: kbStatus is non-null with at least one repo. Tell
+  // TS to narrow the type so the rest of the component doesn't have to
+  // null-check everywhere.
+  if (!kbStatus) return null;
 
   return (
     <div className="page-enter" style={{

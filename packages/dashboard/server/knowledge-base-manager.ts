@@ -179,7 +179,11 @@ export interface KBQueryResult {
 
 // ── Knowledge Base Manager ────────────────────────────────────────────
 
-export class KnowledgeBaseManager {
+// Phase G — `implements KbManagerLike` pins the shape step modules
+// consume from core-pipeline. Type-only.
+import type { KbManagerLike } from '@esankhan3/anvil-core-pipeline';
+
+export class KnowledgeBaseManager implements KbManagerLike {
   private projectLoader: ProjectLoader;
   private refreshing = false;
   private lastProgress: KBRefreshProgress | null = null;

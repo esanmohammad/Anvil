@@ -52,6 +52,7 @@ import type {
   StepHookPoint,
   StepRegistry,
   StepRetryPolicy,
+  StepSkipContext,
 } from './types.js';
 
 export interface PipelineDeps {
@@ -98,6 +99,22 @@ export interface PipelineDeps {
    * read them from `ctx.shared` (Phase 3).
    */
   completedSteps?: string[];
+  /**
+   * Re-run from a specific step ID (reviewer rewind). Differs from
+   * `resumeFromStep` in that it ALSO drops every `completedSteps` entry
+   * at-or-after the rewind index — those steps re-run.
+   *
+   *   prior completedSteps: [clarify, requirements, specs, tasks, build]
+   *   rewindTo: 'specs'
+   *   →  clarify + requirements skip with reason 'rewind';
+   *      specs, tasks, build re-run.
+   *
+   * Mutually exclusive with `resumeFromStep`. Throws if both are set or
+   * if `rewindTo` is not in the registry. Phase A2 of the dashboard
+   * pipeline-consolidation — replaces the dashboard's sentinel-error
+   * `__anvilRewind` flow.
+   */
+  rewindTo?: string;
 }
 
 export class Pipeline {
@@ -117,7 +134,7 @@ export class Pipeline {
   }
 
   async run(): Promise<PipelineRunResult> {
-    const { registry, bus, runId, signal, resumeFromStep, completedSteps: priorCompleted } = this.deps;
+    const { registry, bus, runId, signal, resumeFromStep, completedSteps: priorCompleted, rewindTo } = this.deps;
     const now = this.deps.now ?? Date.now;
     const startedAt = now();
     const completedSteps: string[] = [];
@@ -127,9 +144,20 @@ export class Pipeline {
     let lastError: unknown;
     let prevOutput: unknown = this.deps.initialInput;
 
-    // Resolve the skip set from resumeFromStep + completedSteps.
+    if (rewindTo && resumeFromStep) {
+      throw new Error(
+        `Pipeline.run: rewindTo and resumeFromStep are mutually exclusive ` +
+          `(rewindTo="${rewindTo}", resumeFromStep="${resumeFromStep}").`,
+      );
+    }
+
+    // Resolve the skip set from resumeFromStep + completedSteps + rewindTo.
     const orderedSteps = registry.steps();
-    const skipSet = new Set<string>(priorCompleted ?? []);
+    const skipReason: Map<string, 'completed' | 'resume' | 'rewind'> = new Map();
+    if (priorCompleted) {
+      for (const id of priorCompleted) skipReason.set(id, 'completed');
+    }
+
     if (resumeFromStep) {
       const resumeIdx = orderedSteps.findIndex((s) => s.id === resumeFromStep);
       if (resumeIdx < 0) {
@@ -139,9 +167,31 @@ export class Pipeline {
         );
       }
       for (let i = 0; i < resumeIdx; i++) {
-        skipSet.add(orderedSteps[i].id);
+        if (!skipReason.has(orderedSteps[i].id)) skipReason.set(orderedSteps[i].id, 'resume');
       }
     }
+
+    if (rewindTo) {
+      const rewindIdx = orderedSteps.findIndex((s) => s.id === rewindTo);
+      if (rewindIdx < 0) {
+        throw new Error(
+          `Pipeline.run: rewindTo "${rewindTo}" is not in the registry. ` +
+            `Known steps: ${orderedSteps.map((s) => s.id).join(', ')}`,
+        );
+      }
+      // Re-run rewindTo and everything after it: drop their priorCompleted
+      // entries from the skip map, AND mark the prefix as 'rewind' so the
+      // emitted reason is accurate.
+      for (let i = 0; i < orderedSteps.length; i++) {
+        const id = orderedSteps[i].id;
+        if (i < rewindIdx) {
+          skipReason.set(id, priorCompleted?.includes(id) ? 'rewind' : skipReason.get(id) ?? 'rewind');
+        } else {
+          skipReason.delete(id);
+        }
+      }
+    }
+    const skipSet = new Set<string>(skipReason.keys());
 
     await this.emit(bus, {
       hook: 'pipeline:started',
@@ -162,11 +212,40 @@ export class Pipeline {
           runId,
           stepId: step.id,
           ts: this.iso(now),
-          payload: { reason: resumeFromStep ? 'resume' : 'completed' },
+          payload: { reason: skipReason.get(step.id) ?? (resumeFromStep ? 'resume' : 'completed') },
         });
         // Track in completedSteps so the result reflects what the run "saw".
         completedSteps.push(step.id);
         continue;
+      }
+
+      if (step.skipIf) {
+        try {
+          const shouldSkip = await step.skipIf(this.buildSkipContext(prevOutput));
+          if (shouldSkip) {
+            await this.emit(bus, {
+              hook: 'step:skipped',
+              runId,
+              stepId: step.id,
+              ts: this.iso(now),
+              payload: { reason: 'skipIf' },
+            });
+            completedSteps.push(step.id);
+            continue;
+          }
+        } catch (err) {
+          failedStep = step.id;
+          status = 'failed';
+          lastError = err;
+          await this.emit(bus, {
+            hook: 'step:failed',
+            runId,
+            stepId: step.id,
+            ts: this.iso(now),
+            error: this.serializeError(err),
+          });
+          break;
+        }
       }
 
       await this.emit(bus, {
@@ -395,6 +474,21 @@ export class Pipeline {
       memory,
       llm,
       signal: sig,
+    };
+  }
+
+  /**
+   * Build a stripped-down `StepSkipContext` for `Step.skipIf` predicates.
+   * No bus / emit / signal so the predicate cannot mutate run state.
+   */
+  private buildSkipContext(input: unknown): StepSkipContext {
+    return {
+      runId: this.deps.runId,
+      workspaceDir: this.deps.workspaceDir,
+      repoPaths: this.deps.repoPaths,
+      shared: this.shared,
+      artifacts: this.artifacts,
+      input,
     };
   }
 

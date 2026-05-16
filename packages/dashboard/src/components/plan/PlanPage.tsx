@@ -20,33 +20,97 @@ import { RoutingCard } from '../common/RoutingCard.js';
 export interface PlanPageProps {
   project: string | null;
   ws: WebSocket | null;
+  /**
+   * Discovered default model — threaded into every `run-plan` /
+   * `run-plan-variants` / `regen-plan-section` call so the plan is
+   * persisted with a real model (not the backend's hard-coded
+   * `'sonnet'` fallback). Variants and regen prefer `plan.model` if a
+   * plan already exists; this is the floor for fresh generations.
+   */
+  defaultModel?: string;
 }
 
 // ── Types (mirror server plan-store.ts) ────────────────────────────────
 
 type PlanSection =
-  | 'problem' | 'scope' | 'repos' | 'contracts' | 'architecture'
-  | 'risks' | 'rollout' | 'tests' | 'estimate';
+  | 'problem' | 'scope' | 'repos' | 'contracts' | 'data' | 'observability'
+  | 'architecture' | 'risks' | 'rollout' | 'tests' | 'estimate';
 
-interface PlanRepoImpact { name: string; changes: string; files: string[]; symbols: string[] }
-interface PlanContract { kind: string; name: string; producer: string; consumers: string[]; description: string }
-interface PlanRisk { title: string; mitigation: string; severity: 'low' | 'med' | 'high' }
+// ── Plan v2 type mirror (matches @esankhan3/anvil-core-pipeline) ─────────
+//
+// The PlanPage keeps a local mirror of the Plan shape rather than
+// importing from the server package — the dashboard frontend doesn't
+// depend on core-pipeline at the bundle level. Keep this in sync with
+// `packages/core-pipeline/src/utils/plan-types.ts`.
+
+interface FileClaim { path: string; kind: 'new' | 'modified'; reason: string }
+interface SymbolClaim {
+  file: string;
+  name: string;
+  kind: 'function' | 'type' | 'class' | 'const' | 'interface' | 'enum';
+  signature?: string;
+}
+interface PlanRepoImpact {
+  name: string;
+  changes: string;
+  mustExist: FileClaim[];
+  mustTouch: FileClaim[];
+  mustNotBreak: string[];
+  symbols: SymbolClaim[];
+}
+type PlanContract =
+  | { kind: 'http'; method: 'GET'|'POST'|'PUT'|'PATCH'|'DELETE'; path: string; producer: string; consumers: string[]; status: number[] }
+  | { kind: 'kafka'; topic: string; producer: string; consumers: string[]; schemaRef: string }
+  | { kind: 'grpc'; service: string; method: string; producer: string; consumers: string[] }
+  | { kind: 'db'; table: string; producer: string; columns: Array<{ name: string; type: string; nullable?: boolean; defaultValue?: string }> };
+interface PlanRisk {
+  id: string;
+  title: string;
+  severity: 'low' | 'med' | 'high';
+  blastRadius: 'one-repo' | 'cross-repo' | 'data-loss' | 'auth-bypass';
+  mitigation: string;
+  detection: string;
+}
+interface ScopeItem { id: string; description: string; acceptance: string[] }
+interface TestCaseSpec { id: string; acceptanceRef: string; file: string; name: string; given: string; when: string; then: string }
+interface ManualStep { id: string; description: string; expected: string }
+interface DataChange { kind: 'migration'|'seed'|'drop'|'rename'|'index'; repo: string; migrationFile: string; rollback: string }
+interface ObservabilitySignal { kind: 'metric'|'log'|'trace'|'monitor'; name: string; reason: string }
+
+interface PlanApprovalRecord {
+  user: string;
+  approvedAt: string;
+  planHash: string;
+  note?: string;
+}
 
 interface Plan {
+  schema: 2;
   version: number;
+  parentVersion: number | null;
+  contentHash: string;
   slug: string;
   project: string;
   title: string;
-  problem: string;
-  scope: { inScope: string[]; outOfScope: string[] };
+  problem: { statement: string; why_now: string; success_signals: string[] };
+  scope: { inScope: ScopeItem[]; outOfScope: ScopeItem[] };
   repos: PlanRepoImpact[];
   contracts: PlanContract[];
+  data: DataChange[];
+  observability: { signals: ObservabilitySignal[] };
   architecture: { mermaid: string; notes: string };
   risks: PlanRisk[];
-  rollout: { strategy: string; flags: string[]; order: string[]; rollback: string };
-  tests: { unit: string[]; integration: string[]; manual: string[] };
-  estimate: { usd: number; minutes: number; prs: number };
+  rollout: {
+    strategy: 'feature-flag'|'canary'|'blue-green'|'direct';
+    flags: string[];
+    order: string[];
+    rollback: { command: string; verify: string };
+  };
+  tests: { unit: TestCaseSpec[]; integration: TestCaseSpec[]; manual: ManualStep[] };
+  estimate: { usd: number; minutes: number; prs: number; calibratedFrom: string[] };
   model: string;
+  createdBy: { kind: 'model' | 'human'; model?: string; user?: string };
+  approval?: PlanApprovalRecord;
   feature: string;
   createdAt: string;
   updatedAt: string;
@@ -58,6 +122,26 @@ interface PlanIssue {
   message: string;
   repo?: string;
   hint?: string;
+  ruleId?: string;
+  autoFixable?: boolean;
+}
+
+// ── Display helpers ──────────────────────────────────────────────────────
+
+function contractDisplay(c: PlanContract): string {
+  if (c.kind === 'http') return `${c.method} ${c.path}`;
+  if (c.kind === 'kafka') return c.topic;
+  if (c.kind === 'grpc') return `${c.service}.${c.method}`;
+  return c.table;
+}
+function contractConsumers(c: PlanContract): string[] {
+  return c.kind === 'db' ? [] : c.consumers;
+}
+function repoTouchedPaths(r: PlanRepoImpact): string[] {
+  const out = new Set<string>();
+  for (const f of r.mustTouch ?? []) if (f?.path) out.add(f.path);
+  for (const f of r.mustExist ?? []) if (f?.path) out.add(f.path);
+  return [...out];
 }
 
 interface PlanValidation {
@@ -72,22 +156,34 @@ interface PlanValidation {
 function planToMarkdown(plan: Plan): string {
   const parts: string[] = [];
   parts.push(`# ${plan.title}`, `_Plan v${plan.version} — ${plan.project} — ${plan.model}_`, '');
-  parts.push('## Problem', plan.problem, '');
+  parts.push('## Problem', plan.problem.statement, '');
+  if (plan.problem.why_now) parts.push(`**Why now:** ${plan.problem.why_now}`, '');
+  if (plan.problem.success_signals.length) {
+    parts.push('**Success signals:**');
+    plan.problem.success_signals.forEach((s) => parts.push(`- ${s}`));
+    parts.push('');
+  }
   parts.push('## Scope');
-  parts.push('**In scope**'); plan.scope.inScope.forEach((s) => parts.push(`- ${s}`));
-  parts.push(''); parts.push('**Out of scope**'); plan.scope.outOfScope.forEach((s) => parts.push(`- ${s}`));
+  parts.push('**In scope**');
+  plan.scope.inScope.forEach((s) => {
+    parts.push(`- **${s.id}** — ${s.description}`);
+    s.acceptance.forEach((a) => parts.push(`  - _Acceptance:_ ${a}`));
+  });
+  parts.push(''); parts.push('**Out of scope**');
+  plan.scope.outOfScope.forEach((s) => parts.push(`- ${s.description}`));
   parts.push('', '## Affected repositories');
   for (const r of plan.repos) {
     parts.push(`### ${r.name}`, r.changes);
-    if (r.files.length) parts.push(`**Files:** ${r.files.map((f) => `\`${f}\``).join(', ')}`);
-    if (r.symbols.length) parts.push(`**Symbols:** ${r.symbols.map((s) => `\`${s}\``).join(', ')}`);
+    const touched = repoTouchedPaths(r);
+    if (touched.length) parts.push(`**Files:** ${touched.map((f) => `\`${f}\``).join(', ')}`);
+    if (r.symbols.length) parts.push(`**Symbols:** ${r.symbols.map((s) => `\`${s.name}\``).join(', ')}`);
     parts.push('');
   }
   if (plan.contracts.length) {
     parts.push('## Cross-repo contracts');
     for (const c of plan.contracts) {
-      parts.push(`- **${c.kind.toUpperCase()} · ${c.name}** — ${c.producer} → ${c.consumers.join(', ')}`);
-      parts.push(`  ${c.description}`);
+      const cons = contractConsumers(c);
+      parts.push(`- **${c.kind.toUpperCase()} · ${contractDisplay(c)}** — ${c.producer}${cons.length ? ' → ' + cons.join(', ') : ''}`);
     }
     parts.push('');
   }
@@ -98,18 +194,28 @@ function planToMarkdown(plan: Plan): string {
   }
   if (plan.risks.length) {
     parts.push('## Risks');
-    for (const r of plan.risks) parts.push(`- **[${r.severity}] ${r.title}** — ${r.mitigation}`);
+    for (const r of plan.risks) parts.push(`- **[${r.severity}/${r.blastRadius}] ${r.title}** — ${r.mitigation}`);
     parts.push('');
   }
   parts.push('## Rollout');
-  if (plan.rollout.strategy) parts.push(plan.rollout.strategy);
+  if (plan.rollout.strategy) parts.push(`Strategy: \`${plan.rollout.strategy}\``);
   if (plan.rollout.flags.length) parts.push(`- Flags: ${plan.rollout.flags.join(', ')}`);
   if (plan.rollout.order.length) parts.push(`- Order: ${plan.rollout.order.join(' → ')}`);
-  if (plan.rollout.rollback) parts.push(`- Rollback: ${plan.rollout.rollback}`);
+  if (plan.rollout.rollback.command) parts.push(`- Rollback: \`${plan.rollout.rollback.command}\``);
+  if (plan.rollout.rollback.verify) parts.push(`  (verify: \`${plan.rollout.rollback.verify}\`)`);
   parts.push('', '## Tests');
-  if (plan.tests.unit.length) { parts.push('**Unit**'); plan.tests.unit.forEach((t) => parts.push(`- ${t}`)); }
-  if (plan.tests.integration.length) { parts.push('**Integration**'); plan.tests.integration.forEach((t) => parts.push(`- ${t}`)); }
-  if (plan.tests.manual.length) { parts.push('**Manual**'); plan.tests.manual.forEach((t) => parts.push(`- ${t}`)); }
+  if (plan.tests.unit.length) {
+    parts.push('**Unit**');
+    plan.tests.unit.forEach((t) => parts.push(`- \`${t.name || '(unnamed)'}\` in \`${t.file}\` — ${t.then || t.given}`));
+  }
+  if (plan.tests.integration.length) {
+    parts.push('**Integration**');
+    plan.tests.integration.forEach((t) => parts.push(`- \`${t.name || '(unnamed)'}\` in \`${t.file}\` — ${t.then || t.given}`));
+  }
+  if (plan.tests.manual.length) {
+    parts.push('**Manual**');
+    plan.tests.manual.forEach((t) => parts.push(`- ${t.description}`));
+  }
   parts.push('', '## Estimate');
   parts.push(`- ~$${plan.estimate.usd.toFixed(2)} · ${plan.estimate.minutes} min · ${plan.estimate.prs} PR(s)`);
   return parts.join('\n');
@@ -320,7 +426,7 @@ function Bullets({ items, empty = '—' }: { items: string[]; empty?: string }) 
 
 // ── Main page ──────────────────────────────────────────────────────────
 
-export function PlanPage({ project, ws }: PlanPageProps) {
+export function PlanPage({ project, ws, defaultModel }: PlanPageProps) {
   const [feature, setFeature] = useState('');
   const [plan, setPlan] = useState<Plan | null>(null);
   const [validation, setValidation] = useState<PlanValidation | null>(null);
@@ -341,6 +447,27 @@ export function PlanPage({ project, ws }: PlanPageProps) {
   // section. Timeouts are tracked so edit mode always exits cleanly.
   const [drafts, setDrafts] = useState<Partial<Record<PlanSection, unknown>>>({});
   const [saving, setSaving] = useState<Partial<Record<PlanSection, boolean>>>({});
+  // Phase H UX additions:
+  //   - lineage: full chain of plan versions (v1 → v2 → … → current).
+  //   - perSectionCost: USD spent regenerating each section in the current session.
+  //   - cumulativeCost: total spent on this plan since the page loaded.
+  //   - refineBudgetUsd: cap from the built-in default cost policy.
+  const [lineage, setLineage] = useState<Array<{ version: number; updatedAt: string; createdBy?: { kind: string; model?: string } }> | null>(null);
+  const [lineageOpen, setLineageOpen] = useState(false);
+  const [perSectionCost, setPerSectionCost] = useState<Partial<Record<PlanSection, number>>>({});
+  const [cumulativeCost, setCumulativeCost] = useState(0);
+  // Plan-flow refine budget (matches DEFAULT_COST_POLICY.maxPerPlanRefineUsd).
+  const refineBudgetUsd = 1.5;
+  // Plan lifecycle snapshot — kept in sync with `plan-lifecycle` WS events.
+  // null = no lifecycle entry yet (e.g. brand-new feature with no plan).
+  const [lifecycle, setLifecycle] = useState<{
+    state: 'idle' | 'drafting' | 'verifying' | 'refining' | 'awaiting_approval' | 'executing' | 'reconciling' | 'complete' | 'failed';
+    refineAttempts: number;
+    refineSpentUsd: number;
+    maxRefineAttempts: number;
+    maxRefineUsd: number;
+    lastError?: string;
+  } | null>(null);
   const saveTimeouts = useRef<Partial<Record<PlanSection, ReturnType<typeof setTimeout>>>>({});
 
   const clearSaveTimeout = useCallback((section: PlanSection) => {
@@ -417,8 +544,14 @@ export function PlanPage({ project, ws }: PlanPageProps) {
     setPlan(null);
     setValidation(null);
     setBanner(null);
-    ws.send(JSON.stringify({ action: 'run-plan', project, feature: feature.trim(), options: {} }));
-  }, [ws, project, feature, loading]);
+    const model = plan?.model ?? defaultModel;
+    ws.send(JSON.stringify({
+      action: 'run-plan',
+      project,
+      feature: feature.trim(),
+      options: model ? { model } : {},
+    }));
+  }, [ws, project, feature, loading, plan, defaultModel]);
 
   // Build per-label guidance for the prompts sent to the variants runner.
   // Each variant receives the same feature but a tailored "Approach" hint.
@@ -452,31 +585,33 @@ export function PlanPage({ project, ws }: PlanPageProps) {
     try {
       window.sessionStorage.setItem('anvil.planVariants.labels', JSON.stringify(labels));
     } catch { /* ignore */ }
+    const model = plan?.model ?? defaultModel;
     ws.send(JSON.stringify({
       action: 'run-plan-variants',
       project,
       feature: feature.trim(),
       variants,
-      options: {},
+      options: model ? { model } : {},
     }));
     setBanner({ level: 'info', message: `Drafting ${labels.length} variants — opening Compare…` });
     const q = `project=${encodeURIComponent(project)}&feature=${encodeURIComponent(feature.trim())}`;
     window.setTimeout(() => {
       window.location.hash = `/plan/compare?${q}`;
     }, 250);
-  }, [ws, project, feature, loading, variantLabels, hintForLabel]);
+  }, [ws, project, feature, loading, variantLabels, hintForLabel, plan, defaultModel]);
 
   const handleRegenSection = useCallback((section: PlanSection) => {
     if (!ws || !project || !plan) return;
     setRegenLoading((prev) => ({ ...prev, [section]: true }));
+    const model = plan.model || defaultModel;
     ws.send(JSON.stringify({
       action: 'regen-plan-section',
       project,
       planSlug: plan.slug,
       section,
-      options: {},
+      options: model ? { model } : {},
     }));
-  }, [ws, project, plan]);
+  }, [ws, project, plan, defaultModel]);
 
   const handleValidate = useCallback(() => {
     if (!ws || !project || !plan) return;
@@ -496,6 +631,37 @@ export function PlanPage({ project, ws }: PlanPageProps) {
     // Navigate to Active Runs after a short delay so the user sees the plan
     // accepted feedback before the view changes.
     window.setTimeout(() => { window.location.hash = '/runs'; }, 400);
+  }, [ws, project, plan]);
+
+  // Phase C UX — approve the current plan version. Server-side, this
+  // stamps `plan.approval = { user, approvedAt, planHash, note? }`
+  // pinned to the current contentHash. Any subsequent edit invalidates it.
+  const handleApprove = useCallback(() => {
+    if (!ws || !project || !plan) return;
+    const note = window.prompt(
+      `Approve plan v${plan.version}?\n\nApproval is pinned to the current plan content. Any edit after approval will invalidate it and you'll need to re-approve.\n\nOptional note:`,
+    );
+    if (note === null) return; // user cancelled
+    ws.send(JSON.stringify({
+      action: 'approve-plan',
+      project,
+      planSlug: plan.slug,
+      ...(note.trim() ? { note: note.trim() } : {}),
+    }));
+    setBanner({ level: 'info', message: `Approving v${plan.version}…` });
+  }, [ws, project, plan]);
+
+  // Phase H — auto-refine the plan: applies every deterministic patch
+  // surfaced by the rule engine and then asks the server to regen the
+  // remaining sections that have fixHints.
+  const handleAutoRefine = useCallback(() => {
+    if (!ws || !project || !plan) return;
+    ws.send(JSON.stringify({
+      action: 'auto-refine-plan',
+      project,
+      planSlug: plan.slug,
+    }));
+    setBanner({ level: 'info', message: 'Auto-refine started — applying deterministic patches first, then targeted regen for the rest.' });
   }, [ws, project, plan]);
 
   const handleCopy = useCallback(() => {
@@ -537,6 +703,19 @@ export function PlanPage({ project, ws }: PlanPageProps) {
               setPlan(incoming);
               if (msg.payload?.validation) setValidation(msg.payload.validation);
               setLoading(false);
+              // Track per-section + cumulative cost on every plan update.
+              // The server attaches `payload.cost` on regen completions.
+              const cost = Number(msg.payload?.cost ?? 0);
+              if (cost > 0) {
+                setCumulativeCost((prev) => prev + cost);
+                const section = msg.payload?.section as PlanSection | undefined;
+                if (section) {
+                  setPerSectionCost((prev) => ({
+                    ...prev,
+                    [section]: (prev[section] ?? 0) + cost,
+                  }));
+                }
+              }
               if (msg.payload?.section) {
                 setRegenLoading((prev) => {
                   const next = { ...prev };
@@ -551,6 +730,37 @@ export function PlanPage({ project, ws }: PlanPageProps) {
                 exitEditMode(s);
               }
             }
+            break;
+          }
+          case 'plan-lineage': {
+            const versions = msg.payload?.versions;
+            if (Array.isArray(versions)) setLineage(versions);
+            break;
+          }
+          case 'plan-lifecycle': {
+            // Server emits this on every state transition for any plan;
+            // filter to the current plan to avoid cross-plan state noise.
+            const snap = msg.payload;
+            if (!snap || !plan) break;
+            if (snap.slug !== plan.slug || snap.project !== plan.project) break;
+            setLifecycle({
+              state: snap.state,
+              refineAttempts: snap.refineAttempts ?? 0,
+              refineSpentUsd: snap.refineSpentUsd ?? 0,
+              maxRefineAttempts: snap.maxRefineAttempts ?? 3,
+              maxRefineUsd: snap.maxRefineUsd ?? 1.5,
+              ...(snap.lastError ? { lastError: snap.lastError } : {}),
+            });
+            break;
+          }
+          case 'plan-approved': {
+            setBanner({ level: 'info', message: `Plan approved at v${msg.payload?.approval?.approvedVersion ?? '?'}.` });
+            // The server will broadcast a fresh plan-updated next with the stamped approval.
+            break;
+          }
+          case 'auto-refine-progress': {
+            const summary = msg.payload?.summary ?? '';
+            setBanner({ level: 'info', message: `Auto-refine: ${summary}` });
             break;
           }
           case 'plan-validation': {
@@ -602,6 +812,29 @@ export function PlanPage({ project, ws }: PlanPageProps) {
   const canGenerate = !!project && feature.trim().length > 0;
   const hasErrors = (validation?.counts.errors ?? 0) > 0;
 
+  // Phase C UX — approval state derived from the plan's `approval` stamp.
+  // The stamp is pinned to `planHash`; any edit invalidates it.
+  const approvalState: 'unapproved' | 'approved' | 'stale' = useMemo(() => {
+    if (!plan?.approval) return 'unapproved';
+    return plan.approval.planHash === plan.contentHash ? 'approved' : 'stale';
+  }, [plan]);
+
+  // Phase H UX — fetch lineage when the lineage popover opens.
+  useEffect(() => {
+    if (!lineageOpen || !ws || !project || !plan) return;
+    ws.send(JSON.stringify({ action: 'get-plan-lineage', project, planSlug: plan.slug }));
+  }, [lineageOpen, ws, project, plan]);
+
+  // Fetch lifecycle snapshot once a plan exists. After this, the
+  // server pushes updates via plan-lifecycle on every transition.
+  useEffect(() => {
+    if (!ws || !project || !plan) return;
+    ws.send(JSON.stringify({ action: 'get-plan-lifecycle', project, planSlug: plan.slug }));
+  }, [ws, project, plan?.slug]);
+
+  const budgetExceeded = cumulativeCost > refineBudgetUsd;
+  const autoFixableCount = (validation?.issues ?? []).filter((i) => i.autoFixable).length;
+
   // Build the edit-related props for a SectionCard. Returns `isEditing` so
   // callers can conditionally render either the read view or the editor.
   const editPropsFor = (section: PlanSection) => {
@@ -628,15 +861,167 @@ export function PlanPage({ project, ws }: PlanPageProps) {
         <h2 style={{ fontSize: 18, fontWeight: 600, margin: 0 }}>Plan</h2>
         {project && <span style={{ fontSize: 13, color: 'var(--text-tertiary)' }}>/ {project}</span>}
         {plan && (
-          <span style={{
-            fontSize: 11, color: 'var(--text-tertiary)',
-            padding: '2px 8px', borderRadius: 999,
-            background: 'var(--bg-elevated-3)', marginLeft: 'auto',
-          }}>
-            v{plan.version} · {plan.slug}
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto' }}>
+            {/* Lifecycle state badge — drives off the pure state machine
+                in core-pipeline. Auto-fires verify + refine; the user
+                sees the current phase + budget consumption. */}
+            {lifecycle && (() => {
+              const LIFECYCLE_COLOR: Record<typeof lifecycle.state, { bg: string; fg: string }> = {
+                idle: { bg: 'var(--bg-elevated-3)', fg: 'var(--text-tertiary)' },
+                drafting: { bg: 'rgba(99,102,241,0.12)', fg: 'var(--accent)' },
+                verifying: { bg: 'rgba(99,102,241,0.12)', fg: 'var(--accent)' },
+                refining: { bg: 'rgba(245,158,11,0.12)', fg: 'var(--color-warning, #f59e0b)' },
+                awaiting_approval: { bg: 'var(--bg-elevated-3)', fg: 'var(--text-secondary)' },
+                executing: { bg: 'rgba(99,102,241,0.18)', fg: 'var(--accent)' },
+                reconciling: { bg: 'rgba(99,102,241,0.12)', fg: 'var(--accent)' },
+                complete: { bg: 'rgba(34,197,94,0.12)', fg: 'var(--color-success, #22c55e)' },
+                failed: { bg: 'rgba(239,68,68,0.12)', fg: 'var(--color-error, #ef4444)' },
+              };
+              const c = LIFECYCLE_COLOR[lifecycle.state];
+              const labelMap: Record<typeof lifecycle.state, string> = {
+                idle: 'idle',
+                drafting: 'drafting…',
+                verifying: 'verifying…',
+                refining: `refining (${lifecycle.refineAttempts + 1}/${lifecycle.maxRefineAttempts})`,
+                awaiting_approval: 'awaiting approval',
+                executing: 'executing…',
+                reconciling: 'reconciling…',
+                complete: 'complete',
+                failed: 'failed',
+              };
+              return (
+                <span
+                  title={
+                    lifecycle.state === 'refining' || lifecycle.refineAttempts > 0
+                      ? `Refine budget: $${lifecycle.refineSpentUsd.toFixed(2)} / $${lifecycle.maxRefineUsd.toFixed(2)} (${lifecycle.refineAttempts} attempt${lifecycle.refineAttempts === 1 ? '' : 's'})`
+                      : lifecycle.lastError
+                      ? `Last error: ${lifecycle.lastError}`
+                      : `Lifecycle: ${lifecycle.state}`
+                  }
+                  style={{
+                    fontSize: 10, fontWeight: 600,
+                    padding: '2px 8px', borderRadius: 999,
+                    background: c.bg, color: c.fg,
+                    textTransform: 'uppercase', letterSpacing: 0.3,
+                  }}
+                >
+                  {labelMap[lifecycle.state]}
+                </span>
+              );
+            })()}
+            {/* Approval badge */}
+            <span
+              title={
+                approvalState === 'approved'
+                  ? `Approved by ${plan.approval?.user} at ${plan.approval?.approvedAt}${plan.approval?.note ? ` — ${plan.approval.note}` : ''}`
+                  : approvalState === 'stale'
+                  ? `Approval is stale — was pinned to ${plan.approval?.planHash.slice(0, 8)}, now ${plan.contentHash.slice(0, 8)}`
+                  : 'Plan has not been approved yet'
+              }
+              style={{
+                fontSize: 10, fontWeight: 600,
+                padding: '2px 8px', borderRadius: 999,
+                background: approvalState === 'approved'
+                  ? 'rgba(34,197,94,0.12)'
+                  : approvalState === 'stale'
+                  ? 'rgba(245,158,11,0.12)'
+                  : 'var(--bg-elevated-3)',
+                color: approvalState === 'approved'
+                  ? 'var(--color-success, #22c55e)'
+                  : approvalState === 'stale'
+                  ? 'var(--color-warning, #f59e0b)'
+                  : 'var(--text-tertiary)',
+                textTransform: 'uppercase', letterSpacing: 0.3,
+              }}
+            >
+              {approvalState === 'approved' ? '● approved' : approvalState === 'stale' ? '◌ stale' : '○ unapproved'}
+            </span>
+            {/* Lineage popover trigger */}
+            <button
+              onClick={() => setLineageOpen((x) => !x)}
+              title="Plan version history"
+              style={{
+                fontSize: 11, color: 'var(--text-tertiary)',
+                padding: '2px 8px', borderRadius: 999,
+                background: 'var(--bg-elevated-3)',
+                border: 'none', cursor: 'pointer',
+                fontFamily: 'var(--font-mono)',
+              }}
+            >
+              v{plan.version}{plan.parentVersion !== null ? ` ← v${plan.parentVersion}` : ''}
+            </button>
+            <span
+              title="Content hash"
+              style={{
+                fontSize: 10, color: 'var(--text-tertiary)',
+                padding: '2px 8px', borderRadius: 999,
+                background: 'var(--bg-elevated-3)',
+                fontFamily: 'var(--font-mono)',
+              }}
+            >
+              {plan.contentHash.slice(0, 8)}
+            </span>
+          </div>
         )}
       </div>
+
+      {/* Lineage popover */}
+      {plan && lineageOpen && (
+        <div
+          role="region"
+          aria-label="Plan version history"
+          style={{
+            marginBottom: 10,
+            padding: '8px 12px',
+            background: 'var(--bg-elevated-2)',
+            border: '1px solid var(--separator)',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: 12, color: 'var(--text-secondary)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+            <span style={{ fontWeight: 600 }}>Lineage</span>
+            <span style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>
+              {lineage ? `${lineage.length} version(s)` : 'loading…'}
+            </span>
+            <button
+              onClick={() => setLineageOpen(false)}
+              aria-label="Close lineage"
+              style={{
+                marginLeft: 'auto', background: 'transparent', border: 'none',
+                color: 'var(--text-tertiary)', cursor: 'pointer',
+              }}
+            >
+              <X size={12} strokeWidth={2} />
+            </button>
+          </div>
+          {lineage && lineage.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {lineage.map((v) => (
+                <span
+                  key={v.version}
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 4,
+                    fontSize: 11, padding: '2px 8px',
+                    borderRadius: 999,
+                    background: v.version === plan.version
+                      ? 'var(--accent)'
+                      : 'var(--bg-base)',
+                    color: v.version === plan.version
+                      ? 'var(--text-inverse)'
+                      : 'var(--text-secondary)',
+                    border: '1px solid var(--separator)',
+                    fontFamily: 'var(--font-mono)',
+                  }}
+                  title={`${v.createdBy?.kind ?? 'unknown'}${v.createdBy?.model ? ` (${v.createdBy.model})` : ''} · ${v.updatedAt}`}
+                >
+                  v{v.version}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Input row */}
       <div style={{
@@ -928,9 +1313,22 @@ export function PlanPage({ project, ws }: PlanPageProps) {
                 onChange={(v: any) => handleDraftChange('problem', v)}
               />
             ) : (
-              <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                {plan.problem}
-              </p>
+              <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                <p style={{ margin: 0 }}>{plan.problem.statement}</p>
+                {plan.problem.why_now && (
+                  <p style={{ margin: '6px 0 0' }}>
+                    <em style={{ color: 'var(--text-tertiary)' }}>Why now:</em> {plan.problem.why_now}
+                  </p>
+                )}
+                {plan.problem.success_signals.length > 0 && (
+                  <div style={{ marginTop: 6 }}>
+                    <em style={{ color: 'var(--text-tertiary)' }}>Success signals:</em>
+                    <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+                      {plan.problem.success_signals.map((s, i) => <li key={i}>{s}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
             )}
           </SectionCard>
 
@@ -950,11 +1348,11 @@ export function PlanPage({ project, ws }: PlanPageProps) {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
                 <div>
                   <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>IN SCOPE</div>
-                  <Bullets items={plan.scope.inScope} />
+                  <Bullets items={plan.scope.inScope.map((s) => `${s.id}: ${s.description}${s.acceptance.length ? ` — ${s.acceptance.length} acceptance` : ''}`)} />
                 </div>
                 <div>
                   <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>OUT OF SCOPE</div>
-                  <Bullets items={plan.scope.outOfScope} />
+                  <Bullets items={plan.scope.outOfScope.map((s) => s.description)} />
                 </div>
               </div>
             )}
@@ -990,10 +1388,10 @@ export function PlanPage({ project, ws }: PlanPageProps) {
                       {r.changes}
                     </p>
                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>FILES</div>
-                    <ChipList items={r.files} />
+                    <ChipList items={repoTouchedPaths(r)} />
                     <div style={{ height: 6 }} />
                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>SYMBOLS</div>
-                    <ChipList items={r.symbols} />
+                    <ChipList items={r.symbols.map((s) => `${s.name} (${s.kind})`)} />
                   </div>
                 ))}
               </div>
@@ -1024,11 +1422,11 @@ export function PlanPage({ project, ws }: PlanPageProps) {
                       background: 'var(--bg-elevated-3)', color: 'var(--text-secondary)',
                       marginRight: 6, textTransform: 'uppercase',
                     }}>{c.kind}</span>
-                    <strong style={{ color: 'var(--text-primary)' }}>{c.name}</strong>
+                    <strong style={{ color: 'var(--text-primary)' }}>{contractDisplay(c)}</strong>
                     <span style={{ color: 'var(--text-tertiary)' }}>
-                      {'  '}— {c.producer} → {c.consumers.join(', ') || '(none)'}
+                      {'  '}— {c.producer}
+                      {contractConsumers(c).length ? ` → ${contractConsumers(c).join(', ')}` : ''}
                     </span>
-                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>{c.description}</div>
                   </li>
                 ))}
               </ul>
@@ -1130,7 +1528,8 @@ export function PlanPage({ project, ws }: PlanPageProps) {
                 <KeyValueList items={[
                   ['Flags', plan.rollout.flags.join(', ') || '—'],
                   ['Order', plan.rollout.order.join(' → ') || '—'],
-                  ['Rollback', plan.rollout.rollback || '—'],
+                  ['Rollback', plan.rollout.rollback.command || '—'],
+                  ['Verify', plan.rollout.rollback.verify || '—'],
                 ]} />
               </>
             )}
@@ -1152,15 +1551,15 @@ export function PlanPage({ project, ws }: PlanPageProps) {
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
                 <div>
                   <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>UNIT</div>
-                  <Bullets items={plan.tests.unit} />
+                  <Bullets items={plan.tests.unit.map((t) => `${t.name || '(unnamed)'} — ${t.then || t.given || ''}`)} />
                 </div>
                 <div>
                   <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>INTEGRATION</div>
-                  <Bullets items={plan.tests.integration} />
+                  <Bullets items={plan.tests.integration.map((t) => `${t.name || '(unnamed)'} — ${t.then || t.given || ''}`)} />
                 </div>
                 <div>
                   <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginBottom: 4 }}>MANUAL</div>
-                  <Bullets items={plan.tests.manual} />
+                  <Bullets items={plan.tests.manual.map((m) => m.description)} />
                 </div>
               </div>
             )}
@@ -1196,30 +1595,70 @@ export function PlanPage({ project, ws }: PlanPageProps) {
         <div style={{
           flexShrink: 0, marginTop: 8,
           padding: '10px 12px',
-          display: 'flex', alignItems: 'center', gap: 8,
+          display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
           background: 'var(--bg-elevated-2)',
           border: '1px solid var(--separator)',
           borderRadius: 'var(--radius-md)',
         }}>
+          {/* Phase C — Approve button. Disabled when errors > 0 OR when
+              the plan is already approved at the current hash. */}
+          <button
+            onClick={handleApprove}
+            disabled={hasErrors || approvalState === 'approved'}
+            title={
+              hasErrors
+                ? 'Fix validation errors before approving'
+                : approvalState === 'approved'
+                ? `Already approved at this hash (${plan.contentHash.slice(0, 8)})`
+                : approvalState === 'stale'
+                ? 'Re-approve at the current hash'
+                : 'Approve this plan version'
+            }
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              height: 34, padding: '0 14px',
+              fontSize: 13, fontWeight: 600,
+              background: hasErrors || approvalState === 'approved'
+                ? 'var(--bg-elevated-3)'
+                : approvalState === 'stale'
+                ? 'var(--color-warning, #f59e0b)'
+                : 'var(--color-success, #22c55e)',
+              color: hasErrors || approvalState === 'approved'
+                ? 'var(--text-tertiary)'
+                : 'var(--text-inverse)',
+              border: 'none', borderRadius: 'var(--radius-sm)',
+              cursor: hasErrors || approvalState === 'approved' ? 'not-allowed' : 'pointer',
+              fontFamily: 'var(--font-sans)',
+            }}
+          >
+            <CheckCircle2 size={14} strokeWidth={1.75} />
+            {approvalState === 'approved' ? 'Approved' : approvalState === 'stale' ? 'Re-approve' : 'Approve plan'}
+          </button>
           <button
             onClick={() => handleExecute(false)}
-            disabled={hasErrors}
-            title={hasErrors ? 'Fix validation errors or force-execute' : 'Start the pipeline from this plan'}
+            disabled={hasErrors || approvalState !== 'approved'}
+            title={
+              hasErrors
+                ? 'Fix validation errors before executing'
+                : approvalState !== 'approved'
+                ? 'Approve the plan first (or use Force)'
+                : 'Start the pipeline from this approved plan'
+            }
             style={{
               display: 'inline-flex', alignItems: 'center', gap: 6,
               height: 34, padding: '0 16px',
               fontSize: 13, fontWeight: 600,
-              background: hasErrors ? 'var(--bg-elevated-3)' : 'var(--accent)',
-              color: hasErrors ? 'var(--text-tertiary)' : 'var(--text-inverse)',
+              background: hasErrors || approvalState !== 'approved' ? 'var(--bg-elevated-3)' : 'var(--accent)',
+              color: hasErrors || approvalState !== 'approved' ? 'var(--text-tertiary)' : 'var(--text-inverse)',
               border: 'none', borderRadius: 'var(--radius-sm)',
-              cursor: hasErrors ? 'not-allowed' : 'pointer',
+              cursor: hasErrors || approvalState !== 'approved' ? 'not-allowed' : 'pointer',
               fontFamily: 'var(--font-sans)',
             }}
           >
             <Play size={14} strokeWidth={1.75} />
             Execute pipeline
           </button>
-          {hasErrors && (
+          {(hasErrors || approvalState !== 'approved') && (
             <button
               onClick={() => handleExecute(true)}
               style={{
@@ -1232,12 +1671,59 @@ export function PlanPage({ project, ws }: PlanPageProps) {
                 color: 'var(--color-error, #ef4444)',
                 cursor: 'pointer', fontFamily: 'var(--font-sans)',
               }}
+              title={hasErrors ? 'Force-execute with unresolved errors' : 'Force-execute without approval'}
             >
               Force execute anyway
             </button>
           )}
-          <span style={{ fontSize: 11, color: 'var(--text-tertiary)', marginLeft: 8 }}>
-            Estimated ~${plan.estimate.usd.toFixed(2)} · {plan.estimate.prs} PR(s)
+          {/* Phase I UX — auto-refine button. Greyed out when no errors
+              are auto-fixable or when the refine budget is exhausted. */}
+          {(validation && validation.issues.length > 0) && (
+            <button
+              onClick={handleAutoRefine}
+              disabled={autoFixableCount === 0 || budgetExceeded}
+              title={
+                budgetExceeded
+                  ? `Refine budget exhausted ($${cumulativeCost.toFixed(2)} / $${refineBudgetUsd.toFixed(2)})`
+                  : autoFixableCount === 0
+                  ? 'No deterministic patches available'
+                  : `Apply ${autoFixableCount} deterministic patch${autoFixableCount === 1 ? '' : 'es'} + targeted regen for the rest`
+              }
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                height: 34, padding: '0 14px',
+                fontSize: 12, fontWeight: 500,
+                background: 'transparent',
+                border: '1px solid var(--separator)',
+                borderRadius: 'var(--radius-sm)',
+                color: autoFixableCount === 0 || budgetExceeded ? 'var(--text-tertiary)' : 'var(--text-secondary)',
+                cursor: autoFixableCount === 0 || budgetExceeded ? 'not-allowed' : 'pointer',
+                fontFamily: 'var(--font-sans)',
+              }}
+            >
+              <Map size={12} strokeWidth={1.75} />
+              Auto-refine{autoFixableCount > 0 ? ` (${autoFixableCount})` : ''}
+            </button>
+          )}
+          {/* Live cost meter — cumulative regen spend on this plan + budget cap. */}
+          <span
+            style={{
+              fontSize: 11, color: budgetExceeded ? 'var(--color-error, #ef4444)' : 'var(--text-tertiary)',
+              marginLeft: 8,
+              fontFamily: 'var(--font-mono)',
+            }}
+            title={
+              `Estimate: ~$${plan.estimate.usd.toFixed(2)}\n` +
+              `Spent so far (regens this session): $${cumulativeCost.toFixed(2)}\n` +
+              `Refine budget cap: $${refineBudgetUsd.toFixed(2)}` +
+              (Object.keys(perSectionCost).length > 0
+                ? `\n\nPer section:\n${Object.entries(perSectionCost)
+                    .map(([k, v]) => `  ${k}: $${(v ?? 0).toFixed(3)}`)
+                    .join('\n')}`
+                : '')
+            }
+          >
+            ~${plan.estimate.usd.toFixed(2)} · {plan.estimate.prs} PR(s) · refine: ${cumulativeCost.toFixed(2)} / ${refineBudgetUsd.toFixed(2)}
           </span>
           <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
             <button

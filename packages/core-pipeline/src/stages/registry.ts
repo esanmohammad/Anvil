@@ -28,6 +28,13 @@ export interface StageDefinition {
   persona: StagePersona;
   /** Whether the stage fans out across repos. */
   perRepo: boolean;
+  /**
+   * True when the stage runs deterministic code instead of invoking an
+   * LLM. The dashboard hides the model badge and cost row for these
+   * stages — showing `$0.00` next to a model name reads as "agent
+   * failed silently" rather than "no agent involved".
+   */
+  deterministic?: boolean;
 }
 
 export const STAGES: readonly StageDefinition[] = [
@@ -37,7 +44,7 @@ export const STAGES: readonly StageDefinition[] = [
   { index: 3, name: 'specs',             label: 'Writing specs',         persona: 'architect',   perRepo: true  },
   { index: 4, name: 'tasks',             label: 'Creating tasks',        persona: 'lead',        perRepo: true  },
   { index: 5, name: 'build',             label: 'Writing code',          persona: 'engineer',    perRepo: true  },
-  { index: 6, name: 'test',              label: 'Generating tests',      persona: 'test-author', perRepo: true  },
+  { index: 6, name: 'test',              label: 'Generating tests',      persona: 'test-author', perRepo: true,  deterministic: true },
   { index: 7, name: 'validate',          label: 'Testing',               persona: 'tester',      perRepo: true  },
   { index: 8, name: 'ship',              label: 'Shipping',              persona: 'engineer',    perRepo: false },
 ] as const;

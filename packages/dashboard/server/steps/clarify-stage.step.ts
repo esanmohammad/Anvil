@@ -1,359 +1,100 @@
 /**
- * `clarify-stage` — Phase 4f.4 of the dashboard consolidation.
+ * Phase H7 — `clarify-stage.step` was promoted into core-pipeline with
+ * a refactored signature requiring `AgentSession` (the legacy direct
+ * `AgentManager` fallback was dropped from the canonical path).
  *
- * Lifts the full 3-phase orchestration that
- * `pipeline-runner.ts:runClarifyStage()` performs:
+ * This file remains in dashboard as a back-compat adapter — keeps the
+ * legacy `agentManager`-based API by constructing an
+ * `AgentManagerSession` internally. Direct consumers should migrate
+ * to the canonical path:
  *
- *   - Phase A (explore):   spawn the clarifier agent, wait for the
- *                          explore-phase output (raw markdown of questions).
- *   - Phase B (Q&A loop):  parse questions, ask each one through the
- *                          dashboard's WebSocket userMessage path, collect
- *                          answers. Loop bails on cancellation, empty
- *                          answer, or resolver rejection.
- *   - Phase C (synthesize): when at least one Q&A pair landed, resume the
- *                          SAME agent via `agentManager.sendInput` with
- *                          the synthesis prompt and wait for it to emit
- *                          `CLARIFICATION.md`.
+ *   import { createClarifyStageStep, runClarifyForProject,
+ *     type ClarifyStageStepOptions, type RunClarifyForProjectOptions,
+ *     type RunClarifyForProjectResult }
+ *     from '@esankhan3/anvil-core-pipeline';
  *
- * Phase 4e's `clarify.step.ts` already lifts Phase B in isolation as a
- * `Step<string, ClarifyResult>`; this module composes it with the
- * agent-spawn lifecycle so `pipeline-runner.runClarifyStage` can shrink
- * to a thin closure over the helper. Phase 4f.7 will register the
- * Step factory exported here so `Pipeline.run()` becomes the orchestrator.
- *
- * The dashboard's WebSocket event vocabulary (D10 — 133 messages
- * unchanged) is preserved via callbacks on the helper's options:
- * `onClarifyQuestion`, `onWaitingForInput`, `onUserInput`,
- * `onClarifyAck`, `setWaitingState`. The helper does NOT speak WS
- * directly — pipeline-runner wires those callbacks today.
+ * @deprecated Construct an `AgentManagerSession` and call canonical
+ *   `runClarifyForProject` / `createClarifyStageStep`.
  */
 
-import { spawnAndWait, waitForAgent } from './agent-spawner.js';
-import {
-  buildClarifySynthesisPrompt,
-  formatQAPairs,
-  parseClarifyQuestions,
+import type {
+  AgentSession,
+  Step,
+  StepContext,
+  RunClarifyForProjectOptions,
+  RunClarifyForProjectResult,
 } from '@esankhan3/anvil-core-pipeline';
-import type { ClarifyQAPair } from '@esankhan3/anvil-core-pipeline';
+import {
+  createClarifyStageStep as createClarifyStageStepCanonical,
+  runClarifyForProject as runClarifyForProjectCanonical,
+} from '@esankhan3/anvil-core-pipeline';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
-import type { Step, StepContext } from '@esankhan3/anvil-core-pipeline';
+import { AgentManagerSession } from '../runners/agent-manager-session.js';
 
-export interface RunClarifyForProjectOptions {
-  /**
-   * Multi-turn agent surface. When supplied, the explore + synthesize
-   * phases route through `agentSession.start` / `sendInput` — chain
-   * fallback and empty-output throws are baked in by the underlying
-   * runner. When omitted, falls back to direct `agentManager` calls.
-   */
-  agentSession?: import('@esankhan3/anvil-core-pipeline').AgentSession;
-  /** Legacy direct path — used when `agentSession` is omitted. */
-  agentManager?: AgentManager;
-  /** Project slug — forwarded to the spawn config. */
-  project: string;
-  /** Working directory for the explore-phase agent (project workspace). */
-  workspaceDir: string;
-  /** Resolved model id for the clarify stage. */
-  model: string;
-  /** Optional output-token ceiling. */
-  maxOutputTokens?: number;
-  /** Pre-built explore-phase user prompt. */
-  explorePrompt: string;
-  /** Pre-built per-stage project (system) prompt. */
-  projectPrompt: string;
-  /**
-   * Resolves each parsed question to the user's reply. Required —
-   * pipeline-runner wires this to its WebSocket userMessage path; tests
-   * can supply a stub. An empty string is treated as "user cancelled"
-   * and stops the loop.
-   */
-  inputResolver: (question: string, qIndex: number, qTotal: number) => Promise<string>;
-  /** Returns true when the run has been cancelled — checked before each question. */
-  isCancelled: () => boolean;
-  /**
-   * Called once with the freshly-spawned explore agent id. Caller is
-   * expected to set `state.stages[index].agentId` and broadcast state.
-   * Same agent id is used for the synthesize phase (sendInput resumes it).
-   */
-  onAgentSpawned?: (agentId: string) => void;
-  /** Called when the agent's stop_reason is `max_tokens`. */
-  onTruncation?: (agentName: string, outputTokens: number) => void;
-  /** Called as each question is dispatched (legacy `clarify-question` event). */
-  onClarifyQuestion?: (questionIndex: number, totalQuestions: number, question: string) => void;
-  /**
-   * Called immediately before awaiting the user's reply. The legacy sets
-   * `state.stages[i].status='waiting'` + `state.status='waiting'` +
-   * `state.waitingForInput=true` and broadcasts before emitting
-   * `waiting-for-input`.
-   */
-  onWaitingForInput?: (agentId: string) => void;
-  /**
-   * Called after recording a non-empty answer. The legacy clears
-   * `state.waitingForInput=false` and broadcasts (without touching stage
-   * status — it stays `'waiting'` between questions until Phase C).
-   */
-  onAnswerReceived?: (answer: string) => void;
-  /** Called after `onAnswerReceived`, mirroring the legacy `clarify-ack`. */
-  onClarifyAck?: (questionIndex: number, totalQuestions: number, hasMore: boolean) => void;
-  /**
-   * Called once before the synthesize phase runs. The legacy sets
-   * `state.stages[i].status='running'` + `state.status='running'` +
-   * `state.waitingForInput=false` and broadcasts. Skipped when the loop
-   * bailed without collecting any Q&A pairs.
-   */
-  onSynthesizeStart?: () => void;
-  /** Test seams — forwarded to spawnAndWait + waitForAgent. */
-  pollIntervalMs?: number;
-  sleep?: (ms: number) => Promise<void>;
-  /** Per-stage allow list for tool names — drives BuiltinToolExecutor for
-   *  agentic non-Claude adapters. Clarify defaults to read-only. */
-  allowedTools?: string[];
-}
-
-export interface RunClarifyForProjectResult {
-  /** Final artifact — synthesize output if it ran, else the explore output. */
-  artifact: string;
-  /** Total cost across explore + synthesize phases. */
-  cost: number;
-  /** Agent id used for both phases (sendInput resumes the same agent). */
-  agentId: string;
-  /** Questions parsed from the explore-phase output. */
-  questions: string[];
-  /** Q&A pairs collected from the user. */
-  qaPairs: ClarifyQAPair[];
-  /** True when the synthesize phase ran (qaPairs non-empty + not cancelled). */
-  synthesizeRan: boolean;
-  /** True when the loop terminated via cancellation or empty answer. */
-  cancelled: boolean;
-  /** Aggregate input tokens across explore + synthesize phases. */
-  inputTokens: number;
-  /** Aggregate output tokens across explore + synthesize phases. */
-  outputTokens: number;
-  /** Aggregate cache READ tokens (Anthropic prompt cache hits). */
-  cacheReadTokens: number;
-  /** Aggregate cache WRITE tokens (first-call cache provisioning). */
-  cacheWriteTokens: number;
-}
-
-const CLARIFY_DISALLOWED_TOOLS: readonly string[] = [
-  'Write', 'Edit', 'NotebookEdit', 'Bash',
-];
+export type {
+  RunClarifyForProjectOptions,
+  RunClarifyForProjectResult,
+};
 
 /**
- * Run the dashboard's interactive clarify stage end-to-end. Returns
- * the final artifact + accumulated cost. The caller is expected to
- * surface the dashboard state mutations (status='waiting' /
- * waitingForInput=true) via the supplied `setWaitingState` callback.
+ * Legacy options shape — accepts either `agentSession` or `agentManager`.
+ * When only `agentManager` is supplied, builds an `AgentManagerSession`.
  */
+export interface LegacyRunClarifyForProjectOptions
+  extends Omit<RunClarifyForProjectOptions, 'agentSession'> {
+  agentSession?: AgentSession;
+  agentManager?: AgentManager;
+  onTruncation?: (agentName: string, outputTokens: number) => void;
+  pollIntervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
 export async function runClarifyForProject(
-  opts: RunClarifyForProjectOptions,
+  opts: LegacyRunClarifyForProjectOptions,
 ): Promise<RunClarifyForProjectResult> {
-  // Phase A — explore. Prefer the multi-turn AgentSession path when
-  // available; fall back to direct AgentManager spawning for callers
-  // that haven't migrated yet.
-  let explore: {
-    agentId: string;
-    artifact: string;
-    cost: number;
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
-  };
-  if (opts.agentSession) {
-    const r = await opts.agentSession.start({
-      persona: 'clarifier',
-      projectPrompt: opts.projectPrompt,
-      userPrompt: opts.explorePrompt,
-      workingDir: opts.workspaceDir,
-      stage: 'clarify',
-      model: opts.model,
-      allowedTools: opts.allowedTools,
-      disallowedTools: [...CLARIFY_DISALLOWED_TOOLS],
-      maxOutputTokens: opts.maxOutputTokens,
-    });
-    explore = {
-      agentId: r.sessionId,
-      artifact: r.output,
-      cost: r.costUsd ?? 0,
-      inputTokens: r.inputTokens ?? 0,
-      outputTokens: r.outputTokens ?? 0,
-      cacheReadTokens: r.cacheReadTokens ?? 0,
-      cacheWriteTokens: r.cacheWriteTokens ?? 0,
-    };
-    opts.onAgentSpawned?.(explore.agentId);
-  } else {
-    if (!opts.agentManager) {
-      throw new Error('runClarifyForProject requires either agentSession or agentManager');
-    }
-    explore = await spawnAndWait({
-      agentManager: opts.agentManager,
-      spec: {
-        name: `clarifier-${opts.project}`,
-        persona: 'clarifier',
-        project: opts.project,
-        stage: 'clarify',
-        prompt: opts.explorePrompt,
-        model: opts.model,
-        cwd: opts.workspaceDir,
-        projectPrompt: opts.projectPrompt,
-        permissionMode: 'bypassPermissions',
-        disallowedTools: [...CLARIFY_DISALLOWED_TOOLS],
-        allowedTools: opts.allowedTools,
-        maxOutputTokens: opts.maxOutputTokens,
-      },
-      isCancelled: opts.isCancelled,
-      onSpawn: opts.onAgentSpawned,
-      onTruncation: opts.onTruncation,
-      pollIntervalMs: opts.pollIntervalMs,
-      sleep: opts.sleep,
-    });
+  const session = opts.agentSession ?? buildSession(opts);
+  return runClarifyForProjectCanonical({
+    agentSession: session,
+    project: opts.project,
+    workspaceDir: opts.workspaceDir,
+    model: opts.model,
+    maxOutputTokens: opts.maxOutputTokens,
+    explorePrompt: opts.explorePrompt,
+    projectPrompt: opts.projectPrompt,
+    inputResolver: opts.inputResolver,
+    isCancelled: opts.isCancelled,
+    onAgentSpawned: opts.onAgentSpawned,
+    onClarifyQuestion: opts.onClarifyQuestion,
+    onWaitingForInput: opts.onWaitingForInput,
+    onAnswerReceived: opts.onAnswerReceived,
+    onClarifyAck: opts.onClarifyAck,
+    onSynthesizeStart: opts.onSynthesizeStart,
+    allowedTools: opts.allowedTools,
+  });
+}
+
+function buildSession(opts: LegacyRunClarifyForProjectOptions): AgentSession {
+  if (!opts.agentManager) {
+    throw new Error('runClarifyForProject requires either agentSession or agentManager');
   }
-
-  let totalCost = explore.cost;
-
-  // Phase B — Q&A loop.
-  const parsed = parseClarifyQuestions(explore.artifact);
-  const trimmedArtifact = explore.artifact.trim();
-  // Three-tier fallback:
-  //   1. Parsed numbered list — happy path.
-  //   2. Non-empty unparsed output — legacy: treat the whole artifact
-  //      as one question (still useful, e.g. model wrote prose).
-  //   3. Empty artifact — model spent its turns on tool reads /
-  //      thinking but never emitted final text. Surface a clear
-  //      catch-all question so the user can drive the run forward
-  //      instead of seeing a blank Q1.
-  let questions: string[];
-  if (parsed.length > 0) {
-    questions = parsed;
-  } else if (trimmedArtifact.length > 0) {
-    questions = [trimmedArtifact];
-  } else {
-    console.warn(
-      `[clarify] model produced no parseable text for ${opts.project}; ` +
-      `agentId=${explore.agentId}. Falling back to a generic clarifier question.`,
-    );
-    questions = [
-      'I could not generate clarifying questions automatically. ' +
-      'Please describe the feature in more detail — scope, constraints, ' +
-      'edge cases, and any acceptance criteria you have in mind.',
-    ];
-  }
-
-  const qaPairs: ClarifyQAPair[] = [];
-  let cancelled = false;
-
-  for (let qi = 0; qi < questions.length; qi += 1) {
-    if (opts.isCancelled()) {
-      cancelled = true;
-      break;
-    }
-
-    const question = questions[qi];
-    opts.onClarifyQuestion?.(qi, questions.length, question);
-    opts.onWaitingForInput?.(explore.agentId);
-
-    let answer: string;
-    try {
-      answer = await opts.inputResolver(question, qi, questions.length);
-    } catch {
-      // Resolver rejection is treated as cancellation — same as legacy
-      // where the readline reject-on-cancel path bails out of the loop.
-      cancelled = true;
-      break;
-    }
-
-    if (opts.isCancelled() || !answer) {
-      cancelled = true;
-      break;
-    }
-
-    qaPairs.push({ question, answer });
-    opts.onAnswerReceived?.(answer);
-    opts.onClarifyAck?.(qi, questions.length, qi < questions.length - 1);
-  }
-
-  // Phase C — synthesize (only if at least one Q&A pair landed AND we
-  // weren't cancelled mid-loop).
-  if (cancelled || qaPairs.length === 0) {
-    return {
-      artifact: explore.artifact,
-      cost: totalCost,
-      agentId: explore.agentId,
-      questions,
-      qaPairs,
-      synthesizeRan: false,
-      cancelled,
-      inputTokens: explore.inputTokens,
-      outputTokens: explore.outputTokens,
-      cacheReadTokens: explore.cacheReadTokens,
-      cacheWriteTokens: explore.cacheWriteTokens,
-    };
-  }
-
-  opts.onSynthesizeStart?.();
-
-  const synthesisPrompt = buildClarifySynthesisPrompt(formatQAPairs(qaPairs));
-  let synthesize: {
-    artifact: string;
-    cost: number;
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
-  };
-  if (opts.agentSession) {
-    const r = await opts.agentSession.sendInput(explore.agentId, synthesisPrompt);
-    synthesize = {
-      artifact: r.output,
-      cost: r.costUsd ?? 0,
-      inputTokens: r.inputTokens ?? 0,
-      outputTokens: r.outputTokens ?? 0,
-      cacheReadTokens: r.cacheReadTokens ?? 0,
-      cacheWriteTokens: r.cacheWriteTokens ?? 0,
-    };
-  } else {
-    if (!opts.agentManager) {
-      throw new Error('runClarifyForProject synthesize phase requires either agentSession or agentManager');
-    }
-    opts.agentManager.sendInput(explore.agentId, synthesisPrompt);
-    synthesize = await waitForAgent({
-      agentId: explore.agentId,
-      agentManager: opts.agentManager,
-      isCancelled: opts.isCancelled,
-      onTruncation: opts.onTruncation,
-      pollIntervalMs: opts.pollIntervalMs,
-      sleep: opts.sleep,
-    });
-  }
-
-  totalCost += synthesize.cost;
-
-  return {
-    artifact: synthesize.artifact || explore.artifact,
-    cost: totalCost,
-    agentId: explore.agentId,
-    questions,
-    qaPairs,
-    synthesizeRan: true,
-    cancelled: false,
-    inputTokens: explore.inputTokens + synthesize.inputTokens,
-    outputTokens: explore.outputTokens + synthesize.outputTokens,
-    cacheReadTokens: explore.cacheReadTokens + synthesize.cacheReadTokens,
-    cacheWriteTokens: explore.cacheWriteTokens + synthesize.cacheWriteTokens,
-  };
+  return new AgentManagerSession({
+    agentManager: opts.agentManager,
+    project: opts.project,
+    workspaceDir: opts.workspaceDir,
+    isCancelled: opts.isCancelled,
+    resolveModel: () => opts.model,
+    onTruncation: opts.onTruncation,
+  });
 }
 
 export interface ClarifyStageStepOptions {
-  /** Optional Step id override; defaults to `clarify-stage`. */
   id?: string;
   agentManager: AgentManager;
   project: string;
   workspaceDir: string;
   model: string;
   maxOutputTokens?: number;
-  /** Builds the explore-phase user prompt for the project. */
   buildExplorePrompt: () => string;
-  /** Builds the project (system) prompt for the clarify stage. */
   buildProjectPrompt: () => string;
   inputResolver: (question: string, qIndex: number, qTotal: number) => Promise<string>;
   onAgentSpawned?: (agentId: string) => void;
@@ -363,55 +104,38 @@ export interface ClarifyStageStepOptions {
   onAnswerReceived?: (answer: string) => void;
   onClarifyAck?: (questionIndex: number, totalQuestions: number, hasMore: boolean) => void;
   onSynthesizeStart?: () => void;
-  /**
-   * Optional cancellation predicate — defaults to checking
-   * `ctx.signal.aborted`. Override when the caller has its own cancel
-   * flag (e.g. PipelineRunner.cancelled).
-   */
   isCancelled?: (ctx: StepContext<unknown>) => boolean;
   pollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
 }
 
-/**
- * Step factory for the full clarify stage (explore + Q&A + synthesize).
- * NOT auto-registered — Phase 4f.7 wires it once `Pipeline.run()` becomes
- * the orchestrator.
- */
 export function createClarifyStageStep(
   opts: ClarifyStageStepOptions,
 ): Step<unknown, RunClarifyForProjectResult> {
-  const id = opts.id ?? 'clarify-stage';
-
-  return {
-    id,
-    name: 'Clarify stage (explore + Q&A + synthesize)',
-    parallelism: 'serial',
-    async run(ctx: StepContext<unknown>): Promise<RunClarifyForProjectResult> {
-      const isCancelled = opts.isCancelled
-        ? () => opts.isCancelled!(ctx)
-        : () => ctx.signal.aborted;
-
-      return runClarifyForProject({
-        agentManager: opts.agentManager,
-        project: opts.project,
-        workspaceDir: opts.workspaceDir,
-        model: opts.model,
-        maxOutputTokens: opts.maxOutputTokens,
-        explorePrompt: opts.buildExplorePrompt(),
-        projectPrompt: opts.buildProjectPrompt(),
-        inputResolver: opts.inputResolver,
-        isCancelled,
-        onAgentSpawned: opts.onAgentSpawned,
-        onTruncation: opts.onTruncation,
-        onClarifyQuestion: opts.onClarifyQuestion,
-        onWaitingForInput: opts.onWaitingForInput,
-        onAnswerReceived: opts.onAnswerReceived,
-        onClarifyAck: opts.onClarifyAck,
-        onSynthesizeStart: opts.onSynthesizeStart,
-        pollIntervalMs: opts.pollIntervalMs,
-        sleep: opts.sleep,
-      });
-    },
-  };
+  const session = new AgentManagerSession({
+    agentManager: opts.agentManager,
+    project: opts.project,
+    workspaceDir: opts.workspaceDir,
+    isCancelled: () => false,
+    resolveModel: () => opts.model,
+    onTruncation: opts.onTruncation,
+  });
+  return createClarifyStageStepCanonical({
+    id: opts.id,
+    agentSession: session,
+    project: opts.project,
+    workspaceDir: opts.workspaceDir,
+    model: opts.model,
+    maxOutputTokens: opts.maxOutputTokens,
+    buildExplorePrompt: opts.buildExplorePrompt,
+    buildProjectPrompt: opts.buildProjectPrompt,
+    inputResolver: opts.inputResolver,
+    onAgentSpawned: opts.onAgentSpawned,
+    onClarifyQuestion: opts.onClarifyQuestion,
+    onWaitingForInput: opts.onWaitingForInput,
+    onAnswerReceived: opts.onAnswerReceived,
+    onClarifyAck: opts.onClarifyAck,
+    onSynthesizeStart: opts.onSynthesizeStart,
+    isCancelled: opts.isCancelled,
+  });
 }

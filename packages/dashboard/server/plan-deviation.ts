@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import type { Plan } from './plan-store.js';
+import { planRepoTouchedPaths } from '@esankhan3/anvil-core-pipeline';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -103,7 +104,8 @@ export function captureDeviation(plan: Plan, deps: CaptureDeps): PlanDeviation {
     const repoPath = deps.repoLocalPaths[planRepo.name];
     if (!repoPath) continue;
     const actualFiles = gitChangedFiles(repoPath, deps.baseBranch).map(normalise);
-    const plannedFiles = planRepo.files.map(normalise);
+    // Plan v2: collect mustTouch + mustExist paths.
+    const plannedFiles = planRepoTouchedPaths(planRepo).map(normalise);
     const plannedSet = new Set(plannedFiles);
     const actualSet = new Set(actualFiles);
 

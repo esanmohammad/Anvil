@@ -114,7 +114,8 @@ export class SqliteHotIndex {
 
   /** FTS5 BM25-ranked text search. Returns highest-relevance first. */
   searchByText(query: string, opts: SearchOpts = {}): Memory[] {
-    if (query.trim().length === 0) return [];
+    const safeQuery = toFtsQuery(query);
+    if (safeQuery.length === 0) return [];
     const limitClause = opts.limit ? `LIMIT ${Number(opts.limit) | 0}` : '';
     const nsClause = this.namespaceClause(opts.namespace, 'm');
     const sql = `
@@ -126,7 +127,7 @@ export class SqliteHotIndex {
     `;
     const rows = this.db
       .prepare(sql)
-      .all(query, ...nsClause.bind) as Record<string, unknown>[];
+      .all(safeQuery, ...nsClause.bind) as Record<string, unknown>[];
     return rows.map((r) => this.rowToMemory(r));
   }
 
@@ -503,4 +504,22 @@ export class SqliteHotIndex {
       ? { where: '', bind: [] }
       : { where: ' AND ' + conds.join(' AND '), bind };
   }
+}
+
+/**
+ * Sanitize a free-text query for FTS5 MATCH. FTS5 treats `column:term`,
+ * bareword operators (`AND` / `OR` / `NOT`), `*`, `^`, parens, and double
+ * quotes as syntactic — passing raw memory bodies through MATCH explodes
+ * with `SqliteError: no such column: X` the moment the text contains
+ * `Word:` followed by anything. We split into alphanumeric tokens and
+ * quote each as a literal phrase so FTS5 treats them as plain terms.
+ */
+function toFtsQuery(raw: string): string {
+  const tokens = raw.match(/[\p{L}\p{N}]+/gu);
+  if (!tokens) return '';
+  const quoted = tokens
+    .filter((t) => t.length >= 2 && t.length <= 64)
+    .slice(0, 32)
+    .map((t) => `"${t.replace(/"/g, '""')}"`);
+  return quoted.join(' OR ');
 }

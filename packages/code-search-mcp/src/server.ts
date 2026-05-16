@@ -22,6 +22,7 @@ import { registerResources, handleResource } from './resources/resources';
 import { getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
 import { indexFromPath } from '@esankhan3/anvil-knowledge-core';
 import { loadServerConfig, type ServerConfig } from './core/env-config.js';
+import { toKnowledgeConfig } from './core/config.js';
 import { startHttpTransport } from './transports/http-transport.js';
 
 // State shared across tools
@@ -273,9 +274,16 @@ async function trackedIndex(
   ctx.indexing.error = null;
   pushHistory(ctx, 'start', `${label}: started for "${project}" at ${dirPath}`);
 
+  // P3 — explicit KnowledgeConfig threaded from the unified resolver, so
+  // CODE_SEARCH_* env vars / config file / CLI flags actually reach the
+  // indexer (issue #6). Previously knowledge-core read DEFAULT_CONFIG.
+  const unified = loadServerConfig().__unified;
+  const knowledgeConfig = toKnowledgeConfig(unified);
+
   try {
     const stats = await indexFromPath(project, dirPath, {
       force: opts?.force,
+      config: knowledgeConfig,
       onProgress: (m) => {
         ctx.indexing.message = m;
         console.error(`[${label}] ${m}`);

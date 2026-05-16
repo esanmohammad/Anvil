@@ -12,7 +12,7 @@
  */
 import { runWithChainFallback } from '@esankhan3/anvil-core-pipeline';
 import { spawnAndWait } from '../steps/agent-spawner.js';
-import { disallowedToolsForPersona } from '../steps/per-repo-stage.step.js';
+import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 export class AgentManagerRunner {
     opts;
     constructor(opts) {

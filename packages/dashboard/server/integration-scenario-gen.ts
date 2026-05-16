@@ -208,12 +208,16 @@ export function generateIntegrationScenarios(opts: ScenarioOptions): ScenarioRes
 
   const buffered: Array<{ source: string; input: BuildInput }> = [];
 
-  // 1. inScope
+  // 1. inScope — Plan v2: ScopeItem[] with description + acceptance.
   const inScope = plan.scope?.inScope ?? [];
-  for (const bullet of inScope) {
-    const trimmed = (bullet ?? '').trim();
+  for (const item of inScope) {
+    const trimmed = (item?.description ?? '').trim();
     if (!trimmed) continue;
     buffered.push({ source: 'inScope', input: { source: 'inScope', rawIntent: trimmed } });
+    for (const a of item.acceptance ?? []) {
+      const ta = a.trim();
+      if (ta) buffered.push({ source: 'inScope', input: { source: 'inScope', rawIntent: ta } });
+    }
   }
 
   // 2. rollout.order consecutive pairs
@@ -231,16 +235,22 @@ export function generateIntegrationScenarios(opts: ScenarioOptions): ScenarioRes
     });
   }
 
-  // 3. contracts with multiple consumers
+  // 3. contracts with multiple consumers — Plan v2: db contracts have none.
   const contracts = plan.contracts ?? [];
   for (const c of contracts) {
-    if (!c || !Array.isArray(c.consumers) || c.consumers.length < 2) continue;
-    const consumerList = c.consumers.join(', ');
+    if (!c || c.kind === 'db') continue;
+    const consumers = c.consumers ?? [];
+    if (consumers.length < 2) continue;
+    const display = c.kind === 'http'
+      ? `${c.method} ${c.path}`
+      : c.kind === 'kafka' ? c.topic
+      : `${c.service}.${c.method}`;
+    const consumerList = consumers.join(', ');
     buffered.push({
       source: 'contracts',
       input: {
         source: 'contracts',
-        rawIntent: `Exercise ${c.kind} contract "${c.name}" from ${c.producer} through ${consumerList}`,
+        rawIntent: `Exercise ${c.kind} contract "${display}" from ${c.producer} through ${consumerList}`,
       },
     });
   }

@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { ServerConfig } from '../core/env-config.js';
 import { createAuthMiddleware, type AuthIdentity } from '../middleware/auth.js';
+import { registry, metrics } from '../observability/metrics.js';
 
 /** Factory that creates a fresh, fully-wired MCP Server instance */
 export type McpServerFactory = () => Promise<{
@@ -35,6 +36,9 @@ interface Session {
 export async function startHttpTransport(opts: HttpTransportOptions): Promise<void> {
   const { config, createMcpServer, onReady, getHealth } = opts;
   const authenticate = createAuthMiddleware(config);
+
+  // P7 — uptime for /admin/api/status.
+  const startedAt = Date.now();
 
   // Map of sessionId → session (with TTL + max limit)
   const sessions = new Map<string, Session & { lastActivity: number }>();
@@ -76,6 +80,51 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<vo
       const status = opts.getStatus?.() ?? {};
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(status, null, 2));
+      return;
+    }
+
+    // ── Version (P7) ────────────────────────────────────────────────
+    if (path === '/version' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        name: 'code-search-mcp',
+        version: '0.1.0',
+        node: process.version,
+        platform: process.platform,
+      }));
+      return;
+    }
+
+    // ── Readiness (P7) — true only after first index complete ──────
+    if (path === '/ready' && req.method === 'GET') {
+      const health = getHealth?.() ?? {};
+      const ready = health.indexReady === true;
+      res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ready, ...health }));
+      return;
+    }
+
+    // ── Prometheus metrics (P7) ────────────────────────────────────
+    if (path === '/metrics' && req.method === 'GET') {
+      // Update gauges with current state.
+      const status = opts.getStatus?.() ?? {};
+      const indexing = (status.indexing as { phase?: string; percent?: number } | undefined);
+      metrics.indexAge.set(0, { phase: indexing?.phase ?? 'idle' });
+      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+      res.end(registry.render());
+      return;
+    }
+
+    // ── Admin JSON status (P7) ─────────────────────────────────────
+    if (path === '/admin/api/status' && req.method === 'GET') {
+      const status = opts.getStatus?.() ?? {};
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        version: '0.1.0',
+        uptime: Math.floor((Date.now() - startedAt) / 1000),
+        sessions: sessions.size,
+        ...status,
+      }, null, 2));
       return;
     }
 

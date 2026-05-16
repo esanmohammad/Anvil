@@ -19,7 +19,7 @@
  * `StepContext` (which stays generic per core-pipeline's contract).
  */
 import { InMemoryStepRegistry } from '@esankhan3/anvil-core-pipeline';
-import { FEATURE_MANIFEST_STAGES, createFeatureManifestStep, } from './feature-manifest.step.js';
+import { FEATURE_MANIFEST_STAGES, createFeatureManifestStep, } from '@esankhan3/anvil-core-pipeline';
 /**
  * Build the dashboard's `StepRegistry` for one pipeline run.
  *

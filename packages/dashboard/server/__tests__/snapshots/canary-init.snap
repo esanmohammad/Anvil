@@ -1,0 +1,12 @@
+{
+  "payloadKeys": [
+    "activeRuns",
+    "availableModels",
+    "features",
+    "projects",
+    "prs",
+    "runs",
+    "state"
+  ],
+  "type": "init"
+}

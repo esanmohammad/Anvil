@@ -336,3 +336,4 @@ export function createFeatureBranches(opts: CreateFeatureBranchesOptions): void 
     ensureBranch(opts.workspaceDir, 'workspace root');
   }
 }
+

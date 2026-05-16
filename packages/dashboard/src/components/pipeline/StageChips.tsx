@@ -11,6 +11,13 @@ export interface StageChipData {
   cost?: number;
   modelLabel?: string;
   permissionClasses?: ('read' | 'write' | 'exec')[];
+  /**
+   * True when the stage runs deterministic code (no LLM call). The card
+   * hides the model badge and the `$0.00` cost row, and shows a
+   * `deterministic` chip instead — otherwise users read "agent
+   * silently failed" into a $0.00 row.
+   */
+  deterministic?: boolean;
 }
 
 export interface StageChipsProps {
@@ -153,7 +160,24 @@ export function StageChips({ stages, currentStage: _currentStage, onStageSelect,
                   {getDisplayName(stage.name)}
                 </span>
 
-                {(stage.modelLabel || (isCompleted && stage.cost != null)) && (
+                {stage.deterministic ? (
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                    <span
+                      title="This stage runs deterministic code, no LLM call"
+                      style={{
+                        fontSize: 10,
+                        fontFamily: 'var(--font-mono)',
+                        color: 'var(--text-tertiary)',
+                        background: 'var(--bg-elevated-3)',
+                        padding: '1px 5px',
+                        borderRadius: 'var(--radius-sm)',
+                        lineHeight: '14px',
+                      }}
+                    >
+                      deterministic
+                    </span>
+                  </span>
+                ) : (stage.modelLabel || (isCompleted && stage.cost != null)) && (
                   <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
                     {stage.modelLabel && (
                       <span

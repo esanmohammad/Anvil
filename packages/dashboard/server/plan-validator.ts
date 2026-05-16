@@ -1,26 +1,32 @@
 /**
- * PlanValidator — cheap (no-LLM) validation of a Plan against the KB.
+ * PlanValidator — bridge from the dashboard's legacy validation API
+ * to the core-pipeline rule engine.
  *
- * Validates that every repo/file/symbol referenced in the plan actually
- * exists in the knowledge graph + on disk. Catches hallucinated references
- * BEFORE the pipeline spends a dollar building them.
+ * The constructor + `validate(plan, options)` shape is preserved so
+ * existing callers (`case 'validate-plan'` / `case 'execute-plan'` in
+ * dashboard-server.ts, `pipeline-runner.ts`'s pre-flight check) keep
+ * working unchanged. Internally we build a `RuleContext` from:
+ *   - `projectLoader.getRepoLocalPaths(project)` — project repo set
+ *   - Per-repo KB graph reads (paths + symbols)
+ * …then dispatch to `runPlanRules(plan, ctx)`. The returned
+ * `Issue[]` is reshaped to the legacy `PlanIssue[]` so the UI doesn't
+ * need to know about the new vocabulary yet.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import type { Plan } from './plan-store.js';
+import type { Plan } from '@esankhan3/anvil-core-pipeline';
+import {
+  runPlanRules,
+  type Issue,
+  type RuleContext,
+} from '@esankhan3/anvil-core-pipeline';
 import type { ProjectLoader } from './project-loader.js';
 import { checkBudget } from './plan-validator-rules/budget.js';
-// Convention enforcement on plans is intentionally absent — the legacy
-// `plan-validator-rules/conventions.ts` read its own bespoke
-// `~/.anvil/projects/<project>/conventions.json` outside convention-core.
-// Per the single-source-of-truth migration, plans no longer get
-// convention checks here; convention-core is consulted only by the
-// review/build stages where rule shape and severity are already wired.
 import { checkPrConflicts } from './plan-validator-rules/pr-conflicts.js';
 
-// ── Types ────────────────────────────────────────────────────────────────
+// ── Types preserved for back-compat ─────────────────────────────────────
 
 export type IssueSeverity = 'error' | 'warn' | 'info';
 
@@ -30,6 +36,10 @@ export interface PlanIssue {
   message: string;
   repo?: string;
   hint?: string;
+  /** Plan v2 — surfaces the rule that fired so the UI can dedupe + dispatch auto-fix. */
+  ruleId?: string;
+  /** Plan v2 — true if the engine can patch the plan deterministically. */
+  autoFixable?: boolean;
 }
 
 export interface RepoCoverage {
@@ -44,6 +54,8 @@ export interface RepoCoverage {
 export interface PlanValidation {
   generatedAt: string;
   planVersion: number;
+  /** Plan v2 — sha256 of the canonical plan JSON. */
+  planHash?: string;
   issues: PlanIssue[];
   counts: { errors: number; warnings: number; infos: number };
   repoCoverage: RepoCoverage[];
@@ -59,7 +71,7 @@ export interface ValidateOptions {
   maxPerDay?: number;
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+// ── KB index helpers ─────────────────────────────────────────────────────
 
 const ANVIL_HOME = process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil');
 const KB_DIR = join(ANVIL_HOME, 'knowledge-base');
@@ -91,21 +103,26 @@ function loadGraph(project: string, repo: string): GraphData | null {
   }
 }
 
-/**
- * Build a lookup set of every string that could match a "symbol" reference:
- * node ids, labels, names, plus the basename of any referenced file.
- * Matching is case-insensitive and strips common suffixes.
- */
+function buildFileSet(graph: GraphData): Set<string> {
+  const set = new Set<string>();
+  for (const n of graph.nodes ?? []) {
+    for (const v of [n.file, n.path, n.id]) {
+      if (typeof v === 'string' && v.trim() && /[./]/.test(v)) {
+        set.add(v);
+      }
+    }
+  }
+  return set;
+}
+
 function buildSymbolSet(graph: GraphData): Set<string> {
   const set = new Set<string>();
   for (const n of graph.nodes ?? []) {
     for (const v of [n.id, n.name, n.label]) {
       if (typeof v === 'string' && v.trim()) {
         set.add(v.toLowerCase());
-        // Strip common prefixes: "repo::", "file::"
         const stripped = v.replace(/^[^:]+::/, '').toLowerCase();
         if (stripped) set.add(stripped);
-        // Last component after '.' or '/' or ':'
         const tail = v.split(/[./:]/).pop();
         if (tail) set.add(tail.toLowerCase());
       }
@@ -114,16 +131,8 @@ function buildSymbolSet(graph: GraphData): Set<string> {
   return set;
 }
 
-function buildFileSet(graph: GraphData): Set<string> {
-  const set = new Set<string>();
-  for (const n of graph.nodes ?? []) {
-    for (const v of [n.file, n.path, n.id]) {
-      if (typeof v === 'string' && v.trim() && /[./]/.test(v)) {
-        set.add(v.toLowerCase());
-      }
-    }
-  }
-  return set;
+function mapSeverity(s: Issue['severity']): IssueSeverity {
+  return s === 'warning' ? 'warn' : s;
 }
 
 // ── Validator ────────────────────────────────────────────────────────────
@@ -132,183 +141,81 @@ export class PlanValidator {
   constructor(private projectLoader: ProjectLoader) {}
 
   validate(plan: Plan, options: ValidateOptions = {}): PlanValidation {
-    const issues: PlanIssue[] = [];
-    const coverage: RepoCoverage[] = [];
-
-    // 1. Plan-level sanity
-    if (!plan.problem || plan.problem.trim().length < 20) {
-      issues.push({
-        severity: 'warn', path: 'problem',
-        message: 'Problem statement is very short (< 20 chars) — expand for better pipeline output.',
-      });
-    }
-    if (!plan.repos.length) {
-      issues.push({
-        severity: 'error', path: 'repos',
-        message: 'Plan has no affected repositories. Add at least one.',
-      });
-    }
-    if (plan.estimate.usd > 0 && plan.estimate.usd > 100) {
-      issues.push({
-        severity: 'warn', path: 'estimate.usd',
-        message: `Estimated spend is $${plan.estimate.usd.toFixed(2)}. Review scope before executing.`,
-      });
-    }
-
-    // 2. Repo existence — against the project config
     let projectRepos: string[] = [];
     try {
       projectRepos = Object.keys(this.projectLoader.getRepoLocalPaths(plan.project));
-    } catch {
-      issues.push({
-        severity: 'warn', path: 'project',
-        message: `Could not load project "${plan.project}" repo list — skipping repo membership checks.`,
+    } catch { /* project may not be loadable — rules degrade gracefully */ }
+
+    // Per-repo KB indices — fed into the rule engine for KB-grounded checks.
+    const kbFiles: Record<string, Set<string>> = {};
+    const kbSymbols: Record<string, Set<string>> = {};
+    const repoCoverage: RepoCoverage[] = [];
+    for (const r of plan.repos) {
+      const graph = loadGraph(plan.project, r.name);
+      kbFiles[r.name] = graph ? buildFileSet(graph) : new Set();
+      kbSymbols[r.name] = graph ? buildSymbolSet(graph) : new Set();
+      repoCoverage.push({
+        repo: r.name,
+        filesChecked: (r.mustTouch?.length ?? 0) + (r.mustExist?.length ?? 0),
+        filesMissing: 0, // computed below by counting issues per repo
+        symbolsChecked: r.symbols?.length ?? 0,
+        symbolsMissing: 0,
+        kbAvailable: !!graph,
       });
     }
 
-    const repoPathMap: Record<string, string> = (() => {
-      try { return this.projectLoader.getRepoLocalPaths(plan.project); } catch { return {}; }
-    })();
+    const ctx: RuleContext = {
+      project: plan.project,
+      projectRepos,
+      kbFiles,
+      kbSymbols,
+      budget: {
+        medianUsdPerSimilarPlan: null,
+        maxPerRunUsd: options.maxPerRun,
+      },
+    };
 
-    for (let i = 0; i < plan.repos.length; i++) {
-      const r = plan.repos[i];
-      const repoLocalPath = repoPathMap[r.name];
+    const report = runPlanRules(plan, ctx);
 
-      if (projectRepos.length && !projectRepos.includes(r.name)) {
-        issues.push({
-          severity: 'error',
-          path: `repos[${i}].name`,
-          repo: r.name,
-          message: `Repo "${r.name}" is not registered in the project. Known repos: ${projectRepos.join(', ') || '(none)'}`,
-        });
-      }
-
-      // 3. Per-repo validation (files + symbols via KB)
-      const graph = loadGraph(plan.project, r.name);
-      const cov: RepoCoverage = {
-        repo: r.name,
-        filesChecked: r.files.length,
-        filesMissing: 0,
-        symbolsChecked: r.symbols.length,
-        symbolsMissing: 0,
-        kbAvailable: !!graph,
+    // Re-shape into the legacy PlanIssue list the UI consumes.
+    const issues: PlanIssue[] = report.issues.map((i) => {
+      const repoMatch = i.path.match(/^repos\[(\d+)\]/);
+      const repoName = repoMatch ? plan.repos[parseInt(repoMatch[1], 10)]?.name : undefined;
+      return {
+        severity: mapSeverity(i.severity),
+        path: i.path,
+        message: i.message,
+        ruleId: i.ruleId,
+        autoFixable: i.autoFixable,
+        ...(repoName ? { repo: repoName } : {}),
+        ...(i.fixHint ? { hint: i.fixHint } : {}),
       };
+    });
 
-      // File existence — prefer disk check (authoritative); fall back to KB.
-      const kbFileSet = graph ? buildFileSet(graph) : null;
-      for (let j = 0; j < r.files.length; j++) {
-        const f = r.files[j];
-        if (!f) continue;
-        let exists = false;
-        if (repoLocalPath) {
-          exists = existsSync(join(repoLocalPath, f));
-        } else if (kbFileSet) {
-          const needle = f.toLowerCase();
-          for (const entry of kbFileSet) {
-            if (entry === needle || entry.endsWith('/' + needle) || entry.endsWith(needle)) {
-              exists = true; break;
-            }
-          }
-        } else {
-          // Nothing to check against — info only
-          issues.push({
-            severity: 'info',
-            path: `repos[${i}].files[${j}]`,
-            repo: r.name,
-            message: `Cannot verify file "${f}" — no local repo path and no KB.`,
-          });
-          continue;
-        }
-        if (!exists) {
-          const isNew = /\/(new|add|create)/.test(r.changes.toLowerCase())
-            || f.toLowerCase().includes('new');
-          issues.push({
-            severity: isNew ? 'info' : 'warn',
-            path: `repos[${i}].files[${j}]`,
-            repo: r.name,
-            message: `File "${f}" not found in ${r.name}.${isNew ? ' (may be intentional if new.)' : ''}`,
-            hint: isNew ? undefined : 'Check the path or add as new file in changes description.',
-          });
-          cov.filesMissing++;
-        }
-      }
-
-      // Symbol existence — KB only.
-      if (graph) {
-        const symbolSet = buildSymbolSet(graph);
-        for (let j = 0; j < r.symbols.length; j++) {
-          const s = r.symbols[j];
-          if (!s) continue;
-          const needle = s.toLowerCase();
-          const tail = needle.split(/[./:]/).pop() ?? needle;
-          if (!symbolSet.has(needle) && !symbolSet.has(tail)) {
-            issues.push({
-              severity: 'info',
-              path: `repos[${i}].symbols[${j}]`,
-              repo: r.name,
-              message: `Symbol "${s}" not found in KB for ${r.name} (may be a new symbol).`,
-            });
-            cov.symbolsMissing++;
-          }
-        }
-      } else if (r.symbols.length > 0) {
-        issues.push({
-          severity: 'info',
-          path: `repos[${i}].symbols`,
-          repo: r.name,
-          message: `No KB available for ${r.name} — cannot validate ${r.symbols.length} symbol(s). Run Knowledge Base refresh.`,
-        });
-      }
-
-      coverage.push(cov);
+    // Bump per-repo missing counts so the UI's coverage card stays useful.
+    for (const i of issues) {
+      if (!i.repo) continue;
+      const cov = repoCoverage.find((c) => c.repo === i.repo);
+      if (!cov) continue;
+      if (i.ruleId?.startsWith('KB.file-')) cov.filesMissing++;
+      if (i.ruleId?.startsWith('KB.symbol-')) cov.symbolsMissing++;
     }
 
-    // 4. Contract consistency
-    for (let i = 0; i < plan.contracts.length; i++) {
-      const c = plan.contracts[i];
-      const planRepoNames = plan.repos.map((r) => r.name);
-      if (c.producer && !planRepoNames.includes(c.producer)) {
-        issues.push({
-          severity: 'warn',
-          path: `contracts[${i}].producer`,
-          message: `Producer "${c.producer}" for contract "${c.name}" is not in the plan's affected repos.`,
-        });
-      }
-      for (let j = 0; j < c.consumers.length; j++) {
-        const con = c.consumers[j];
-        if (con && !planRepoNames.includes(con)) {
-          issues.push({
-            severity: 'warn',
-            path: `contracts[${i}].consumers[${j}]`,
-            message: `Consumer "${con}" for contract "${c.name}" is not in the plan's affected repos.`,
-          });
-        }
-      }
-    }
-
-    // ── Phase-2 extension rules ──────────────────────────────────────────
-    // Each rule is additive — failures/absence never break the core validation.
-
-    // 5. Budget
+    // ── Add-on rules (budget / PR conflicts) — non-fatal, additive ──────
     if (options.maxPerRun || options.maxPerDay) {
       try {
-        issues.push(...checkBudget(plan, {
+        const budgetIssues = checkBudget(plan, {
           anvilHome: ANVIL_HOME,
           maxPerRun: options.maxPerRun,
           maxPerDay: options.maxPerDay,
-        }));
-      } catch { /* rule failure is non-fatal */ }
+        });
+        for (const b of budgetIssues) issues.push({ ...b, ruleId: 'BUDGET.guard' });
+      } catch { /* non-fatal */ }
     }
-
-    // 6. Conventions check removed (was reading a legacy bespoke file).
-    //    Add back here once convention-core grows a plan-shaped check API.
-
-    // 7. Open-PR conflicts (deep only — hits gh CLI)
     if (options.deep && options.githubByRepoName) {
       try {
-        issues.push(...checkPrConflicts(plan, {
-          githubByRepoName: options.githubByRepoName,
-        }));
+        const prIssues = checkPrConflicts(plan, { githubByRepoName: options.githubByRepoName });
+        for (const p of prIssues) issues.push({ ...p, ruleId: 'PR.conflict' });
       } catch { /* non-fatal */ }
     }
 
@@ -321,9 +228,10 @@ export class PlanValidator {
     return {
       generatedAt: new Date().toISOString(),
       planVersion: plan.version,
+      planHash: plan.contentHash,
       issues,
       counts,
-      repoCoverage: coverage,
+      repoCoverage,
     };
   }
 }

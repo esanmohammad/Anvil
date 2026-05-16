@@ -90,35 +90,47 @@ export async function pickAliveModelFromChain(
  * earlier in this run. They're skipped even if their provider's
  * liveness probe says alive.
  */
+export interface ChainWalkSkip {
+  model: string;
+  reason: 'burned' | 'liveness-dead';
+}
+
 export function pickAliveModelFromChainSync(
   chain: ResolvedChain,
   providerOf: (modelId: string) => ProviderName,
   excludeModels: ReadonlySet<string> = new Set(),
-): { model: string; provider: ProviderName; fellBackFrom?: string } {
+): { model: string; provider: ProviderName; fellBackFrom?: string; skipped?: ChainWalkSkip[] } {
   const candidates: Array<{ model: string; isFallback: boolean }> = [
     { model: chain.primary, isFallback: false },
     ...chain.fallbacks.map((fb) => ({ model: fb.model, isFallback: true })),
   ];
 
   let firstSkippedPrimary: string | undefined;
+  const skipped: ChainWalkSkip[] = [];
   for (const c of candidates) {
     if (excludeModels.has(c.model)) {
       if (!c.isFallback) firstSkippedPrimary = c.model;
+      skipped.push({ model: c.model, reason: 'burned' });
       continue;
     }
     const provider = providerOf(c.model);
     const rec = cache.get(provider);
     if (!rec || rec.alive) {
+      const fellBack = c.isFallback || firstSkippedPrimary;
       return {
         model: c.model,
         provider,
-        ...(c.isFallback || firstSkippedPrimary
-          ? { fellBackFrom: firstSkippedPrimary ?? chain.primary }
-          : {}),
+        ...(fellBack ? { fellBackFrom: firstSkippedPrimary ?? chain.primary } : {}),
+        ...(skipped.length > 0 ? { skipped } : {}),
       };
     }
+    skipped.push({ model: c.model, reason: 'liveness-dead' });
   }
-  return { model: chain.primary, provider: providerOf(chain.primary) };
+  return {
+    model: chain.primary,
+    provider: providerOf(chain.primary),
+    ...(skipped.length > 0 ? { skipped } : {}),
+  };
 }
 
 /**

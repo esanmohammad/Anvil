@@ -1,16 +1,18 @@
 /**
  * PlanStore — structured plan artifacts with versioned persistence.
  *
- * A Plan is a typed object produced by the /plan flow BEFORE the pipeline
- * runs. Plans are the contract between idea and implementation: they describe
- * the problem, scope, affected repos, cross-repo contracts, risks, rollout,
- * and tests, and estimate cost/time/PRs.
+ * A Plan is a typed object produced by the /plan flow BEFORE the
+ * pipeline runs. v2 (canonical) makes the plan a machine-verifiable
+ * contract: every field has a deterministic verifier downstream.
  *
  * Storage layout:
  *   ~/.anvil/plans/<project>/<slug>/
  *   ├── v1.json, v2.json, ...       # versioned plan snapshots
  *   ├── current.json                # { currentVersion: N, slug, title, updatedAt }
  *   └── validation.json             # last validator result (may be stale)
+ *
+ * Old v1-shaped JSON on disk is migrated through
+ * `migratePlanJsonToV2()` on read; writes are always v2.
  */
 
 import {
@@ -25,98 +27,45 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 
-// ── Types ────────────────────────────────────────────────────────────────
+import type {
+  Plan,
+  PlanPointer,
+  PlanComment,
+  PlanApproval,
+  PlanSection,
+  PlanRepoImpact,
+  PlanContract,
+  PlanRisk,
+  PlanRollout,
+  PlanTests,
+  PlanEstimate,
+  RiskSeverity,
+  ContractKind,
+} from '@esankhan3/anvil-core-pipeline';
+import {
+  migratePlanJsonToV2,
+  emptyPlanV2,
+  planContentHash,
+  planRepoTouchedPaths,
+  planContractDisplayName,
+  planContractDescription,
+} from '@esankhan3/anvil-core-pipeline';
 
-export type RiskSeverity = 'low' | 'med' | 'high';
-export type ContractKind = 'http' | 'grpc' | 'kafka' | 'db' | 'other';
-
-export interface PlanRepoImpact {
-  name: string;
-  changes: string;
-  files: string[];
-  symbols: string[];
-}
-
-export interface PlanContract {
-  kind: ContractKind;
-  name: string;
-  producer: string;
-  consumers: string[];
-  description: string;
-}
-
-export interface PlanRisk {
-  title: string;
-  mitigation: string;
-  severity: RiskSeverity;
-}
-
-export interface PlanRollout {
-  strategy: string;
-  flags: string[];
-  order: string[];
-  rollback: string;
-}
-
-export interface PlanTests {
-  unit: string[];
-  integration: string[];
-  manual: string[];
-}
-
-export interface PlanEstimate {
-  usd: number;
-  minutes: number;
-  prs: number;
-}
-
-export interface Plan {
-  version: number;
-  slug: string;
-  project: string;
-  title: string;
-  problem: string;
-  scope: { inScope: string[]; outOfScope: string[] };
-  repos: PlanRepoImpact[];
-  contracts: PlanContract[];
-  architecture: { mermaid: string; notes: string };
-  risks: PlanRisk[];
-  rollout: PlanRollout;
-  tests: PlanTests;
-  estimate: PlanEstimate;
-  model: string;
-  feature: string;             // original feature description
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface PlanPointer {
-  slug: string;
-  title: string;
-  currentVersion: number;
-  updatedAt: string;
-}
-
-export type PlanSection =
-  | 'problem' | 'scope' | 'repos' | 'contracts' | 'architecture'
-  | 'risks' | 'rollout' | 'tests' | 'estimate';
-
-export interface PlanComment {
-  id: string;              // `c-${Date.now().toString(36)}-${randHex}`
-  sectionPath: string;     // e.g. "problem", "repos[2].files", "risks[0]"
-  author: string;          // from ANVIL_USER_NAME env or 'anonymous'
-  body: string;
-  createdAt: string;       // ISO
-  resolved: boolean;
-}
-
-export interface PlanApproval {
-  id: string;
-  user: string;
-  approvedVersion: number;
-  approvedAt: string;
-  note?: string;
-}
+export type {
+  Plan,
+  PlanPointer,
+  PlanComment,
+  PlanApproval,
+  PlanSection,
+  PlanRepoImpact,
+  PlanContract,
+  PlanRisk,
+  PlanRollout,
+  PlanTests,
+  PlanEstimate,
+  RiskSeverity,
+  ContractKind,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -124,6 +73,15 @@ function atomicWriteFileSync(filePath: string, data: string): void {
   const tmp = filePath + '.tmp';
   writeFileSync(tmp, data, 'utf-8');
   renameSync(tmp, filePath);
+}
+
+function readPlanJsonSync(filePath: string): Plan | null {
+  try {
+    const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+    return migratePlanJsonToV2(raw);
+  } catch {
+    return null;
+  }
 }
 
 function readJsonSync<T>(filePath: string): T | null {
@@ -201,7 +159,7 @@ export class PlanStore {
 
   // ── CRUD ──────────────────────────────────────────────────────────────
 
-  /** Create v1 of a new plan from a partial payload. */
+  /** Create v1 of a new plan from a partial payload. Always written v2. */
   createPlan(project: string, feature: string, model: string, seed: Partial<Plan> = {}): Plan {
     const baseSlug = slugify(seed.title || feature);
     const slug = this.uniqueSlug(project, baseSlug);
@@ -209,31 +167,28 @@ export class PlanStore {
     ensureDir(dir);
 
     const now = new Date().toISOString();
-    const plan: Plan = {
-      version: 1,
+    // Build a fresh v2 plan with sensible defaults, then overlay the
+    // caller's seed (v2-shaped or v1-shaped — migrator handles both).
+    const skeleton = emptyPlanV2(project, feature, model);
+    const merged: Plan = migratePlanJsonToV2({
+      ...skeleton,
+      ...seed,
       slug,
       project,
       title: seed.title || feature.slice(0, 80),
-      problem: seed.problem ?? feature,
-      scope: seed.scope ?? { inScope: [], outOfScope: [] },
-      repos: seed.repos ?? [],
-      contracts: seed.contracts ?? [],
-      architecture: seed.architecture ?? { mermaid: '', notes: '' },
-      risks: seed.risks ?? [],
-      rollout: seed.rollout ?? { strategy: '', flags: [], order: [], rollback: '' },
-      tests: seed.tests ?? { unit: [], integration: [], manual: [] },
-      estimate: seed.estimate ?? { usd: 0, minutes: 0, prs: 0 },
-      model,
-      feature,
+      version: 1,
+      parentVersion: null,
       createdAt: now,
       updatedAt: now,
-    };
-
-    atomicWriteFileSync(this.versionPath(project, slug, 1), JSON.stringify(plan, null, 2));
-    this.writePointer(project, slug, {
-      slug, title: plan.title, currentVersion: 1, updatedAt: now,
+      model,
+      feature,
     });
-    return plan;
+
+    atomicWriteFileSync(this.versionPath(project, slug, 1), JSON.stringify(merged, null, 2));
+    this.writePointer(project, slug, {
+      slug, title: merged.title, currentVersion: 1, updatedAt: now,
+    });
+    return merged;
   }
 
   /** Append a new version by merging updates into the current version. */
@@ -241,7 +196,7 @@ export class PlanStore {
     const current = this.readCurrent(project, slug);
     if (!current) throw new Error(`Plan not found: ${project}/${slug}`);
 
-    const next: Plan = {
+    const merged: Plan = migratePlanJsonToV2({
       ...current,
       ...updates,
       // never let callers rewrite identity
@@ -249,26 +204,31 @@ export class PlanStore {
       project: current.project,
       createdAt: current.createdAt,
       version: current.version + 1,
+      parentVersion: current.version,
       updatedAt: new Date().toISOString(),
-    };
-
-    atomicWriteFileSync(this.versionPath(project, slug, next.version), JSON.stringify(next, null, 2));
-    this.writePointer(project, slug, {
-      slug, title: next.title, currentVersion: next.version, updatedAt: next.updatedAt,
     });
-    return next;
+    // The migrator stamped a fresh contentHash; if the caller passed
+    // `approval`, leave it stamped (rules will flag if it doesn't
+    // match the new hash).
+    merged.contentHash = planContentHash(merged);
+
+    atomicWriteFileSync(this.versionPath(project, slug, merged.version), JSON.stringify(merged, null, 2));
+    this.writePointer(project, slug, {
+      slug, title: merged.title, currentVersion: merged.version, updatedAt: merged.updatedAt,
+    });
+    return merged;
   }
 
-  /** Read the current (latest) version. */
+  /** Read the current (latest) version — auto-migrates on-disk v1 JSON. */
   readCurrent(project: string, slug: string): Plan | null {
     const pointer = readJsonSync<PlanPointer>(this.pointerPath(project, slug));
     if (!pointer) return null;
-    return readJsonSync<Plan>(this.versionPath(project, slug, pointer.currentVersion));
+    return readPlanJsonSync(this.versionPath(project, slug, pointer.currentVersion));
   }
 
   /** Read a specific version. */
   readVersion(project: string, slug: string, version: number): Plan | null {
-    return readJsonSync<Plan>(this.versionPath(project, slug, version));
+    return readPlanJsonSync(this.versionPath(project, slug, version));
   }
 
   /** List all versions for a plan (sorted ascending). */
@@ -311,31 +271,50 @@ export class PlanStore {
     const lines: string[] = [];
     lines.push(`# ${plan.title}`);
     lines.push(`> Plan v${plan.version} — ${plan.project} — ${plan.model}`);
+    if (plan.contentHash) lines.push(`> hash: \`${plan.contentHash.slice(0, 12)}\``);
     lines.push('');
-    lines.push('## Problem'); lines.push(plan.problem); lines.push('');
+    lines.push('## Problem');
+    lines.push(plan.problem.statement);
+    if (plan.problem.why_now) lines.push(`\n**Why now:** ${plan.problem.why_now}`);
+    if (plan.problem.success_signals.length) {
+      lines.push('\n**Success signals:**');
+      for (const s of plan.problem.success_signals) lines.push(`- ${s}`);
+    }
+    lines.push('');
 
     lines.push('## Scope');
     lines.push('**In scope**');
-    for (const s of plan.scope.inScope) lines.push(`- ${s}`);
+    for (const s of plan.scope.inScope) {
+      lines.push(`- **${s.id}** — ${s.description}`);
+      for (const a of s.acceptance) lines.push(`  - _Acceptance:_ ${a}`);
+    }
     lines.push('');
     lines.push('**Out of scope**');
-    for (const s of plan.scope.outOfScope) lines.push(`- ${s}`);
+    for (const s of plan.scope.outOfScope) lines.push(`- ${s.description}`);
     lines.push('');
 
     lines.push('## Affected repositories');
     for (const r of plan.repos) {
       lines.push(`### ${r.name}`);
       lines.push(r.changes);
-      if (r.files.length) lines.push(`\n**Files:** ${r.files.map((f) => `\`${f}\``).join(', ')}`);
-      if (r.symbols.length) lines.push(`\n**Symbols:** ${r.symbols.map((s) => `\`${s}\``).join(', ')}`);
+      const touched = planRepoTouchedPaths(r);
+      if (touched.length) lines.push(`\n**Files:** ${touched.map((f) => `\`${f}\``).join(', ')}`);
+      if (r.symbols.length) lines.push(`\n**Symbols:** ${r.symbols.map((s) => `\`${s.name}\``).join(', ')}`);
       lines.push('');
     }
 
     if (plan.contracts.length) {
       lines.push('## Cross-repo contracts');
       for (const c of plan.contracts) {
-        lines.push(`- **${c.kind.toUpperCase()} · ${c.name}** — ${c.producer} → ${c.consumers.join(', ') || '(none)'}`);
-        lines.push(`  ${c.description}`);
+        lines.push(`- **${planContractDisplayName(c)}** — ${planContractDescription(c)}`);
+      }
+      lines.push('');
+    }
+
+    if (plan.data.length) {
+      lines.push('## Data changes');
+      for (const d of plan.data) {
+        lines.push(`- **${d.kind}** in \`${d.repo}\` — \`${d.migrationFile}\` (rollback: ${d.rollback || '_not declared_'})`);
       }
       lines.push('');
     }
@@ -353,34 +332,44 @@ export class PlanStore {
 
     if (plan.risks.length) {
       lines.push('## Risks');
-      for (const r of plan.risks) lines.push(`- **[${r.severity}] ${r.title}** — ${r.mitigation}`);
+      for (const r of plan.risks) lines.push(`- **[${r.severity}/${r.blastRadius}] ${r.title}** — ${r.mitigation}`);
       lines.push('');
     }
 
     lines.push('## Rollout');
-    if (plan.rollout.strategy) lines.push(plan.rollout.strategy);
+    if (plan.rollout.strategy) lines.push(`- Strategy: \`${plan.rollout.strategy}\``);
     if (plan.rollout.flags.length) lines.push(`- Flags: ${plan.rollout.flags.join(', ')}`);
     if (plan.rollout.order.length) lines.push(`- Order: ${plan.rollout.order.join(' → ')}`);
-    if (plan.rollout.rollback) lines.push(`- Rollback: ${plan.rollout.rollback}`);
+    if (plan.rollout.rollback.command) lines.push(`- Rollback: \`${plan.rollout.rollback.command}\``);
+    if (plan.rollout.rollback.verify) lines.push(`  (verify: \`${plan.rollout.rollback.verify}\`)`);
     lines.push('');
 
     lines.push('## Tests');
     if (plan.tests.unit.length) {
       lines.push('**Unit**');
-      for (const t of plan.tests.unit) lines.push(`- ${t}`);
+      for (const t of plan.tests.unit) lines.push(`- \`${t.name}\` in \`${t.file}\` — given ${t.given} when ${t.when} then ${t.then}`);
     }
     if (plan.tests.integration.length) {
       lines.push('**Integration**');
-      for (const t of plan.tests.integration) lines.push(`- ${t}`);
+      for (const t of plan.tests.integration) lines.push(`- \`${t.name}\` in \`${t.file}\` — given ${t.given} when ${t.when} then ${t.then}`);
     }
-    if (plan.tests.manual.length) {
+    if (plan.tests.manual?.length) {
       lines.push('**Manual**');
-      for (const t of plan.tests.manual) lines.push(`- ${t}`);
+      for (const t of plan.tests.manual) lines.push(`- ${t.description}`);
     }
     lines.push('');
 
     lines.push('## Estimate');
     lines.push(`- ~$${plan.estimate.usd.toFixed(2)} · ${plan.estimate.minutes} min · ${plan.estimate.prs} PR(s)`);
+    if (plan.estimate.calibratedFrom?.length) {
+      lines.push(`- Calibrated from: ${plan.estimate.calibratedFrom.join(', ')}`);
+    }
+
+    if (plan.approval) {
+      lines.push('');
+      lines.push(`## Approval`);
+      lines.push(`Approved by **${plan.approval.user}** at ${plan.approval.approvedAt} (hash: \`${plan.approval.planHash.slice(0, 12)}\`).`);
+    }
 
     return lines.join('\n');
   }
@@ -407,12 +396,6 @@ export class PlanStore {
   }
 
   // ── Comments ──────────────────────────────────────────────────────────
-  //
-  // Comments are stored per-plan (NOT per-version) because a review
-  // conversation is about the plan as a whole; tying comments to an immutable
-  // version snapshot would orphan them every time the plan is bumped. The
-  // optional `sectionPath` field lets UIs surface comments next to the
-  // section they reference.
 
   listComments(project: string, slug: string): PlanComment[] {
     const data = readJsonSync<PlanComment[]>(this.commentsPath(project, slug));
@@ -469,12 +452,6 @@ export class PlanStore {
   }
 
   // ── Approvals ─────────────────────────────────────────────────────────
-  //
-  // Approvals pin to the plan's current version at the moment of approval.
-  // Bumping the plan (new version) does NOT delete prior approvals — we
-  // simply stop counting them toward the gate. This preserves the audit
-  // trail of who approved which version while ensuring the freshest version
-  // must be re-approved before the pipeline can run.
 
   listApprovals(project: string, slug: string): PlanApproval[] {
     const data = readJsonSync<PlanApproval[]>(this.approvalsPath(project, slug));
@@ -504,6 +481,27 @@ export class PlanStore {
       this.approvalsPath(project, slug),
       JSON.stringify(approvals, null, 2),
     );
+    // Phase C: stamp the active approval onto the plan version so the
+    // execute-plan gate can read it without joining files. planHash
+    // pins the approval to the content — subsequent edits invalidate it.
+    try {
+      const plan = this.readCurrent(project, slug);
+      if (plan) {
+        const stamped: Plan = {
+          ...plan,
+          approval: {
+            user,
+            approvedAt: approval.approvedAt,
+            planHash: plan.contentHash,
+            ...(note !== undefined ? { note } : {}),
+          },
+        };
+        atomicWriteFileSync(
+          this.versionPath(project, slug, plan.version),
+          JSON.stringify(stamped, null, 2),
+        );
+      }
+    } catch { /* leave the legacy approvals list as the audit trail */ }
     return approval;
   }
 
@@ -517,7 +515,6 @@ export class PlanStore {
     if (!pointer) return false;
     const matching = this.listApprovals(project, slug)
       .filter((a) => a.approvedVersion === pointer.currentVersion);
-    // Unique by user so the same approver cannot double-count.
     const uniqueUsers = new Set(matching.map((a) => a.user));
     return uniqueUsers.size >= required;
   }

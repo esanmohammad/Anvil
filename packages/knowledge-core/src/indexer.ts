@@ -13,7 +13,7 @@ import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { detectCrossRepoEdges } from '@esankhan3/anvil-knowledge-core';
 import { detectWorkspace } from '@esankhan3/anvil-knowledge-core';
 import { HybridRetriever } from './retriever.js';
-import { loadKnowledgeConfig, getKnowledgeBasePath, DEFAULT_CONFIG } from '@esankhan3/anvil-knowledge-core';
+import { loadKnowledgeConfig, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
 import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap } from '@esankhan3/anvil-knowledge-core';
 import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
@@ -662,6 +662,8 @@ export async function buildKBFromPath(
     onProgress?: (msg: string) => void;
     onDetailedProgress?: (progress: IndexProgress) => void;
     force?: boolean;
+    /** Explicit config — overrides the default project-yaml/env lookup. P2 entry point. */
+    config?: KnowledgeConfig;
   },
 ): Promise<BuildKBResult> {
   const log = opts?.onProgress ?? (() => {});
@@ -670,7 +672,8 @@ export async function buildKBFromPath(
   if (repos.length === 0) throw new Error(`No git repos found in ${directoryPath}`);
   log(`Discovered ${repos.length} repos`);
   const indexer = new KnowledgeIndexer();
-  return indexer.buildKB(projectName, repos, DEFAULT_CONFIG, opts);
+  const config = opts?.config ?? loadKnowledgeConfig(projectName);
+  return indexer.buildKB(projectName, repos, config, opts);
 }
 
 /**
@@ -682,10 +685,13 @@ export async function embedFromPath(
   opts?: {
     onProgress?: (msg: string) => void;
     onDetailedProgress?: (progress: IndexProgress) => void;
+    /** Explicit config — overrides the default project-yaml/env lookup. */
+    config?: KnowledgeConfig;
   },
 ): Promise<IndexStats> {
   const indexer = new KnowledgeIndexer();
-  return indexer.embedChunks(projectName, DEFAULT_CONFIG, opts);
+  const config = opts?.config ?? loadKnowledgeConfig(projectName);
+  return indexer.embedChunks(projectName, config, opts);
 }
 
 /**
@@ -698,6 +704,8 @@ export async function indexFromPath(
     onProgress?: (msg: string) => void;
     onDetailedProgress?: (progress: IndexProgress) => void;
     force?: boolean;
+    /** Explicit config — overrides the default project-yaml/env lookup. */
+    config?: KnowledgeConfig;
   },
 ): Promise<IndexStats> {
   const log = opts?.onProgress ?? (() => {});
@@ -706,7 +714,8 @@ export async function indexFromPath(
   if (repos.length === 0) throw new Error(`No git repos found in ${directoryPath}`);
   log(`Discovered ${repos.length} repos`);
   const indexer = new KnowledgeIndexer();
-  return indexer.indexProject(projectName, repos, DEFAULT_CONFIG, opts);
+  const config = opts?.config ?? loadKnowledgeConfig(projectName);
+  return indexer.indexProject(projectName, repos, config, opts);
 }
 
 function formatEta(seconds: number): string {
@@ -721,9 +730,21 @@ function formatEta(seconds: number): string {
 // Convenience: get a ready-to-use retriever for an already-indexed project
 // ---------------------------------------------------------------------------
 
-/** Load an existing index and return a configured HybridRetriever with query routing. */
-export async function getRetriever(project: string): Promise<HybridRetriever> {
-  const config = loadKnowledgeConfig(project);
+/**
+ * Load an existing index and return a configured HybridRetriever with
+ * query routing. Caller may pass an explicit config to bypass the
+ * project-yaml/env lookup (P2 entry point).
+ *
+ * Cross-cutting safety: validates that the configured embedding provider
+ * matches what was used at index time. On mismatch, throws a hard error
+ * before any vector search runs — silent vector-space drift is the
+ * canonical "results are garbage and there's no error" symptom.
+ */
+export async function getRetriever(
+  project: string,
+  configOverride?: KnowledgeConfig,
+): Promise<HybridRetriever> {
+  const config = configOverride ?? loadKnowledgeConfig(project);
   const basePath = getKnowledgeBasePath(project);
 
   // Load vector store
@@ -746,6 +767,29 @@ export async function getRetriever(project: string): Promise<HybridRetriever> {
 
   // Create embedding provider for query-time embedding
   const embedder = createEmbeddingProvider(config.embedding);
+
+  // Vector-space safety: refuse to run if the index was embedded with a
+  // different provider/dimension than what the current config resolves to.
+  // Garbage results from silent space mismatch are worse than a hard error.
+  try {
+    if (existsSync(basePath)) {
+      for (const entry of readdirSync(basePath)) {
+        const meta = readRepoIndexMeta(basePath, entry);
+        if (!meta || !meta.embeddingProvider || meta.embeddingProvider === 'pending') continue;
+        if (meta.embeddingProvider !== embedder.name) {
+          throw new Error(
+            `[knowledge-core] Vector-space mismatch for repo "${entry}": ` +
+            `index built with "${meta.embeddingProvider}" but retrieval is using "${embedder.name}". ` +
+            `Reindex with consistent embedding provider, or revert the config change. ` +
+            `(set CODE_SEARCH_EMBEDDING_PROVIDER or config.embedding.provider to match the index.)`,
+          );
+        }
+      }
+    }
+  } catch (err) {
+    // Only re-throw the explicit mismatch error; ignore IO errors.
+    if (err instanceof Error && err.message.startsWith('[knowledge-core] Vector-space mismatch')) throw err;
+  }
 
   // Create reranker (ollama by default, graceful fallback)
   let reranker = null;

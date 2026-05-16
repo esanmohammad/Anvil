@@ -292,6 +292,22 @@ export class AdkAdapter implements ModelAdapter {
 
       buffered.flush();
 
+      // Silent-empty defense: ADK's Runner can terminate without emitting
+      // final assistant text (model refused, hit a safety filter, or the
+      // SDK swallowed an internal error). Surface as a retryable
+      // UpstreamError so `runStageWithFallback` walks the chain to the
+      // next model instead of writing a 0-byte / near-empty artifact
+      // downstream. Mirrors the openrouter / ollama / claude empty-output
+      // contract. `aborted` skips this — caller-driven cancellation is
+      // not retryable.
+      if (!finalText.trim() && !ac.signal.aborted) {
+        throw new UpstreamError(
+          503,
+          `adk model "${config.model}" returned empty final text (outputTokens=${totalOutputTokens})`,
+          { provider: this.provider, retryable: true },
+        );
+      }
+
       const pricing = this.getModelPricing(config.model);
       const costUsd = pricing
         ? (totalInputTokens * pricing[0] + totalOutputTokens * pricing[1]) / 1_000_000

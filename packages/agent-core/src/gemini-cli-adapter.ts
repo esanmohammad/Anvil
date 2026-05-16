@@ -164,6 +164,21 @@ export class GeminiCliAdapter implements ModelAdapter {
       throw new Error(`Gemini CLI exited with code ${exitCode}${stderrBuf ? `\n${stderrBuf.slice(0, 400)}` : ''}`);
     }
 
+    // Silent-empty defense: gemini-cli can exit 0 with empty stdout
+    // (safety filter hit, blocked content, prompt rejection logged
+    // only to stderr). The `exitCode !== 0 && !fullText.trim()` branch
+    // above only catches non-zero exits. This branch catches the
+    // "exit 0 but nothing produced" case — surface as retryable so
+    // the chain walker tries the next model. Mirrors openrouter /
+    // ollama / claude / adk / gemini contract.
+    if (exitCode === 0 && !fullText.trim()) {
+      throw new UpstreamError(
+        503,
+        `gemini-cli model "${config.model}" exited 0 with empty stdout${stderrBuf ? ` (stderr: ${stderrBuf.slice(0, 200)})` : ''}`,
+        { provider: 'gemini-cli', retryable: true },
+      );
+    }
+
     // ---- Emit Anvil Stream Format ------------------------------------------
     const outputText = fullText.trim();
 

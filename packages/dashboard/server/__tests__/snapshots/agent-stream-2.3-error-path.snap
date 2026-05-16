@@ -1,0 +1,17 @@
+[
+  {
+    "entries": [
+      {
+        "kind": "stderr",
+        "stage": "agent",
+        "tool": null,
+        "type": "stderr"
+      }
+    ],
+    "hasRunId": false,
+    "type": "agent-output"
+  },
+  {
+    "type": "agent-error"
+  }
+]

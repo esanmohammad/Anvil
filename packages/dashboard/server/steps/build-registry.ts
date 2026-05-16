@@ -28,7 +28,7 @@ import type { MemoryStore } from '../memory-store.js';
 import {
   FEATURE_MANIFEST_STAGES,
   createFeatureManifestStep,
-} from './feature-manifest.step.js';
+} from '@esankhan3/anvil-core-pipeline';
 
 /**
  * Run-scoped deps the dashboard's Steps will close over. Everything is

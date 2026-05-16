@@ -20,12 +20,13 @@ import {
   createPlanRiskStep,
   PLAN_RISK_ARTIFACT_ID,
 } from '../steps/index.js';
-import { scorePlan } from '../plan-risk-scorer.js';
-import type { Plan } from '../plan-store.js';
-import type { RiskScore } from '../plan-risk-types.js';
+import { scorePlan, migratePlanJsonToV2 } from '@esankhan3/anvil-core-pipeline';
+import type { Plan, RiskScore } from '@esankhan3/anvil-core-pipeline';
 
-function makePlan(overrides: Partial<Plan> = {}): Plan {
-  return {
+function makePlan(overrides: Record<string, unknown> = {}): Plan {
+  // Use the migrator so we exercise the v1→v2 promotion AND keep the
+  // fixture concise (callers only set the fields the test cares about).
+  return migratePlanJsonToV2({
     version: 1,
     slug: 'add-login',
     project: 'demo',
@@ -33,27 +34,21 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     problem: 'Users cannot sign in',
     scope: { inScope: ['login form'], outOfScope: ['oauth'] },
     repos: [
-      {
-        repo: 'api',
-        files: ['api/routes/auth.ts', 'api/middleware/session.ts'],
-      } as never,
-      {
-        repo: 'web',
-        files: ['web/pages/login.tsx'],
-      } as never,
+      { name: 'api', changes: '', files: ['api/routes/auth.ts', 'api/middleware/session.ts'], symbols: [] },
+      { name: 'web', changes: '', files: ['web/pages/login.tsx'], symbols: [] },
     ],
     contracts: [],
     architecture: { mermaid: '', notes: '' },
     risks: [],
-    rollout: { phases: [] } as never,
-    tests: { coverage: [] } as never,
-    estimate: { effortDays: 1 } as never,
+    rollout: { strategy: 'direct', flags: [], order: [], rollback: '' },
+    tests: { unit: [], integration: [], manual: [] },
+    estimate: { usd: 0, minutes: 0, prs: 1 },
     model: 'claude-sonnet-4-6',
     feature: 'add login',
     createdAt: '2026-04-29T00:00:00.000Z',
     updatedAt: '2026-04-29T00:00:00.000Z',
     ...overrides,
-  };
+  });
 }
 
 async function runWithPlan(

@@ -80,6 +80,20 @@ export class OpenCodeAdapter extends OpenRouterAdapter {
     };
   }
 
+  /**
+   * OpenCode's proxy strictly validates assistant message shape and
+   * rejects `reasoning` / `reasoning_details` with
+   * `invalid_request_error: Extra inputs are not permitted, field:
+   * 'messages[N].reasoning(_details)'` (observed on Kimi K2.6,
+   * confirmed by anomalyco/opencode #14716 — "OpenCode should not
+   * include reasoning metadata in subsequent message transmissions").
+   * The proxy handles reasoning internally; the client should send
+   * the standard OpenAI-compat shape without sibling fields.
+   */
+  protected override stripReasoningEcho(): boolean {
+    return true;
+  }
+
   // -- Model id handling ----------------------------------------------------
 
   override supportsModel(modelId: string): boolean {

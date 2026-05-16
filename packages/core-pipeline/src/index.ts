@@ -5,9 +5,146 @@
  * lifecycle hooks. See CORE-PIPELINE-EXTRACT-PLAN.md for the phased rollout.
  */
 
+// Phase G — *Like interfaces for FS-backed dashboard storage layers
+export type {
+  FeatureStoreLike,
+  FeatureManifestStoreLike,
+  KbManagerLike,
+  ProjectLoaderLike,
+} from './storage-like.js';
+
+// Phase H — Step factories
+export {
+  createClarifyStep,
+  CLARIFY_QA_ARTIFACT_ID,
+} from './steps/clarify.step.js';
+export type {
+  ClarifyStepOptions,
+  ClarifyResult,
+  ClarifyEvent,
+} from './steps/clarify.step.js';
+export {
+  runValidate,
+  hasValidationFailures,
+  extractRepoSection,
+} from './steps/validate.step.js';
+export type {
+  RunValidateOptions,
+  RunValidateResult,
+} from './steps/validate.step.js';
+export {
+  runFix,
+} from './steps/fix.step.js';
+export type {
+  RunFixOptions,
+  RunFixResult,
+} from './steps/fix.step.js';
+export {
+  createFeatureManifestStep,
+  FEATURE_MANIFEST_STAGES,
+} from './steps/feature-manifest.step.js';
+export type {
+  FeatureManifestStepOptions,
+} from './steps/feature-manifest.step.js';
+export {
+  createTaskBundlerStep,
+  TASK_BUNDLES_ARTIFACT_ID,
+} from './steps/task-bundler.step.js';
+export type {
+  TaskBundleOutput,
+  TaskBundlerStepOptions,
+} from './steps/task-bundler.step.js';
+export {
+  createPlanRiskStep,
+  PLAN_RISK_ARTIFACT_ID,
+} from './steps/plan-risk.step.js';
+export type {
+  PlanRiskStepOptions,
+} from './steps/plan-risk.step.js';
+export {
+  createClarifyStageStep,
+  runClarifyForProject,
+} from './steps/clarify-stage.step.js';
+export type {
+  ClarifyStageStepOptions,
+  RunClarifyForProjectOptions,
+  RunClarifyForProjectResult,
+} from './steps/clarify-stage.step.js';
+export {
+  createFixLoopStep,
+  runFixLoop,
+} from './steps/fix-loop.step.js';
+export type {
+  FixLoopStepOptions,
+  RunFixLoopOptions,
+  RunFixLoopResult,
+} from './steps/fix-loop.step.js';
+export {
+  disallowedToolsForPersona,
+  runPerRepoStageForRepo,
+  combinePerRepoArtifacts,
+  createPerRepoStageStep,
+} from './steps/per-repo-stage.step.js';
+export type {
+  RunPerRepoStageOptions,
+  RunPerRepoStageResult,
+  PerRepoStageStepOptions,
+} from './steps/per-repo-stage.step.js';
+export {
+  runBuildForOneRepo,
+  combineTaskArtifacts,
+  createPerRepoBuildStep,
+  BUILD_DISALLOWED_TOOLS,
+} from './steps/per-repo-build.step.js';
+export type {
+  RunBuildForRepoOptions,
+  RunBuildForRepoResult,
+  PerRepoBuildStepOptions,
+} from './steps/per-repo-build.step.js';
+export {
+  pickRepoForBehavior,
+  runTestGenForProject,
+  createTestGenStageStep,
+} from './steps/test-gen-stage.step.js';
+export {
+  loadPersonaPromptSync,
+  injectTemplateVars,
+  warnIfSystemPromptOversized,
+  buildManifestPrefix,
+  buildProjectPrompt,
+  buildRepoProjectPrompt,
+  buildClarifyExplorePrompt,
+  buildStagePrompt,
+  buildRepoStagePrompt,
+  buildPerTaskPrompt,
+} from './steps/prompt-builders.js';
+export type {
+  PromptBuilderContext,
+  PromptBuilderProjectInfo,
+  StageInfo,
+  RepoArtifacts,
+  KbTier,
+} from './steps/prompt-builders.js';
+export type {
+  TestGenConventions,
+  TestGenBehavior,
+  TestGenSpec,
+  TestGenCase,
+  TestSpecStoreLike,
+  TestCaseStoreLike,
+  TestGenDeps,
+  TestGenArtifactEvent,
+  RunTestGenForProjectOptions,
+  TestGenStageStepOptions,
+} from './steps/test-gen-stage.step.js';
+// `ClarifyQAPair` is already exported from `stages/clarify.ts`; the
+// step's local interface is structurally identical, so we don't
+// re-export it here to avoid a duplicate-identifier error.
+
 export type {
   Step,
   StepContext,
+  StepSkipContext,
   StepRetryPolicy,
   StepHookPoint,
   PipelineEvent,
@@ -22,6 +159,11 @@ export type {
   BusRequest,
   BusRequestListener,
   BusRequestOptions,
+  // Dashboard-domain event payload shapes (ADR §4.5)
+  StageRepoProgressPayload,
+  StageCostUpdatePayload,
+  StageFixAttemptPayload,
+  ReviewerNotePayload,
 } from './types.js';
 export { InMemoryEventBus } from './event-bus.js';
 export {
@@ -34,15 +176,220 @@ export { InMemoryArtifactStore } from './artifacts.js';
 export { Pipeline, makePipelineEvent } from './pipeline.js';
 export type { PipelineDeps } from './pipeline.js';
 export {
+  heuristicTokenCount,
+  heuristicTokenCountFromBytes,
+  countTokens,
+  structurallyTruncate,
+  looksLikeCode,
+  parseSections,
+  findSection,
+  sliceSpecForRefs,
+  enforceBudget,
+  estimateBudgetTokens,
+  getModelTokenLimit,
+  estimateTokens,
+  applyBudget,
+  budgetPromptContext,
+  parseTasks,
+  groupTasksForExecution,
+  runTasksWithDependencyGraph,
+  extractAllTaskFiles,
+  bundleFiles,
+  renderRequirements,
+  renderRepoRequirements,
+  renderRepoSpecs,
+  renderRepoTasks,
+  planCoversRepo,
+  planCoversStagesForRepo,
+  planCoversCrossRepo,
+  summarisePlanSkip,
+  SCORER_VERSION,
+  SENSITIVE_PATH_PATTERNS,
+  scorePlan,
+  computeRiskTier,
+  FEATURE_MANIFEST_VERSION,
+  emptyManifest,
+  extractAcceptanceCriteria,
+  extractAffectedRepos,
+  extractApiEndpoints,
+  extractTablesTouched,
+  extractFilesPlanned,
+  extractTestBehaviors,
+  extractChangeBrief,
+  extractOpenQuestions,
+} from './utils/index.js';
+export type {
+  StructuralTruncateOptions,
+  SpecSection,
+  SliceOptions,
+  SliceResult,
+  PromptSection,
+  BudgetOptions,
+  BudgetDecision,
+  BudgetResult,
+  ContextComponent,
+  ContextBudgetResult,
+  PromptBudgetInput,
+  PromptBudgetOutput,
+  ParsedTask,
+  ExecutionGroup,
+  BundleOptions,
+  SkipReason,
+  BundleResult,
+  RunTasksOptions,
+  RunTasksHooks,
+  RiskSeverity,
+  RiskBlastRadius,
+  ContractKind,
+  PlanRepoImpact,
+  PlanContract,
+  PlanRisk,
+  PlanRollout,
+  RolloutStrategy,
+  PlanTests,
+  PlanEstimate,
+  Plan,
+  PlanPointer,
+  PlanSection,
+  PlanComment,
+  PlanApproval,
+  // Plan v2 additions
+  PlanProblem,
+  PlanScope,
+  ScopeItem,
+  FileClaim,
+  FileClaimKind,
+  SymbolClaim,
+  SymbolKind,
+  DataChange,
+  DataChangeKind,
+  Observability,
+  ObservabilitySignal,
+  TestCaseSpec,
+  ManualStep,
+  ColumnSpec,
+  TypeRef,
+  PlanCreatedBy,
+  PlanApprovalRecord,
+  RiskTier,
+  RiskFactor,
+  RiskScore,
+  ScorePlanOpts,
+  FieldStatus,
+  ManifestField,
+  ApiEndpoint,
+  TableMutation,
+  PlannedFile,
+  TestBehavior,
+  FeatureManifest,
+  ManifestFieldKey,
+  ManifestFieldValue,
+  ExtractorResult,
+  ManifestExtractor,
+} from './utils/index.js';
+export {
+  planRepoTouchedPaths,
+  planRepoTouchedCount,
+  planAllTestCases,
+  planAllTouchedPaths,
+  planContractDisplayName,
+  planContractDescription,
+  planContractConsumers,
+  planRepoSymbolNames,
+  planTestDescriptions,
+} from './utils/index.js';
+
+// — Plan v2 — schema migration, content-hash, verifier, plan-binding
+export {
+  migratePlanJsonToV2,
+  emptyPlanV2,
+  planContentHash,
+  planContentHashShort,
+  runPlanRules,
+  defaultRulePack,
+  bindPlan,
+} from './plan/index.js';
+export type {
+  Issue,
+  IssueSeverity,
+  RuleContext,
+  PlanRule,
+  AutoFixSuggestion,
+  PlanValidationReport,
+  PlanBinding,
+} from './plan/index.js';
+
+// — Plan v2 — compliance gates (Phases E, F, G)
+export {
+  checkBuildCompliance,
+  renderBuildComplianceMarkdown,
+  buildComplianceFixPrompt,
+  checkValidateCompliance,
+  renderValidateComplianceMarkdown,
+  reconcilePlan,
+} from './plan/index.js';
+export type {
+  BuildComplianceReport,
+  BuildComplianceProbes,
+  ComplianceGap,
+  GapKind,
+  ValidateComplianceReport,
+  ValidateComplianceProbes,
+  ValidateComplianceGap,
+  ValidateGapKind,
+  TestRunStatus,
+  PlanReconciliation,
+  ReconcileInput,
+} from './plan/index.js';
+
+// — Plan v2 — Phase I: cost policy + auto-refine
+export {
+  DEFAULT_COST_POLICY,
+  resolveCostPolicy,
+  CostBreachError,
+  autoRefinePlan,
+} from './plan/index.js';
+export type { CostPolicy, AutoRefineOutcome } from './plan/index.js';
+
+// — Plan v2 — lifecycle walker
+export {
+  initLifecycle,
+  transitionLifecycle,
+  snapshotLifecycle,
+} from './plan/index.js';
+export type {
+  LifecycleState,
+  LifecycleContext,
+  LifecycleEvent,
+  LifecycleAction,
+  LifecycleTransition,
+  LifecycleSnapshot,
+  TransitionResult,
+} from './plan/index.js';
+export { buildStandardStepRegistry } from './standard-registry.js';
+export type {
+  RunStageResult,
+  RunStageFn,
+  StandardRegistryDeps,
+} from './standard-registry.js';
+export {
   attachAuditLogHook,
   AUDIT_LOG_HOOKS,
   attachDashboardStateHook,
+  attachDashboardStateRollupHook,
   attachCostTrackerHook,
   attachLearnersHook,
   attachRunStoreHook,
   attachFeatureStoreHook,
   attachApprovalGateHook,
   APPROVAL_GATE_CHANNEL,
+  attachStreamHook,
+  attachCheckpointHook,
+  createFileCheckpointStore,
+  attachPrUrlHook,
+  PR_URL_REGEX,
+  attachLivenessPrefetchHook,
+  migrateLegacyCheckpoint,
 } from './hooks/index.js';
 export type {
   AuditLogHookOptions,
@@ -50,6 +397,11 @@ export type {
   DashboardStateHookOptions,
   DashboardStateHookHandle,
   DashboardStateSnapshot,
+  DashboardRollupState,
+  DashboardRollupStageState,
+  DashboardRollupRepoState,
+  DashboardStateRollupHookOptions,
+  DashboardStateRollupHookHandle,
   CostTrackerHookOptions,
   CostTrackerHookHandle,
   LearnersHookOptions,
@@ -63,6 +415,21 @@ export type {
   ApprovalDecision,
   ApprovalGateHookOptions,
   ApprovalGateHookHandle,
+  StreamSnapshot,
+  StreamHookOptions,
+  StreamHookHandle,
+  CheckpointStatus,
+  CheckpointSnapshot,
+  CheckpointStore,
+  CheckpointHookOptions,
+  CheckpointHookHandle,
+  FileCheckpointStoreOptions,
+  PrUrlHookOptions,
+  PrUrlHookHandle,
+  LivenessPrefetchHookOptions,
+  LivenessPrefetchHookHandle,
+  LegacyPipelineCheckpoint,
+  MigratedCheckpointShared,
 } from './hooks/index.js';
 export { VERSION } from './version.js';
 

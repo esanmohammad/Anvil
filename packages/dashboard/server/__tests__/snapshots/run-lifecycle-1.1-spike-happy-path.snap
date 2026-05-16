@@ -1,0 +1,46 @@
+[
+  {
+    "entries": [
+      {
+        "kind": "text",
+        "tool": null
+      }
+    ],
+    "isOurRun": true,
+    "type": "agent-output"
+  },
+  {
+    "entries": [
+      {
+        "kind": "tool_use",
+        "tool": "grep"
+      }
+    ],
+    "isOurRun": true,
+    "type": "agent-output"
+  },
+  {
+    "agentStatus": "done",
+    "idMatchesAgent": false,
+    "type": "agent-done"
+  },
+  {
+    "type": "runs"
+  },
+  {
+    "runCount": 1,
+    "runStatuses": [
+      {
+        "isOurRun": true,
+        "status": "completed",
+        "type": "spike"
+      }
+    ],
+    "type": "active-runs"
+  },
+  {
+    "runCount": 0,
+    "runStatuses": [],
+    "type": "active-runs"
+  }
+]

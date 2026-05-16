@@ -51,7 +51,12 @@ export function checkPrConflicts(plan, deps) {
     const issues = [];
     for (let i = 0; i < plan.repos.length; i++) {
         const repo = plan.repos[i];
-        if (!repo.files.length)
+        // Plan v2: claimed paths come from mustTouch + mustExist.
+        const claimedPaths = [
+            ...(repo.mustTouch ?? []).map((c) => c.path).filter(Boolean),
+            ...(repo.mustExist ?? []).map((c) => c.path).filter(Boolean),
+        ];
+        if (!claimedPaths.length)
             continue;
         const gh = deps.githubByRepoName[repo.name];
         if (!gh)
@@ -59,11 +64,11 @@ export function checkPrConflicts(plan, deps) {
         const prs = cachedListPrs(gh);
         for (const pr of prs) {
             const prFiles = cachedPrFiles(gh, pr.number);
-            const conflicts = repo.files.filter((f) => prFiles.some((p) => p === f || p.endsWith('/' + f)));
+            const conflicts = claimedPaths.filter((f) => prFiles.some((p) => p === f || p.endsWith('/' + f)));
             if (conflicts.length) {
                 issues.push({
                     severity: 'warn',
-                    path: `repos[${i}].files`,
+                    path: `repos[${i}].mustTouch`,
                     repo: repo.name,
                     message: `Open PR #${pr.number} "${pr.title}" touches ${conflicts.length} of these files (${conflicts.slice(0, 3).join(', ')}${conflicts.length > 3 ? '…' : ''}). Coordinate or rebase before execute.`,
                     hint: pr.url,

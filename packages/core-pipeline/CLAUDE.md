@@ -31,11 +31,17 @@ drive the same pipeline shape.
   `run()`, applies `retryPolicy` to each Step. Accepts
   `{ resumeFromStep?, completedSteps? }` so resume-from-stage
   works (see `step:skipped` event).
-- **Lifecycle hooks** (`src/hooks/`) — eight in-tree hooks:
+- **Lifecycle hooks** (`src/hooks/`) — in-tree hooks:
     - `attachAuditLogHook` — JSONL audit at
       `~/.anvil/runs/<runId>/audit.jsonl`.
     - `attachDashboardStateHook` — debounced JSON snapshot at
       `~/.anvil/state.json`.
+    - `attachDashboardStateRollupHook` — mutates a caller-supplied
+      `state` object on `pipeline:*` / `step:*` / `stage:repo-progress`
+      / `stage:cost-update` / `stage:fix-attempt` / `reviewer:note` and
+      fires a debounced `broadcast()` callback. Replaces the
+      dashboard's ~30 inline `this.broadcastState()` calls. See ADR
+      §4.5.
     - `attachCostTrackerHook` — running USD spend; `.totals()`.
     - `attachLearnersHook` — invokes memory-core write-back on
       `step:completed`. Wires the previously-dead `autoLearnHook`.
@@ -57,10 +63,37 @@ drive the same pipeline shape.
   `clarify · requirements · repo-requirements · specs · tasks ·
   build · test · validate · ship`. (Historical: `project-requirements`
   was renamed to `repo-requirements` to match the dashboard naming.)
+  **Known issue (not yet fixed)**: `ship` and `validate` are both
+  `['read', 'write', 'exec']`. The stage prompts forbid editing
+  source ("DO NOT explore the codebase. DO NOT `read_file` source
+  files." in `ship.ts:89`; validate's prompt instructs run-tests-only)
+  but qwen/glm-class models routinely ignore the soft constraint and
+  patch code anyway. Hard fix is to tighten `ship` to `['read', 'exec']`
+  (git/gh + sanity-build only) and tighten outer `validate` to
+  `['read', 'exec']` (keeping `fix-loop` at full write+exec for the
+  inner repair sub-stage). Prompt-only mitigation has been tried and
+  does not hold.
 - **Routing helpers** (`src/routing/`) — `resolveModelForStage`,
   `resolveModelForTask`, `extractTaskEnvelopes`, `loadStagePolicy`,
   `task-envelope`. Pure helpers for picking models per stage / task
   given a `stage-policy.yaml`.
+- **Plan engine** (`src/plan/`) — plan lifecycle + auto-refine +
+  validation + compliance + binding + cost policy + JSON migration.
+    - `lifecycle.ts` — state machine: `draft → refined → validated →
+      bound → executing → completed`.
+    - `auto-refine.ts` — LLM-driven plan refinement on `draft` plans.
+    - `compliance/build.ts` + `compliance/validate.ts` +
+      `compliance/reconcile.ts` — produce `BUILD_COMPLIANCE.md` /
+      `PLAN_COMPLIANCE.md`; reconcile against build + validate
+      artifacts; force-`--draft` PR if compliance < 100% (see
+      `stages/ship.ts:requireDraft`).
+    - `rules/` — `shape` / `contract` / `floor` / `data-tests-risks` /
+      `kb-grounding`. Run via `run-rules.ts` against the plan JSON.
+    - `plan-binding.ts` + `hash.ts` — bind a plan to a run, stamp
+      `plan: <slug>@v<n> hash:<short>` on PRs.
+    - `cost-policy.ts` — escalation triggers based on plan estimate.
+    - `migrate.ts` — v0 → v1 plan JSON migration.
+    - `types.ts` — `Plan`, `PlanRules`, compliance report shapes.
 
 **`stage-policy.yaml` resolution order** (mirrors `models.yaml` so end
 users have a single mental model):

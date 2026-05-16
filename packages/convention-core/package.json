@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-convention-core",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Project convention extraction, rule engine, and promotion ledger for Anvil. Owns ~/.anvil/conventions/<project>/{conventions.md, rules.json}.",
   "type": "module",
   "license": "MIT",
@@ -25,7 +25,7 @@
     "test": "tsc -b && node --test dist/__tests__/*.test.js"
   },
   "dependencies": {
-    "@esankhan3/anvil-memory-core": "^0.1.0",
+    "@esankhan3/anvil-memory-core": "^0.2.0",
     "yaml": "^2.6.1"
   },
   "devDependencies": {

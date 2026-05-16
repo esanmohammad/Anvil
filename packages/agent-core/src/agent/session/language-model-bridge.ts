@@ -41,6 +41,8 @@ import type {
 import { instrumentModelAdapter } from '../../telemetry/instrument.js';
 import { getTracer } from '../../telemetry/tracer.js';
 import { BuiltinToolExecutor } from '../../tools/index.js';
+import { MergedToolExecutor } from '../../mcp/merged-executor.js';
+import type { McpClientPool } from '../../mcp/pool.js';
 import { loadModelRegistry } from '../../router/model-registry.js';
 
 // ── Capability mapping ───────────────────────────────────────────────────
@@ -218,7 +220,7 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
     // here would be ignored. Keep the construction lazy so this method
     // stays cheap when called by adapters that don't loop.
     if (this.providerName !== 'claude') {
-      const executor = buildBuiltinExecutor(this.request);
+      const executor = buildMergedExecutor(this.request);
       if (executor) config.toolExecutor = executor;
       const ctx = lookupContextWindow(this.request.model);
       if (ctx !== undefined) config.contextWindow = ctx;
@@ -464,6 +466,55 @@ function buildBuiltinExecutor(req: AdapterRequest): ToolExecutorLike | undefined
     ? req.allowedTools
     : ['read_file', 'grep', 'glob', 'list'];
   return new BuiltinToolExecutor({ allowedTools: allowed });
+}
+
+/**
+ * Build the tool executor handed to non-Claude adapters. When the session
+ * carries a hot `mcpPool`, wrap it together with the builtins in a
+ * `MergedToolExecutor` so the agentic loop can call `mcp__<server>__<tool>`
+ * the same way it calls `read_file`. The pool is session-scoped (owned by
+ * `AgentProcess`), so the bridge does NOT close it on kill — only cancels
+ * in-flight MCP calls.
+ *
+ * Prime is awaited synchronously-ish: we kick `prime()` and return the
+ * executor; the adapter's first `listSchemas()` call is `await`-ed via
+ * the agentic loop anyway, but in adapters that consume schemas in the
+ * very first request before any tool call, this fast-path may miss MCP
+ * tools. Adapters that take the `tools[]` upfront should call
+ * `await executor.prime()` explicitly — `OpenRouterAdapter` already does
+ * this implicitly because its agentic loop awaits listSchemas() per
+ * iteration via `ModelAdapterConfig.toolExecutor`.
+ */
+function buildMergedExecutor(req: AdapterRequest): ToolExecutorLike | undefined {
+  if (!req.cwd) return undefined;
+  const allowed = req.allowedTools && req.allowedTools.length > 0
+    ? req.allowedTools
+    : ['read_file', 'grep', 'glob', 'list'];
+  const builtin = new BuiltinToolExecutor({ allowedTools: allowed });
+  if (!req.mcpPool) return builtin;
+  const pool = req.mcpPool as unknown as McpClientPool;
+  const merged = new MergedToolExecutor({
+    builtin,
+    pool,
+    allowedTools: req.allowedTools,
+    onMcpCallStart: ({ tool, serverName }) => req.mcpProgress?.({
+      kind: 'mcp-call-start',
+      serverName,
+      toolName: tool,
+    }),
+    onMcpCallEnd: ({ tool, serverName, durationMs, isError }) => req.mcpProgress?.({
+      kind: 'mcp-call-end',
+      serverName,
+      toolName: tool,
+      durationMs,
+      isError,
+    }),
+  });
+  // Fire-and-forget: warm the MCP tool cache. Adapters that read schemas
+  // before the first listSchemas-await will see only builtins on first
+  // pass; subsequent calls will see the merged set.
+  void merged.prime().catch(() => { /* surface as exec error on first call */ });
+  return merged;
 }
 
 /**

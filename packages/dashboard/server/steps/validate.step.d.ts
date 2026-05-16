@@ -1,53 +1,47 @@
 /**
- * `validate` step factory — standalone validate stage callable from the
- * Fix flow (and any future flow that wants a validate pass without the
- * full build pipeline).
+ * Phase H2 — `validate.step` was promoted into
+ * `core-pipeline/src/steps/validate.step.ts` with a new signature
+ * accepting an `AgentRunner` (canonical agent invocation surface).
  *
- * Behavior parity with `pipeline-runner.ts`'s validate stage:
- *   - Per-repo fan-out when `repoNames.length > 0`, else single-workspace.
- *   - Combines per-repo outputs into one VALIDATE.md artifact.
- *   - Detects failure via `hasValidationFailures` (lifted from fix-loop).
- *   - Persona = 'tester'; allowedTools sourced by the caller.
+ * This file remains in dashboard as a back-compat adapter so existing
+ * callers (`fix-flow.ts`) keep using the legacy `agentManager + isCancelled
+ * + onSpawn + onTruncation + pollIntervalMs + sleep + ...` opts shape.
+ * Internally we wrap those into an `AgentManagerRunner` and call the
+ * canonical `runValidate(opts)`.
+ *
+ * Direct consumers should migrate to the canonical path:
+ *   import { runValidate, hasValidationFailures, extractRepoSection,
+ *     type RunValidateOptions, type RunValidateResult }
+ *     from '@esankhan3/anvil-core-pipeline';
+ *
+ * Construct an `AgentRunner` (e.g. dashboard's `AgentManagerRunner`)
+ * and pass it as `runner`.
  */
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
+import { hasValidationFailures, extractRepoSection, type RunValidateResult } from '@esankhan3/anvil-core-pipeline';
+export { hasValidationFailures, extractRepoSection, };
+export type { RunValidateResult };
+/** Legacy options shape kept here for back-compat with fix-flow.ts. */
 export interface RunValidateOptions {
     agentManager: AgentManager;
     project: string;
-    /** Resolved model id for the validate stage. */
     model: string;
     workspaceDir: string;
     repoNames: string[];
     repoPaths: Record<string, string>;
-    /** Builds the per-repo project (system) prompt. Mirrors fix-loop's hook. */
     buildRepoProjectPrompt: (repoName: string) => string;
-    /** Builds the project-wide system prompt for single-workspace path. */
     buildProjectPrompt: () => string;
     isCancelled: () => boolean;
     onTruncation?: (agentName: string, outputTokens: number) => void;
-    /** Optional output-token ceiling. */
     maxOutputTokens?: number;
-    /** Per-stage allow list. Validate is read+exec only (lint/typecheck/tests). */
     allowedTools?: string[];
     pollIntervalMs?: number;
     sleep?: (ms: number) => Promise<void>;
-    /** Optional spawn-id sink so the caller can persist for future resume. */
     onSpawn?: (repoName: string | null, agentId: string) => void;
 }
-export interface RunValidateResult {
-    /** Combined VALIDATE.md across all repos. */
-    artifact: string;
-    /** True when at least one repo failed (or single-workspace mode failed). */
-    failed: boolean;
-    /** Per-repo outcome — empty for single-workspace mode. */
-    perRepo: Record<string, {
-        failed: boolean;
-        section: string;
-    }>;
-    cost: number;
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
-}
+/**
+ * Back-compat wrapper. Constructs an `AgentManagerRunner` from the
+ * legacy opts and dispatches to the canonical `runValidate`.
+ */
 export declare function runValidate(opts: RunValidateOptions): Promise<RunValidateResult>;
 //# sourceMappingURL=validate.step.d.ts.map

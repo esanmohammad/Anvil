@@ -846,7 +846,11 @@ function configToProjectInfo(config: FactoryConfig, repoPaths: Record<string, st
 
 // ── ProjectLoader class ──────────────────────────────────────────────────
 
-export class ProjectLoader {
+// Phase G — `implements ProjectLoaderLike` pins the shape step modules
+// consume from core-pipeline. Type-only.
+import type { ProjectLoaderLike } from '@esankhan3/anvil-core-pipeline';
+
+export class ProjectLoader implements ProjectLoaderLike {
   private configs = new Map<string, FactoryConfig>();
 
   constructor() {

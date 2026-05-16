@@ -17,7 +17,7 @@ import type {
 } from '@esankhan3/anvil-core-pipeline';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import { spawnAndWait, waitForAgent } from '../steps/agent-spawner.js';
-import { disallowedToolsForPersona } from '../steps/per-repo-stage.step.js';
+import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 
 export interface AgentManagerSessionOptions {
   agentManager: AgentManager;

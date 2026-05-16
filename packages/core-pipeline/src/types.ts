@@ -35,7 +35,40 @@ export interface Step<I, O> {
    *                     `Record<string, O>` keyed by repo name. Phase 4a.
    */
   parallelism?: 'serial' | 'per-project' | 'per-repo';
+  /**
+   * Optional declarative skip predicate. Evaluated by the walker just
+   * before this step would run, AFTER the resume / completedSteps skip
+   * set has been consulted. When it returns true the walker emits
+   * `step:skipped` with `payload.reason === 'skipIf'`, threads the
+   * previous step's output into the next step (input passes through
+   * unchanged), and continues.
+   *
+   * Use cases:
+   *   - "plan-derived" stages that should be skipped when a planSeed is
+   *     present (`ctx.shared.planSeed != null`).
+   *   - Stages that should be skipped on a per-feature flag in
+   *     `ctx.shared` without forcing every consumer to call
+   *     `Pipeline.run({ resumeFromStep })`.
+   *
+   * The predicate sees a stripped-down `StepSkipContext` — no bus,
+   * emit, or signal — to keep skip decisions side-effect-free. If
+   * `skipIf` throws, the walker treats it as a terminal failure
+   * (emits `step:failed`); the walker does NOT silently fall through
+   * and run the step, since a thrown predicate signals a bug, not a
+   * "skip negative" answer.
+   */
+  skipIf?: (ctx: StepSkipContext) => boolean | Promise<boolean>;
 }
+
+/**
+ * Context handed to `Step.skipIf` predicates. Subset of `StepContext`
+ * with no mutation seams (no `emit`, no `bus`, no `signal`) so skip
+ * decisions are forced to be pure reads.
+ */
+export type StepSkipContext = Pick<
+  StepContext<unknown>,
+  'runId' | 'workspaceDir' | 'repoPaths' | 'shared' | 'artifacts' | 'input'
+>;
 
 export interface StepContext<I> {
   /** Stable run id (matches today's `~/.anvil/runs/<runId>/`). */
@@ -102,7 +135,90 @@ export type StepHookPoint =
   | 'step:skipped'
   | 'sub-step:started'
   | 'sub-step:completed'
-  | 'artifact:emitted';
+  | 'artifact:emitted'
+  // ── Dashboard-domain events (CORE-PIPELINE-EXTRACT-ADR.md §4.5) ──
+  /**
+   * Fires when a single repo within a `parallelism: 'per-repo'` stage
+   * transitions status (running / completed / failed). Replaces the
+   * dashboard's inline `state.stages[i].repos[r].status = ...` mutations.
+   *
+   * Payload: `StageRepoProgressPayload`.
+   */
+  | 'stage:repo-progress'
+  /**
+   * Fires when the run's cumulative USD ledger increments — once per
+   * spawn / per fix attempt / per repo task. Replaces the scattered
+   * `this.state.totalCost += result.cost` increments in pipeline-runner.
+   *
+   * Payload: `StageCostUpdatePayload`.
+   */
+  | 'stage:cost-update'
+  /**
+   * Fires at the start of each iteration of the validate→fix loop
+   * (capped at `maxFixAttempts`, default 3). The dashboard surfaces
+   * this so users see "fix attempt 2 of 3" without polling.
+   *
+   * Payload: `StageFixAttemptPayload`.
+   */
+  | 'stage:fix-attempt'
+  /**
+   * Fires when a reviewer-supplied note is armed for a stage — either
+   * from a pause-resolution path or from a reviewer artifact edit.
+   * Replaces the dashboard's private `pendingReviewNote` /
+   * `currentStageReviewNote` plumbing.
+   *
+   * Payload: `ReviewerNotePayload`.
+   */
+  | 'reviewer:note';
+
+// ---------------------------------------------------------------------------
+// Dashboard-domain event payload shapes (CORE-PIPELINE-EXTRACT-ADR.md §4.5)
+// ---------------------------------------------------------------------------
+
+/** `stage:repo-progress` payload. */
+export interface StageRepoProgressPayload {
+  stageId: string;
+  stageIndex: number;
+  repoName: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  /** USD attributed to this repo's portion of the stage; present on `completed`. */
+  costUsd?: number;
+  /** Failure detail; present on `failed`. */
+  error?: { message: string };
+}
+
+/** `stage:cost-update` payload. */
+export interface StageCostUpdatePayload {
+  stageId: string;
+  stageIndex: number;
+  /** USD added to the run's running ledger by this update. */
+  deltaUsd: number;
+  /** Running total post-delta. */
+  totalUsd: number;
+}
+
+/** `stage:fix-attempt` payload. */
+export interface StageFixAttemptPayload {
+  stageId: string;
+  stageIndex: number;
+  /** Set when the fix is per-repo; absent for stage-wide validate→fix. */
+  repoName?: string;
+  /** 1-indexed. */
+  attempt: number;
+  maxAttempts: number;
+  /** Which half of the loop this attempt is — fix vs. revalidate. */
+  phase: 'fix' | 'revalidate';
+}
+
+/** `reviewer:note` payload. */
+export interface ReviewerNotePayload {
+  stageId: string;
+  stageIndex: number;
+  /** Reviewer's free-form text. Trimmed; never empty (caller skips emission for empty). */
+  note: string;
+  /** Where the note came from — pause resolution vs. reviewer artifact edit. */
+  source: 'pause-resolution' | 'edit-artifact';
+}
 
 export interface PipelineEvent<P = unknown> {
   hook: StepHookPoint;

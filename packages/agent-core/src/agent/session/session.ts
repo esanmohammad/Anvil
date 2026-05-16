@@ -20,8 +20,11 @@ import type {
   AdapterRequest,
   AgentAdapter,
   AgentAdapterFactory,
+  McpActivityEvent,
+  McpClientPoolLike,
 } from './adapter.js';
 import { buildAdapterRequest } from './adapter.js';
+import { McpClientPool } from '../../mcp/pool.js';
 import { getTracer } from '../../telemetry/tracer.js';
 import type {
   AgentActivity,
@@ -72,6 +75,11 @@ export class AgentProcess extends EventEmitter {
   private sessionSpan: Span | null = null;
   private sessionContext: Context | null = null;
   private sessionEnded = false;
+  /** Lazy session-scoped MCP client pool. One workspace = one pool that
+   *  outlives every individual adapter spawn within this session (resume
+   *  turns reuse it). Constructed on first start() when workspaceDir is
+   *  present and torn down by kill(). */
+  private mcpPool: McpClientPool | null = null;
 
   constructor(spec: SpawnConfig, opts: AgentProcessOpts) {
     super();
@@ -105,7 +113,8 @@ export class AgentProcess extends EventEmitter {
   /** Start the process. Spawns the underlying adapter and begins streaming. */
   start(): void {
     this.openSessionSpan();
-    const req = buildAdapterRequest(this.spec, this.sessionId);
+    const baseReq = buildAdapterRequest(this.spec, this.sessionId);
+    const req = this.augmentRequestWithMcp(baseReq);
     // Run the factory inside the session-span's context so any setAttribute
     // calls inside `defaultAdapterFactory` (e.g. `anvil.skills.activated.*`,
     // `anvil.mcp.*` from Phase 6) land on the session span. Without the
@@ -141,7 +150,7 @@ export class AgentProcess extends EventEmitter {
     this.state.status = 'running';
     this.state.finishedAt = null;
 
-    const req: AdapterRequest = buildAdapterRequest(
+    const baseReq: AdapterRequest = buildAdapterRequest(
       { ...this.spec, prompt: text },
       this.sessionId,
       // No cwdOverride — Claude's session storage is keyed by cwd, so a
@@ -151,6 +160,8 @@ export class AgentProcess extends EventEmitter {
       // from the project workspace it spawned the agent in.
       { resume: true },
     );
+    // Resume reuses the same session-scoped MCP pool — no reconnect.
+    const req = this.augmentRequestWithMcp(baseReq);
     const resumeAdapter = this.factory(req);
     if (
       typeof this.spec.maxOutputTokens === 'number'
@@ -174,9 +185,68 @@ export class AgentProcess extends EventEmitter {
         this.adapter.kill(signal);
       } catch { /* already dead */ }
     }
+    // Cancel any in-flight MCP tool calls + tear down the pool so stdio
+    // subprocesses don't leak. Async; fire-and-forget — kill() returns
+    // synchronously so callers don't block on stdio shutdown.
+    if (this.mcpPool) {
+      const pool = this.mcpPool;
+      this.mcpPool = null;
+      void pool.close().catch(() => { /* best-effort */ });
+    }
     this.state.status = 'killed';
     this.state.finishedAt = this.now();
     this.closeSessionSpan('killed');
+  }
+
+  /**
+   * Attach the session-scoped MCP pool + activity callback to an
+   * `AdapterRequest` if the spawn has a workspaceDir AND mcp.json wires
+   * any servers. No-op when MCP isn't configured — the factory + bridge
+   * fall through to the builtin-only executor path.
+   */
+  private augmentRequestWithMcp(req: AdapterRequest): AdapterRequest {
+    if (!req.workspaceDir) return req;
+    if (!this.mcpPool) {
+      const pool = new McpClientPool({
+        workspaceRoot: req.workspaceDir,
+        runId: req.runId,
+        onProgress: (ev) => this.emitMcpActivity({
+          kind: 'mcp-progress',
+          serverName: ev.serverName,
+          toolName: ev.toolName,
+          progress: ev.progress,
+          total: ev.total,
+          message: ev.message,
+        }),
+      });
+      if (!pool.hasServers()) {
+        // No servers configured for this workspace — skip the pool entirely
+        // so the factory's MCP-aware path is bypassed.
+        return req;
+      }
+      this.mcpPool = pool;
+    }
+    const pool: McpClientPoolLike = this.mcpPool;
+    return {
+      ...req,
+      mcpPool: pool,
+      mcpProgress: (ev) => this.emitMcpActivity(ev),
+    };
+  }
+
+  /** Surface an MCP activity event on the agent's `activity` stream so
+   *  the dashboard's activity panel renders the same way it does for
+   *  builtin tool_use. */
+  private emitMcpActivity(ev: McpActivityEvent): void {
+    const summary = mcpActivitySummary(ev);
+    const activity: AgentActivity = {
+      id: `mcp-${this.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      kind: 'tool_use',
+      tool: ev.toolName ?? `mcp:${ev.serverName}`,
+      summary,
+      timestamp: this.now(),
+    };
+    this.emit('activity', activity);
   }
 
   // ── State queries ────────────────────────────────────────────────────
@@ -396,6 +466,24 @@ export function accumulateCost(prev: CostInfo, next: CostInfo): CostInfo {
     durationMs: prev.durationMs + next.durationMs,
     stopReason: next.stopReason ?? prev.stopReason,
   };
+}
+
+/** Human-readable summary of an MCP activity event for the agent stream. */
+function mcpActivitySummary(ev: McpActivityEvent): string {
+  switch (ev.kind) {
+    case 'mcp-call-start':
+      return `[mcp:${ev.serverName}] calling ${ev.toolName ?? ''}`;
+    case 'mcp-call-end':
+      return ev.isError
+        ? `[mcp:${ev.serverName}] ${ev.toolName ?? ''} failed (${ev.durationMs ?? 0}ms)`
+        : `[mcp:${ev.serverName}] ${ev.toolName ?? ''} ok (${ev.durationMs ?? 0}ms)`;
+    case 'mcp-progress':
+      return `[mcp:${ev.serverName}] ${ev.message ?? `progress ${ev.progress ?? 0}/${ev.total ?? '?'}`}`;
+    case 'mcp-server-failed':
+      return `[mcp:${ev.serverName}] server unavailable: ${ev.message ?? 'unknown error'}`;
+    default:
+      return `[mcp:${ev.serverName}] ${ev.message ?? ''}`;
+  }
 }
 
 /**

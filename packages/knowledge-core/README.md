@@ -24,14 +24,27 @@ you're asking about an identifier vs an error code vs a natural-
 language question and weights the signals accordingly.
 
 ```ts
-import { KnowledgeIndexer, getRetriever } from '@anvil/knowledge-core';
+import {
+  indexFromPath,
+  getRetriever,
+  loadKnowledgeConfig,
+} from '@esankhan3/anvil-knowledge-core';
 
-// Index once — incremental thereafter.
-const indexer = new KnowledgeIndexer({ project: 'space-tourism' });
-await indexer.indexProject();
+// Build a fully-resolved KnowledgeConfig: YAML at
+// ~/.anvil/projects/<project>/factory.yaml, overlaid by CODE_SEARCH_*
+// env vars. Or hand-construct one — the indexer accepts any shape.
+const config = loadKnowledgeConfig('space-tourism');
+
+// Index once — incremental thereafter. Pass config explicitly so
+// CODE_SEARCH_* env vars (provider, model, dims, API key, base URL)
+// actually reach the embedder — pre-P1 they were silently ignored.
+await indexFromPath('space-tourism', '/path/to/workspace', { config });
 
 // Retrieve — vector + BM25 + 1-hop graph + cross-encoder rerank.
-const retriever = await getRetriever('space-tourism');
+// Pass the same config so query-time embedder matches the index.
+// getRetriever() also hard-errors on vector-space mismatch (P2) so
+// silent provider drift is impossible.
+const retriever = await getRetriever('space-tourism', config);
 const result = await retriever.retrieve(
   'where do we validate booking seat tiers?',
 );
@@ -70,10 +83,32 @@ The query classifier picks adaptive weights — identifiers lean
 BM25, natural-language leans vector, error codes lean both.
 
 ### Six embedding providers, four rerankers
-**Embed:** Codestral · Voyage · OpenAI · Ollama · Gemini OAuth ·
-OpenAI-compatible · `auto` (picks based on what's configured).
-**Rerank:** Ollama (default) · Cohere · Voyage · OpenAI-compatible.
+**Embed:** Codestral / Mistral · Voyage · OpenAI · Ollama · Gemini OAuth
+(auto-refreshes expired access tokens via `refresh_token`) ·
+OpenAI-compatible / Custom · `auto` (picks based on what's configured).
+**Rerank:** Ollama (default `qwen2.5-coder:7b` — qwen3:0.6b was a
+silent no-op and was dropped) · Cohere · Voyage · OpenAI-compatible.
 Plug in whatever fits your cost/quality/latency curve.
+
+### Explicit config + env-override
+`KnowledgeConfig` is the single contract. `EmbeddingProviderConfig`
+takes `{provider, model?, dimensions?, apiKey?, baseUrl?, ollamaHost?}`;
+`RerankerProviderConfig` takes `{provider, model?, apiKey?, baseUrl?,
+timeoutMs?}`. `loadKnowledgeConfig(project)` reads the project YAML
+then overlays `CODE_SEARCH_*` env vars (`EMBEDDING_PROVIDER` /
+`_MODEL` / `_DIMENSIONS` / `_API_KEY` / `_BASE_URL` / `OLLAMA_HOST` /
+`RERANKER_PROVIDER` / `_MODEL` / `_API_KEY` / `_BASE_URL` /
+`RETRIEVAL_MAX_CHUNKS` / `_MAX_TOKENS` / `AUTO_INDEX`). Provider
+classes still read documented vendor env vars (`MISTRAL_API_KEY`,
+`OPENAI_API_KEY`, ...) as a deprecated fallback — every first read
+emits a one-shot stderr warning; library env reads are removed in 1.0.
+
+### Vector-space safety
+`getRetriever(project, config?)` reads each repo's `index_meta.json`
+on open. If the recorded `embeddingProvider` doesn't match the
+current config, it throws a hard error — never returns garbage
+vectors from a config drift. (Pre-P2, silent space mismatch was the
+canonical "results are useless and there's no error" bug.)
 
 ### Project graph
 A `graphology` directed multi-graph stitches every repo together.

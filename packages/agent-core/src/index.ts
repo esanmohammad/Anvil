@@ -45,4 +45,27 @@ export {
   prefetchLiveness,
   _resetLivenessCache,
 } from './provider-liveness.js';
+export {
+  DEFAULT_SPEC,
+  getModelSpec,
+  getContextWindow,
+  getMaxOutput,
+} from './model-catalog.js';
+export type { ModelSpec } from './model-catalog.js';
+export {
+  resolveModelByTier,
+  setDiscoveryResult,
+  invalidateResolverCache,
+} from './model-tier-resolver.js';
+export type {
+  ResolverTier,
+  ResolverCapability,
+  ResolverModelWeight,
+  ResolverModel,
+  ResolverDiscoveryResult,
+} from './model-tier-resolver.js';
+// NOTE: the resolver's deprecated `ModelTier` alias is intentionally
+// NOT re-exported here to avoid colliding with `router/model-registry.ts`'s
+// `ModelTier` (different vocabulary). Reach the alias via the subpath
+// import `@esankhan3/anvil-agent-core/model-tier-resolver.js` if needed.
 export { VERSION } from './version.js';

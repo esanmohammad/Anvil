@@ -137,12 +137,19 @@ export function PipelineContainer({
   // server stamps when the registry resolver fires; fall back to the
   // legacy modelPerStage map for stages that haven't run yet.
   const modelPerStage = pipelineData?.modelPerStage;
+  // Frontend mirror of `STAGES[*].deterministic` from
+  // `@esankhan3/anvil-core-pipeline`. Kept inline (vs. importing the
+  // registry) so we don't pull the whole core-pipeline barrel into the
+  // browser bundle for one flag. Update both sides when adding more
+  // deterministic stages.
+  const DETERMINISTIC_STAGES = new Set(['test']);
   const stageChips: StageChipData[] = (pipelineData?.stages ?? []).map((s, idx) => ({
     name: s.name,
     status: s.status === 'waiting' ? 'running' : s.status,
     cost: s.cost,
     modelLabel: s.resolvedModel ?? modelPerStage?.[idx],
     permissionClasses: s.permissionClasses,
+    deterministic: DETERMINISTIC_STAGES.has(s.name),
   }));
 
   const inputPlaceholder = isWaiting

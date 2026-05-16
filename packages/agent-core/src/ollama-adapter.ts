@@ -276,7 +276,12 @@ export class OllamaAdapter implements ModelAdapter {
     // text. Surface as retryable so the dashboard's chain-fallback walks
     // to the next chain entry instead of writing a 0-byte artifact.
     // Mirrors claude-adapter + openrouter-adapter contract.
-    if (!aggregatedText.trim() && stopReason !== 'aborted') {
+    //
+    // Exclude `iteration_limit` — that's a deliberate caller-side cap, not
+    // a model failure. The caller asked us to stop after N iterations and
+    // we did exactly that; surfacing it as a retryable upstream error
+    // would burn the model on the chain walker for no reason.
+    if (!aggregatedText.trim() && stopReason !== 'aborted' && stopReason !== 'iteration_limit') {
       throw new UpstreamError(
         503,
         `ollama model "${config.model}" returned empty final text (stopReason=${stopReason}, outputTokens=${totalOut}, toolCalls=${countToolCalls(messages)})`,

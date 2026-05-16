@@ -31,7 +31,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/version-0.1.0-3b82f6.svg" alt="Version 0.1.0" />
+  <img src="https://img.shields.io/badge/version-0.2.0-3b82f6.svg" alt="Version 0.2.0" />
   <img src="https://img.shields.io/badge/license-MIT-3b82f6.svg" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%E2%89%A518-339933.svg" alt="Node 18+" />
   <img src="https://img.shields.io/badge/TypeScript-5.8-3178c6.svg" alt="TypeScript" />
@@ -504,8 +504,11 @@ Three different fronts ride on the same engine:
 
 - **`anvil` CLI** — `init`, `doctor`, `dashboard` (the front door)
 - **Dashboard** — full pipeline control with live agent activity
-- **`code-search-mcp`** — same retriever exposed over MCP, usable
-  from Claude Code, Claude Desktop, Cursor, or any MCP client
+- **`code-search-mcp`** — the standalone code-search product:
+  MCP server, the `code-search` CLI (`index` / `query` / `status` /
+  `reset` / `daemon` / `serve` / `mcp`), and the
+  `code-search-daemon` long-running indexer. Three bins, one
+  install. Works without the Anvil agent stack.
 
 ### Per-package deep dives
 
@@ -518,7 +521,7 @@ Three different fronts ride on the same engine:
 | [`@esankhan3/anvil-knowledge-core`](packages/knowledge-core/) | AST chunks, graph, hybrid retrieval |
 | [`@esankhan3/anvil-memory-core`](packages/memory-core/) | Five-type memory, bi-temporal, drift detection |
 | [`@esankhan3/anvil-convention-core`](packages/convention-core/) | Convention extractor + promotion ledger |
-| [`@esankhan3/code-search-mcp`](packages/code-search-mcp/) | MCP server wrapping `knowledge-core` |
+| [`@esankhan3/code-search-mcp`](packages/code-search-mcp/) | Standalone code-search: MCP server + `code-search` CLI + `code-search-daemon` |
 
 ---
 
@@ -590,7 +593,7 @@ verifies the chain automatically.
 | [`@esankhan3/anvil-memory-core`](packages/memory-core) | Long-term memory — five-type taxonomy, bi-temporal facts, drift detection, sleeptime ratification. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-memory-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-memory-core) |
 | [`@esankhan3/anvil-convention-core`](packages/convention-core) | Convention extraction, rule engine, promotion ledger. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-convention-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-convention-core) |
 | [`@esankhan3/anvil-core-pipeline`](packages/core-pipeline) | Typed `Step<I,O>` graph, `EventBus`, `StepRegistry`, lifecycle hooks. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-core-pipeline.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-core-pipeline) |
-| [`@esankhan3/code-search-mcp`](packages/code-search-mcp) | MCP server for multi-repo code search — GitHub org or local path, zero config. | [![npm](https://img.shields.io/npm/v/@esankhan3/code-search-mcp.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/code-search-mcp) |
+| [`@esankhan3/code-search-mcp`](packages/code-search-mcp) | Standalone code-search product — MCP server + `code-search` CLI + `code-search-daemon` (file-watcher + UDS JSON-RPC). | [![npm](https://img.shields.io/npm/v/@esankhan3/code-search-mcp.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/code-search-mcp) |
 
 > The dashboard (`@anvil-dev/dashboard`) is bundled inside the cli — it is
 > not published as a standalone npm package.

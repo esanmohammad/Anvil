@@ -13,7 +13,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { InMemoryEventBus } from '../event-bus.js';
-import type { PipelineEvent } from '../types.js';
+import type {
+  PipelineEvent,
+  StageRepoProgressPayload,
+  StageCostUpdatePayload,
+  StageFixAttemptPayload,
+  ReviewerNotePayload,
+} from '../types.js';
 
 const make = (overrides: Partial<PipelineEvent> = {}): PipelineEvent => ({
   hook: 'step:started',
@@ -106,6 +112,130 @@ describe('InMemoryEventBus (Phase 2)', () => {
     await bus.emit(make());
     await bus.emit(make());
     assert.equal(count, 1);
+  });
+
+  // ── Phase E — dashboard-domain events (ADR §4.5) ───────────────────
+
+  it('stage:repo-progress flows through on/emit with documented payload', async () => {
+    const bus = new InMemoryEventBus();
+    const seen: StageRepoProgressPayload[] = [];
+    bus.on('stage:repo-progress', (e) => {
+      seen.push(e.payload as StageRepoProgressPayload);
+    });
+    const payload: StageRepoProgressPayload = {
+      stageId: 'build',
+      stageIndex: 5,
+      repoName: 'svc-orders',
+      status: 'running',
+    };
+    await bus.emit({ hook: 'stage:repo-progress', runId: 'r1', stepId: 'build', ts: '2026-04-29T00:00:00.000Z', payload });
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0], payload);
+  });
+
+  it('stage:repo-progress carries costUsd on completed and error on failed', async () => {
+    const bus = new InMemoryEventBus();
+    const seen: StageRepoProgressPayload[] = [];
+    bus.on('stage:repo-progress', (e) => {
+      seen.push(e.payload as StageRepoProgressPayload);
+    });
+    await bus.emit({
+      hook: 'stage:repo-progress',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:00.000Z',
+      payload: { stageId: 'specs', stageIndex: 3, repoName: 'web', status: 'completed', costUsd: 0.014 },
+    });
+    await bus.emit({
+      hook: 'stage:repo-progress',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:01.000Z',
+      payload: { stageId: 'specs', stageIndex: 3, repoName: 'api', status: 'failed', error: { message: 'spawn timeout' } },
+    });
+    assert.equal(seen[0].costUsd, 0.014);
+    assert.equal(seen[1].error?.message, 'spawn timeout');
+  });
+
+  it('stage:cost-update flows through on/emit with documented payload', async () => {
+    const bus = new InMemoryEventBus();
+    const totals: number[] = [];
+    bus.on('stage:cost-update', (e) => {
+      const p = e.payload as StageCostUpdatePayload;
+      totals.push(p.totalUsd);
+    });
+    await bus.emit({
+      hook: 'stage:cost-update',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:00.000Z',
+      payload: { stageId: 'build', stageIndex: 5, deltaUsd: 0.022, totalUsd: 0.022 },
+    });
+    await bus.emit({
+      hook: 'stage:cost-update',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:01.000Z',
+      payload: { stageId: 'build', stageIndex: 5, deltaUsd: 0.011, totalUsd: 0.033 },
+    });
+    assert.deepEqual(totals, [0.022, 0.033]);
+  });
+
+  it('stage:fix-attempt flows through with phase + attempt counters', async () => {
+    const bus = new InMemoryEventBus();
+    const seen: StageFixAttemptPayload[] = [];
+    bus.on('stage:fix-attempt', (e) => {
+      seen.push(e.payload as StageFixAttemptPayload);
+    });
+    await bus.emit({
+      hook: 'stage:fix-attempt',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:00.000Z',
+      payload: { stageId: 'validate', stageIndex: 7, attempt: 1, maxAttempts: 3, phase: 'fix' },
+    });
+    await bus.emit({
+      hook: 'stage:fix-attempt',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:01.000Z',
+      payload: { stageId: 'validate', stageIndex: 7, attempt: 1, maxAttempts: 3, phase: 'revalidate' },
+    });
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].phase, 'fix');
+    assert.equal(seen[1].phase, 'revalidate');
+    assert.equal(seen[1].attempt, 1);
+  });
+
+  it('reviewer:note flows through with source discriminator', async () => {
+    const bus = new InMemoryEventBus();
+    const seen: ReviewerNotePayload[] = [];
+    bus.on('reviewer:note', (e) => {
+      seen.push(e.payload as ReviewerNotePayload);
+    });
+    await bus.emit({
+      hook: 'reviewer:note',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:00.000Z',
+      payload: { stageId: 'specs', stageIndex: 3, note: 'Tighten the auth scopes', source: 'pause-resolution' },
+    });
+    await bus.emit({
+      hook: 'reviewer:note',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:01.000Z',
+      payload: { stageId: 'tasks', stageIndex: 4, note: 'Split task 3 into two', source: 'edit-artifact' },
+    });
+    assert.equal(seen[0].source, 'pause-resolution');
+    assert.equal(seen[1].source, 'edit-artifact');
+  });
+
+  it('new dashboard-domain events honor priority ordering with existing hooks', async () => {
+    const bus = new InMemoryEventBus();
+    const order: string[] = [];
+    bus.on('stage:cost-update', () => { order.push('audit'); }, { priority: 100 });
+    bus.on('stage:cost-update', () => { order.push('rollup'); }, { priority: 10 });
+    bus.on('stage:cost-update', () => { order.push('cost'); }, { priority: 20 });
+    await bus.emit({
+      hook: 'stage:cost-update',
+      runId: 'r1',
+      ts: '2026-04-29T00:00:00.000Z',
+      payload: { stageId: 'build', stageIndex: 5, deltaUsd: 0.01, totalUsd: 0.01 },
+    });
+    assert.deepEqual(order, ['audit', 'cost', 'rollup']);
   });
 
   it('priority ordering: high → low, FIFO tie-break at equal priority', async () => {

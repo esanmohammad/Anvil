@@ -20,8 +20,19 @@
 
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
+import { printConfig, resolveCodeSearchConfig, parseCliFlags } from './core/config.js';
 
 const args = process.argv.slice(2);
+
+// P3 — short-circuit `--print-config` so users can verify the resolved
+// settings without booting the MCP server. Honors all the same precedence
+// layers (defaults → file → env → CLI flags).
+if (args.includes('--print-config')) {
+  const { patch } = parseCliFlags(args.filter((a) => a !== '--print-config'));
+  const cfg = resolveCodeSearchConfig({ cli: patch });
+  process.stdout.write(printConfig(cfg) + '\n');
+  process.exit(0);
+}
 
 // ── Parse arguments ──────────────────────────────────────────────────
 

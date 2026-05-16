@@ -21,7 +21,7 @@ console.log(`Compiling ${files.length} files...`);
 
 // 2. Compile each with esbuild
 for (const f of files) {
-  const out = f.replace(/^src\//, 'dist/').replace(/\.ts$/, '.js');
+  const out = f.replace(/^src[\\/]/, 'dist/').replace(/\.ts$/, '.js');
   mkdirSync(dirname(out), { recursive: true });
   execSync(`npx esbuild "${f}" --outfile="${out}" --format=esm --platform=node --target=node20`, { stdio: 'pipe' });
 }

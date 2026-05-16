@@ -201,6 +201,24 @@ export class OpenRouterAdapter implements ModelAdapter {
     return (process.env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
   }
 
+  /**
+   * Whether to strip `reasoning` / `reasoning_details` fields from
+   * the echoed assistant turn when re-prompting after tool results.
+   *
+   * Default `false` — OpenRouter requires the reasoning trace echoed
+   * back for thinking models (DeepSeek V4, Kimi K2.x, GLM thinking)
+   * or it 400s with "reasoning_content is missing in assistant tool
+   * call".
+   *
+   * Subclasses override to `true` when their upstream proxy is strict
+   * about extra sibling fields on the assistant message (e.g. OpenCode
+   * for Kimi K2.6, where the proxy rejects both `reasoning` AND
+   * `reasoning_details` as "Extra inputs not permitted").
+   */
+  protected stripReasoningEcho(): boolean {
+    return false;
+  }
+
   protected getExtraHeaders(): Record<string, string> {
     return {
       // OpenRouter-recommended attribution headers — surface in their
@@ -278,16 +296,29 @@ export class OpenRouterAdapter implements ModelAdapter {
         // Append assistant turn to history so the model sees its own
         // tool_calls when we re-prompt with results. Thinking models
         // (DeepSeek V4, Kimi K2, GLM thinking variants…) require the
-        // reasoning trace echoed back — without it they 400 with
-        // "reasoning_content is missing in assistant tool call".
-        // Send both `reasoning` (string) and `reasoning_details`
-        // (structured) so OpenRouter can map to whichever shape the
-        // upstream provider expects.
+        // reasoning trace echoed back via OpenRouter — without it they
+        // 400 with "reasoning_content is missing in assistant tool
+        // call".
+        //
+        // Per OpenRouter docs (openrouter.ai/docs/guides/best-practices
+        // /reasoning-tokens), the model returns EITHER `reasoning`
+        // (string) OR `reasoning_details` (array) — not both. Preserve
+        // whichever was returned, "exactly as returned." Prefer the
+        // structured `reasoning_details` since it's the canonical shape
+        // for tool-calling.
+        //
+        // Some OpenAI-compatible proxies (OpenCode for Kimi K2.6) reject
+        // reasoning fields entirely — they're strict on unknown sibling
+        // fields. Subclasses override `stripReasoningEcho()` to return
+        // true and skip the echo. See anomalyco/opencode #14716.
         messages.push({
           role: 'assistant',
           content: turn.text || null,
-          ...(turn.reasoning ? { reasoning: turn.reasoning } : {}),
-          ...(turn.reasoningDetails.length > 0 ? { reasoning_details: turn.reasoningDetails } : {}),
+          ...(this.stripReasoningEcho()
+            ? {}
+            : turn.reasoningDetails.length > 0
+              ? { reasoning_details: turn.reasoningDetails }
+              : (turn.reasoning ? { reasoning: turn.reasoning } : {})),
           tool_calls: turn.toolCalls,
         });
 
@@ -340,9 +371,13 @@ export class OpenRouterAdapter implements ModelAdapter {
     // appending final text content (model spent its turns on tool_use /
     // reasoning blocks but never emitted assistant text), surface as a
     // retryable upstream error so the dashboard's chain-fallback walks
-    // to the next chain entry instead of writing a 0-byte artifact
+    // to the next chain entry instead of writing a 0-byte artifact.
+    //
+    // Exclude `iteration_limit` — that's a deliberate caller-side cap,
+    // not a model failure. The model did what it was asked; bubbling
+    // this up as retryable would needlessly burn the model.
     // downstream. Mirrors the claude-adapter contract.
-    if (!aggregatedText.trim() && stopReason !== 'aborted') {
+    if (!aggregatedText.trim() && stopReason !== 'aborted' && stopReason !== 'iteration_limit') {
       throw new _UpstreamError(
         503,
         `${this.provider} model "${config.model}" returned empty final text (stopReason=${stopReason}, outputTokens=${totalOut}, toolCalls=${countToolCalls(messages)})`,
@@ -410,16 +445,30 @@ export class OpenRouterAdapter implements ModelAdapter {
       body.max_tokens = config.maxOutputTokens;
     }
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-        ...this.getExtraHeaders(),
-      },
-      body: JSON.stringify(body),
-      signal,
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          ...this.getExtraHeaders(),
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (err) {
+      // Network-layer failures (DNS, connection refused, TLS handshake,
+      // network unreachable) surface as raw `TypeError: fetch failed`
+      // here — never reach the `!response.ok` branch below. Wrap as a
+      // retryable UpstreamError so the chain walker burns this model
+      // and tries the next chain entry instead of bubbling unwrapped.
+      // Honor caller-driven aborts (signal.aborted) — those are not
+      // retryable; the run was intentionally cancelled.
+      if (signal?.aborted) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new _UpstreamError(0, `fetch failed: ${msg}`, { provider: this.provider, retryable: true });
+    }
 
     if (!response.ok) {
       const errBody = await response.text();

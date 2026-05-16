@@ -85,6 +85,39 @@ export interface AdapterRequest {
    *  forwards it to `ModelAdapterConfig.mcpConfigPath` so claude-cli
    *  reads it via `--mcp-config <path>`. Not user-facing. */
   claudeMcpConfigPath?: string;
+  /** Internal — populated by `AgentProcess` once per session for non-Claude
+   *  paths. The bridge wraps it into a `MergedToolExecutor` so the adapter's
+   *  agentic loop can call MCP tools the same way it calls builtins. The
+   *  pool is session-scoped so resume turns reuse already-connected
+   *  servers. Not user-facing. */
+  mcpPool?: McpClientPoolLike;
+  /** Internal — callback fired by `MergedToolExecutor` whenever an MCP
+   *  tool call starts/ends. Routed up to the agent's `activity` stream so
+   *  the dashboard shows MCP work in the activity panel. */
+  mcpProgress?: (ev: McpActivityEvent) => void;
+}
+
+/** Subset of `McpClientPool` consumed via `AdapterRequest`. Avoids a
+ *  hard import cycle with `mcp/pool.ts` from this adapter type file. */
+export interface McpClientPoolLike {
+  hasServers(): boolean;
+  discoverTools(): Promise<unknown[]>;
+  callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
+  cancelInFlight(reason?: string): void;
+  close(): Promise<void>;
+  readonly failures: ReadonlyArray<{ server: string; reason: string }>;
+}
+
+/** Activity events surfaced from the MCP layer to the agent stream. */
+export interface McpActivityEvent {
+  kind: 'mcp-call-start' | 'mcp-call-end' | 'mcp-progress' | 'mcp-server-failed';
+  serverName: string;
+  toolName?: string;
+  durationMs?: number;
+  isError?: boolean;
+  progress?: number;
+  total?: number;
+  message?: string;
 }
 
 /**
