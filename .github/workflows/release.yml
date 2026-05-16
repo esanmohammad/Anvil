@@ -57,6 +57,16 @@ jobs:
       - name: Build code-search-mcp
         run: cd packages/code-search-mcp && node build.mjs
 
+      # code-search-mcp ships three bin entries
+      # (code-search-mcp / code-search / code-search-daemon).
+      # Refuse to publish if any one is missing — mirrors the
+      # dashboard guard below; same shape as the 0.1.2 incident.
+      - name: Verify code-search bin entries landed
+        run: |
+          test -f packages/code-search-mcp/dist/index.js         || { echo "::error::dist/index.js missing — refusing to publish"; exit 1; }
+          test -f packages/code-search-mcp/dist/cli/index.js     || { echo "::error::dist/cli/index.js missing — refusing to publish"; exit 1; }
+          test -f packages/code-search-mcp/dist/daemon/index.js  || { echo "::error::dist/daemon/index.js missing — refusing to publish"; exit 1; }
+
       - name: Build cli (also builds dashboard)
         run: npm -w @esankhan3/anvil-cli run build
 

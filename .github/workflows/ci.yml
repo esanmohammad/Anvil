@@ -80,6 +80,10 @@ jobs:
       - name: Test knowledge-core
         run: npm -w @esankhan3/anvil-knowledge-core test
 
+      - name: Test code-search-mcp
+        # Pinned-down P3/P4/P7/P8 contracts.
+        run: npm -w @esankhan3/code-search-mcp test
+
       - name: Test CLI
         run: npm -w @esankhan3/anvil-cli test
 

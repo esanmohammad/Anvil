@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-agent-core",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Shared LLM stack — unified LanguageModel interface, provider adapters, agent subprocess machinery, and cost calculation for cli + knowledge-core + headless runners.",
   "type": "module",
   "license": "MIT",

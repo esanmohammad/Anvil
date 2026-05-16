@@ -12,12 +12,16 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DEFAULT_CONFIG } from '@esankhan3/anvil-knowledge-core';
+import { DEFAULT_CONFIG, normalizeRerankerConfig } from '@esankhan3/anvil-knowledge-core';
 import { createReranker } from '@esankhan3/anvil-knowledge-core';
 
 describe('knowledge defaults — Phase 6', () => {
   it('uses ollama as the default reranker so rerank is always on', () => {
-    assert.equal(DEFAULT_CONFIG.retrieval.reranker, 'ollama');
+    // P0 — reranker is now a struct (`{ provider: 'ollama' }`) but
+    // normalizeRerankerConfig handles either shape, so the legacy
+    // contract still holds.
+    const r = normalizeRerankerConfig(DEFAULT_CONFIG.retrieval.reranker);
+    assert.equal(r.provider, 'ollama');
   });
 
   it('keeps the default top-K tight (≤10) so rerank can re-narrow the pool', () => {

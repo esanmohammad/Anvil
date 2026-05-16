@@ -230,6 +230,14 @@ cost loader resolves the JSON via `fileURLToPath(import.meta.url)`.
 `FF_AGENT_CMD`, etc.) are honored with a one-time stderr deprecation
 warning. Resolution path lives in `single-shot.ts:readAliased`.
 
+Note (F1, code-search-mcp consumer): `@esankhan3/code-search-mcp`'s
+`resolveCodeSearchConfig()` pre-promotes `CODE_SEARCH_LLM_*` →
+`ANVIL_LLM_*` before any agent-core module is imported, so the
+deprecation warning never fires for standalone code-search users.
+Search for `bridgeLegacyEnvVars` in `packages/code-search-mcp/src/core/config.ts`
+if behavior diverges. Only writes when canonical is unset, so explicit
+`ANVIL_*` always wins.
+
 OpenCode adapter:
 - `OPENCODE_API_KEY` — required. Subscribe at https://opencode.ai/zen.
 - `OPENCODE_BASE_URL` — optional override (default

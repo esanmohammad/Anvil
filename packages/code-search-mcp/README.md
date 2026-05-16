@@ -39,9 +39,43 @@ That's the whole setup. Claude Desktop now knows your codebase.
 
 ---
 
-## Three modes, one binary
+## Three bin entries (one install)
 
-### Remote proxy (default)
+The npm package ships three binaries. Pick the one that matches the
+job — none of them need a separate install.
+
+| Bin | Use case |
+|---|---|
+| `code-search-mcp` | The MCP-server entry. Three operating modes below. |
+| `code-search` | Standalone CLI: `index` / `query` / `status` / `reset` / `daemon` / `serve` / `mcp`. |
+| `code-search-daemon` | Long-running indexer with file-watcher and JSON-RPC socket. |
+
+### Standalone CLI
+```sh
+code-search index .                                  # index current dir
+code-search query "where do we verify JWTs"          # hybrid by default
+code-search query "createPet" --mode bm25 --top-k 5  # exact-identifier mode
+code-search status --project petshop                 # JSON report
+code-search reset --project petshop                  # drop the index
+code-search --print-config                           # resolved config (redacted)
+```
+Every `CodeSearchConfig` leaf is settable as `--<dotted-path>` —
+e.g. `--embedding.provider codestral`, `--retrieval.max-chunks 12`,
+`--no-indexing.auto-index`.
+
+### Daemon mode (long-running indexer)
+```sh
+code-search-daemon --workspace /path/to/repos
+```
+Builds the index once, then watches the workspace and debounce-
+reindexes on file events. Listens on a UDS socket at
+`<dataDir>/daemon/<project>.sock` (named pipe on Windows). The CLI
+and MCP server automatically prefer the daemon when it's alive,
+falling back to in-process when it isn't.
+
+### MCP — three modes (`code-search-mcp` argv)
+
+**Remote proxy (default)**
 ```sh
 code-search-mcp                  # default — proxies to remote
 code-search-mcp --remote URL
@@ -51,7 +85,7 @@ Zero local setup, zero local index — perfect for hosted
 deployments where the index lives in the cloud and dev machines
 stay light. Auth via `CODE_SEARCH_API_KEY`.
 
-### Local
+**Local**
 ```sh
 code-search-mcp --local /path/to/repos
 code-search-mcp --local github:my-org/my-pattern
@@ -60,14 +94,15 @@ Discovers every repo under a path (or clones a GitHub org), builds
 the knowledge base, and serves over stdio. Works fully offline if
 your embedder + reranker are local (Ollama).
 
-### Serve
+**Serve**
 ```sh
 code-search-mcp --serve --port 4000 --auth api-key
 ```
 Boots an HTTP server (Streamable HTTP transport, SSE optional)
-with `/mcp`, `/health`, `/status`, and an admin `POST /index`. Use
-this to host one index for a whole team — every dev points their
-client at the same URL.
+with `/mcp`, `/health`, `/ready`, `/version`, `/status`,
+`/metrics` (Prometheus), `/admin/api/status`, and an admin
+`POST /index`. Use this to host one index for a whole team — every
+dev points their client at the same URL.
 
 ---
 
@@ -139,6 +174,45 @@ HTTP, gRPC, databases, env vars, npm/workspace deps, k8s,
 docker-compose, proto, Redis, S3, and shared constants. Plus an
 LLM-inferred semantic edge layer. `find_callers` works *across
 repos*. So does `impact_analysis`.
+
+---
+
+## Observability
+
+`code-search-mcp --serve` exposes these endpoints out of the box —
+no scrape config or APM agent required.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | Liveness ping with project + uptime |
+| `GET /ready` | `200` only after first index completes |
+| `GET /version` | Package + Node + platform |
+| `GET /status` | Current indexing phase + last-success history |
+| `GET /metrics` | Prometheus text format (queries, latency histogram, chunks, embedding/LLM calls, errors) |
+| `GET /admin/api/status` | JSON status dashboard for the admin UI |
+
+Set `CODE_SEARCH_STRUCTURED_LOGS=1` for one-JSON-line-per-event
+stderr logs, and `CODE_SEARCH_TELEMETRY_RECORD_QUERIES=1` to opt
+into recording query text in spans (off by default — queries are
+PII-shaped).
+
+---
+
+## Multi-project / multi-tenant
+
+Drop project entries under `<dataDir>/projects/<name>/project.yaml`:
+
+```yaml
+workspace: /Users/me/repos/petshop
+scopes: [team-shop]
+quotas:
+  max_queries_per_minute: 60
+  max_embedding_cost_usd: 5
+```
+
+`ProjectRegistry` reads them at boot. `projectAccessAllowed`
+gates by scope (`*` is admin). `checkProjectQuota` enforces a
+sliding 1-minute window per `(identity, project)`.
 
 ---
 
@@ -221,21 +295,64 @@ LanceDB store, same graph files.
 
 ---
 
-## Configuration
+## Configuration — defaults → file → env → CLI flags
 
-Everything is `CODE_SEARCH_*` env vars, single source of truth in
-`src/core/env-config.ts`:
+Single resolver in `src/core/config.ts`. Five precedence layers
+(lowest → highest):
 
-| Var | What it does |
+1. compiled-in `DEFAULTS`
+2. `~/.code-search/config.yaml` (user-global)
+3. `<workspaceDir>/.code-search.yaml` (per-workspace overlay)
+4. `CODE_SEARCH_*` env vars
+5. CLI flags via `--<dotted-path>` (e.g. `--embedding.provider codestral`)
+
+Run `code-search --print-config` or `code-search-mcp --print-config`
+any time to see the resolved struct (secrets redacted).
+
+| Var (`CODE_SEARCH_*`) | Effect |
 |---|---|
-| `CODE_SEARCH_SERVER` | Remote URL (proxy mode) |
-| `CODE_SEARCH_API_KEY` | API key for proxy or serve modes |
-| `CODE_SEARCH_DATA_DIR` | Override `~/.anvil/knowledge-base` |
-| `CODE_SEARCH_REINDEX_INTERVAL` | `30m` / `1h` / `6h` / `0` |
-| `EMBEDDING_PROVIDER` | `auto` / `voyage` / `openai` / `ollama` / … |
-| `EMBEDDING_API_KEY` | Bridged to provider-specific var |
-| `RERANKER_PROVIDER` | `ollama` / `cohere` / `voyage` / `none` |
+| `SERVER` | Remote URL (proxy mode) |
+| `API_KEY` | API key for proxy or serve modes |
+| `DATA_DIR` | Override the index storage root |
+| `PORT` / `HOST` / `TRANSPORT` | HTTP server bind |
+| `AUTH_MODE` / `AUTH_API_KEYS` / `AUTH_JWT_SECRET` | Server auth |
+| `REINDEX_INTERVAL` | `30m` / `1h` / `6h` / `0` |
+| `EMBEDDING_PROVIDER` | `auto` / `codestral` / `voyage` / `openai` / `ollama` / `openai-compatible` / `custom` / `gemini-oauth` |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | Model + dims |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` | Credentials |
 | `OLLAMA_HOST` | Default `http://localhost:11434` |
+| `RERANKER_PROVIDER` | `ollama` (default) / `cohere` / `voyage` / `openai-compatible` / `custom` / `none` |
+| `RERANKER_MODEL` / `RERANKER_API_KEY` / `RERANKER_BASE_URL` | Reranker config |
+| `RETRIEVAL_MAX_CHUNKS` / `RETRIEVAL_MAX_TOKENS` | Retrieval tuning |
+| `AUTO_INDEX` | `false` to disable startup auto-index |
+| `DAEMON_DISABLED` / `DAEMON_AUTO_SPAWN` | Daemon backend control |
+| `LLM_MODE` / `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | Profiling + service-mesh LLM. Pre-promoted to `ANVIL_LLM_*` so the agent-core integration is silent. |
+| `INDEXING_DEBOUNCE_MS` / `CHUNKING_MAX_TOKENS` | Indexer knobs |
+| `METRICS_ENABLED` / `STRUCTURED_LOGS` / `TELEMETRY_RECORD_QUERIES` | Observability |
+
+### Per-workspace config
+
+Drop a `.code-search.yaml` at the root of your workspace:
+
+```yaml
+embedding:
+  provider: codestral
+  model: codestral-embed-2505
+  dimensions: 1024
+reranker:
+  provider: ollama
+  model: qwen2.5-coder:7b           # the default that actually answers
+retrieval:
+  max_chunks: 12
+  hybrid_weights: { vector: 0.55, bm25: 0.3, graph: 0.15 }
+indexing:
+  auto_index: true
+  debounce_ms: 500
+```
+
+CLI flags override env, env overrides this file, this file overrides
+the user-global `~/.code-search/config.yaml`, that overrides
+`DEFAULTS`.
 
 ---
 
@@ -262,11 +379,49 @@ logs a warning instead of pretending it's fine.
 
 ---
 
+## End-to-end smoke test (T1–T8)
+
+The eight-case smoke that pins the standalone product contract lives
+at `scripts/smoke/run-smoke.sh`. It spins up a tiny `pet-shop` git
+fixture under `/tmp/cs-smoke/`, then runs:
+
+| # | Verifies |
+|---|---|
+| **T1** | `--print-config` env + CLI flag layering, redaction |
+| **T2** | `code-search index` produces a real Ollama-backed index; no stale legacy-env warning |
+| **T3** | `code-search query --mode vector` and `--mode bm25` both return the right file |
+| **T4** | `code-search status` reports provider + chunk count |
+| **T5** | Issue-#6 reproduction: `CODE_SEARCH_EMBEDDING_PROVIDER=openai` actually constructs the OpenAI embedder (skipped when `OPENAI_API_KEY` is unset) |
+| **T6** | Vector-space mismatch guard hard-errors on cross-provider query |
+| **T7** | Daemon round-trip: spawn, UDS socket, query through RPC, file-watcher debounce-reindex |
+| **T8** | HTTP serve: `/health` `/ready` `/version` `/metrics` `/admin/api/status` all 200; Prom text format |
+
+Run it locally:
+
+```sh
+npm -w @esankhan3/code-search-mcp run build      # required first
+npm -w @esankhan3/code-search-mcp run smoke      # T1–T8
+```
+
+Requirements: Ollama on `$OLLAMA_HOST` (default `localhost:11434`)
+with `bge-m3` pulled. Pass `OPENAI_API_KEY=...` to exercise the T5
+provider-switch path against the real OpenAI endpoint.
+
+The smoke runs **outside CI** — it requires Ollama + real models —
+so it's a hand-rolled local check, not a release gate. The release
+workflow does enforce a static guard that every bin entry
+(`code-search-mcp` / `code-search` / `code-search-daemon`) is in the
+built tarball before publishing.
+
+---
+
 ## Status
 
 Stable. The retrieval and graph layers move with
 `@anvil/knowledge-core`; the MCP surface is locked. New tools
-land additively.
+land additively. P0–P8 of the standalone-product plan
+(`docs/CODE-SEARCH-MCP-STANDALONE-PLAN.md`) have landed; F1–F4
+follow-up fixes verified by `scripts/smoke/run-smoke.sh`.
 
 ---
 

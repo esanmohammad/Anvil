@@ -9,19 +9,37 @@ future-tense roadmap content — only what compiles today.
 ```
                  ┌──────────────────────────────────────────────────┐
                  │ Browser (React, Vite-built) — packages/dashboard/src │
+                 │   wireToEvent(wire) → dashboardReducer(state, ev) │
                  └──────────────────────────────────────────────────┘
-                                       │ WS + HTTP (port 5173 / 7475)
+                                       │ WS (/ws) + HTTP (port 5173/7475)
+                                       │ + socket.io (/socket.io, env-gated)
                                        ▼
    ┌──────────────────────────────────────────────────────────────────┐
-   │ dashboard-server.ts (~6000 LOC) — single-file orchestrator       │
-   │   • createServer (HTTP) + WebSocketServer                        │
-   │   • registers ~50 WS message handlers                            │
+   │ dashboard-server.ts (~8,350 LOC) — single-file orchestrator      │
+   │   • createServer (HTTP) + WebSocketServer({path:'/ws'})          │
+   │   • registers ~150 WS client actions                             │
    │   • boots subsystems: AgentManager, MemoryStore, FeatureStore,   │
    │     KnowledgeBaseManager, PipelinePauseStore, PipelineRunner,    │
    │     CostLedger, BridgedCostLedger, RunStore                      │
    │   • OTel auto-detection (probes Langfuse at localhost:3000/)     │
    │   • PR URL extraction + PR-tracker rollup                        │
    │   • approval-token HTTP handlers (/approve, /reject)             │
+   │                                                                  │
+   │  ┌──── Phase 2–6 typed event layer ─────────────────────────┐    │
+   │  │  services/                  events/                       │    │
+   │  │    RunService               types.ts (DashboardEvent ∪)   │    │
+   │  │    AgentService             topics.ts (roomsForEvent)     │    │
+   │  │    PipelineService          replay.ts (ring buffer)       │    │
+   │  │    ReviewService            bridge.ts (legacy adapter)    │    │
+   │  │    PlanService              services-bridge.ts (socket.io)│    │
+   │  │    TestService              sync-emitter.ts (base class)  │    │
+   │  │    BindService                                            │    │
+   │  │    IncidentService     ws/                                │    │
+   │  │    KbService             socket-server.ts                 │    │
+   │  │    CostService             (mountSocketServer w/coexist)  │    │
+   │  │    ProjectGraphService                                    │    │
+   │  │    SystemService                                          │    │
+   │  └───────────────────────────────────────────────────────────┘    │
    └──────────────────────────────────────────────────────────────────┘
        │                    │                    │
        ▼                    ▼                    ▼
@@ -49,6 +67,37 @@ future-tense roadmap content — only what compiles today.
                   │  + stage permissions │
                   └──────────────────────┘
 ```
+
+## 1.1 Typed event flow (Phase 2–6)
+
+```
+Handler / Domain logic
+  │
+  │  services.runs.emit('run.active-snapshot', { runs })
+  ▼
+SyncEmitter.emit  ──── synchronous dispatch ────► onAny listeners
+  │                                                  │
+  │                                                  ▼
+  │                                       attachLegacyBridge
+  │                                          │
+  │                                          ├──► roomsForEvent(ev) → topics
+  │                                          ├──► replay.append(envelope)
+  │                                          └──► toLegacyWire(ev) → broadcast()
+  │                                                                    │
+  │                                                                    ▼
+  │                                              React frontend (raw WS today)
+  │
+  └──► bridgeServicesToRooms (when socket.io mounted)
+        │
+        ├──► replay.append(envelope)
+        └──► io.to(rooms).emit(legacyType, payload) ──► socket.io clients
+```
+
+Key invariants:
+- **Single emit path**: domain logic NEVER calls `broadcast(...)` directly; it goes through `services.<X>.emit(kind, payload)`.
+- **Sync dispatch**: `SyncEmitter` runs listeners in-line during `emit()` so wire ordering matches a direct `broadcast()` call. Emittery's microtask dispatch would reorder.
+- **Topic routing is exhaustive**: `roomsForEvent(ev)` uses `ts-pattern.match(...).exhaustive()` — adding a new kind without a topic map is a compile error.
+- **Bridge translates back to legacy**: while the React frontend still consumes `{type,payload}`, the bridge re-emits each typed event into that shape. Phase 7+ frontend swap removes the legacy bridge entirely.
 
 ## 2. Workspace imports (verified `grep "from '@anvil"`)
 

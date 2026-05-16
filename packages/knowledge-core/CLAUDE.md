@@ -87,18 +87,68 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 - `discoverRepos(directoryPath)` — zero-config repo discovery (single
   git repo or scan-subdirs).
 - `buildKBFromPath` / `embedFromPath` / `indexFromPath` — path-based
-  facades.
-- `getRetriever(project)` — resolved `HybridRetriever` for a project.
+  facades. Each accepts an optional `config: KnowledgeConfig` in `opts`;
+  when omitted, falls back to `loadKnowledgeConfig(project)`. Consumers
+  (cli, dashboard, code-search-mcp) are expected to pass their fully-
+  resolved config explicitly — see boundary rules in
+  `docs/CODE-SEARCH-MCP-STANDALONE-PLAN.md`.
+- `getRetriever(project, configOverride?)` — resolved `HybridRetriever`.
+  On open, walks `<basePath>/<repo>/index_meta.json` and **hard-errors**
+  if the recorded `embeddingProvider` doesn't match the resolved config's
+  embedder. Pre-P2 this divergence silently returned garbage vectors.
 
-### Config
-- `loadKnowledgeConfig(project)` — minimal yaml parse from
-  `~/.anvil/projects/<project>/factory.yaml` (or `project.yaml`).
+### Config (P0–P2)
+- **`KnowledgeConfig`** — typed config struct. `embedding` is a
+  `EmbeddingProviderConfig` (`{provider, model?, dimensions?, apiKey?,
+  baseUrl?, ollamaHost?}`), `retrieval.reranker` is a
+  `RerankerProviderConfig` struct (`{provider, model?, apiKey?, baseUrl?,
+  timeoutMs?}`) — back-compat: a bare string id is accepted and normalized
+  via `normalizeRerankerConfig`. Provider unions
+  (`EmbeddingProviderId`, `RerankerProviderId`) match the factory branches
+  one-for-one (`provider-unions.test.ts` pins this).
+- `loadKnowledgeConfig(project)` — yaml from
+  `~/.anvil/projects/<project>/factory.yaml` (or `project.yaml`), then
+  overlays `CODE_SEARCH_*` env vars via `applyEnvOverrides` (issue #6 fix,
+  pinned by `env-overrides.test.ts`). Recognized env: `EMBEDDING_PROVIDER`,
+  `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_API_KEY`,
+  `EMBEDDING_BASE_URL`, `OLLAMA_HOST`, `RERANKER_PROVIDER`,
+  `RERANKER_MODEL`, `RERANKER_API_KEY`, `RERANKER_BASE_URL`,
+  `RETRIEVAL_MAX_CHUNKS`, `RETRIEVAL_MAX_TOKENS`, `AUTO_INDEX`.
+- `cloneKnowledgeConfig(c)` — deep clone used by every override layer.
+- `applyEnvOverrides(c)` — pure transformer, never mutates.
 - `getKnowledgeBasePath(project)` — `CODE_SEARCH_DATA_DIR` →
   `ANVIL_HOME/knowledge-base` → `~/.anvil/knowledge-base`.
 - `DEFAULT_CONFIG` — `embedding.provider='auto'`, `dimensions=1024`,
   `chunking.maxTokens=500`, `retrieval.maxChunks=8`, `maxTokens=12000`,
-  `hybridWeights={vector:0.5, bm25:0.3, graph:0.2}`, `reranker='ollama'`,
-  `autoIndex=true`.
+  `hybridWeights={vector:0.5, bm25:0.3, graph:0.2}`,
+  `reranker={provider:'ollama'}` (now a struct), `autoIndex=true`.
+
+### Provider classes — env reads are deprecated (P2)
+Every embedder + reranker constructor takes `apiKey`/`baseUrl`/`ollamaHost`/
+`timeoutMs` directly. The classes still fall back to documented env vars
+(`MISTRAL_API_KEY`, `VOYAGE_API_KEY`, `OPENAI_API_KEY`, `COHERE_API_KEY`,
+`OLLAMA_HOST`, `CODE_SEARCH_EMBEDDING_BASE_URL` / `_MODEL` / `_API_KEY`,
+`CODE_SEARCH_RERANKER_BASE_URL` / `_MODEL` / `_API_KEY`,
+`RERANKER_MODEL`) for one release cycle, but each first read emits a
+one-shot `[knowledge-core] DEPRECATED:` stderr warning via
+`deprecatedEnv()`. Library env reads are removed in 1.0; consumers must
+pass credentials through the config struct.
+
+### P6 retrieval primitives (opt-in)
+- `bm25-tokenizers.ts` — `tokenizerFor(language)`; per-language
+  tokenizers for `typescript` / `javascript` / `python` / `go` / `rust` /
+  `java` / `php` capture lang-significant tokens
+  (Rust `'static`, Python `__init__`, Go receivers, Java `@Annotation`,
+  PHP `$variable`). Unknown languages fall through to `genericTokenize`.
+- `query-expander.ts` — `expandQuery(query, classification, llm, opts)`
+  returns `{queries, weights}`. HyDE-lite: skips `identifier`/`path`/
+  `error-code` types unless `forceExpand`; LRU 128 / 10-min cache; uses
+  any `LlmClient` adapter. `fuseRrf(rankings, weights, k=60)` merges
+  expanded retrievals.
+- `rerank-cache.ts` — `RerankCache` on-disk LRU keyed by
+  SHA(query|chunkId|model). Default 50k entries, debounced 1s
+  serialization. Wiring into `HybridRetriever` is intentionally deferred —
+  the building blocks are public so future surgery is local.
 
 Public barrel: `src/index.ts`. Note: `tree-sitter-parser` re-exports are
 explicit (not `*`) because it had a `computeStructuralHash` symbol that

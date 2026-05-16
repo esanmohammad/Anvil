@@ -1,6 +1,6 @@
 {
   "name": "@anvil-dev/dashboard",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "React dashboard and Node.js server for Anvil — real-time pipeline orchestration, knowledge graph visualization, and agent management",
   "type": "module",
@@ -43,11 +43,11 @@
     "test:server": "npx tsc -p server/tsconfig.json && node --test server/out/__tests__/*.test.js"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.1.2",
-    "@esankhan3/anvil-convention-core": "^0.1.1",
-    "@esankhan3/anvil-core-pipeline": "^0.1.2",
-    "@esankhan3/anvil-knowledge-core": "^0.1.1",
-    "@esankhan3/anvil-memory-core": "^0.1.1",
+    "@esankhan3/anvil-agent-core": "^0.2.0",
+    "@esankhan3/anvil-convention-core": "^0.2.0",
+    "@esankhan3/anvil-core-pipeline": "^0.2.0",
+    "@esankhan3/anvil-knowledge-core": "^0.2.0",
+    "@esankhan3/anvil-memory-core": "^0.2.0",
     "lucide-react": "1.8.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

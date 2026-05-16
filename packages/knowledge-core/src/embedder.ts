@@ -1,8 +1,30 @@
 import { execSync as execSyncCmd } from 'node:child_process';
-import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from 'node:fs';
+import { existsSync as fsExistsSync, readFileSync as fsReadFileSync, writeFileSync as fsWriteFileSync } from 'node:fs';
 import { join as pathJoin } from 'node:path';
 import { homedir as osHomedir } from 'node:os';
-import type { EmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
+import type { EmbeddingProvider } from './types.js';
+import type { EmbeddingProviderConfig } from './config.js';
+
+// ---------------------------------------------------------------------------
+// Deprecation-warning seam (P2). Provider classes still read env when the
+// caller didn't pass an explicit credential — but each fallback fires a
+// single stderr warning so consumers know what to migrate. Cleared in 1.0.
+// ---------------------------------------------------------------------------
+
+const WARNED_ENV_KEYS = new Set<string>();
+
+function deprecatedEnv(key: string): string | undefined {
+  const v = process.env[key];
+  if (v && !WARNED_ENV_KEYS.has(key)) {
+    WARNED_ENV_KEYS.add(key);
+    process.stderr.write(
+      `[knowledge-core] DEPRECATED: ${key} read from process.env. ` +
+      `Pass via config.embedding.apiKey / .baseUrl / .ollamaHost instead. ` +
+      `Library env reads will be removed in 1.0.\n`,
+    );
+  }
+  return v;
+}
 
 // ---------------------------------------------------------------------------
 // 1. Codestral (Mistral) Embedder
@@ -12,16 +34,18 @@ export class CodestralEmbedder implements EmbeddingProvider {
   readonly name = 'codestral';
   readonly dimensions: number;
   private readonly model: string;
+  private readonly apiKey: string | undefined;
 
-  constructor(options?: { model?: string; dimensions?: number }) {
+  constructor(options?: { model?: string; dimensions?: number; apiKey?: string }) {
     this.model = options?.model ?? 'codestral-embed-2505';
     this.dimensions = options?.dimensions ?? 1024;
+    this.apiKey = options?.apiKey;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const apiKey = process.env.MISTRAL_API_KEY;
+    const apiKey = this.apiKey ?? deprecatedEnv('MISTRAL_API_KEY');
     if (!apiKey) {
-      throw new Error('MISTRAL_API_KEY environment variable is not set');
+      throw new Error('MISTRAL_API_KEY (or config.embedding.apiKey) is not set');
     }
 
     const response = await fetch('https://api.mistral.ai/v1/embeddings', {
@@ -60,16 +84,18 @@ export class VoyageEmbedder implements EmbeddingProvider {
   readonly name = 'voyage';
   readonly dimensions: number;
   private readonly model: string;
+  private readonly apiKey: string | undefined;
 
-  constructor(options?: { model?: string; dimensions?: number }) {
+  constructor(options?: { model?: string; dimensions?: number; apiKey?: string }) {
     this.model = options?.model ?? 'voyage-code-3';
     this.dimensions = options?.dimensions ?? 1024;
+    this.apiKey = options?.apiKey;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const apiKey = process.env.VOYAGE_API_KEY;
+    const apiKey = this.apiKey ?? deprecatedEnv('VOYAGE_API_KEY');
     if (!apiKey) {
-      throw new Error('VOYAGE_API_KEY environment variable is not set');
+      throw new Error('VOYAGE_API_KEY (or config.embedding.apiKey) is not set');
     }
 
     const response = await fetch('https://api.voyageai.com/v1/embeddings', {
@@ -108,16 +134,18 @@ export class OpenAIEmbedder implements EmbeddingProvider {
   readonly name = 'openai';
   readonly dimensions: number;
   private readonly model: string;
+  private readonly apiKey: string | undefined;
 
-  constructor(options?: { model?: string; dimensions?: number }) {
+  constructor(options?: { model?: string; dimensions?: number; apiKey?: string }) {
     this.model = options?.model ?? 'text-embedding-3-large';
     this.dimensions = options?.dimensions ?? 1024;
+    this.apiKey = options?.apiKey;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = this.apiKey ?? deprecatedEnv('OPENAI_API_KEY');
     if (!apiKey) {
-      throw new Error('OPENAI_API_KEY environment variable is not set');
+      throw new Error('OPENAI_API_KEY (or config.embedding.apiKey) is not set');
     }
 
     const response = await fetch('https://api.openai.com/v1/embeddings', {
@@ -173,10 +201,10 @@ export class OllamaEmbedder implements EmbeddingProvider {
   private readonly baseUrl: string;
   private readonly prefixes: { document: string; query: string } | null;
 
-  constructor(options?: { model?: string; dimensions?: number }) {
+  constructor(options?: { model?: string; dimensions?: number; ollamaHost?: string }) {
     this.model = options?.model ?? 'bge-m3';
     this.dimensions = options?.dimensions ?? OLLAMA_MODEL_DIMS[this.model] ?? 1024;
-    this.baseUrl = process.env.OLLAMA_HOST ?? 'http://localhost:11434';
+    this.baseUrl = options?.ollamaHost ?? deprecatedEnv('OLLAMA_HOST') ?? 'http://localhost:11434';
     this.prefixes = OLLAMA_PREFIX_MODELS[this.model] ?? null;
   }
 
@@ -216,6 +244,119 @@ export class OllamaEmbedder implements EmbeddingProvider {
 // 5. Gemini OAuth Embedder (uses Gemini CLI's stored OAuth token)
 // ---------------------------------------------------------------------------
 
+/**
+ * Auto-refresh requires the OAuth client credentials gemini-cli used to
+ * mint the user's `~/.gemini/oauth_creds.json`. We do NOT bundle these —
+ * they belong to whoever owns the gemini-cli install. Users opt-in by
+ * exporting:
+ *
+ *   GEMINI_OAUTH_CLIENT_ID=...
+ *   GEMINI_OAUTH_CLIENT_SECRET=...
+ *
+ * before running the embedder. When unset, the refresh path throws a
+ * clear actionable error pointing at `gemini auth login`, which the CLI
+ * uses to re-mint the creds file end-to-end.
+ */
+
+interface GeminiOAuthCreds {
+  access_token: string;
+  refresh_token?: string;
+  scope?: string;
+  token_type?: string;
+  id_token?: string;
+  /** Milliseconds-since-epoch (Google's standard). */
+  expiry_date?: number;
+}
+
+/**
+ * Refresh an expired gemini-cli access token in place. Persists the new
+ * tokens back to `oauth_creds.json` so subsequent calls (and the CLI
+ * itself) pick them up. Returns the fresh `access_token`.
+ *
+ * F3 — without this, the embedder would 401 forever once the user's
+ * first token aged out (~1h). Mirrors gemini-cli's refresh logic.
+ */
+async function refreshGeminiAccessToken(
+  oauthPath: string,
+  creds: GeminiOAuthCreds,
+): Promise<string> {
+  if (!creds.refresh_token) {
+    throw new Error(
+      'Gemini OAuth access_token expired and no refresh_token is present. ' +
+      'Run: gemini auth login',
+    );
+  }
+
+  // No literal client id / secret is baked in — the consumer must supply
+  // them via env if they want non-interactive refresh. Otherwise the user
+  // re-auths via the gemini CLI itself.
+  const clientId = process.env.GEMINI_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GEMINI_OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      'Gemini OAuth access_token expired. Auto-refresh requires ' +
+      'GEMINI_OAUTH_CLIENT_ID + GEMINI_OAUTH_CLIENT_SECRET env vars ' +
+      '(use the values your gemini-cli install uses), or just re-auth: ' +
+      'gemini auth login',
+    );
+  }
+
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: 'refresh_token',
+    refresh_token: creds.refresh_token,
+  });
+
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    // F3 — when the configured OAuth client doesn't match the one that
+    // minted the user's creds file, Google returns `invalid_client`. The
+    // correct fallback is to re-auth via the gemini CLI, which
+    // re-mints the creds file using its own client config.
+    const hint = text.includes('invalid_client')
+      ? 'GEMINI_OAUTH_CLIENT_ID/SECRET don\'t match the client your gemini-cli is using. '
+      : '';
+    throw new Error(
+      `Gemini OAuth refresh failed (${response.status}): ${text.slice(0, 200)}. ` +
+      `${hint}Run: gemini auth login`,
+    );
+  }
+
+  const next = (await response.json()) as {
+    access_token: string;
+    expires_in: number;
+    scope?: string;
+    token_type?: string;
+    id_token?: string;
+    refresh_token?: string;
+  };
+
+  const updated: GeminiOAuthCreds = {
+    ...creds,
+    access_token: next.access_token,
+    expiry_date: Date.now() + next.expires_in * 1000,
+    scope: next.scope ?? creds.scope,
+    token_type: next.token_type ?? creds.token_type,
+    id_token: next.id_token ?? creds.id_token,
+    // Google usually omits a fresh refresh_token; keep the old one.
+    refresh_token: next.refresh_token ?? creds.refresh_token,
+  };
+
+  try {
+    fsWriteFileSync(oauthPath, JSON.stringify(updated, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  } catch {
+    // Persistence failure isn't fatal — we still have a valid token in memory.
+  }
+  return updated.access_token;
+}
+
 export class GeminiOAuthEmbedder implements EmbeddingProvider {
   readonly name = 'gemini-oauth';
   readonly dimensions: number;
@@ -226,20 +367,27 @@ export class GeminiOAuthEmbedder implements EmbeddingProvider {
     this.dimensions = options?.dimensions ?? 768;
   }
 
-  private getAccessToken(): string {
+  private async getAccessToken(): Promise<string> {
     const oauthPath = pathJoin(osHomedir(), '.gemini', 'oauth_creds.json');
     if (!fsExistsSync(oauthPath)) {
       throw new Error('Gemini CLI not authenticated. Run: gemini auth login');
     }
-    const creds = JSON.parse(fsReadFileSync(oauthPath, 'utf-8'));
+    const creds = JSON.parse(fsReadFileSync(oauthPath, 'utf-8')) as GeminiOAuthCreds;
     if (!creds.access_token) {
       throw new Error('Gemini OAuth token not found. Run: gemini auth login');
+    }
+
+    // F3 — auto-refresh when expired (or within the 5-minute clock-skew
+    // buffer). Without this the embedder dies with 401 after ~1h.
+    const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+    if (typeof creds.expiry_date === 'number' && creds.expiry_date - REFRESH_BUFFER_MS < Date.now()) {
+      return refreshGeminiAccessToken(oauthPath, creds);
     }
     return creds.access_token;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const token = this.getAccessToken();
+    const token = await this.getAccessToken();
     const results: number[][] = [];
 
     // Gemini embedding API processes one text at a time via batchEmbedContents
@@ -285,10 +433,8 @@ export class GeminiOAuthEmbedder implements EmbeddingProvider {
 // Supports: OpenAI, Mistral, Together, Fireworks, OpenRouter, Jina,
 //           local vLLM, LM Studio, llama.cpp, text-embeddings-inference, etc.
 //
-// Config via env:
-//   CODE_SEARCH_EMBEDDING_BASE_URL   — API base URL (required)
-//   CODE_SEARCH_EMBEDDING_API_KEY    — API key
-//   CODE_SEARCH_EMBEDDING_MODEL      — model name (required)
+// Constructor takes config; falls back to CODE_SEARCH_EMBEDDING_* env vars
+// only when the field is omitted (one-shot deprecation warning per key).
 // ---------------------------------------------------------------------------
 
 export class OpenAICompatibleEmbedder implements EmbeddingProvider {
@@ -299,13 +445,13 @@ export class OpenAICompatibleEmbedder implements EmbeddingProvider {
   private readonly apiKey: string | undefined;
 
   constructor(options?: { model?: string; dimensions?: number; baseUrl?: string; apiKey?: string }) {
-    this.baseUrl = options?.baseUrl || process.env.CODE_SEARCH_EMBEDDING_BASE_URL || '';
-    this.model = options?.model || process.env.CODE_SEARCH_EMBEDDING_MODEL || '';
-    this.apiKey = options?.apiKey || process.env.CODE_SEARCH_EMBEDDING_API_KEY;
+    this.baseUrl = options?.baseUrl ?? deprecatedEnv('CODE_SEARCH_EMBEDDING_BASE_URL') ?? '';
+    this.model = options?.model ?? deprecatedEnv('CODE_SEARCH_EMBEDDING_MODEL') ?? '';
+    this.apiKey = options?.apiKey ?? deprecatedEnv('CODE_SEARCH_EMBEDDING_API_KEY');
     this.dimensions = options?.dimensions ?? 1024;
 
-    if (!this.baseUrl) throw new Error('Embedding base URL required. Set CODE_SEARCH_EMBEDDING_BASE_URL');
-    if (!this.model) throw new Error('Embedding model required. Set CODE_SEARCH_EMBEDDING_MODEL');
+    if (!this.baseUrl) throw new Error('Embedding base URL required. Pass config.embedding.baseUrl or set CODE_SEARCH_EMBEDDING_BASE_URL');
+    if (!this.model) throw new Error('Embedding model required. Pass config.embedding.model or set CODE_SEARCH_EMBEDDING_MODEL');
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -342,12 +488,9 @@ export class OpenAICompatibleEmbedder implements EmbeddingProvider {
 // Factory
 // ---------------------------------------------------------------------------
 
-/**
- * Check if Ollama is running locally.
- */
-function isOllamaRunning(): boolean {
+/** Check if Ollama is running locally. */
+function isOllamaRunning(host: string): boolean {
   try {
-    const host = process.env.OLLAMA_HOST ?? 'http://localhost:11434';
     execSyncCmd(`curl -s --max-time 2 ${host}/api/tags`, { stdio: 'pipe', timeout: 3000 });
     return true;
   } catch {
@@ -355,9 +498,7 @@ function isOllamaRunning(): boolean {
   }
 }
 
-/**
- * Check if Gemini CLI is authenticated and has a valid OAuth token.
- */
+/** Check if Gemini CLI is authenticated and has a valid OAuth token. */
 function isGeminiCliAuthenticated(): boolean {
   try {
     const oauthPath = pathJoin(osHomedir(), '.gemini', 'oauth_creds.json');
@@ -369,50 +510,86 @@ function isGeminiCliAuthenticated(): boolean {
   }
 }
 
-export function createEmbeddingProvider(config: {
-  provider: string;
-  model?: string;
-  dimensions?: number;
-}): EmbeddingProvider {
-  const opts = { model: config.model, dimensions: config.dimensions };
+/**
+ * Build an embedding provider from an explicit config struct.
+ * Accepts the legacy `{ provider, model, dimensions }` shape too — extra
+ * struct fields (`apiKey`, `baseUrl`, `ollamaHost`) just flow through when
+ * present.
+ */
+export function createEmbeddingProvider(
+  config: EmbeddingProviderConfig | { provider: string; model?: string; dimensions?: number },
+): EmbeddingProvider {
+  // Allow legacy `{ provider, model, dimensions }` callers to keep working
+  // while P2 migration is in flight.
+  const cfg = config as EmbeddingProviderConfig;
+  const baseOpts = {
+    model: cfg.model,
+    dimensions: cfg.dimensions,
+    apiKey: cfg.apiKey,
+  };
 
-  switch (config.provider) {
+  switch (cfg.provider) {
     case 'codestral':
     case 'mistral':
-      return new CodestralEmbedder(opts);
+      return new CodestralEmbedder(baseOpts);
     case 'voyage':
-      return new VoyageEmbedder(opts);
+      return new VoyageEmbedder(baseOpts);
     case 'openai':
-      return new OpenAIEmbedder(opts);
+      return new OpenAIEmbedder(baseOpts);
     case 'ollama':
-      return new OllamaEmbedder(opts);
+      return new OllamaEmbedder({
+        model: cfg.model,
+        dimensions: cfg.dimensions,
+        ollamaHost: cfg.ollamaHost ?? cfg.baseUrl,
+      });
     case 'gemini-oauth':
     case 'gemini':
-      return new GeminiOAuthEmbedder(opts);
+      return new GeminiOAuthEmbedder({ model: cfg.model, dimensions: cfg.dimensions });
     case 'openai-compatible':
     case 'custom':
-      return new OpenAICompatibleEmbedder(opts);
+      return new OpenAICompatibleEmbedder({
+        model: cfg.model,
+        dimensions: cfg.dimensions,
+        baseUrl: cfg.baseUrl,
+        apiKey: cfg.apiKey,
+      });
     case 'auto': {
-      // Auto-detect: custom base URL → local Ollama → API keys → CLI OAuth
-      if (process.env.CODE_SEARCH_EMBEDDING_BASE_URL) return new OpenAICompatibleEmbedder(opts);
-      if (isOllamaRunning()) return new OllamaEmbedder(opts);
-      if (process.env.MISTRAL_API_KEY) return new CodestralEmbedder(opts);
-      if (process.env.OPENAI_API_KEY) return new OpenAIEmbedder(opts);
-      if (process.env.VOYAGE_API_KEY) return new VoyageEmbedder(opts);
-      if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
-        return new GeminiOAuthEmbedder(opts);
+      // Auto-detect: explicit baseUrl → openai-compatible; local Ollama →
+      // ollama; API keys → cloud; fall through to Gemini CLI OAuth.
+      const host = cfg.ollamaHost ?? deprecatedEnv('OLLAMA_HOST') ?? 'http://localhost:11434';
+      if (cfg.baseUrl || process.env.CODE_SEARCH_EMBEDDING_BASE_URL) {
+        return new OpenAICompatibleEmbedder({
+          model: cfg.model,
+          dimensions: cfg.dimensions,
+          baseUrl: cfg.baseUrl,
+          apiKey: cfg.apiKey,
+        });
       }
-      if (isGeminiCliAuthenticated()) return new GeminiOAuthEmbedder(opts);
+      if (isOllamaRunning(host)) {
+        return new OllamaEmbedder({ model: cfg.model, dimensions: cfg.dimensions, ollamaHost: host });
+      }
+      if (cfg.apiKey || process.env.MISTRAL_API_KEY) {
+        return new CodestralEmbedder(baseOpts);
+      }
+      if (process.env.OPENAI_API_KEY) return new OpenAIEmbedder(baseOpts);
+      if (process.env.VOYAGE_API_KEY) return new VoyageEmbedder(baseOpts);
+      if (process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY) {
+        return new GeminiOAuthEmbedder({ model: cfg.model, dimensions: cfg.dimensions });
+      }
+      if (isGeminiCliAuthenticated()) {
+        return new GeminiOAuthEmbedder({ model: cfg.model, dimensions: cfg.dimensions });
+      }
       throw new Error(
-        'No embedding provider available. Install Ollama (brew install ollama && ollama pull nomic-embed-text), ' +
-        'or set an API key (MISTRAL_API_KEY, OPENAI_API_KEY), ' +
-        'or set CODE_SEARCH_EMBEDDING_BASE_URL for a custom provider.',
+        'No embedding provider available. Install Ollama (brew install ollama && ollama pull bge-m3), ' +
+        'set an API key (MISTRAL_API_KEY, OPENAI_API_KEY, VOYAGE_API_KEY) — or pass ' +
+        'config.embedding.apiKey + config.embedding.baseUrl for a custom provider.',
       );
     }
     default:
       throw new Error(
-        `Unknown embedding provider "${config.provider}". ` +
-          'Supported: codestral, mistral, voyage, openai, ollama, gemini, openai-compatible, custom, auto',
+        `Unknown embedding provider "${cfg.provider}". ` +
+          'Supported: codestral, mistral, voyage, openai, ollama, gemini, gemini-oauth, ' +
+          'openai-compatible, custom, auto. Removed: nomic-local.',
       );
   }
 }

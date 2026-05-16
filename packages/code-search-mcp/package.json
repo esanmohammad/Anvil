@@ -1,26 +1,38 @@
 {
   "name": "@esankhan3/code-search-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for multi-repo code search — GitHub org or local path, zero config",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "code-search-mcp": "./dist/index.js"
+    "code-search-mcp": "./dist/index.js",
+    "code-search": "./dist/cli/index.js",
+    "code-search-daemon": "./dist/daemon/index.js"
   },
   "exports": {
     ".": "./dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "scripts/smoke"
   ],
   "scripts": {
     "build": "node build.mjs",
-    "dev": "tsc -b --watch"
+    "dev": "tsc -b --watch",
+    "test": "node --test dist/__tests__/*.test.js",
+    "smoke": "bash scripts/smoke/run-smoke.sh"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.1.0",
-    "@esankhan3/anvil-knowledge-core": "^0.1.0",
+    "@esankhan3/anvil-agent-core": "^0.2.0",
+    "@esankhan3/anvil-knowledge-core": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "optionalDependencies": {
+    "@lancedb/lancedb-darwin-arm64": "0.27.2",
+    "@lancedb/lancedb-darwin-x64": "0.27.2",
+    "@lancedb/lancedb-linux-x64-gnu": "0.27.2",
+    "@lancedb/lancedb-linux-arm64-gnu": "0.27.2",
+    "@lancedb/lancedb-win32-x64-msvc": "0.27.2"
   },
   "devDependencies": {
     "@types/node": "^22.15.2"
