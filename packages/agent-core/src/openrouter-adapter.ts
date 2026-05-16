@@ -371,9 +371,13 @@ export class OpenRouterAdapter implements ModelAdapter {
     // appending final text content (model spent its turns on tool_use /
     // reasoning blocks but never emitted assistant text), surface as a
     // retryable upstream error so the dashboard's chain-fallback walks
-    // to the next chain entry instead of writing a 0-byte artifact
+    // to the next chain entry instead of writing a 0-byte artifact.
+    //
+    // Exclude `iteration_limit` — that's a deliberate caller-side cap,
+    // not a model failure. The model did what it was asked; bubbling
+    // this up as retryable would needlessly burn the model.
     // downstream. Mirrors the claude-adapter contract.
-    if (!aggregatedText.trim() && stopReason !== 'aborted') {
+    if (!aggregatedText.trim() && stopReason !== 'aborted' && stopReason !== 'iteration_limit') {
       throw new _UpstreamError(
         503,
         `${this.provider} model "${config.model}" returned empty final text (stopReason=${stopReason}, outputTokens=${totalOut}, toolCalls=${countToolCalls(messages)})`,

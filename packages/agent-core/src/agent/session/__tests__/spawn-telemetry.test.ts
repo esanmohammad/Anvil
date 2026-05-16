@@ -32,7 +32,38 @@ import type { AdapterRequest } from '../adapter.js';
 let exporter: InMemorySpanExporter;
 let provider: NodeTracerProvider;
 
+/**
+ * Sandbox HOME (and USERPROFILE on Windows) so the global fallbacks
+ * inside `resolveSkillsDir` (`$HOME/.claude/skills/`) and
+ * `findMcpConfigPath` (`$HOME/.claude/mcp.json`) can never observe the
+ * developer's or CI runner's real home dir. Without this seam, the test
+ * "empty workspace: no skill attrs (absence stays absent)" was flaky
+ * because users with `~/.claude/skills/*` (common — claude-cli skills,
+ * personal helpers) would surface a non-zero count.
+ */
+let sandboxHome: string | null = null;
+let savedHome: string | undefined;
+let savedUserprofile: string | undefined;
+
+function installHomeSandbox(): void {
+  sandboxHome = mkdtempSync(join(tmpdir(), 'anvil-tel-home-'));
+  savedHome = process.env.HOME;
+  savedUserprofile = process.env.USERPROFILE;
+  process.env.HOME = sandboxHome;
+  process.env.USERPROFILE = sandboxHome;
+}
+
+function uninstallHomeSandbox(): void {
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  if (savedUserprofile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = savedUserprofile;
+  if (sandboxHome) rmSync(sandboxHome, { recursive: true, force: true });
+  sandboxHome = null;
+}
+
 async function installInMemoryExporter(): Promise<void> {
+  installHomeSandbox();
   await resetTracer();
   exporter = new InMemorySpanExporter();
   provider = new NodeTracerProvider({
@@ -51,6 +82,7 @@ async function uninstallInMemoryExporter(): Promise<void> {
   }
   exporter.reset();
   trace.disable();
+  uninstallHomeSandbox();
 }
 
 function makeRequest(overrides: Partial<AdapterRequest> = {}): AdapterRequest {
@@ -139,10 +171,11 @@ describe('defaultAdapterFactory telemetry', () => {
       });
       assert.equal(span.attributes['anvil.skills.activated.count'], undefined);
       assert.equal(span.attributes['anvil.skills.activated.names'], undefined);
-      // Note: anvil.mcp.servers.count may still appear if the user has a
-      // global ~/.claude/mcp.json (rank-5 fallback in findMcpConfigPath).
-      // We assert only on per-workspace skill-absence to keep the test
-      // robust across machines.
+      // With the HOME sandbox in beforeEach, no global skills can leak in
+      // from the developer's or CI runner's actual home directory, so MCP
+      // discovery should also stay silent — but only when the user has no
+      // workspace-level mcp.json, which makeEmptyWorkspace() guarantees.
+      assert.equal(span.attributes['anvil.mcp.servers.count'], undefined);
     } finally {
       ws.cleanup();
     }
