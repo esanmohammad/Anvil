@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-cli",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Anvil — AI-powered feature development pipeline (CLI + dashboard)",
   "type": "module",
   "license": "MIT",
@@ -151,8 +151,12 @@
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-force-graph-2d": "1.29.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "ts-pattern": "^5.9.0",
     "ws": "^8.18.0",
-    "yaml": "^2.7.1"
+    "yaml": "^2.7.1",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^22.15.2"
