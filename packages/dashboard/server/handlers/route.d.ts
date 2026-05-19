@@ -238,6 +238,7 @@ export interface HandlerExtras {
     /** Live pipeline-runner ref. `null` between runs. */
     getActivePipelineRunner?: () => {
         cancel(): void;
+        provideStageAnswer?(stageIndex: number, repoName: string | null, questionIndex: number, text: string): unknown;
     } | null;
     /** Plan validator (writes go through `unsafeStores.planStore`). Wide
      * shape — concrete `PlanIssue` has more optional fields than we model. */

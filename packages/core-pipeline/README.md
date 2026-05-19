@@ -117,6 +117,38 @@ model per stage given a `stage-policy.yaml`. Resolution order
 mirrors `models.yaml` — env override, per-workspace, per-user,
 bundled default — so end users have a single mental model.
 
+### Durable execution &nbsp;<sub><i>new in 0.3.0</i></sub>
+Pattern-2 durable execution at the step + effect granularity. Pass
+a `DurableStore` into `Pipeline.run()` and every `step:started`,
+`step:completed`, `effect:started`, `effect:completed` lands in a
+SQLite event log. Replay walks the log, skips steps with a
+recorded `step:completed`, and short-circuits each `ctx.effect()`
+call to its recorded result — no double spawns, no re-running tools,
+no re-prompting users. `ctx.effect(name, fn)`, `ctx.now()`,
+`ctx.uuid()`, `ctx.random()`, `ctx.sleep(ms)`, and
+`ctx.waitForSignal(channel)` cover every nondeterministic operation
+a step body might reach for. Opt-in: omit `durableStore` and the
+walker runs byte-identically to pre-0.3.0.
+
+### Multi-process race arbitration &nbsp;<sub><i>new in 0.3.0</i></sub>
+`LeaseManager` claims a TTL'd lease in the durable store on
+`Pipeline.run()` entry, heartbeats it at `ttl/3`, and emits `'lost'`
+when a peer steals it. `findOrphanedRuns(store)` scans for
+`status='running'` rows with expired leases — the canonical
+crash-recovery signal. `tryTakeOverLease(store, runId, newHolder,
+ttlMs)` claims one. The dashboard's boot wiring auto-claims orphan
+leases and replays them through `Pipeline.run({resumeFromStep,
+durableStore})`. No manual intervention; no duplicated work across
+processes.
+
+### Determinism lint &nbsp;<sub><i>new in 0.3.0</i></sub>
+`npm run lint:stages` walks every stage + step source file and flags
+direct calls to `Date.now`, `Math.random`, `crypto.randomUUID`,
+`fs.*`, `exec*`, `setTimeout`. Recommended replacement:
+`ctx.now()`, `ctx.uuid()`, `ctx.effect('<name>', fn)`. Advisory
+by default; set `ANVIL_LINT_STAGES_STRICT=1` in CI to block merges
+on new violations.
+
 ---
 
 ## Architecture at a glance
@@ -195,10 +227,11 @@ responders on the bus.
 
 ## Status
 
-Shipped through Phase 9 of the original extraction. The dashboard
-runs on it today; the CLI is migrating off its legacy
-orchestrator. Public surface is stable; ongoing work focuses on
-durable execution and richer routing.
+Shipped through Phase 9 of the original extraction plus the v0.3.0
+durable-execution rollout (Phases D1–D6 + E0–E10 + F1–F9 + G1–G4).
+The dashboard runs on it today; the CLI is migrating off its
+legacy orchestrator. Public surface is stable. Recent additions:
+`ctx.effect` + replay + lease arbitration + compensation walk.
 
 ---
 

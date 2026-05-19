@@ -348,5 +348,149 @@ No vendor LLM SDK. No durability backend. No broker.
   `~/.anvil/runs/<runId>/audit.jsonl` (append-only),
   `~/.anvil/state.json` (debounced snapshot),
   `~/.anvil/features/<project>/<slug>/*.md` (write-once artifacts).
-  Step-level cross-process replay (Pattern 2) is explicitly
-  out-of-scope (P7).
+- **v0.3.0 — Pattern-2 durable execution (`src/durable/`).** Step-level
+  cross-process replay is now in-scope (P7 from the original
+  extraction ADR is done). See §11 below.
+
+## 11. Durable execution module (`src/durable/`)
+
+```
+              ┌─────────────────────────────────────────────────┐
+              │ Caller: Pipeline.run({durableStore, holder})    │
+              └────────────────────────┬────────────────────────┘
+                                       ▼
+              ┌─────────────────────────────────────────────────┐
+              │ Pipeline.run() —                                │
+              │   1. Read prior events                          │
+              │   2. Skip 'replay-completed' steps              │
+              │   3. For each remaining step:                   │
+              │      a. version check vs prior 'step:started'   │
+              │      b. attach EffectRuntime to ctx             │
+              │      c. invoke step.run(ctx)                    │
+              │      d. record step:completed                   │
+              │   4. On failure: compensation walk in reverse   │
+              └────────────────────────┬────────────────────────┘
+                                       ▼
+                  ┌────────────────────────────────────────┐
+                  │ EffectRuntime (per step)               │
+                  │ ctx.effect(name, fn, opts)             │
+                  │ ctx.now / uuid / random / sleep        │
+                  │ ctx.waitForSignal(channel)             │
+                  └────────────────┬───────────────────────┘
+                                   ▼
+              ┌─────────────────────────────────────────────┐
+              │ DurableStore (driver: SQLite or in-memory)  │
+              │ ┌─────────────────────────────────────────┐ │
+              │ │ runs  events  signals  meta             │ │
+              │ └─────────────────────────────────────────┘ │
+              │ acquireLease | renewLease | releaseLease    │
+              │ appendEvent | readEvents | readEffectEvents │
+              │ enqueueSignal | consumeSignal | readSignals │
+              │ vacuum                                      │
+              └─────────────────────────────────────────────┘
+                                   ▲
+                                   │
+              ┌────────────────────┴───────────────────────┐
+              │ LeaseManager (multi-process arbitration)   │
+              │   • periodic renew at ttl/3                │
+              │   • emits 'lost' on peer takeover          │
+              │   • findOrphanedRuns / tryTakeOverLease    │
+              └────────────────────────────────────────────┘
+```
+
+### File layout
+
+```
+packages/core-pipeline/src/durable/
+├── index.ts             Public barrel.
+├── types.ts             RunStatus, RunRecord, EventRecord, SignalRecord,
+│                          DeterminismViolationError, ...
+├── store.ts             DurableStore interface. Every driver implements.
+├── sqlite-store.ts      SQLiteDurableStore (production driver,
+│                          ~/.anvil/durable.db via better-sqlite3 + WAL).
+├── in-memory-store.ts   InMemoryDurableStore (tests).
+├── effect-runtime.ts    EffectRuntime — implements ctx.effect / now /
+│                          uuid / random / sleep / waitForSignal.
+├── effect-helpers.ts    serializeAgentRunResult, contentHash,
+│                          artifactIdempotencyKey.
+├── lease-manager.ts     LeaseManager + tryTakeOverLease +
+│                          findOrphanedRuns.
+├── replay-equivalence.ts Two-pass replay test seam:
+│                          seedStoreFromLog, throwingSpy, countingSpy.
+└── lint.ts              Seven regex rules: no-direct-{date-now,
+                            math-random, crypto-uuid, fs-write,
+                            fs-read, exec, setTimeout}.
+```
+
+### Effect protocol
+
+```
+Step body:
+  const x = await ctx.effect('build:spawn-task-<repo>-<id>', async () => {
+    return spawnAgentAndWait(...);   // side effect
+  });
+
+EffectRuntime.effect(name, fn, opts):
+  1. idx = perStepCounter++
+  2. recorded = recordedEffects.find(e => e.name === name && e.idx === idx)
+  3. if recorded:
+       if recorded.kind === 'completed': return recorded.result
+       if recorded.kind === 'failed': throw recorded.error
+  4. else: NEW effect
+       appendEvent({kind: 'effect:started', stepId, name, idx, ts, ...})
+       try {
+         result = await fn()
+         appendEvent({kind: 'effect:completed', result, ...})
+         return result
+       } catch (err) {
+         appendEvent({kind: 'effect:failed', error, retryable, ...})
+         throw err
+       }
+```
+
+Name + idx tuple is the determinism key. On replay, the runtime
+walks `recordedEffects` in order and matches by `(name, idx)`. A
+mismatch (different name at same idx, or missing) throws
+`DeterminismViolationError(reason: 'effect-order-mismatch')`.
+
+### Lease arbitration
+
+Each `LeaseManager` instance:
+- Owns a `(runId, holderId)` lease in the durable store.
+- Heartbeats `renewLease(ttlMs)` at `ttl/3` cadence.
+- On `renewLease` failure → emits `'lost'` event; caller cancels
+  the in-flight run.
+- `tryTakeOverLease(store, runId, newHolder, ttlMs)` — peer takeover
+  when the current lease is expired.
+- `findOrphanedRuns(store)` — at boot, scan for `status='running'`
+  rows with expired leases. The dashboard's `setup/durable.ts`
+  calls this and dispatches each through `auto-replay-queue`.
+
+### Signal channel
+
+```
+Producer (any in-process or remote actor):
+  durableStore.enqueueSignal(runId, channel, payload)
+
+Consumer (step body):
+  const answer = await ctx.waitForSignal<string>(channel)
+    1. Check signals table for unconsumed entries
+    2. If found: mark consumed, return payload
+    3. If not: subscribe to in-process notifier
+    4. Block until either: signal arrives, run cancels
+```
+
+Channel naming convention:
+- `stage-answer-<stageIndex>` — project-level Q&A
+- `stage-answer-<stageIndex>:<repoName>` — per-repo Q&A
+- `reviewer-decision-<stageLabel>` — review pause decisions
+
+### Lint rule
+
+`scripts/lint-stages.js` (driven by `npm run lint:stages`) walks
+`src/stages/` + `src/steps/` + `dashboard/server/pipeline-stages.ts`
+applying `lintStepSource` to each. Violations: direct
+`Date.now()`, `Math.random()`, `crypto.randomUUID()`, `fs.write*`,
+`fs.read*`, `exec*`, `setTimeout`. Recommended replacement:
+`ctx.now()`, `ctx.uuid()`, `ctx.effect('<name>', fn)`. Advisory
+mode by default; set `ANVIL_LINT_STAGES_STRICT=1` for CI fail.

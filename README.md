@@ -391,6 +391,41 @@ graph, no dashboard required.
 
 </td>
 </tr>
+<tr>
+<td width="33%" valign="top">
+
+### Durable execution &nbsp;<sub><i>new in 0.3.0</i></sub>
+Pattern-2 durable execution. Every step and every side effect is
+recorded to a SQLite event log at `~/.anvil/durable.db`. Kill the
+dashboard mid-run, relaunch, and the run picks up exactly where it
+left off — recorded effects return their cached result, no double
+spawns, no re-asking the user the same question. `ctx.effect()`,
+`ctx.waitForSignal()`, deterministic clock and uuid.
+
+</td>
+<td width="33%" valign="top">
+
+### Race arbitration &nbsp;<sub><i>new in 0.3.0</i></sub>
+Multi-process lease arbitration. Each run holds a TTL'd lease in
+the durable store; the live process heartbeats it. Crash mid-run
+and a sibling process auto-takes-over on boot — orphan scan finds
+expired leases, claims them, and the auto-resume queue replays
+the workflow from the durable cursor. No manual intervention; no
+duplicated work.
+
+</td>
+<td width="33%" valign="top">
+
+### Policy gates &nbsp;<sub><i>new in 0.3.0</i></sub>
+Policy editor lives at `/policy` in the dashboard. Toggle pause
+gates per stage (plan, implement, test, ship), set auto-approve
+thresholds on risk + confidence, cap per-run and per-day cost,
+configure Q&A budgets. Paused runs surface an in-app banner +
+modal — approve, reject, modify the artifact, iterate with a
+note, or rerun from a target stage.
+
+</td>
+</tr>
 </table>
 
 ---
@@ -619,14 +654,17 @@ commands are on deck.
 
 Pipeline orchestration · multi-provider routing · knowledge
 indexing · memory ratification · convention extraction ·
-PR review · OpenTelemetry · dashboard UI.
+PR review · OpenTelemetry · dashboard UI · **durable
+execution (Pattern-2, v0.3.0)** · **multi-process race
+arbitration (v0.3.0)** · **policy editor (v0.3.0)**.
 
 </td>
 </tr>
 </table>
 
-**In flight:** durable execution · richer plan validators · deeper
-RAG-eval · additional MCP tools.
+**In flight:** richer plan validators · deeper RAG-eval ·
+additional MCP tools · cost-policy enforcement (UI scaffolded —
+ships in the next minor) · notification channels (Slack + email).
 
 ---
 

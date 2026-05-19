@@ -30,6 +30,7 @@ export const routes: RouteConfig[] = [
   { path: '/memory', id: 'memory', label: 'Memory', secondary: true },
   { path: '/project', id: 'project', label: 'Project', secondary: true },
   { path: '/knowledge-graph', id: 'knowledge-graph', label: 'Knowledge Graph', secondary: true },
+  { path: '/policy', id: 'policy', label: 'Policy', secondary: true },
 
   { path: '/settings', id: 'settings', label: 'Settings', secondary: true },
 ];

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { RotateCcw, Undo2 } from 'lucide-react';
+import { RotateCcw } from 'lucide-react';
 import { RunTimeline } from './RunTimeline.js';
+import { DurableTimeline } from './DurableTimeline.js';
 import { Badge } from '../ui/Badge.js';
 import { MarkdownRenderer } from '../output/MarkdownRenderer.js';
 import type { RunSummary } from './RunRow.js';
@@ -14,21 +15,14 @@ export interface RunDetailProps {
 
 export function RunDetail({ run, stages, ws }: RunDetailProps) {
   const [showReplayPicker, setShowReplayPicker] = useState(false);
-  const [showRollbackConfirm, setShowRollbackConfirm] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
-  // Surface server replies for replay / rollback so the buttons feel responsive.
+  // Surface server replies for replay so the button feels responsive.
   useEffect(() => {
     if (!ws) return;
     const handler = (event: MessageEvent) => {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'rollback-done') {
-          const ok = msg.payload?.ok;
-          const count = msg.payload?.results?.length ?? 0;
-          setToast(ok ? `Rolled back ${count} repo(s).` : 'Rollback completed with errors — see server logs.');
-          window.setTimeout(() => setToast(null), 4000);
-        }
         if (msg.type === 'error' && typeof msg.payload?.message === 'string') {
           setToast(msg.payload.message);
           window.setTimeout(() => setToast(null), 4000);
@@ -93,21 +87,6 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
               <RotateCcw size={12} />
               Replay
             </button>
-            {/* Rollback button */}
-            <button
-              onClick={() => setShowRollbackConfirm(true)}
-              style={{
-                display: 'inline-flex', alignItems: 'center', gap: 6,
-                padding: '5px 12px', fontSize: 12, fontWeight: 500,
-                background: 'var(--bg-hover)', color: 'var(--color-error)',
-                border: '1px solid var(--border-default)', borderRadius: 'var(--radius-sm)',
-                cursor: 'pointer',
-              }}
-            >
-              <Undo2 size={12} />
-              Rollback
-            </button>
-
             {/* Replay stage picker dropdown */}
             {showReplayPicker && (
               <div style={{
@@ -146,54 +125,6 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
               </div>
             )}
 
-            {/* Rollback confirmation dialog */}
-            {showRollbackConfirm && (
-              <div style={{
-                position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 20,
-                minWidth: 220, padding: '12px 16px',
-                background: 'var(--bg-elevated-2)', border: '1px solid var(--border-default)',
-                borderRadius: 'var(--radius-md)', boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
-              }}>
-                <div style={{ fontSize: 13, color: 'var(--text-primary)', marginBottom: 10, fontWeight: 500 }}>
-                  Rollback this run?
-                </div>
-                <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 12, lineHeight: 1.5 }}>
-                  This will attempt to undo changes made by this run.
-                </div>
-                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-                  <button
-                    onClick={() => setShowRollbackConfirm(false)}
-                    style={{
-                      padding: '5px 12px', fontSize: 12,
-                      background: 'none', border: '1px solid var(--border-default)',
-                      borderRadius: 'var(--radius-sm)', color: 'var(--text-secondary)', cursor: 'pointer',
-                    }}
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (!ws || ws.readyState !== WebSocket.OPEN) {
-                        setToast('Not connected — restart `anvil-loc dashboard`.');
-                        window.setTimeout(() => setToast(null), 4000);
-                      } else {
-                        ws.send(JSON.stringify({ action: 'rollback-run', runId: run.id }));
-                        setToast('Rollback requested…');
-                        window.setTimeout(() => setToast(null), 3000);
-                      }
-                      setShowRollbackConfirm(false);
-                    }}
-                    style={{
-                      padding: '5px 12px', fontSize: 12, fontWeight: 500,
-                      background: 'var(--color-error)', color: '#fff', border: 'none',
-                      borderRadius: 'var(--radius-sm)', cursor: 'pointer',
-                    }}
-                  >
-                    Rollback
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
         </div>
         <div style={{ display: 'flex', gap: 'var(--space-sm)', fontSize: 'var(--text-sm)', color: 'var(--text-secondary)', flexWrap: 'wrap', alignItems: 'center' }}>
@@ -249,6 +180,16 @@ export function RunDetail({ run, stages, ws }: RunDetailProps) {
           progress: s.status === 'completed' ? 100 : 0,
         }))} />
       </div>
+
+      {/* Durable timeline (Phase F8) */}
+      <details style={{ marginTop: 'var(--space-md)' }}>
+        <summary style={{ cursor: 'pointer', fontSize: 'var(--text-sm)', fontWeight: 500, marginBottom: 'var(--space-xs)' }}>
+          Durable execution log
+        </summary>
+        <div style={{ marginTop: 'var(--space-xs)' }}>
+          <DurableTimeline runId={run.id} ws={ws} />
+        </div>
+      </details>
 
       {/* Repositories */}
       {run.repos.length > 0 && (

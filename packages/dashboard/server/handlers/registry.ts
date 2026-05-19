@@ -33,6 +33,7 @@ import { plansSpawnRoutes } from './plans-spawn.js';
 import { reviewsSpawnRoutes } from './reviews-spawn.js';
 import { testsPipelineRoutes } from './tests-pipeline.js';
 import { incidentsSpawnRoutes } from './incidents-spawn.js';
+import { durableRoutes } from './durable.js';
 
 /** Construct the registry. Pure factory — no side effects. */
 export function buildRegistry(): Record<string, Handler> {
@@ -56,6 +57,7 @@ export function buildRegistry(): Record<string, Handler> {
     ...reviewsSpawnRoutes(),
     ...testsPipelineRoutes(),
     ...incidentsSpawnRoutes(),
+    ...durableRoutes(),
   };
 }
 

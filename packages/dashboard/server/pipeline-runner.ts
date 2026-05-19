@@ -99,9 +99,10 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import { InMemoryEventBus } from '@esankhan3/anvil-core-pipeline';
+import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper, attachDurableLogHook, LeaseManager } from '@esankhan3/anvil-core-pipeline';
 import { attachPipelineHooks } from './pipeline-hooks.js';
 import { runPipelineLoop } from './pipeline-loop.js';
+import { getDurableStore, durableHolderId } from './durable-store-singleton.js';
 import { DEFAULT_WALKER_CONFIG } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
 import { type PromptBuilderContext } from '@esankhan3/anvil-core-pipeline';
@@ -119,6 +120,24 @@ import { FeatureManifestStore } from './feature-manifest.js';
 // Re-exported above for back-compat.
 
 // ── Pipeline Runner ───────────────────────────────────────────────────
+
+/** Build the lookup key for a per-(stage, repo) Q&A input resolver. */
+function stageInputKey(stageIndex: number, repoName: string | null): string {
+  return `${stageIndex}|${repoName ?? '__'}`;
+}
+
+/**
+ * Durable signal channel name for stage Q&A answers. Per-repo runs are
+ * suffixed with the repo so two repos paused at the same stage don't
+ * collide on a single channel (the in-process resolver was already
+ * keyed correctly via `stageInputKey`, but the durable signal was not).
+ *
+ * Producer: `provideStageAnswer` in this file.
+ * Consumer: `pipeline-stages.ts` Q&A wait (per-repo + project-level).
+ */
+export function stageAnswerChannel(stageIndex: number, repoName: string | null): string {
+  return repoName ? `stage-answer-${stageIndex}:${repoName}` : `stage-answer-${stageIndex}`;
+}
 
 export class PipelineRunner extends EventEmitter {
   private agentManager: AgentManager;
@@ -205,6 +224,24 @@ export class PipelineRunner extends EventEmitter {
   // For interactive clarify — resolves when user provides input
   private inputResolve: ((text: string) => void) | null = null;
 
+  /**
+   * Per-(stageIndex, repoName?) input resolvers for stage Q&A. The
+   * resolver fires once every question for the stage has an answer; the
+   * server resolves it with a `<answers>...</answers>` block ready to
+   * paste back into the agent session via `agentSession.sendInput`.
+   *
+   * Key: `${stageIndex}|${repoName ?? '__'}`.
+   */
+  private stageInputResolvers = new Map<string, (text: string) => void>();
+
+  /** Project Q&A policy snapshot — set by the dashboard before run() starts. */
+  private qaPolicy: { enabled?: boolean; maxQuestionsPerStage?: number } | undefined;
+
+  /** Wire the project's Q&A policy block into the runner before `run()`. */
+  setQAPolicy(policy: { enabled?: boolean; maxQuestionsPerStage?: number } | undefined): void {
+    this.qaPolicy = policy;
+  }
+
   constructor(
     agentManager: AgentManager,
     projectLoader: ProjectLoader,
@@ -240,7 +277,7 @@ export class PipelineRunner extends EventEmitter {
     });
 
     const featureSlug = FeatureStore.slugify(config.feature);
-    const runId = `run-${Date.now().toString(36)}`;
+    const runId = config.runId ?? `run-${Date.now().toString(36)}`;
 
     this.state = {
       runId,
@@ -376,6 +413,72 @@ export class PipelineRunner extends EventEmitter {
     }
   }
 
+  /**
+   * Record the user's answer for one Q&A question on a specific stage
+   * (and repo, when the stage is per-repo). Mutates state, broadcasts a
+   * `stage-answer-recorded` event, and — once every question for this
+   * (stage, repo) has an answer — resolves the agent's input promise
+   * with a formatted `<answers>` block. Returns the new "remaining"
+   * count so the WS handler can echo it back.
+   */
+  provideStageAnswer(stageIndex: number, repoName: string | null, questionIndex: number, text: string): {
+    remaining: number;
+    accepted: boolean;
+  } {
+    const stage = this.state.stages[stageIndex];
+    if (!stage) return { remaining: 0, accepted: false };
+    const list = repoName
+      ? stage.repos.find((r) => r.repoName === repoName)?.questions
+      : stage.questions;
+    if (!list) return { remaining: 0, accepted: false };
+    const target = list.find((q) => q.index === questionIndex);
+    if (!target) return { remaining: 0, accepted: false };
+    target.answer = text.trim();
+    target.answeredAt = new Date().toISOString();
+    const remaining = list.filter((q) => !q.answer).length;
+    this.broadcastState();
+    this.emit('stage-answer-recorded', { stageIndex, repoName, questionIndex, remaining });
+    if (remaining === 0) {
+      const key = stageInputKey(stageIndex, repoName);
+      const resolve = this.stageInputResolvers.get(key);
+      const answersBlock = formatStageAnswersHelper(list.map((q) => ({
+        question: q.text,
+        answer: q.answer ?? '',
+      })));
+      if (resolve) {
+        this.stageInputResolvers.delete(key);
+        resolve(answersBlock);
+      }
+      // Phase E9: enqueue a durable signal so a crashed process
+      // resumes Q&A without re-prompting. The receiver
+      // (runStageWithQA) races the in-process resolver against
+      // ctx.waitForSignal — first one to land wins. The channel
+      // is per-(stage, repo) — see `stageAnswerChannel` — so two
+      // repos paused at the same stage don't share one channel.
+      const durableStore = getDurableStore();
+      if (durableStore) {
+        const channel = stageAnswerChannel(stageIndex, repoName);
+        void durableStore
+          .enqueueSignal(this.state.runId, channel, answersBlock)
+          .catch((err) => {
+            console.warn(
+              `[pipeline-runner] enqueueSignal failed for ${channel}: ${err instanceof Error ? err.message : err}`,
+            );
+          });
+      }
+    }
+    return { remaining, accepted: true };
+  }
+
+  /** Read-only view of the questions for a (stage, repo) — used by the dashboard. */
+  getStageQuestions(stageIndex: number, repoName: string | null = null) {
+    const stage = this.state.stages[stageIndex];
+    if (!stage) return [];
+    return repoName
+      ? stage.repos.find((r) => r.repoName === repoName)?.questions ?? []
+      : stage.questions ?? [];
+  }
+
   cancel(): void {
     this.cancelled = true;
     // Kill all running agents
@@ -431,7 +534,56 @@ export class PipelineRunner extends EventEmitter {
         broadcast: () => this.broadcastState(),
         prefetchProviderLiveness: () => this.prefetchProviderLiveness(),
       });
+
+      // Phase D3: durable store integration. Open the singleton,
+      // create/upsert a `runs` row for this runId, attach the
+      // durable-log hook so step:* events are persisted, and
+      // pass the store down to the Pipeline walker so step
+      // bodies that opt into ctx.effect get checkpointed.
+      const durableStore = getDurableStore();
+      const durableHolder = durableHolderId();
+      let durableHookHandle: { unsubscribe(): void } | null = null;
+      let leaseManager: LeaseManager | null = null;
+      if (durableStore) {
+        try {
+          await durableStore.createRun({
+            runId: this.state.runId,
+            project: this.config.project,
+            feature: this.config.feature,
+            featureSlug: this.state.featureSlug,
+          });
+          await durableStore.acquireLease(this.state.runId, durableHolder, 60_000);
+          await durableStore.updateRunStatus(this.state.runId, 'running', null);
+          durableHookHandle = attachDurableLogHook(
+            this.pipelineBus,
+            durableStore,
+            this.state.runId,
+          );
+          // Phase D6: heartbeat the lease so a crashed process's
+          // lease expires within ttlMs and a peer (or this process
+          // restarted) can take over.
+          leaseManager = new LeaseManager({
+            store: durableStore,
+            runId: this.state.runId,
+            holder: durableHolder,
+            ttlMs: 60_000,
+          });
+          leaseManager.on('lost', () => {
+            console.warn(`[pipeline-runner] Lost durable lease for ${this.state.runId} — another process took over.`);
+          });
+          leaseManager.on('error', (err: Error) => {
+            console.warn(`[pipeline-runner] Lease heartbeat error: ${err.message}`);
+          });
+          leaseManager.start();
+        } catch (err) {
+          console.warn(
+            `[pipeline-runner] Durable store wiring failed; continuing in non-durable mode: ${err instanceof Error ? err.message : err}`,
+          );
+        }
+      }
+
       let loopResult;
+      console.log(`[trace] ${this.state.runId} before runPipelineLoop`);
       try {
         loopResult = await runPipelineLoop({
           stageOps: this.depsForStageOps(),
@@ -444,11 +596,31 @@ export class PipelineRunner extends EventEmitter {
           resumeStage,
           initialPrevArtifact: prevArtifact,
           isCancelled: () => this.cancelled,
+          ...(durableStore ? { durableStore, durableHolder } : {}),
         });
       } finally {
         hooksHandle.detach();
+        durableHookHandle?.unsubscribe();
+        if (leaseManager) {
+          await leaseManager.stop();
+        } else if (durableStore) {
+          try {
+            await durableStore.releaseLease(this.state.runId, durableHolder);
+          } catch {
+            /* swallow — best-effort release */
+          }
+        }
       }
-      if (loopResult.pipelineEarlyReturn) return this.state;
+      if (loopResult.pipelineEarlyReturn) {
+        if (durableStore) {
+          try {
+            await durableStore.updateRunStatus(this.state.runId, 'failed');
+          } catch {
+            /* swallow */
+          }
+        }
+        return this.state;
+      }
 
       if (!this.cancelled) {
         this.state.status = 'completed';
@@ -459,6 +631,19 @@ export class PipelineRunner extends EventEmitter {
           status: 'completed',
           totalCost: this.state.totalCost,
         });
+        if (durableStore) {
+          try {
+            await durableStore.updateRunStatus(this.state.runId, 'completed');
+          } catch {
+            /* swallow */
+          }
+        }
+      } else if (durableStore) {
+        try {
+          await durableStore.updateRunStatus(this.state.runId, 'cancelled');
+        } catch {
+          /* swallow */
+        }
       }
     } catch (err) {
       console.error('[pipeline-runner] Fatal error:', err);
@@ -466,6 +651,14 @@ export class PipelineRunner extends EventEmitter {
       this.broadcastState();
       this.checkpoint(); // Save: fatal failure
       this.emit('pipeline-fail', this.state);
+      const fallbackStore = getDurableStore();
+      if (fallbackStore) {
+        try {
+          await fallbackStore.updateRunStatus(this.state.runId, 'failed');
+        } catch {
+          /* swallow */
+        }
+      }
     }
 
     return this.state;
@@ -538,6 +731,12 @@ export class PipelineRunner extends EventEmitter {
       handleOutputTruncation: (agentName, outputTokens) => handleOutputTruncationFn(this.depsForTelemetry(), agentName, outputTokens),
       writePerRepoTelemetry: (stage, repo, stats) => writePerRepoTelemetryFn(this.depsForTelemetry(), stage, repo, stats),
       setInputResolve: (resolve) => { this.inputResolve = resolve; },
+      getQAPolicy: () => this.qaPolicy,
+      setStageInputResolver: (stageIndex, repoName, resolve) => {
+        const key = stageInputKey(stageIndex, repoName);
+        if (resolve) this.stageInputResolvers.set(key, resolve);
+        else this.stageInputResolvers.delete(key);
+      },
       fixLoopAgentByRepo: this.fixLoopAgentByRepo,
       getFixLoopAgentSingle: () => this.fixLoopAgentSingle,
       setFixLoopAgentSingle: (id) => { this.fixLoopAgentSingle = id; },

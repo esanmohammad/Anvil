@@ -384,6 +384,24 @@ npm -w @anvil-dev/dashboard run dev         # Vite frontend on 5173
 node packages/dashboard/server/dashboard-server.js   # WS+HTTP backend
 ```
 
+### ⚠ `anvil-loc dashboard` runs the CLI's bundled copy, not this workspace
+
+The CLI symlink `anvil-loc` boots
+`packages/cli/dist/dashboard/server/dashboard-server.js`, NOT
+`packages/dashboard/server/dashboard-server.js`. After editing
+anything under `packages/dashboard/`, you MUST run:
+
+```sh
+npm -w @esankhan3/anvil-cli run build
+```
+
+That cascades: rebuilds this workspace → mirrors fresh output into
+`cli/dist/dashboard/` via `bundle-dashboard.mjs`. Without that final
+step, `anvil-loc dashboard` keeps executing the previously-bundled
+code and your fix appears not to work. See
+`packages/cli/CLAUDE.md` → "Dashboard changes need the **CLI** build"
+for the full diagnosis.
+
 The build pipeline is `vite build && tsc -p server/tsconfig.json &&
 node ./scripts/copy-out.mjs`. `tsc` writes to `server/out/`;
 `copy-out.mjs` walks the tree recursively and mirrors every
@@ -554,18 +572,36 @@ Code's convention: `mcp__<server>__<tool>`.
   spawn. The pool records `{ server, reason }` in `failures[]`; the
   agent still runs with the other servers + the builtins.
 
-### Stopping a build — broadcast first, kill chain after
+### Stopping a build — UI first, kill chain in background
 
-`stop-run` flips `run.status='failed'` and emits the
-`run-stopped` + `broadcastActiveRuns()` broadcasts FIRST, then calls
-`runner.cancel()` and walks `agentToRunId` to kill every spawned
-agent (deduped into a `Set` so a stage-tracked + map-tracked agent
-isn't killed twice). Map entries are cleaned up as we go. The kill
-chain (`AgentManager.kill` → `AgentProcess.kill` → `adapter.kill()`
-→ per-call `AbortController`) severs in-flight HTTP requests on
-Ollama/OpenRouter/OpenCode adapters and SIGTERM-s CLI subprocesses.
-The UI sees the run flip immediately even though the async kill
-unwind takes a few seconds for in-flight LLM calls.
+`stop-run` removes the run from `activeRuns` AND broadcasts FIRST,
+then defers `runner.cancel()` + the agent-kill walk into a
+`queueMicrotask` so the UI gets its `active-runs` payload without
+waiting for any of that to finish. The runner's `cancel()` is
+synchronous (sets `this.cancelled = true`), but if its body is stuck
+inside an `await` with no `AbortSignal` wired (e.g. a hung HTTP
+fetch in a non-Claude adapter, an embedder call inside KB
+retrieval), flipping the flag won't unblock it. We accept that the
+runner may keep churning in the background until the underlying
+Promise rejects on its own — the user's Active Runs row is gone
+immediately, which is what matters. The kill chain
+(`AgentManager.kill` → `AgentProcess.kill` → `adapter.kill()` →
+per-call `AbortController`) still runs and severs in-flight HTTP
+requests on Ollama/OpenRouter/OpenCode adapters + SIGTERMs CLI
+subprocesses; it just happens *after* the UI has updated.
+
+**Optimistic placeholder for Build clicks.** The frontend inserts a
+`pending-build-<base36>` row into `activeRunsList` the moment the
+user clicks Build, so the run appears in Active Runs instantly
+instead of after the server round-trip. When the server's
+`active-runs` payload arrives, the reducer at
+`src/main.tsx:506` MERGES (not replaces) — preserving any
+`pending-*` rows whose `(project, description, type)` triple isn't
+yet present in the server list. After 15 s a pending placeholder
+that's never been claimed is dropped (treated as orphaned —
+server rejected the start). Without this merge, the placeholder
+would be wiped on the very next server broadcast and the user would
+see nothing until the server got around to registering the run.
 
 ### PR URL extraction from `tool_result`
 
@@ -696,3 +732,97 @@ breaks reproducibility — only invalidate on explicit `clearCache()`.
   pipeline runner shape, provider matrix.
 - `ARCHITECTURE.md` — module map, single-process layout, WS protocol
   surface, hot-path sequence.
+
+## Durable execution (server wiring)
+
+**v0.3.0** wires the dashboard to `@esankhan3/anvil-core-pipeline`'s
+durable execution module. Three boot-time daemons + a runner
+integration + four WS handlers + three React surfaces.
+
+**Server wiring** (the dashboard IS the orchestrator that drives
+durable runs):
+- **`server/durable-store-singleton.ts`** — process-wide SQLite store
+  at `~/.anvil/durable.db`. `getDurableStore()` returns the shared
+  handle; `null` when `ANVIL_DURABLE_DISABLED=1` (opt-out for tests).
+  `durableHolderId()` returns `${pid}@${hostname}` for lease tracking.
+- **`server/durable-migration.ts`** — boot scanner. Pattern-1 sweep
+  (incomplete audit logs → durable table as `failed` + marker) +
+  orphan takeover (claim expired leases via `tryTakeOverLease`).
+  Set `ANVIL_DURABLE_AUTO_TAKEOVER=0` to revert to mark-failed.
+- **`server/durable-vacuum.ts`** — `scheduleDurableVacuum(store)`
+  runs once at boot + daily on `setInterval`. Drops terminal runs
+  older than `ANVIL_DURABLE_RETENTION_DAYS` (default 30).
+- **`server/durable-resume-queue.ts`** — `dispatchTakenOverRuns()`
+  derives resume-from-stage from cursor + events, calls
+  `startPipeline(project, feature, {resumeFromStage})`. **Disabled by
+  default** as of 2026-05-17 — auto-starting an old run on every
+  dashboard boot is surprising and ties the user's hands. Set
+  `ANVIL_DURABLE_AUTO_RESUME=1` to opt in.
+- **`server/setup/durable.ts`** — `bootDurable()` orchestrates the
+  three daemons above. Called from `dashboard-server.ts` near the end
+  of boot, before `listenAndReturnHandle`. Returns a stop handle
+  registered with the shutdown chain. **Orphan-claim status flip**:
+  `tryTakeOverLease` updates only the `lease_holder` + `lease_expires`
+  columns; it does NOT touch `status`. So when an old dashboard died
+  with a run at `status='running'`, the row stays `running` even
+  after takeover. To prevent the UI from rendering "auto-resumed"
+  green-pulsing entries that aren't actually executing, `bootDurable`
+  now flips claimed orphans to `paused` whenever auto-resume is
+  disabled. Boot log:
+  `[dashboard] auto-resume disabled — N orphan(s) marked paused`.
+- **`server/pipeline-runner.ts`** — every `run()` acquires a lease
+  via `LeaseManager`, attaches `attachDurableLogHook(bus, store,
+  runId)`, threads `durableStore` + `durableHolder` into
+  `Pipeline.run()`. On termination releases the lease + stops the
+  heartbeat. Q&A reviewer-decision waits go through
+  `ctx.waitForSignal()` so they survive process restart.
+
+**WS handlers** (in `server/handlers/durable.ts`):
+- `get-durable-timeline` → `{run, events}` for the Run Detail UI.
+- `provide-stage-answer` → routes Q&A answer to active runner;
+  emits a durable signal so crash-recovery skips past the pause.
+
+**React surfaces**:
+- `/policy` route — `src/components/policy/PolicyPage.tsx` —
+  pause-stage toggles, cost-budget caps, auto-approve thresholds,
+  Q&A enabled flag + max-questions.
+- `RunDetail → Durable execution log` — collapsible disclosure that
+  mounts `DurableTimeline` to render per-run event log.
+- `PipelineContainer → StageQuestionsPanel` — surfaces in-flight
+  agent Q&A; user types answers; sends `provide-stage-answer`.
+- **`Active Runs row → Replay button`** — for any row with status
+  `failed` / `cancelled` / `paused`, surfaces a Replay action that
+  sends `{action:'resume', runId}` to the server. The server's
+  `runs-pipeline.ts:resume` handler reads durable storage to derive
+  the resume-from-stage and re-dispatches via `startPipeline`. This
+  is how users manually replay orphan-claimed runs now that
+  auto-resume is off by default.
+- **`RunDetail → Replay button`** (top right) — same wire as
+  Active Runs' button. Alt-click opens a stage picker for resume
+  from an arbitrary stage. The previously-adjacent Rollback button
+  was removed — rollback semantics weren't reliable, and the
+  reviewer's revert flow has its own surface.
+
+**Wire-protocol gotcha for durable WS handlers**: the dashboard's
+handler registry routes on `msg.action`, not `msg.type`. The
+original `DurableTimeline.tsx` sent
+`{ type: 'get-durable-timeline', runId }` and the server silently
+dropped the message — the timeline disclosure spun on "Loading…"
+forever. Any new durable component MUST use
+`ws.send(JSON.stringify({ action: '<handler-name>', ... }))`.
+
+**Env knobs**:
+- `ANVIL_DURABLE_DISABLED=1` — bypass durable persistence entirely.
+- `ANVIL_DURABLE_AUTO_TAKEOVER=0` — disable orphan claiming.
+- `ANVIL_DURABLE_AUTO_RESUME=0` — disable auto-resume dispatch.
+- `ANVIL_DURABLE_VACUUM_DISABLED=1` — disable retention sweep.
+- `ANVIL_DURABLE_RETENTION_DAYS=30` — retention window.
+
+**Where to look first** (durable-specific):
+- New durable WS message? Add a route to
+  `server/handlers/durable.ts` + register via `durableRoutes()` in
+  `handlers/registry.ts`.
+- Effect not replaying? `core-pipeline/src/durable/effect-runtime.ts`
+  + `npm run -w @esankhan3/anvil-core-pipeline durable-lint`.
+- Auto-takeover not firing? `server/setup/durable.ts` → log line
+  `[dashboard] auto-takeover: claimed N orphaned run(s)`.

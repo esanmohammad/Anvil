@@ -94,3 +94,5 @@ export type {
   LegacyPipelineCheckpoint,
   MigratedCheckpointShared,
 } from './legacy-checkpoint-migration.js';
+export { attachDurableLogHook } from './durable-log.hook.js';
+export type { DurableLogHookOptions, DurableLogHookHandle } from './durable-log.hook.js';

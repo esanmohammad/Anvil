@@ -72,6 +72,17 @@ export interface DashboardStageState {
     resolvedModel?: string;
     /** Phase 8 — tool-permission classes for this stage. */
     permissionClasses?: ('read' | 'write' | 'exec')[];
+    /**
+     * Stage Q&A — populated when the agent's first response is a
+     * `<questions>...</questions>` block. Frontend's PipelineContainer
+     * mounts StageQuestionsPanel when this is non-empty. Each entry's
+     * `answer` is filled in by `provideStageAnswer` as the user replies.
+     */
+    questions?: Array<{
+        index: number;
+        text: string;
+        answer?: string;
+    }>;
 }
 export interface DashboardPipeline {
     runId: string;

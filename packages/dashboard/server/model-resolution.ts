@@ -183,6 +183,17 @@ export async function prefetchProviderLiveness(): Promise<WalkerConfig> {
   const providers = registry && registry.models.length > 0
     ? Array.from(new Set(registry.models.map((m) => m.provider)))
     : ['ollama', 'claude', 'openai', 'openrouter', 'gemini', 'gemini-cli', 'opencode', 'adk'] as ProviderName[];
-  await prefetchLiveness(providers);
+  // Hard 5s cap: a hung probe used to block `pipeline:started` (and
+  // therefore the entire run) forever. Provider liveness is a cache
+  // warm — a stale cache is fine, an infinite hang is not.
+  await Promise.race([
+    prefetchLiveness(providers).catch((err) => {
+      console.warn(`[pipeline] liveness prefetch failed: ${(err as Error).message}`);
+    }),
+    new Promise<void>((resolve) => setTimeout(() => {
+      console.warn('[pipeline] liveness prefetch timed out after 5s — continuing with cached/stale data');
+      resolve();
+    }, 5000)),
+  ]);
   return walkerConfig;
 }

@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-memory-core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Long-term memory layer for Anvil — five-type taxonomy (working/episodic/semantic/procedural/profile), bi-temporal facts, code-fact drift detection, sleeptime ratification, PR-as-episode primitives.",
   "type": "module",
   "license": "MIT",
@@ -25,8 +25,8 @@
     "test": "tsc -b && node --test dist/__tests__/*.test.js"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.2.0",
-    "@esankhan3/anvil-knowledge-core": "^0.2.0",
+    "@esankhan3/anvil-agent-core": "^0.3.0",
+    "@esankhan3/anvil-knowledge-core": "^0.3.0",
     "better-sqlite3": "^11.7.0",
     "ulid": "^2.3.0"
   },

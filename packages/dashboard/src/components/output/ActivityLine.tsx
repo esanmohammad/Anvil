@@ -161,16 +161,26 @@ export function ActivityLine({ entry, lineNumber: _lineNumber, isExpanded, onTog
     );
   }
 
-  // Clarify acknowledgment
+  // Clarify acknowledgment — the "All questions answered. Synthesizing..."
+  // line is the terminal ack before the agent runs the synthesis turn.
+  // That turn can take 10-60s on slower models, so we show a spinner
+  // instead of the check icon to make the wait feel active.
   if (entry.kind === 'clarify-ack') {
+    const content = entry.content ?? entry.summary ?? '';
+    const isSynthesizing = /synthesizing/i.test(content);
     return (
       <div style={{
         display: 'flex', alignItems: 'center', gap: 8,
         padding: '6px 16px', margin: '4px 16px',
-        fontSize: 12, color: 'var(--color-success)',
+        fontSize: 12,
+        color: isSynthesizing ? 'var(--text-secondary)' : 'var(--color-success)',
       }}>
-        <CheckCircle2 size={14} strokeWidth={1.75} />
-        <span>{entry.content ?? entry.summary}</span>
+        {isSynthesizing ? (
+          <div className="status-dot-spin" style={{ width: 14, height: 14 }} />
+        ) : (
+          <CheckCircle2 size={14} strokeWidth={1.75} />
+        )}
+        <span>{content}</span>
       </div>
     );
   }

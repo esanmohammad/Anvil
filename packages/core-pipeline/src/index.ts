@@ -390,6 +390,7 @@ export {
   PR_URL_REGEX,
   attachLivenessPrefetchHook,
   migrateLegacyCheckpoint,
+  attachDurableLogHook,
 } from './hooks/index.js';
 export type {
   AuditLogHookOptions,
@@ -524,3 +525,44 @@ export type {
   OrderedTaskBatch,
 } from './routing/resolve-model-for-task.js';
 export type { TaskPriority } from './routing/task-envelope.js';
+
+// — Durable execution (Phases D1–D6 + E0–E10 + F1–F9 + G1–G4)
+export type {
+  RunStatus,
+  NewRunRecord,
+  RunRecord,
+  DurableEventKind,
+  NewEventRecord,
+  EventRecord,
+  EffectEventPair,
+  SignalRecord,
+  DurableStore,
+  VacuumStats,
+  SQLiteDurableStoreOptions,
+  LintViolation,
+} from './durable/index.js';
+export {
+  DeterminismViolationError,
+  DurableStoreUnavailableError,
+  EffectResultNotSerialisableError,
+  Pattern1MigrationError,
+  InMemoryDurableStore,
+  SQLiteDurableStore,
+  lintStepSource,
+  LeaseManager,
+  tryTakeOverLease,
+  findOrphanedRuns,
+  serializeAgentRunResult,
+  contentHash,
+  artifactIdempotencyKey,
+  seedStoreFromLog,
+  throwingSpy,
+  countingSpy,
+} from './durable/index.js';
+
+// — Stage Q&A primitives (used by clarify + per-stage questions panel)
+export {
+  STAGE_QA_PROMPT_HEADER,
+  parseStageQuestions,
+  formatStageAnswers,
+} from './stages/qa.js';
