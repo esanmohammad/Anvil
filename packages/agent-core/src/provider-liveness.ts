@@ -15,6 +15,7 @@
 
 import type { ProviderName } from './types.js';
 import type { ResolvedChain } from './router/resolver.js';
+import { getFetchPool, recycleFetchPoolOnFailure } from './fetch-pool.js';
 
 interface LivenessRecord {
   alive: boolean;
@@ -176,10 +177,17 @@ async function probeOllama(): Promise<boolean> {
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 2000);
-    const res = await fetch(`${baseUrl}/api/tags`, { signal: ctrl.signal });
+    const res = await fetch(`${baseUrl}/api/tags`, {
+      signal: ctrl.signal,
+      // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+      dispatcher: getFetchPool('ollama'),
+    });
     clearTimeout(timer);
     return res.ok;
-  } catch {
+  } catch (err) {
+    // Probe failure isn't propagated, but it IS a signal the pool may
+    // be poisoned — heal so the next real request gets a fresh socket.
+    void recycleFetchPoolOnFailure('ollama', err);
     return false;
   }
 }

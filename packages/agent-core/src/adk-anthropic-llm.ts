@@ -32,6 +32,7 @@ import { BaseLlm, LLMRegistry } from '@google/adk';
 import type { LlmRequest, LlmResponse, BaseLlmConnection } from '@google/adk';
 import type { Content, Part, FunctionDeclaration } from '@google/genai';
 import { UpstreamError } from './upstream-error.js';
+import { getFetchPool, recycleFetchPoolOnFailure } from './fetch-pool.js';
 
 // ───────────────────────────────────────────────────────────────────────
 // Anthropic wire-format types (subset we use)
@@ -150,16 +151,26 @@ export class AnthropicLlm extends BaseLlm {
     if (llmRequest.config?.temperature != null) body.temperature = llmRequest.config.temperature;
     if (llmRequest.config?.topP != null) body.top_p = llmRequest.config.topP;
 
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': ANTHROPIC_API_VERSION,
-      },
-      body: JSON.stringify(body),
-      signal: abortSignal,
-    });
+    let response: Response;
+    try {
+      response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': ANTHROPIC_API_VERSION,
+        },
+        body: JSON.stringify(body),
+        signal: abortSignal,
+        // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+        dispatcher: getFetchPool('anthropic'),
+      });
+    } catch (err) {
+      if (abortSignal?.aborted) throw err;
+      void recycleFetchPoolOnFailure('anthropic', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new UpstreamError(0, `fetch failed: ${msg}`, { provider: 'anthropic', retryable: true });
+    }
 
     if (!response.ok) {
       const errBody = await response.text().catch(() => '');

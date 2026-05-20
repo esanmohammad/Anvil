@@ -134,10 +134,17 @@ describe('evaluatePolicy', () => {
     assert.deepEqual([...decision.reviewers].sort(), ['alice', 'bob', 'carol', 'dave']);
   });
 
-  it('defaultPolicy pauses after plan and nothing else', () => {
+  it('defaultPolicy ships with enabled:false and never pauses', () => {
+    // BUILTIN_DEFAULT_POLICY was changed (pipeline-policy.ts) to ship with
+    // enabled:false + pauseAfter:[] after the previous `enabled:true +
+    // pauseAfter:['plan']` deadlocked clarify on every project that didn't
+    // author a pipeline-policy.yaml — nothing in the UI surfaced the pause
+    // for that path. Pauses are now strictly opt-in via the Policy page.
     const policy = defaultPolicy();
+    assert.equal(policy.enabled, false);
+    assert.deepEqual(policy.defaults?.pauseAfter ?? [], []);
     const planned = evaluatePolicy(policy, { stage: 'plan', touchedFiles: ['x.ts'] });
-    assert.equal(planned.pause, true);
+    assert.equal(planned.pause, false);
     const implemented = evaluatePolicy(policy, { stage: 'implement', touchedFiles: ['x.ts'] });
     assert.equal(implemented.pause, false);
   });

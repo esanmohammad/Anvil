@@ -13,6 +13,7 @@ import type {
 } from './types.js';
 import { emitContent, emitThinking, emitResult } from './stream-format.js';
 import { UpstreamError } from './upstream-error.js';
+import { getFetchPool, recycleFetchPoolOnFailure } from './fetch-pool.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
@@ -115,12 +116,22 @@ export class GeminiAdapter implements ModelAdapter {
     let thinkingTokens = 0;
     let cacheReadTokens = 0;
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: this.abortController.signal,
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: this.abortController.signal,
+        // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+        dispatcher: getFetchPool('gemini'),
+      });
+    } catch (err) {
+      if (this.abortController.signal.aborted) throw err;
+      void recycleFetchPoolOnFailure('gemini', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new UpstreamError(0, `fetch failed: ${msg}`, { provider: 'gemini', retryable: true });
+    }
 
     if (!response.ok) {
       const errBody = await response.text();

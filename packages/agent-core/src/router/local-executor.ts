@@ -20,6 +20,8 @@
  *   • Same-id consecutive calls do NOT trigger eviction.
  */
 
+import { getFetchPool, recycleFetchPoolOnFailure } from '../fetch-pool.js';
+
 export interface LocalExecutorDeps {
   /** Override the eviction call (used by tests; defaults to `fetch` to Ollama). */
   evict?: (modelId: string) => Promise<void>;
@@ -137,22 +139,30 @@ async function defaultEvict(modelId: string): Promise<void> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: modelId, prompt: '', keep_alive: 0 }),
-  }).catch(() => {
+    // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+    dispatcher: getFetchPool('ollama'),
+  }).catch((err) => {
     // Eviction is best-effort; if Ollama is unreachable, the next /api/chat
-    // will surface the real error. Don't double-fail here.
+    // will surface the real error. Don't double-fail here — but DO recycle
+    // the pool in case the failure is socket poisoning.
+    void recycleFetchPoolOnFailure('ollama', err);
   });
 
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
     let stillLoaded = false;
     try {
-      const ps = await fetch(`${baseUrl}/api/ps`).then((r) => r.json() as Promise<{
+      const ps = await fetch(`${baseUrl}/api/ps`, {
+        // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+        dispatcher: getFetchPool('ollama'),
+      }).then((r) => r.json() as Promise<{
         models?: Array<{ name?: string; model?: string }>;
       }>);
       stillLoaded = (ps.models ?? []).some(
         (m) => m.name === modelId || m.model === modelId,
       );
-    } catch {
+    } catch (err) {
+      void recycleFetchPoolOnFailure('ollama', err);
       return; // probe failed — trust the unload, don't loop forever
     }
     if (!stillLoaded) return;
@@ -165,7 +175,10 @@ async function defaultEvict(modelId: string): Promise<void> {
 async function defaultProbeResident(): Promise<string[]> {
   const baseUrl = (process.env.OLLAMA_HOST ?? 'http://localhost:11434').replace(/\/+$/, '');
   try {
-    const ps = await fetch(`${baseUrl}/api/ps`).then((r) => r.json() as Promise<{
+    const ps = await fetch(`${baseUrl}/api/ps`, {
+      // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+      dispatcher: getFetchPool('ollama'),
+    }).then((r) => r.json() as Promise<{
       models?: Array<{ name?: string; model?: string }>;
     }>);
     const names: string[] = [];
@@ -174,7 +187,8 @@ async function defaultProbeResident(): Promise<string[]> {
       if (id) names.push(id);
     }
     return names;
-  } catch {
+  } catch (err) {
+    void recycleFetchPoolOnFailure('ollama', err);
     return [];
   }
 }

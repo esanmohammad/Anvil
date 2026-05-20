@@ -68,4 +68,13 @@ export type {
 // NOT re-exported here to avoid colliding with `router/model-registry.ts`'s
 // `ModelTier` (different vocabulary). Reach the alias via the subpath
 // import `@esankhan3/anvil-agent-core/model-tier-resolver.js` if needed.
+export {
+  getFetchPool,
+  recycleFetchPoolOnFailure,
+  getPoolMetrics,
+} from './fetch-pool.js';
+export type {
+  ProviderId as FetchPoolProviderId,
+  PoolMetrics as FetchPoolMetrics,
+} from './fetch-pool.js';
 export { VERSION } from './version.js';
