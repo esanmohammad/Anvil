@@ -13,6 +13,33 @@
  * orchestration. Each function takes a `StageOpsDeps` opts bag that
  * bundles the runner's state, config, helpers, and side-effect hooks
  * — no FS state of its own; no module-level cache.
+ *
+ * # Durable execution boundary (Phases E1–E10)
+ *
+ * Each step-body function accepts an optional `ctx?: StepContext<string>`.
+ * When provided (durable mode), every external touch — agent spawn,
+ * artifact write, fix-loop attempt, deploy — flows through
+ * `ctx.effect(...)` so a process crash mid-stage resumes from the
+ * last completed effect on the next process. When `ctx` is undefined
+ * (legacy callers / tests / non-durable mode), calls fire directly
+ * — the contract is a transparent superset.
+ *
+ * **What is NOT wrapped:** state-mutation projections (e.g.
+ * `state.stages[i].startedAt = new Date().toISOString()`) stay direct.
+ * These are observable side effects on the dashboard's in-memory state
+ * + state.json projection — re-writing them on replay is harmless +
+ * intentional (the replay process IS live; the user expects to see
+ * fresh timestamps as the run progresses through replay-completed
+ * steps). The durable log is the workflow record; state.json is a
+ * projection.
+ *
+ * **What stays outside the durable log on purpose:**
+ *   - Telemetry (`writePerRepoTelemetry`) — JSONL appenders, idempotent.
+ *   - Cost ledger writes — JSONL, replay re-records cleanly.
+ *   - State broadcasts (`deps.broadcast()`) — recompute from state.
+ *
+ * See `docs/durable-effect-conversion-plan.md` for the full
+ * conversion catalog.
  */
 import { join } from 'node:path';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
@@ -22,7 +49,6 @@ import {
   combinePerRepoArtifacts,
   runBuildForOneRepo,
   hasValidationFailures as hasValidationFailuresHelper,
-  extractRepoSection,
   buildProjectPrompt as buildProjectPromptHelper,
   buildRepoProjectPrompt as buildRepoProjectPromptHelper,
   buildClarifyExplorePrompt as buildClarifyExplorePromptHelper,
@@ -30,8 +56,13 @@ import {
   buildRepoStagePrompt as buildRepoStagePromptHelper,
   buildPerTaskPrompt as buildPerTaskPromptHelper,
   disallowedToolsForPersona,
+  STAGE_QA_PROMPT_HEADER,
+  parseStageQuestions,
+  serializeAgentRunResult,
+  artifactIdempotencyKey,
   type ParsedTask,
   type PromptBuilderContext,
+  type StepContext,
 } from '@esankhan3/anvil-core-pipeline';
 import { runClarifyForProject } from './steps/clarify-stage.step.js';
 import { runFixLoop as runFixLoopStep } from './steps/fix-loop.step.js';
@@ -43,6 +74,7 @@ import {
 } from './steps/workspace-ops.js';
 import { AgentManagerRunner } from './runners/agent-manager-runner.js';
 import { AgentManagerSession } from './runners/agent-manager-session.js';
+import { stageAnswerChannel } from './pipeline-runner.js';
 import { renderPlanDerivedArtifact as renderPlanDerivedArtifactBridge } from './manifest-bridge.js';
 import { extractAndUpdateManifest as extractAndUpdateManifestBridge } from './manifest-bridge.js';
 import { clearManifestFieldsForStages as clearManifestFieldsForStagesBridge } from './manifest-bridge.js';
@@ -142,6 +174,12 @@ export interface StageOpsDeps {
   // Clarify input resolver (writable slot)
   setInputResolve: (resolve: ((text: string) => void) | null) => void;
 
+  // Stage Q&A controls.
+  /** Read the project's Q&A policy block — disabled by default returns undefined. */
+  getQAPolicy: () => { enabled?: boolean; maxQuestionsPerStage?: number } | undefined;
+  /** Register an input resolver for a (stageIndex, repoName?) Q&A round. */
+  setStageInputResolver: (stageIndex: number, repoName: string | null, resolve: ((text: string) => void) | null) => void;
+
   // Fix-loop session refs (mutable)
   fixLoopAgentByRepo: Map<string, string>;
   getFixLoopAgentSingle: () => string | null;
@@ -217,10 +255,9 @@ export function makeAgentRunner(deps: StageOpsDeps, stageName: string): AgentMan
     onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
     onBurn: ({ model, status }) => {
       deps.runtimeBurnedModels.add(model);
-      deps.burnedModelReasons.set(model, `HTTP ${status} (per-task stage)`);
       deps.emit('project-event', {
         source: 'routing',
-        message: `${model} burned: HTTP ${status}; chain walker will skip on next call`,
+        message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
         level: 'warn',
       });
     },
@@ -232,8 +269,75 @@ export function makeAgentRunner(deps: StageOpsDeps, stageName: string): AgentMan
 async function runClarifyStage(
   deps: StageOpsDeps,
   index: number,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const session = makeAgentSession(deps);
+  const runOnce = (model: string) => runClarifyForProject({
+    agentSession: session,
+    project: deps.config.project,
+    workspaceDir: deps.workspaceDir,
+    model,
+    allowedTools: deps.allowedToolsForCurrentStage('clarify'),
+    maxOutputTokens: maxOutputTokensForStage('clarify'),
+    explorePrompt: buildClarifyExplorePromptHelper(deps.getPromptContext()),
+    projectPrompt: buildProjectPromptHelper(deps.getPromptContext(), STAGES[0]),
+    isCancelled: () => deps.isCancelled(),
+    onAgentSpawned: (agentId) => {
+      deps.state.stages[index].agentId = agentId;
+      deps.broadcast();
+      deps.emit('stage-start', index, agentId);
+      deps.emit('project-event', {
+        source: 'pipeline',
+        stage: 'clarify',
+        message: `[clarify] clarifier agent spawned (model: ${model}) — awaiting first response…`,
+      });
+    },
+    onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
+    onClarifyQuestion: (questionIndex, totalQuestions, question) => {
+      deps.emit('clarify-question', {
+        stageIndex: index,
+        questionIndex,
+        totalQuestions,
+        question,
+      });
+    },
+    onWaitingForInput: (agentId) => {
+      deps.state.stages[index].status = 'waiting';
+      deps.state.status = 'waiting';
+      deps.state.waitingForInput = true;
+      deps.broadcast();
+      deps.emit('waiting-for-input', index, agentId);
+    },
+    onAnswerReceived: (answer) => {
+      deps.emit('user-input', { stageIndex: index, text: answer });
+      deps.state.waitingForInput = false;
+      deps.broadcast();
+    },
+    onClarifyAck: (questionIndex, totalQuestions, hasMore) => {
+      deps.emit('clarify-ack', {
+        stageIndex: index,
+        questionIndex,
+        totalQuestions,
+        hasMore,
+      });
+    },
+    onSynthesizeStart: () => {
+      deps.state.stages[index].status = 'running';
+      deps.state.status = 'running';
+      deps.state.waitingForInput = false;
+      deps.broadcast();
+    },
+    inputResolver: () => new Promise<string>((resolve) => {
+      deps.setInputResolve(resolve);
+    }),
+  });
+
+  // Phase E1: wrap the chain-fallback in ctx.effect when a durable
+  // store is wired. Effect name includes the model identifier so a
+  // chain rotation between runs surfaces as DeterminismViolationError
+  // (caller reruns from-stage with the same chain). The system effect
+  // is the *outer* runWithChainFallback call — each model attempt
+  // inside the chain stays a single recorded effect.
   const result = await runWithChainFallback(
     {
       stageName: 'clarify',
@@ -241,74 +345,20 @@ async function runClarifyStage(
       resolveModel: () => deps.resolveModelForStage('clarify'),
       onBurn: ({ model, status }) => {
         deps.runtimeBurnedModels.add(model);
-        deps.burnedModelReasons.set(model, `HTTP ${status} (clarify stage)`);
-        console.warn(`[pipeline] clarify: ${model} burned (HTTP ${status} retryable)`);
+        console.warn(`[pipeline] clarify: ${model} hit ${status} (retryable); burning + falling back`);
         deps.emit('project-event', {
           source: 'routing',
-          message: `${model} burned: HTTP ${status} during clarify; chain walker will skip on next call`,
+          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
           level: 'warn',
         });
       },
     },
-    (model) => runClarifyForProject({
-      agentSession: session,
-      project: deps.config.project,
-      workspaceDir: deps.workspaceDir,
-      model,
-      allowedTools: deps.allowedToolsForCurrentStage('clarify'),
-      maxOutputTokens: maxOutputTokensForStage('clarify'),
-      explorePrompt: buildClarifyExplorePromptHelper(deps.getPromptContext()),
-      projectPrompt: buildProjectPromptHelper(deps.getPromptContext(), STAGES[0]),
-      isCancelled: () => deps.isCancelled(),
-      onAgentSpawned: (agentId) => {
-        deps.state.stages[index].agentId = agentId;
-        deps.broadcast();
-        deps.emit('stage-start', index, agentId);
-        deps.emit('project-event', {
-          source: 'pipeline',
-          stage: 'clarify',
-          message: `[clarify] clarifier agent spawned (model: ${model}) — awaiting first response…`,
-        });
-      },
-      onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
-      onClarifyQuestion: (questionIndex, totalQuestions, question) => {
-        deps.emit('clarify-question', {
-          stageIndex: index,
-          questionIndex,
-          totalQuestions,
-          question,
-        });
-      },
-      onWaitingForInput: (agentId) => {
-        deps.state.stages[index].status = 'waiting';
-        deps.state.status = 'waiting';
-        deps.state.waitingForInput = true;
-        deps.broadcast();
-        deps.emit('waiting-for-input', index, agentId);
-      },
-      onAnswerReceived: (answer) => {
-        deps.emit('user-input', { stageIndex: index, text: answer });
-        deps.state.waitingForInput = false;
-        deps.broadcast();
-      },
-      onClarifyAck: (questionIndex, totalQuestions, hasMore) => {
-        deps.emit('clarify-ack', {
-          stageIndex: index,
-          questionIndex,
-          totalQuestions,
-          hasMore,
-        });
-      },
-      onSynthesizeStart: () => {
-        deps.state.stages[index].status = 'running';
-        deps.state.status = 'running';
-        deps.state.waitingForInput = false;
-        deps.broadcast();
-      },
-      inputResolver: () => new Promise<string>((resolve) => {
-        deps.setInputResolve(resolve);
-      }),
-    }),
+    ctx
+      ? (model) => ctx.effect(
+          `clarify:run-for-project:${model}`,
+          async () => serializeAgentRunResult(await runOnce(model) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runOnce>>,
+        )
+      : runOnce,
   );
 
   return {
@@ -325,51 +375,17 @@ async function runClarifyStage(
 
 // ── Per-repo stage execution ───────────────────────────────────────
 
-/**
- * Per-promise timeout (default 30 min) that fires if a single repo's
- * runner never resolves. Without this, `Promise.all` waits forever on
- * a hung agent, freezing the parent stage. Override via
- * `ANVIL_REPO_STAGE_TIMEOUT_MS`. The timeout rejects the wait but
- * does NOT kill the underlying agent — that requires plumbing
- * `isCancelled` per-repo, deferred. Acceptable token leak in exchange
- * for unblocking the parent.
- */
-function repoStageTimeoutMs(): number {
-  const raw = parseInt(process.env.ANVIL_REPO_STAGE_TIMEOUT_MS ?? '', 10);
-  if (Number.isFinite(raw) && raw > 0) return raw;
-  return 30 * 60 * 1000;
-}
-
 async function runPerRepoStage(
   deps: StageOpsDeps,
   index: number,
   stage: StageDefinition,
   prevArtifact: string,
-  opts: { repoFilter?: ReadonlySet<string> } = {},
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-  const allRepos = deps.state.repoNames;
-  const filter = opts.repoFilter;
-  const repos = filter ? allRepos.filter((r) => filter.has(r)) : allRepos;
+  const repos = deps.state.repoNames;
 
   if (repos.length === 0) {
-    if (filter && allRepos.length > 0) {
-      // Filter eliminated every repo. Nothing to do this pass; preserve
-      // the prior per-repo artifacts so the combined output is the
-      // last-good state.
-      const carried = allRepos
-        .map((repoName) => {
-          const repoIdx = allRepos.indexOf(repoName);
-          const r = deps.state.stages[index].repos[repoIdx];
-          return { repoName, artifact: r?.artifact ?? '' };
-        })
-        .filter((r) => r.artifact);
-      return {
-        artifact: combinePerRepoArtifacts(carried),
-        cost: 0,
-        tokens: zeroTokenStats(),
-      };
-    }
-    return runSingleStage(deps, index, stage, prevArtifact);
+    return runSingleStage(deps, index, stage, prevArtifact, ctx);
   }
 
   const promises: Promise<{
@@ -382,40 +398,17 @@ async function runPerRepoStage(
   for (let r = 0; r < repos.length; r++) {
     const repoName = repos[r];
     const repoPath = deps.repoPaths()[repoName] || join(deps.workspaceDir, repoName);
-    // Map back to the canonical index in `state.stages[index].repos`
-    // — that array is keyed on `state.repoNames`, not the filtered
-    // subset, so writes to the wrong slot would clobber a different
-    // repo's state.
-    const repoIdx = allRepos.indexOf(repoName);
+    const repoIdx = r;
 
-    if (deps.state.stages[index].repos[repoIdx]) {
-      deps.state.stages[index].repos[repoIdx].status = 'running';
+    if (deps.state.stages[index].repos[r]) {
+      deps.state.stages[index].repos[r].status = 'running';
     }
-    // Broadcast on every repo status flip so the dashboard's per-repo
-    // chips light up immediately. Without this, all N repos stay
-    // grayed-out until each one completes silently — which can be
-    // minutes for a build fanning out across 4 repos.
-    deps.broadcast();
-    deps.emit('artifact-written', {
-      stage: stage.name,
-      repo: repoName,
-      file: '',
-      summary: `[${repoName}] Preparing ${stage.name}…`,
-      content: '',
-    });
 
     const projectPrompt = buildRepoProjectPromptHelper(deps.getPromptContext(), stage, repoName);
 
     if (stage.name === 'build' && stage.persona === 'engineer') {
-      deps.emit('artifact-written', {
-        stage: 'build',
-        repo: repoName,
-        file: '',
-        summary: `[${repoName}] Loading tasks + bundling files for engineer agent…`,
-        content: '',
-      });
       promises.push(
-        runBuildForRepo(deps, index, repoIdx, stage, repoName, repoPath, projectPrompt)
+        runBuildForRepo(deps, index, repoIdx, stage, repoName, repoPath, projectPrompt, ctx)
           .then((res) => ({
             repoName,
             artifact: res.artifact,
@@ -470,7 +463,18 @@ async function runPerRepoStage(
             }
             return r;
           };
-          result = await runOnce();
+          // Phase E3: durable wrap for per-repo spawn. Effect name
+          // includes the repo so per-repo crashes resume per-repo.
+          // Empty-artifact retry preserved — the throw inside fn
+          // surfaces as effect:failed (retryable upstream error)
+          // and the outer chain-fallback in surrounding code path
+          // re-resolves the model.
+          result = ctx
+            ? await ctx.effect(
+                `${stage.name}:spawn-${repoName}`,
+                async () => serializeAgentRunResult(await runOnce() as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runOnce>>,
+              )
+            : await runOnce();
         } catch (err) {
           const errorMsg = err instanceof Error ? err.message : String(err);
           const repoState = deps.state.stages[index].repos[repoIdx];
@@ -490,18 +494,25 @@ async function runPerRepoStage(
         const repoState = deps.state.stages[index].repos[repoIdx];
         if (repoState) {
           repoState.status = 'completed';
-          // Accumulate, don't overwrite — the validate→fix loop calls
-          // `runPerRepoStage` more than once per repo and the prior
-          // attempt's cost is real money already spent. Setting `=`
-          // here hides the first-pass cost the moment a revalidate
-          // overwrites it.
-          repoState.cost = (repoState.cost ?? 0) + (result.costUsd ?? 0);
+          repoState.cost = result.costUsd ?? 0;
           repoState.artifact = result.output;
         }
         deps.broadcast();
         deps.checkpoint();
 
-        writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.output);
+        // Phase E3: durable wrap for per-repo artifact write.
+        if (ctx) {
+          await ctx.effect(
+            `${stage.name}:write-${repoName}`,
+            async () => {
+              writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.output);
+              return null;
+            },
+            { idempotencyKey: artifactIdempotencyKey(stage.name, repoName, result.output) },
+          );
+        } else {
+          writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.output);
+        }
 
         deps.writePerRepoTelemetry(stage.name, repoName, {
           outputBytes: result.output?.length ?? 0,
@@ -527,65 +538,13 @@ async function runPerRepoStage(
     );
   }
 
-  // Wrap each per-repo promise in `Promise.race` against a per-repo
-  // timeout. Without this, a hung runner (no resolve, no reject) leaves
-  // `Promise.all` waiting forever and wedges the parent stage. The
-  // timeout marks the repo's `repoState.status='failed'` so the
-  // `failedRepos.length > 0` check below throws cleanly. The underlying
-  // agent is NOT killed here — that requires per-repo plumbing of
-  // `isCancelled`, deferred.
-  const timeoutMs = repoStageTimeoutMs();
-  const timedPromises = promises.map((promise, idx) => {
-    const repoName = repos[idx];
-    const canonicalIdx = allRepos.indexOf(repoName);
-    return Promise.race<{
-      repoName: string;
-      artifact: string;
-      cost: number;
-      tokens: StageTokenStats;
-    }>([
-      promise,
-      new Promise((_resolve, reject) => {
-        const handle = setTimeout(() => {
-          const repoState = deps.state.stages[index].repos[canonicalIdx];
-          if (repoState && repoState.status === 'running') {
-            repoState.status = 'failed';
-            repoState.error = `Timed out after ${Math.round(timeoutMs / 60000)} min — agent never produced output. Underlying agent may still be running (token leak); cancel the run to reclaim.`;
-          }
-          deps.broadcast();
-          reject(new Error(`Per-repo stage "${stage.name}/${repoName}" timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-        (handle as { unref?: () => void }).unref?.();
-      }),
-    ]).catch(() => ({
-      repoName,
-      artifact: '',
-      cost: 0,
-      tokens: zeroTokenStats(),
-    }));
-  });
-
-  const results = await Promise.all(timedPromises);
+  const results = await Promise.all(promises);
   const totalCost = results.reduce((sum, r) => sum + r.cost, 0);
   const tokens = sumTokenStats(results.map((r) => r.tokens));
   const successResults = results.filter((r) => r.artifact);
   const failedRepos = results.filter((r) => !r.artifact).map((r) => r.repoName);
 
-  // When a filter is in effect (validate fix-loop revalidation), carry
-  // forward the artifacts of the repos we skipped this pass so the
-  // combined output is the full validate report, not just the
-  // re-validated subset.
-  const carriedResults: Array<{ repoName: string; artifact: string }> = [];
-  if (filter) {
-    for (const repoName of allRepos) {
-      if (filter.has(repoName)) continue;
-      const repoIdx = allRepos.indexOf(repoName);
-      const r = deps.state.stages[index].repos[repoIdx];
-      if (r?.artifact) carriedResults.push({ repoName, artifact: r.artifact });
-    }
-  }
-
-  const combined = combinePerRepoArtifacts([...carriedResults, ...successResults]);
+  const combined = combinePerRepoArtifacts(successResults);
 
   if (failedRepos.length > 0) {
     throw new Error(
@@ -607,24 +566,23 @@ async function runBuildForRepo(
   repoName: string,
   repoPath: string,
   projectPrompt: string,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const repoArtifacts = loadRepoArtifactsFn(deps.depsForArtifactIO(), repoName);
-  // Tell the dashboard how many tasks we're about to dispatch + give
-  // it a chance to render before the first agent spawn (task bundling
-  // can itself take a second or two for a large task graph).
-  const taskCount = (repoArtifacts.tasks?.match(/^- \[ \]/gm) ?? []).length;
-  deps.emit('artifact-written', {
-    stage: 'build',
-    repo: repoName,
-    file: '',
-    summary: taskCount > 0
-      ? `[${repoName}] Dispatching ${taskCount} task(s) to engineer agent…`
-      : `[${repoName}] Spawning engineer agent…`,
-    content: '',
-  });
 
   const runner = makeAgentRunner(deps, stage.name);
-  const result = await runBuildForOneRepo({
+  // Phase F2: per-task wrapper threads ctx.effect into the
+  // dependency-graph scheduler so each task spawn is its own
+  // recorded effect. The wrapper closes over ctx + repoName
+  // so the effect name disambiguates per-(repo, task).
+  const wrapTaskRun = ctx
+    ? <R>(taskId: string, fn: () => Promise<R>) => ctx.effect(
+        `build:spawn-task-${repoName}-${taskId}`,
+        async () => serializeAgentRunResult(await fn() as unknown as Record<string, unknown>) as unknown as R,
+        { idempotencyKey: `${ctx.runId}:${repoName}:${taskId}` },
+      )
+    : undefined;
+  const buildOpts = {
     runner,
     project: deps.config.project,
     stageName: stage.name,
@@ -639,21 +597,43 @@ async function runBuildForRepo(
       buildPerTaskPromptHelper(deps.getPromptContext(), repoName, repoPath, task, repoArtifacts.specs),
     buildFallbackPrompt: () => buildRepoStagePromptHelper(deps.getPromptContext(), stage, repoName, ''),
     isCancelled: () => deps.isCancelled(),
-    onProjectEvent: (level, message) => {
+    onProjectEvent: (level: 'info' | 'warn' | 'error', message: string) => {
       deps.emit('project-event', { source: 'pipeline', message, level });
     },
-  });
+    ...(wrapTaskRun ? { wrapTaskRun } : {}),
+  };
+  // Phase E5: durable wrap for per-repo build. Idempotency key
+  // includes the runId + repo to scope replay to this run.
+  // Per-task granularity is a future refinement (would require
+  // threading ctx through runBuildForOneRepo in core-pipeline).
+  const result = ctx
+    ? await ctx.effect(
+        `build:repo-${repoName}`,
+        async () => serializeAgentRunResult(await runBuildForOneRepo(buildOpts) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runBuildForOneRepo>>,
+        { idempotencyKey: `${ctx.runId}:${repoName}:build` },
+      )
+    : await runBuildForOneRepo(buildOpts);
 
   const repoStateDone = deps.state.stages[stageIndex].repos[repoIdx];
   if (repoStateDone) {
     repoStateDone.status = 'completed';
-    // Accumulate across passes (see same note in `runPerRepoStage`).
-    repoStateDone.cost = (repoStateDone.cost ?? 0) + (result.cost ?? 0);
+    repoStateDone.cost = result.cost;
     repoStateDone.artifact = result.artifact;
   }
   deps.broadcast();
   deps.checkpoint();
-  writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.artifact);
+  if (ctx) {
+    await ctx.effect(
+      `build:write-${repoName}`,
+      async () => {
+        writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.artifact);
+        return null;
+      },
+      { idempotencyKey: artifactIdempotencyKey('build', repoName, result.artifact) },
+    );
+  } else {
+    writeRepoArtifactFn(deps.depsForArtifactIO(), stage, repoName, result.artifact);
+  }
 
   return {
     artifact: result.artifact,
@@ -669,17 +649,192 @@ async function runBuildForRepo(
 
 // ── Single-agent stage execution ───────────────────────────────────
 
+/**
+ * Stage names whose agents may pause to ask the user clarifying
+ * questions before producing the artifact. Hard-coded so users can't
+ * enable Q&A on `build` (a known anti-pattern: see plan §2 non-goals).
+ */
+const STAGES_WITH_QA: ReadonlySet<string> = new Set([
+  'requirements',
+  'repo-requirements',
+  'specs',
+]);
+
+function isQAEnabled(deps: StageOpsDeps, stageName: string): { enabled: boolean; max: number } {
+  if (!STAGES_WITH_QA.has(stageName)) return { enabled: false, max: 0 };
+  const policy = deps.getQAPolicy();
+  if (!policy || policy.enabled === false) return { enabled: false, max: 0 };
+  const max = typeof policy.maxQuestionsPerStage === 'number' && policy.maxQuestionsPerStage > 0
+    ? policy.maxQuestionsPerStage
+    : 5;
+  return { enabled: true, max };
+}
+
+/**
+ * Q&A-aware single-stage runner. Spawns a multi-turn session with a
+ * `<questions>...</questions>` opt-in header in the prompt. If the agent
+ * emits questions, the runner pauses, broadcasts each question to the
+ * dashboard, awaits user answers via the per-stage input resolver, then
+ * resumes the session with an `<answers>...</answers>` block. The
+ * session's second response is the artifact.
+ *
+ * Confident agents skip the Q&A block entirely; the first response IS
+ * the artifact and we return immediately.
+ */
+async function runStageWithQA(
+  deps: StageOpsDeps,
+  index: number,
+  stage: StageDefinition,
+  prevArtifact: string,
+  maxQuestions: number,
+  ctx?: StepContext<string>,
+): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
+  const baseUserPrompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
+  const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
+  const qaPrompt = STAGE_QA_PROMPT_HEADER(maxQuestions) + baseUserPrompt;
+
+  const session = makeAgentSession(deps);
+  const startReq = {
+    persona: stage.persona,
+    projectPrompt,
+    userPrompt: qaPrompt,
+    workingDir: deps.workspaceDir,
+    stage: stage.name,
+    allowedTools: deps.allowedToolsForCurrentStage(stage.name),
+    disallowedTools: disallowedToolsForPersona(stage.persona),
+    maxOutputTokens: maxOutputTokensForStage(stage.name),
+  };
+  // Phase E2: durable wrap for the Q&A session start. On replay the
+  // recorded first.output (questions or artifact) returns directly,
+  // skipping the agent spawn.
+  const first = ctx
+    ? await ctx.effect(
+        `${stage.name}:session-start`,
+        async () => serializeAgentRunResult(await session.start(startReq) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof session.start>>,
+      )
+    : await session.start(startReq);
+
+  if (first.agentId) {
+    deps.state.stages[index].agentId = first.agentId;
+    deps.broadcast();
+  }
+
+  const questions = parseStageQuestions(first.output, maxQuestions);
+  if (questions.length === 0) {
+    // Agent was confident — first response is the artifact.
+    return {
+      artifact: first.output,
+      cost: first.costUsd ?? 0,
+      tokens: {
+        inputTokens: first.inputTokens ?? 0,
+        outputTokens: first.outputTokens ?? 0,
+        cacheReadTokens: first.cacheReadTokens ?? 0,
+        cacheWriteTokens: first.cacheWriteTokens ?? 0,
+      },
+    };
+  }
+
+  // Q&A path — populate state, broadcast each question, await answers.
+  const stageState = deps.state.stages[index];
+  stageState.questions = questions.map((text, qi) => ({ index: qi, text }));
+  stageState.status = 'waiting';
+  deps.state.status = 'waiting';
+  deps.state.waitingForInput = true;
+  deps.broadcast();
+  for (let qi = 0; qi < questions.length; qi += 1) {
+    deps.emit('stage-question', {
+      stageIndex: index,
+      stageName: stage.name,
+      questionIndex: qi,
+      totalQuestions: questions.length,
+      question: questions[qi],
+    });
+  }
+  deps.emit('waiting-for-input', index, first.agentId ?? null);
+
+  // Phase E9: dual-path answer wait. When durable mode is on,
+  // ctx.waitForSignal reads from the durable signals queue (which
+  // `provideStageAnswer` populates alongside the in-process
+  // resolver Map for back-compat). This lets Q&A survive a
+  // process crash mid-wait — on replay the recorded answer
+  // payload returns without re-prompting the user.
+  //
+  // Non-durable mode keeps the resolver-Map behaviour unchanged.
+  // Project-level wait (no repoName). The channel name is built via the
+  // shared `stageAnswerChannel` helper so producer + consumer stay aligned
+  // when a future per-repo Q&A wait site is added — pass the repoName
+  // through both sides and the channel auto-suffixes with `:<repo>`.
+  const answersBlock = ctx
+    ? await Promise.race([
+        ctx.waitForSignal<string>(stageAnswerChannel(index, null)),
+        new Promise<string>((resolve) => {
+          deps.setStageInputResolver(index, null, resolve);
+        }),
+      ])
+    : await new Promise<string>((resolve) => {
+        deps.setStageInputResolver(index, null, resolve);
+      });
+
+  // Cancellation guard — the resolver fires with '' on cancel.
+  if (!answersBlock) {
+    return {
+      artifact: '',
+      cost: first.costUsd ?? 0,
+      tokens: {
+        inputTokens: first.inputTokens ?? 0,
+        outputTokens: first.outputTokens ?? 0,
+        cacheReadTokens: first.cacheReadTokens ?? 0,
+        cacheWriteTokens: first.cacheWriteTokens ?? 0,
+      },
+    };
+  }
+
+  // Resume — the agent now has the answers and produces the artifact.
+  stageState.status = 'running';
+  deps.state.status = 'running';
+  deps.state.waitingForInput = false;
+  deps.broadcast();
+
+  // Phase E2: durable wrap for Q&A session resume. On replay the
+  // recorded artifact returns directly; the answers block was
+  // already in the recorded session-start payload so the agent
+  // doesn't see it twice.
+  const second = ctx
+    ? await ctx.effect(
+        `${stage.name}:session-resume`,
+        async () => serializeAgentRunResult(await session.sendInput(first.sessionId, answersBlock) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof session.sendInput>>,
+      )
+    : await session.sendInput(first.sessionId, answersBlock);
+
+  return {
+    artifact: second.output,
+    cost: (first.costUsd ?? 0) + (second.costUsd ?? 0),
+    tokens: {
+      inputTokens: (first.inputTokens ?? 0) + (second.inputTokens ?? 0),
+      outputTokens: (first.outputTokens ?? 0) + (second.outputTokens ?? 0),
+      cacheReadTokens: (first.cacheReadTokens ?? 0) + (second.cacheReadTokens ?? 0),
+      cacheWriteTokens: (first.cacheWriteTokens ?? 0) + (second.cacheWriteTokens ?? 0),
+    },
+  };
+}
+
 async function runSingleStage(
   deps: StageOpsDeps,
   index: number,
   stage: StageDefinition,
   prevArtifact: string,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
+  const qa = isQAEnabled(deps, stage.name);
+  if (qa.enabled) {
+    return runStageWithQA(deps, index, stage, prevArtifact, qa.max, ctx);
+  }
+
   const prompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
   const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
 
   const runner = makeAgentRunner(deps, stage.name);
-  const result = await runner.run({
+  const runReq = {
     persona: stage.persona,
     projectPrompt,
     userPrompt: prompt,
@@ -688,7 +843,15 @@ async function runSingleStage(
     allowedTools: deps.allowedToolsForCurrentStage(stage.name),
     disallowedTools: disallowedToolsForPersona(stage.persona),
     maxOutputTokens: maxOutputTokensForStage(stage.name),
-  });
+  };
+  // Phase E2/E4: durable wrap for single-stage agent spawns
+  // (requirements when Q&A disabled, tasks, validate-without-fanout).
+  const result = ctx
+    ? await ctx.effect(
+        `${stage.name}:spawn-agent`,
+        async () => serializeAgentRunResult(await runner.run(runReq) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runner.run>>,
+      )
+    : await runner.run(runReq);
 
   if (result.agentId) {
     deps.state.stages[index].agentId = result.agentId;
@@ -709,26 +872,37 @@ async function runSingleStage(
 
 // ── Test-gen stage ─────────────────────────────────────────────────
 
-async function runTestGenStage(deps: StageOpsDeps, stageIndex: number): Promise<string> {
+async function runTestGenStage(
+  deps: StageOpsDeps,
+  stageIndex: number,
+  ctx?: StepContext<string>,
+): Promise<string> {
   const repoNames = deps.state.repoNames.length
     ? deps.state.repoNames
     : Object.keys(deps.repoPaths());
   const repoLocalPaths: Record<string, string> = {};
   for (const r of repoNames) repoLocalPaths[r] = deps.repoPaths()[r] ?? join(deps.workspaceDir, r);
 
-  return runTestGenForProject({
+  const opts = {
     planSeed: deps.config.planSeed ?? null,
     project: deps.config.project,
     model: deps.config.model,
     workspaceDir: deps.workspaceDir,
     repoLocalPaths,
-    onConventionsDetected: (artifact) => {
+    onConventionsDetected: (artifact: string) => {
       deps.state.stages[stageIndex].artifact = artifact;
     },
-    onArtifactWritten: (event) => {
+    onArtifactWritten: (event: unknown) => {
       deps.emit('artifact-written', event);
     },
-  });
+  };
+  // Phase E7: durable wrap for test-gen. Single effect — the
+  // test-gen path inside runTestGenForProject is already
+  // serial-per-repo internally; per-repo granularity is a future
+  // refinement that would require threading ctx into core-pipeline.
+  return ctx
+    ? ctx.effect('test:spawn-testgen', async () => runTestGenForProject(opts))
+    : runTestGenForProject(opts);
 }
 
 // ── Validate→fix loop ──────────────────────────────────────────────
@@ -738,6 +912,7 @@ async function runFixLoop(
   _validateStageIndex: number,
   validateArtifact: string,
   attempt: number,
+  ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const buildStage = STAGES.find((s) => s.name === 'build')!;
   const repoPaths: Record<string, string> = {};
@@ -745,6 +920,29 @@ async function runFixLoop(
     repoPaths[repoName] = deps.repoPaths()[repoName] || join(deps.workspaceDir, repoName);
   }
   const session = makeAgentSession(deps);
+  const runFixOnce = (model: string) => runFixLoopStep({
+    agentSession: session,
+    project: deps.config.project,
+    model,
+    allowedTools: deps.allowedToolsForCurrentStage('fix-loop'),
+    maxOutputTokens: maxOutputTokensForStage('build'),
+    workspaceDir: deps.workspaceDir,
+    repoNames: deps.state.repoNames,
+    repoPaths,
+    validateArtifact,
+    attempt,
+    priorByRepo: deps.fixLoopAgentByRepo,
+    priorSingleId: deps.getFixLoopAgentSingle(),
+    buildProjectPromptForBuildStage: () => buildProjectPromptHelper(deps.getPromptContext(), buildStage),
+    buildRepoProjectPromptForBuildStage: (repoName: string) =>
+      buildRepoProjectPromptHelper(deps.getPromptContext(), buildStage, repoName),
+    isCancelled: () => deps.isCancelled(),
+  });
+  // Phase E6: durable wrap for fix-loop attempts. Effect name
+  // includes the attempt number so successive fix iterations
+  // record distinct events; the per-step idx counter would also
+  // disambiguate, but the explicit attempt index is more
+  // diagnostic in the durable log.
   const result = await runWithChainFallback(
     {
       stageName: 'fix-loop',
@@ -752,33 +950,20 @@ async function runFixLoop(
       resolveModel: () => deps.resolveModelForStage('fix-loop'),
       onBurn: ({ model, status }) => {
         deps.runtimeBurnedModels.add(model);
-        deps.burnedModelReasons.set(model, `HTTP ${status} (fix-loop stage)`);
-        console.warn(`[pipeline] fix-loop: ${model} burned (HTTP ${status} retryable)`);
+        console.warn(`[pipeline] fix-loop: ${model} hit ${status} (retryable); burning + falling back`);
         deps.emit('project-event', {
           source: 'routing',
-          message: `${model} burned: HTTP ${status} during fix-loop; chain walker will skip on next call`,
+          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
           level: 'warn',
         });
       },
     },
-    (model) => runFixLoopStep({
-      agentSession: session,
-      project: deps.config.project,
-      model,
-      allowedTools: deps.allowedToolsForCurrentStage('fix-loop'),
-      maxOutputTokens: maxOutputTokensForStage('build'),
-      workspaceDir: deps.workspaceDir,
-      repoNames: deps.state.repoNames,
-      repoPaths,
-      validateArtifact,
-      attempt,
-      priorByRepo: deps.fixLoopAgentByRepo,
-      priorSingleId: deps.getFixLoopAgentSingle(),
-      buildProjectPromptForBuildStage: () => buildProjectPromptHelper(deps.getPromptContext(), buildStage),
-      buildRepoProjectPromptForBuildStage: (repoName: string) =>
-        buildRepoProjectPromptHelper(deps.getPromptContext(), buildStage, repoName),
-      isCancelled: () => deps.isCancelled(),
-    }),
+    ctx
+      ? (model) => ctx.effect(
+          `validate:fix-attempt-${attempt}:${model}`,
+          async () => serializeAgentRunResult(await runFixOnce(model) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runFixOnce>>,
+        )
+      : runFixOnce,
   );
   if (result.newSingleId !== null) {
     deps.setFixLoopAgentSingle(result.newSingleId);
@@ -808,6 +993,16 @@ export async function runOneStage(
   isResume: boolean,
   resumeStage: number,
   prevArtifactIn: string,
+  /**
+   * Walker StepContext. Optional so legacy callers / tests that
+   * invoke `runOneStage` directly keep working. When supplied, the
+   * stage's effect-bearing calls go through `ctx.effect(...)` so
+   * a durable store records them. When undefined, calls fire
+   * directly — the contract is a transparent superset.
+   *
+   * Phase E1+ of the effect-site conversion plan.
+   */
+  ctx?: StepContext<string>,
 ): Promise<{
   control: 'continue' | 'next' | 'cancelled' | 'fail-early-return' | 'rewind';
   rewindTo?: number;
@@ -876,7 +1071,7 @@ export async function runOneStage(
         return { control: 'continue', prevArtifact };
       }
       try {
-        const artifact = await runTestGenStage(deps, i);
+        const artifact = await runTestGenStage(deps, i, ctx);
         deps.state.stages[i].status = 'completed';
         deps.state.stages[i].artifact = artifact;
         deps.state.stages[i].completedAt = new Date().toISOString();
@@ -897,34 +1092,12 @@ export async function runOneStage(
 
     console.log(`[pipeline] Entering stage "${stage.name}" (${i + 1}/${STAGES.length})`);
 
-    // Flip stage to running IMMEDIATELY on entry so the dashboard chip
-    // lights up before the pre-spawn prep work (auth probe, feature
-    // branches, format/lint guards) runs. Without this, the chip sits
-    // grayed-out for ~30s while git + linters run silently — the user
-    // sees nothing happening on the dashboard.
-    deps.state.currentStage = i;
-    deps.state.stages[i].status = 'running';
-    deps.state.stages[i].startedAt = new Date().toISOString();
-    deps.broadcast();
-
     deps.reviewer.armForCurrentStage();
-    deps.emit('artifact-written', {
-      stage: stage.name,
-      file: '',
-      summary: `Checking ${stage.name} provider auth…`,
-      content: '',
-    });
     await deps.ensureAuth(stage.name);
 
     if (stage.name === 'build') {
       const branchName = `anvil/${deps.state.featureSlug}`;
       console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
-      deps.emit('artifact-written', {
-        stage: 'build',
-        file: '',
-        summary: `Creating feature branch "${branchName}" across ${deps.state.repoNames.length} repo(s)…`,
-        content: '',
-      });
       createFeatureBranchesHelper({
         featureSlug: deps.state.featureSlug,
         repoPaths: deps.repoPaths(),
@@ -938,12 +1111,6 @@ export async function runOneStage(
     }
     if (stage.name === 'validate') {
       console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
-      deps.emit('artifact-written', {
-        stage: 'validate',
-        file: '',
-        summary: 'Running format + lint auto-fix guards…',
-        content: '',
-      });
       const reposForGuards = deps.state.repoNames.length > 0
         ? deps.state.repoNames.map((r) => ({ name: r, path: deps.repoPaths()[r] || join(deps.workspaceDir, r) }))
         : [{ name: deps.config.project, path: deps.workspaceDir }];
@@ -958,26 +1125,22 @@ export async function runOneStage(
       console.log('[pipeline] Post-build guards complete.');
     }
 
-    // Stage is already flipped to running above (hoisted from here so
-    // the chip lights up during prep work). Persist + emit start now.
+    deps.state.currentStage = i;
+    deps.state.stages[i].status = 'running';
+    deps.state.stages[i].startedAt = new Date().toISOString();
+    deps.broadcast();
     deps.checkpoint();
     deps.emit('stage-start', i, '');
-    deps.emit('artifact-written', {
-      stage: stage.name,
-      file: '',
-      summary: `Spawning ${stage.persona} agent for ${stage.name}…`,
-      content: '',
-    });
 
     try {
       let result: { artifact: string; cost: number; tokens: StageTokenStats };
 
       if (stage.name === 'clarify') {
-        result = await runClarifyStage(deps, i);
+        result = await runClarifyStage(deps, i, ctx);
       } else if (stage.perRepo && deps.state.repoNames.length > 0) {
-        result = await runPerRepoStage(deps, i, stage, prevArtifact);
+        result = await runPerRepoStage(deps, i, stage, prevArtifact, ctx);
       } else {
-        result = await runSingleStage(deps, i, stage, prevArtifact);
+        result = await runSingleStage(deps, i, stage, prevArtifact, ctx);
       }
 
       if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
@@ -999,6 +1162,14 @@ export async function runOneStage(
       if (afterStageHook) {
         try {
           const risk = deps.planRisk.get(deps.config.planSeed);
+          // Phase F1: durable-signal-aware reviewer pause. When ctx
+          // is provided, the after-stage hook can call
+          // waitForReviewerDecision(channel) which delegates to
+          // ctx.waitForSignal — a recorded decision on replay
+          // returns immediately without re-blocking on the user.
+          const waitForReviewerDecision = ctx
+            ? (channel: string) => ctx.waitForSignal(channel)
+            : undefined;
           await afterStageHook({
             runId: deps.state.runId,
             project: deps.config.project,
@@ -1010,6 +1181,7 @@ export async function runOneStage(
             touchedFiles: manifestGetTouchedFiles(deps.depsForManifest()),
             riskTier: risk.tier,
             confidence: risk.confidence,
+            ...(waitForReviewerDecision ? { waitForReviewerDecision } : {}),
           });
           if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
         } catch (err) {
@@ -1047,7 +1219,21 @@ export async function runOneStage(
       if (edited !== null) {
         prevArtifact = edited;
       } else {
-        writeStageArtifactFn(deps.depsForArtifactIO(), stage, result.artifact);
+        // Phase E2: durable wrap for stage artifact write. Idempotency key
+        // includes the content hash so re-runs with the same body collapse;
+        // re-runs with a different body surface as a determinism violation.
+        if (ctx) {
+          await ctx.effect(
+            `${stage.name}:write-artifact`,
+            async () => {
+              writeStageArtifactFn(deps.depsForArtifactIO(), stage, result.artifact);
+              return null;
+            },
+            { idempotencyKey: artifactIdempotencyKey(stage.name, 'stage', result.artifact) },
+          );
+        } else {
+          writeStageArtifactFn(deps.depsForArtifactIO(), stage, result.artifact);
+        }
       }
 
       try {
@@ -1086,56 +1272,39 @@ export async function runOneStage(
         } catch (err) {
           console.warn('[pipeline] Plan deviation capture failed:', err);
         }
-
-        // Phase E — deterministic build-compliance check.
-        // Stores the report on shared state so the ship stage can stamp
-        // PR bodies + auto-draft when compliance < 100%.
-        if (deps.config.planBinding) {
-          try {
-            const { runBuildCompliance, renderBuildComplianceMarkdown } =
-              await import('./plan-compliance-bridge.js');
-            const featureDir = deps.featureStore.getFeatureDir(deps.config.project, deps.state.featureSlug);
-            const repoLocalPaths: Record<string, string> = {};
-            for (const r of deps.state.repoNames) repoLocalPaths[r] = deps.repoPaths()[r] ?? '';
-            const report = runBuildCompliance({
-              binding: deps.config.planBinding,
-              repoLocalPaths,
-              reposChecked: deps.state.repoNames,
-              baseBranch: deps.config.baseBranch ?? 'main',
-            });
-            const md = renderBuildComplianceMarkdown(report);
-            const { writeFileSync } = await import('node:fs');
-            const { join } = await import('node:path');
-            writeFileSync(join(featureDir, 'BUILD_COMPLIANCE.md'), md, 'utf-8');
-            writeFileSync(join(featureDir, 'build-compliance.json'), JSON.stringify(report, null, 2), 'utf-8');
-            // Stash on the runner state so the ship stage can read it
-            // without re-running the check.
-            (deps.state as unknown as { __buildCompliance?: typeof report }).__buildCompliance = report;
-            deps.emit('artifact-written', {
-              stage: 'build',
-              file: `${featureDir}/BUILD_COMPLIANCE.md`,
-              summary: `Build compliance: ${report.passed}/${report.total}`,
-              content: md,
-            });
-          } catch (err) {
-            console.warn('[pipeline] Build compliance check failed:', err);
-          }
-        }
       }
 
       if (stage.name === 'ship' && deps.config.deploy && !deps.isCancelled()) {
-        deployProject({
+        const deployOpts = {
           project: deps.config.project,
           mode: deps.config.deploy,
           workspaceDir: deps.workspaceDir,
           configDeployCmd: deps.projectLoader.getConfig(deps.config.project)?.pipeline?.ship?.deploy,
           envDeployCmd: process.env.ANVIL_DEPLOY_CMD || process.env.FF_DEPLOY_CMD,
-          onArtifact: (artifact) => deps.emit('artifact-written', artifact),
-          onLog: (level, message) => {
+          onArtifact: (artifact: unknown) => deps.emit('artifact-written', artifact),
+          onLog: (level: string, message: string) => {
             if (level === 'info') console.log(`[pipeline] ${message}`);
             else console.warn(`[pipeline] ${message}`);
           },
-        });
+        };
+        // Phase E8: durable wrap for nexus deploy. Idempotency
+        // key includes runId so a re-run of the same project +
+        // mode replays cleanly. Note: deployProject's external
+        // idempotency (e.g. nexus dedup on deploy id) lives in
+        // deployProject itself; this wrap protects against
+        // re-spawning the deploy command on resume.
+        if (ctx) {
+          await ctx.effect(
+            'ship:deploy',
+            async () => {
+              deployProject(deployOpts);
+              return null;
+            },
+            { idempotencyKey: `${ctx.runId}:${deps.config.project}:${deps.config.deploy ?? 'local'}` },
+          );
+        } else {
+          deployProject(deployOpts);
+        }
       }
 
       if (stage.name === 'requirements' && deps.state.repoNames.length === 0) {
@@ -1147,53 +1316,18 @@ export async function runOneStage(
         let fixAttempts = 0;
         const MAX_FIX_ATTEMPTS = 3;
 
-        // The 1st pass at line 887 set `state.stages[i].status='completed'`.
-        // If the artifact has failure markers we're about to re-open the
-        // stage via the fix-loop, so re-flip to 'running' here. Without
-        // this, the UI shows the stage as done even while the fix-loop
-        // churns through per-repo revalidate spawns. The post-loop block
-        // below re-flips back to 'completed'.
-        const reopened = hasValidationFailuresHelper(validateArtifact);
-        if (reopened) {
-          deps.state.stages[i].status = 'running';
-          deps.broadcast();
-        }
-
         while (fixAttempts < MAX_FIX_ATTEMPTS && hasValidationFailuresHelper(validateArtifact)) {
           fixAttempts++;
           console.log(`[pipeline] Validation failed — fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}`);
 
-          const fixResult = await runFixLoop(deps, i, validateArtifact, fixAttempts);
+          const fixResult = await runFixLoop(deps, i, validateArtifact, fixAttempts, ctx);
           deps.state.totalCost += fixResult.cost;
           deps.aggregateRunTokens(fixResult.tokens);
           deps.logCacheTelemetry(`${stage.name}:fix-${fixAttempts}`, fixResult.tokens);
 
           if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
 
-          // Compute the subset of repos whose validate sections still
-          // contain failure markers. Pass that subset as a filter to
-          // `runPerRepoStage` so we only re-pay validation for repos
-          // that need it. Repos whose 1st-pass output was clean keep
-          // their `repoState.status='completed'` + prior cost. If we
-          // can't isolate per-repo failure (extractRepoSection returned
-          // empty for all repos), fall back to revalidating everyone.
-          const failingRepos = new Set<string>();
-          for (const repoName of deps.state.repoNames) {
-            const section = extractRepoSection(validateArtifact, repoName);
-            if (!section || hasValidationFailuresHelper(section)) {
-              failingRepos.add(repoName);
-            }
-          }
-          const repoFilter = failingRepos.size > 0 && failingRepos.size < deps.state.repoNames.length
-            ? failingRepos
-            : undefined;
-          if (repoFilter) {
-            console.log(
-              `[pipeline] Revalidating ${repoFilter.size}/${deps.state.repoNames.length} repo(s): ${[...repoFilter].join(', ')}`,
-            );
-          }
-
-          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact, { repoFilter });
+          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact, ctx);
           validateArtifact = revalidateResult.artifact;
           deps.state.stages[i].artifact = validateArtifact;
           deps.state.stages[i].cost += revalidateResult.cost;
@@ -1202,7 +1336,21 @@ export async function runOneStage(
           deps.logCacheTelemetry(`${stage.name}:revalidate-${fixAttempts}`, revalidateResult.tokens);
           deps.broadcast();
 
-          writeStageArtifactFn(deps.depsForArtifactIO(), stage, validateArtifact);
+          // Phase E6: wrap revalidate write. Effect name includes
+          // the attempt count so successive revalidates land as
+          // distinct events.
+          if (ctx) {
+            await ctx.effect(
+              `validate:revalidate-write-${fixAttempts}`,
+              async () => {
+                writeStageArtifactFn(deps.depsForArtifactIO(), stage, validateArtifact);
+                return null;
+              },
+              { idempotencyKey: artifactIdempotencyKey('validate', `revalidate-${fixAttempts}`, validateArtifact) },
+            );
+          } else {
+            writeStageArtifactFn(deps.depsForArtifactIO(), stage, validateArtifact);
+          }
         }
 
         if (hasValidationFailuresHelper(validateArtifact)) {
@@ -1211,68 +1359,6 @@ export async function runOneStage(
           console.log(`[pipeline] Validation recovered after ${fixAttempts} fix attempt(s)`);
         } else {
           console.log(`[pipeline] Validation clean — proceeding to Ship`);
-        }
-
-        // Re-flip the parent stage to 'completed' once the fix-loop is
-        // truly done. Pairs with the 'running' flip above so the
-        // sidebar doesn't get stuck on a ghost-completed validate
-        // while children are still in flight.
-        if (reopened) {
-          deps.state.stages[i].status = 'completed';
-          deps.state.stages[i].completedAt = new Date().toISOString();
-          deps.broadcast();
-          deps.checkpoint();
-        }
-
-        // Phase F — plan-compliance pass after the test suite. Reads
-        // the validate stage's outcome to decide which tests
-        // passed/failed/skipped, then verifies every plan TestCaseSpec,
-        // contract reference, and migration file is honored. Stored on
-        // shared state for the ship stage's PR-body stamp.
-        if (deps.config.planBinding) {
-          try {
-            const { runValidateCompliance, renderValidateComplianceMarkdown } =
-              await import('./plan-compliance-bridge.js');
-            const repoLocalPaths: Record<string, string> = {};
-            for (const r of deps.state.repoNames) repoLocalPaths[r] = deps.repoPaths()[r] ?? '';
-            // Parse passing/failing/skipped tests out of the artifact
-            // text — Go's "--- FAIL: TestX" / "--- PASS: TestX", plus
-            // "--- SKIP:" lines. Conservative — empty sets keep the
-            // verifier from making false negative claims.
-            const passingTests = new Set<string>();
-            const failingTests = new Set<string>();
-            const skippedTests = new Set<string>();
-            const PASS_RE = /---\s+PASS:\s+(\S+)/g;
-            const FAIL_RE = /---\s+FAIL:\s+(\S+)/g;
-            const SKIP_RE = /---\s+SKIP:\s+(\S+)/g;
-            let m: RegExpExecArray | null;
-            while ((m = PASS_RE.exec(validateArtifact))) passingTests.add(m[1]);
-            while ((m = FAIL_RE.exec(validateArtifact))) failingTests.add(m[1]);
-            while ((m = SKIP_RE.exec(validateArtifact))) skippedTests.add(m[1]);
-
-            const report = runValidateCompliance({
-              binding: deps.config.planBinding,
-              repoLocalPaths,
-              passingTests,
-              failingTests,
-              skippedTests,
-            });
-            const md = renderValidateComplianceMarkdown(report);
-            const featureDir = deps.featureStore.getFeatureDir(deps.config.project, deps.state.featureSlug);
-            const { writeFileSync } = await import('node:fs');
-            const { join } = await import('node:path');
-            writeFileSync(join(featureDir, 'PLAN_COMPLIANCE.md'), md, 'utf-8');
-            writeFileSync(join(featureDir, 'plan-compliance.json'), JSON.stringify(report, null, 2), 'utf-8');
-            (deps.state as unknown as { __validateCompliance?: typeof report }).__validateCompliance = report;
-            deps.emit('artifact-written', {
-              stage: 'validate',
-              file: `${featureDir}/PLAN_COMPLIANCE.md`,
-              summary: `Plan compliance: ${report.passed}/${report.total}`,
-              content: md,
-            });
-          } catch (err) {
-            console.warn('[pipeline] Validate compliance check failed:', err);
-          }
         }
 
         prevArtifact = validateArtifact;

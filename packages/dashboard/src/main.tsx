@@ -18,6 +18,7 @@ import { TriagePanel } from './components/ci-triage/TriagePanel.js';
 import { PlanPage } from './components/plan/PlanPage.js';
 import { PlanCompare } from './components/plan/PlanCompare.js';
 import { SettingsPage } from './components/settings/SettingsPage.js';
+import { PolicyPage } from './components/policy/PolicyPage.js';
 import type { ActivityEntry } from './components/output/ActivityLine.js';
 import { OutputPanel } from './components/output/OutputPanel.js';
 import type { ChangeEntry } from './components/output/OutputPanel.js';
@@ -115,6 +116,8 @@ interface DashboardStageState {
   resolvedModel?: string;
   /** Phase 8 — tool-permission classes enforced for this stage. */
   permissionClasses?: ('read' | 'write' | 'exec')[];
+  /** Stage Q&A — agent's parsed `<questions>...</questions>` block. */
+  questions?: Array<{ index: number; text: string; answer?: string }>;
 }
 
 interface DashboardPipeline {
@@ -198,6 +201,11 @@ function toPipelineData(pipeline: DashboardPipeline | null): PipelineData | null
       // permission glyphs.
       resolvedModel: s.resolvedModel,
       permissionClasses: s.permissionClasses,
+      // Stage Q&A — required for StageQuestionsPanel to mount.
+      // Both the server's state mapper and this client mapper used to
+      // omit it, so the answer UI never appeared and runs paused on
+      // `ctx.waitForSignal` forever.
+      questions: s.questions,
     })),
     totalCost: pipeline.cost.estimatedCost,
     pendingApproval: null,
@@ -503,7 +511,25 @@ function App() {
         break;
 
       case 'active-runs':
-        if (Array.isArray(msg.payload)) setActiveRunsList(msg.payload);
+        if (Array.isArray(msg.payload)) {
+          // Preserve optimistic `pending-*` placeholders. They get cleared
+          // when (a) the matching real run shows up in the server payload
+          // (same project + description), or (b) the placeholder is older
+          // than 15s (orphaned because the server rejected the start).
+          const serverList = msg.payload as typeof activeRunsList;
+          setActiveRunsList((prev) => {
+            const now = Date.now();
+            const pendings = prev.filter((r) => {
+              if (!r.id.startsWith('pending-')) return false;
+              if (now - r.startedAt > 15_000) return false;
+              const claimed = serverList.some(
+                (s) => s.project === r.project && s.description === r.description && s.type === r.type,
+              );
+              return !claimed;
+            });
+            return [...pendings, ...serverList];
+          });
+        }
         break;
 
       case 'cost-snapshot': {
@@ -886,6 +912,25 @@ function App() {
       activityIdCounter = 0;
       setActionPending('build');
 
+      // Optimistic active-run entry — eliminates the "click Build → nothing
+      // happens for a beat" gap. Server's broadcast will replace this
+      // placeholder with the real entry (matched by composite key on type +
+      // project + description) within ~200ms.
+      const optimisticRunId = `pending-build-${Date.now().toString(36)}`;
+      setActiveRunsList((prev) => [
+        {
+          id: optimisticRunId,
+          type: 'build',
+          project: options.project,
+          description: feature,
+          model: options.model,
+          status: 'starting',
+          startedAt: Date.now(),
+          activityCount: 0,
+        },
+        ...prev,
+      ]);
+
       sendWs({
         action: 'run-pipeline',
         project: options.project,
@@ -1030,16 +1075,19 @@ function App() {
 
 
       case 'runs': {
-        // Auto-navigate to the run if action was just started and there's exactly one
-        if (actionPending && activeRunsList.length === 1) {
-          const only = activeRunsList[0];
+        // Auto-navigate to the run if action was just started and there's
+        // exactly one REAL run (skip the optimistic placeholder with the
+        // `pending-` prefix — that gets replaced by the server's broadcast).
+        const realRuns = activeRunsList.filter((r) => !r.id.startsWith('pending-'));
+        if (actionPending && realRuns.length === 1) {
+          const only = realRuns[0];
           setActionPending(null);
           sendWs({ action: 'get-run', runId: only.id });
           navigate(`/run/${only.id}`);
           return <PendingView label="Loading run..." />;
         }
         // Still waiting for server to register the run
-        if (actionPending && activeRunsList.length === 0) {
+        if (actionPending && realRuns.length === 0) {
           return <PendingView label="Starting agent..." />;
         }
         return (
@@ -1164,6 +1212,24 @@ function App() {
                         Stop
                       </span>
                     )}
+                    {(r.status === 'failed' || r.status === 'cancelled' || r.status === 'paused') && (
+                      <span
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          sendWs({ action: 'resume', runId: r.id });
+                        }}
+                        className="btn btn-sm"
+                        style={{
+                          flexShrink: 0,
+                          background: 'var(--bg-elevated-3)',
+                          color: 'var(--text-secondary)',
+                          border: '1px solid var(--border-default)',
+                        }}
+                        title="Replay from last checkpoint (durable storage)"
+                      >
+                        Replay
+                      </span>
+                    )}
                   </div>
                   {r.stages && r.stages.length > 0 && (
                     <div style={{
@@ -1282,6 +1348,7 @@ function App() {
                 changes={changes}
                 onSendInput={handleSendInput}
                 onStop={handleStop}
+                ws={wsRef.current}
                 onResume={() => {
                   const runId = activePipeline?.runId || urlRunId;
                   if (runId) {
@@ -1354,6 +1421,9 @@ function App() {
 
       case 'settings':
         return <SettingsPage project={currentProject?.name ?? null} ws={wsRef.current} />;
+
+      case 'policy':
+        return <PolicyPage project={currentProject?.name ?? null} ws={wsRef.current} />;
 
       case 'history':
         return <RunHistoryList
@@ -1430,16 +1500,9 @@ function App() {
     </>
   ) : null;
 
-  const showGlobalCostChip = !isRunView && runCost && (runCost.limitUsd ?? 0) > 0;
+  const showGlobalCostChip = false; // Cost meters hidden — feature gated as Coming Soon (Policy → Cost).
   const headerRight = isRunView ? (
     <>
-      {runCost && runCost.runId === urlRunId && (runCost.limitUsd ?? 0) > 0 ? (
-        <CostMeter totalUsd={runCost.usd} limitUsd={runCost.limitUsd!} compact />
-      ) : activePipeline?.totalCost != null && activePipeline.totalCost > 0 ? (
-        <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-tertiary)' }}>
-          ${activePipeline.totalCost.toFixed(2)}
-        </span>
-      ) : null}
       {isPipelineLive && (
         <button
           onClick={() => {

@@ -27,7 +27,8 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "node --experimental-vm-modules node_modules/.bin/jest",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "lint:stages": "npm run lint:stages -w @esankhan3/anvil-core-pipeline"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",

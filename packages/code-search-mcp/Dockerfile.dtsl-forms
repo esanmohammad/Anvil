@@ -1,0 +1,224 @@
+# syntax=docker/dockerfile:1.7
+# code-search-mcp — DTSL forms-repo indexer (slim, host-Ollama)
+#
+# Targets every DTSL repo whose name contains "forms" (regex).
+# Uses host's Ollama for embed/rerank (no bundled models — slim image ~600 MB).
+# Uses Anthropic via ADK adapter for repo profiling.
+#
+# REQUIREMENTS on host:
+#   - Ollama running on localhost:11434 with `bge-m3` + `qwen2.5-coder:7b` pulled
+#   - GitHub Personal Access Token with `repo` + `read:org` scope for DTSL
+#   - Anthropic API key
+#
+# Build:
+#   docker build -f packages/code-search-mcp/Dockerfile.dtsl-forms \
+#     -t code-search-mcp:dtsl-forms packages/code-search-mcp
+#
+# Run (Docker Desktop on Mac/Windows — host.docker.internal works automatically):
+#   docker run --rm -it \
+#     -p 4000:4000 \
+#     -e ANTHROPIC_API_KEY="$(grep ANTHROPIC_API_KEY ~/.anvil/.env | cut -d= -f2)" \
+#     -e GITHUB_TOKEN="$(grep GITHUB_TOKEN ~/.anvil/.env | cut -d= -f2)" \
+#     -v code-search-dtsl-forms:/data \
+#     code-search-mcp:dtsl-forms
+#
+# Run on Linux (host.docker.internal needs an explicit gateway):
+#   docker run --rm -it \
+#     --add-host=host.docker.internal:host-gateway \
+#     -p 4000:4000 \
+#     -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+#     -e GITHUB_TOKEN="$GITHUB_TOKEN" \
+#     -v code-search-dtsl-forms:/data \
+#     code-search-mcp:dtsl-forms
+#
+# Default match (word-boundary form/forms — excludes "platform", "transform", etc.):
+#   ^forms?$ | -forms?- | _forms?_ | -forms?$ | ^forms?-
+# As of this writing, that matches 7 DTSL repos:
+#   forms, forms-frontend, forms-backend-v2, popup-forms-editor-frontend,
+#   fraud-forms-detection, form-decrypt, popup-form-renderer
+#
+# Overrides:
+#   -e INDEX_PATTERN="^popup-form"                  # only popup-form-*
+#   -e INDEX_PATTERN="forms"                         # loose substring (matches "platform" too)
+#   -e INDEX_TARGET=github:DTSL  -e INDEX_PATTERN="" # ALL DTSL repos (no filter)
+#   -e PROJECT_NAME=my-name                          # default: dtsl-forms
+#   -e OLLAMA_HOST_URL=http://192.168.1.10:11434     # remote Ollama instead of host
+#
+# Re-index on demand (after host repos update):
+#   curl -X POST http://localhost:4000/index -H 'Content-Type: application/json' \
+#     -d '{"project":"dtsl-forms"}'
+#
+# Wire Claude Code (one-time):
+#   claude mcp add code-search-dtsl-forms -s user \
+#     --transport http http://localhost:4000/mcp
+
+FROM node:22-bookworm-slim
+
+ENV CODE_SEARCH_PORT=4000 \
+    CODE_SEARCH_HOST=0.0.0.0 \
+    CODE_SEARCH_TRANSPORT=streamable-http \
+    CODE_SEARCH_AUTH_MODE=none \
+    CODE_SEARCH_DATA_DIR=/data \
+    ANVIL_HOME=/data \
+    PROJECT_NAME=dtsl-forms \
+    INDEX_TARGET=github:DTSL \
+    INDEX_PATTERN=(^|[-_])forms?([-_]|$) \
+    OLLAMA_HOST_URL=http://host.docker.internal:11434
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git tini gnupg && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p -m 755 /etc/apt/keyrings && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null && \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @esankhan3/code-search-mcp@latest && \
+    npm cache clean --force
+
+# Baked config — same shape as your host ~/.code-search/config.yaml,
+# but Ollama URL is OLLAMA_HOST_URL (resolved at runtime via envsubst).
+RUN mkdir -p /root/.code-search && cat > /root/.code-search/config.yaml.tmpl <<'YAML'
+embedding:
+  provider: ollama
+  model: bge-m3
+  dimensions: 1024
+  ollama_host: __OLLAMA_HOST_URL__
+
+reranker:
+  provider: ollama
+  model: qwen2.5-coder:7b
+  base_url: __OLLAMA_HOST_URL__
+  timeout_ms: 30000
+
+retrieval:
+  max_chunks: 12
+  max_tokens: 12000
+
+indexing:
+  auto_index: true
+  debounce_ms: 500
+
+llm:
+  mode: api
+  model: adk:claude-opus-4-7
+YAML
+
+# Entrypoint:
+#   1. Render config with the resolved OLLAMA_HOST_URL
+#   2. Verify host Ollama reachable + required models present
+#   3. Verify ANTHROPIC_API_KEY + GITHUB_TOKEN
+#   4. Clone DTSL repos matching INDEX_PATTERN via gh
+#   5. Run initial index
+#   6. Start serve mode
+RUN cat > /usr/local/bin/entrypoint.sh <<'BASH' && chmod +x /usr/local/bin/entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVE_PID=
+
+cleanup() {
+  [[ -n "$SERVE_PID" ]] && kill -TERM "$SERVE_PID" 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup TERM INT
+
+# 1. Render config from template
+sed "s|__OLLAMA_HOST_URL__|$OLLAMA_HOST_URL|g" \
+  /root/.code-search/config.yaml.tmpl > /root/.code-search/config.yaml
+echo "[entrypoint] config rendered: ollama=$OLLAMA_HOST_URL"
+
+# 2. Verify host Ollama
+echo "[entrypoint] checking host Ollama at $OLLAMA_HOST_URL"
+if ! curl -sf -m 5 "$OLLAMA_HOST_URL/api/tags" > /dev/null; then
+  echo "[entrypoint] FATAL: cannot reach $OLLAMA_HOST_URL"
+  echo "[entrypoint]   On Mac/Windows Docker Desktop, host.docker.internal works by default."
+  echo "[entrypoint]   On Linux, run with --add-host=host.docker.internal:host-gateway"
+  exit 1
+fi
+
+# Required models present?
+MODELS=$(curl -sf -m 5 "$OLLAMA_HOST_URL/api/tags" | grep -oE '"name":"[^"]*"' || true)
+for required in "bge-m3" "qwen2.5-coder:7b"; do
+  if ! echo "$MODELS" | grep -q "$required"; then
+    echo "[entrypoint] WARN: model '$required' not pulled on host — pull it with:"
+    echo "             ollama pull $required"
+  fi
+done
+
+# 3. Verify required secrets
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "[entrypoint] WARN: ANTHROPIC_API_KEY unset — repo profiling will fall back to LLM_MODE=none."
+fi
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  echo "[entrypoint] FATAL: GITHUB_TOKEN required to clone DTSL private repos"
+  exit 1
+fi
+
+# 4. Clone matching DTSL repos
+ORG_SPEC="${INDEX_TARGET#github:}"
+ORG="${ORG_SPEC%%/*}"
+# If INDEX_TARGET carries an inline pattern (github:ORG/pattern), it wins over INDEX_PATTERN
+if [[ "$ORG_SPEC" == */* ]]; then
+  PATTERN="${ORG_SPEC#*/}"
+else
+  PATTERN="$INDEX_PATTERN"
+fi
+WORKSPACE="/data/sources/$ORG"
+mkdir -p "$WORKSPACE"
+
+echo "[entrypoint] authenticating gh as DTSL"
+echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null || true
+
+echo "[entrypoint] discovering repos in $ORG matching /$PATTERN/"
+MATCHED=$(gh repo list "$ORG" --limit 1000 --json name,nameWithOwner --jq \
+  ".[] | select((\"$PATTERN\" == \"\") or (.name | test(\"$PATTERN\"))) | .nameWithOwner")
+
+if [[ -z "$MATCHED" ]]; then
+  echo "[entrypoint] FATAL: zero repos matched. Check INDEX_PATTERN and token scopes."
+  exit 1
+fi
+
+COUNT=$(echo "$MATCHED" | wc -l | tr -d ' ')
+echo "[entrypoint] $COUNT repo(s) matched. Cloning into $WORKSPACE..."
+echo "$MATCHED" | while read -r FULL; do
+  REPO="${FULL#*/}"
+  if [[ -d "$WORKSPACE/$REPO/.git" ]]; then
+    echo "  -> updating $REPO"
+    git -C "$WORKSPACE/$REPO" fetch --quiet && \
+      git -C "$WORKSPACE/$REPO" pull --quiet --ff-only || true
+  else
+    echo "  -> cloning $FULL"
+    gh repo clone "$FULL" "$WORKSPACE/$REPO" -- --depth=1 --filter=blob:none --quiet || true
+  fi
+done
+
+# 5. Initial index
+echo "[entrypoint] indexing $WORKSPACE as project=$PROJECT_NAME"
+code-search index "$WORKSPACE" --project "$PROJECT_NAME" || \
+  echo "[entrypoint] initial index returned non-zero; continuing into serve"
+
+# 6. Serve
+echo "[entrypoint] starting code-search-mcp --serve --port $CODE_SEARCH_PORT --project $PROJECT_NAME"
+code-search-mcp --serve --port "$CODE_SEARCH_PORT" --project "$PROJECT_NAME" &
+SERVE_PID=$!
+
+wait -n
+RC=$?
+cleanup
+exit $RC
+BASH
+
+VOLUME ["/data"]
+EXPOSE 4000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl -fsS http://localhost:4000/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

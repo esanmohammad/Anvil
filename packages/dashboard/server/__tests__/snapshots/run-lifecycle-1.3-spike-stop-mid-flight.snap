@@ -4,15 +4,12 @@
     "type": "run-stopped"
   },
   {
-    "runCount": 1,
-    "runStatuses": [
-      {
-        "isOurRun": true,
-        "status": "failed",
-        "type": "spike"
-      }
-    ],
+    "runCount": 0,
+    "runStatuses": [],
     "type": "active-runs"
+  },
+  {
+    "type": "runs"
   },
   {
     "entries": [
@@ -26,9 +23,6 @@
   },
   {
     "type": "agent-error"
-  },
-  {
-    "type": "runs"
   },
   {
     "runCount": 0,

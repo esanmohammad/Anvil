@@ -1,0 +1,34 @@
+/**
+ * Public surface for durable execution. The `core-pipeline` barrel
+ * re-exports from here.
+ */
+
+export type {
+  RunStatus,
+  NewRunRecord,
+  RunRecord,
+  DurableEventKind,
+  NewEventRecord,
+  EventRecord,
+  EffectEventPair,
+  SignalRecord,
+} from './types.js';
+
+export {
+  DeterminismViolationError,
+  DurableStoreUnavailableError,
+  EffectResultNotSerialisableError,
+  Pattern1MigrationError,
+} from './types.js';
+
+export type { DurableStore, VacuumStats } from './store.js';
+export { InMemoryDurableStore } from './in-memory-store.js';
+export { SQLiteDurableStore } from './sqlite-store.js';
+export type { SQLiteDurableStoreOptions } from './sqlite-store.js';
+export { lintStepSource } from './lint.js';
+export type { LintViolation } from './lint.js';
+export { LeaseManager, tryTakeOverLease, findOrphanedRuns } from './lease-manager.js';
+export type { LeaseManagerOptions, LeaseManagerEvents } from './lease-manager.js';
+export { serializeAgentRunResult, contentHash, artifactIdempotencyKey } from './effect-helpers.js';
+export { seedStoreFromLog, throwingSpy, countingSpy } from './replay-equivalence.js';
+export type { CountingSpy } from './replay-equivalence.js';

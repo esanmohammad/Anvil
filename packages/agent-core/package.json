@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-agent-core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shared LLM stack — unified LanguageModel interface, provider adapters, agent subprocess machinery, and cost calculation for cli + knowledge-core + headless runners.",
   "type": "module",
   "license": "MIT",
@@ -26,6 +26,7 @@
     "refresh-cost-table": "node scripts/refresh-cost-table.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/exporter-metrics-otlp-http": "^0.200.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.200.0",
@@ -34,8 +35,8 @@
     "@opentelemetry/sdk-trace-base": "^2.0.0",
     "@opentelemetry/sdk-trace-node": "^2.0.0",
     "@opentelemetry/semantic-conventions": "^1.30.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^11.7.0",
+    "undici": "^7.25.0",
     "yaml": "^2.8.3"
   },
   "optionalDependencies": {

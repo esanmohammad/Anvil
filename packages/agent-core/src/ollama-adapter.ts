@@ -35,6 +35,7 @@ import type {
 import { emitContent, emitResult, emitToolResult, emitToolUse } from './stream-format.js';
 import { LocalExecutor, localExecutor } from './router/local-executor.js';
 import { UpstreamError } from './upstream-error.js';
+import { getFetchPool, recycleFetchPoolOnFailure } from './fetch-pool.js';
 
 const DEFAULT_MAX_ITERATIONS = 32;
 const DEFAULT_CONTEXT_WINDOW = 16_384;
@@ -165,10 +166,17 @@ export class OllamaAdapter implements ModelAdapter {
   async checkAvailability(): Promise<{ available: boolean; version?: string; error?: string }> {
     const baseUrl = getBaseUrl();
     try {
-      const res = await fetch(`${baseUrl}/api/tags`, { method: 'GET' });
+      const res = await fetch(`${baseUrl}/api/tags`, {
+        method: 'GET',
+        // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+        dispatcher: getFetchPool('ollama'),
+      });
       if (res.ok) return { available: true };
       return { available: false, error: `Ollama returned ${res.status}` };
     } catch (err: unknown) {
+      // Probe failures are tolerated, but still recycle the pool so the
+      // next real request lands on fresh sockets.
+      void recycleFetchPoolOnFailure('ollama', err);
       const msg = err instanceof Error ? err.message : String(err);
       return { available: false, error: `Cannot reach Ollama at ${baseUrl}: ${msg}` };
     }
@@ -341,12 +349,22 @@ export class OllamaAdapter implements ModelAdapter {
       (body.options as Record<string, unknown>).num_predict = config.maxOutputTokens;
     }
 
-    const response = await fetch(`${baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal,
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${baseUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal,
+        // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+        dispatcher: getFetchPool('ollama'),
+      });
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      void recycleFetchPoolOnFailure('ollama', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new UpstreamError(0, `fetch failed: ${msg}`, { provider: 'ollama', retryable: true });
+    }
 
     if (!response.ok) {
       const errBody = await response.text();

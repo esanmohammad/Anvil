@@ -215,15 +215,63 @@ responsible for their own thread safety inside it (typed contracts
 + explicit locking when relevant; the walker doesn't add a
 mutex).
 
-## Things that don't exist in this package (intentionally)
+## Durable execution module (`src/durable/`)
 
-- No durable execution. We're at "Pattern 1" (audit-log + state-file
-  granularity). Step-level cross-process replay (Pattern 2) is
-  deferred until step boundaries stabilize. See P7 in
-  `CORE-PIPELINE-EXTRACT-ADR.md`.
-- No cross-process pub/sub. `EventBus` is in-process only. Distant
-  consumers (other CLI invocations, dashboards) read via the audit
-  log + state file. P10.
+**Pattern-2 (Temporal-class) durable execution.** v0.3.0 promoted this
+package from Pattern-1 (audit-log + state-file granularity) to a full
+event-sourced engine with replay, multi-process lease arbitration, and
+deterministic-effect protocol. Phases D1–D6 + E0–E10 + F1–F9 + G1–G4.
+
+- **`store.ts`** — `DurableStore` interface every driver implements.
+  Records: runs (with lease + cursor + status), events (`step:*` +
+  `effect:*`), signals (durable Q&A / reviewer-decision channel).
+- **`types.ts`** — `RunStatus` (pending/running/paused/completed/
+  failed/cancelled/compensating), `DurableEventKind`,
+  `DeterminismViolationError`, `EffectResultNotSerialisableError`.
+- **`sqlite-store.ts`** — Production driver. `~/.anvil/durable.db`
+  via `better-sqlite3` + WAL mode. Schema: 4 tables (meta, runs,
+  events, signals).
+- **`in-memory-store.ts`** — Test driver. Bit-identical semantics.
+- **`effect-runtime.ts`** — Implements `ctx.effect/now/uuid/random/
+  sleep/waitForSignal`. Per-step monotonic counter; replay matches
+  `(name, idx)` to recorded events. Mismatch → `DeterminismViolationError`.
+- **`effect-helpers.ts`** — `serializeAgentRunResult`, `contentHash`,
+  `artifactIdempotencyKey`.
+- **`lease-manager.ts`** — Multi-process failover. Heartbeat against
+  `store.renewLease(ttlMs)`. Emits `'lost'` when a peer steals.
+  `tryTakeOverLease(store, runId, newHolder, ttlMs)`,
+  `findOrphanedRuns(store)` for the auto-takeover scanner.
+- **`replay-equivalence.ts`** — Two-pass replay test seam. Pass-1
+  captures the log; pass-2 re-runs against `seedStoreFromLog` with a
+  `throwingSpy()` to assert zero outbound calls.
+- **`lint.ts`** — Static analyzer enforcing "no direct side effects
+  in step bodies." Seven rules: no-direct-{date-now, math-random,
+  crypto-uuid, fs-write, fs-read, exec, setTimeout}. Surfaced as
+  `npm run durable-lint`.
+
+**Effect-name conventions.** Stage-prefixed `<stage>:<op>` strings —
+e.g. `build:spawn-task-<repo>-<taskId>`, `validate:run-fix-loop`,
+`ship:gh-pr-create`. Each call's first argument MUST be a unique stable
+string within the step body. Phase E1–E10 converted ~24 sites across
+the pipeline.
+
+**Step contract additions.**
+- `Step.version?: number` — schema version. Mismatch on replay →
+  `DeterminismViolationError(reason: 'version-mismatch')`. Bump when
+  the step's effect order or input/output shape changes.
+- `Step.compensate?(ctx, output)` — rollback hook invoked during the
+  compensation walk after a run transitions to failed/cancelled.
+
+**Hook**: `attachDurableLogHook(bus, store, runId)` runs at priority
+200 (above audit-log's 100). Awaits `appendEvent` so failure rejects
+the bus emit and the engine marks the run cancelled with
+`reason='infra-error'`. Effect lifecycle events are written DIRECTLY
+by `EffectRuntime`, not via this hook.
+
+## Things that don't exist in this package (intentionally)
+- No cross-process pub/sub for in-flight events. `EventBus` is
+  in-process only. Cross-process coordination uses the durable event
+  log + signal channel (see `src/durable/`).
 - No vendor-specific code. Hooks accept structural types
   (e.g. `{ updateRun(record): Promise<void> }` for `RunStore`),
   not concrete classes — the cli passes its `RunStore`, the

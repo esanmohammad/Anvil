@@ -1336,7 +1336,21 @@ function ReviewsSection() {
   // ── Render ───────────────────────────────────────────────
   return (
     <section aria-label="PR Reviews">
-      <h3 style={sectionTitleStyle}>PR Reviews</h3>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 'var(--space-sm)' }}>
+        <h3 style={{ ...sectionTitleStyle, margin: 0 }}>PR Reviews</h3>
+        <span style={{
+          fontSize: 10,
+          fontWeight: 600,
+          letterSpacing: 0.4,
+          textTransform: 'uppercase',
+          padding: '2px 6px',
+          borderRadius: 4,
+          background: 'var(--bg-elevated-3)',
+          color: 'var(--text-tertiary)',
+        }}>
+          Coming Soon
+        </span>
+      </div>
 
       {loading && !reviews && (
         <div style={{

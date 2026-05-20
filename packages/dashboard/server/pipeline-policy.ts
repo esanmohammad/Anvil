@@ -8,10 +8,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type {
+  AgentQuestionPolicy,
+  CostPolicy,
+  NotificationConfig,
   PathRule,
   PipelinePolicy,
   PipelineStage,
   PolicyDecision,
+  PolicyDefaults,
   PolicyEvaluationInput,
 } from './pipeline-policy-types.js';
 import { POLICY_SCHEMA_VERSION } from './pipeline-policy-types.js';
@@ -296,6 +300,17 @@ function shapePolicy(raw: YamlValue): PipelinePolicy {
 
   const policy: PipelinePolicy = { version, defaults, paths };
 
+  if (typeof raw.enabled === 'boolean') {
+    policy.enabled = raw.enabled;
+  }
+
+  if (isObject(raw.qa)) {
+    const qa: AgentQuestionPolicy = {};
+    if (typeof raw.qa.enabled === 'boolean') qa.enabled = raw.qa.enabled;
+    if (isNumber(raw.qa.maxQuestionsPerStage)) qa.maxQuestionsPerStage = raw.qa.maxQuestionsPerStage;
+    policy.qa = qa;
+  }
+
   if (isObject(raw.cost)) {
     const c = raw.cost;
     const cost: PipelinePolicy['cost'] = {};
@@ -381,48 +396,114 @@ function defaultAnvilHome(): string {
   return join(homedir(), '.anvil');
 }
 
-export function loadPolicy(projectSlug: string, anvilHome?: string): PipelinePolicy | null {
-  const home = anvilHome ?? defaultAnvilHome();
-  const path = join(home, 'projects', projectSlug, 'pipeline-policy.yaml');
-  if (!existsSync(path)) return null;
-  const raw = readFileSync(path, 'utf-8');
-  const node = parseYaml(raw);
-  const policy = shapePolicy(node);
+/**
+ * Built-in default policy used when no `pipeline-policy.yaml` exists.
+ * Ships with `enabled: false` so first-time users get a vanilla
+ * run-to-completion — pauses are opt-in via the Policy page. (Previously
+ * `enabled: true + pauseAfter: ['plan']` deadlocked clarify on every
+ * project that didn't author a yaml, because nothing in the UI surfaces
+ * the pause for that path.)
+ */
+export const BUILTIN_DEFAULT_POLICY: PipelinePolicy = {
+  version: POLICY_SCHEMA_VERSION,
+  enabled: false,
+  defaults: {
+    pauseAfter: [],
+    autoApproveIfRisk: 'low',
+    autoApproveIfConfidence: 0.85,
+  },
+  paths: [],
+  cost: {
+    onBreach: 'ask',
+    autoApproveBelow: 0.15,
+    graceWindowSeconds: 60,
+    limits: {
+      perRun: 10.00,
+      perProjectDaily: 30.00,
+    },
+  },
+  qa: {
+    enabled: true,
+    maxQuestionsPerStage: 5,
+  },
+  notifications: {
+    slack: false,
+    email: false,
+    timeoutHours: 2,
+  },
+};
 
-  // Layer dashboard-managed overlay (Settings → policy editor) on top of YAML.
-  // Stored at `pipeline-policy.overlay.json` so the YAML's comments stay intact.
+interface RawOverlay {
+  enabled?: unknown;
+  defaults?: Partial<PolicyDefaults>;
+  cost?: {
+    onBreach?: 'ask' | 'auto-approve' | 'auto-reject';
+    autoApproveBelow?: number;
+    graceWindowSeconds?: number;
+    limits?: { perRun?: number; perProjectDaily?: number; perStage?: Partial<Record<PipelineStage, number>> };
+  };
+  notifications?: Partial<NotificationConfig>;
+  qa?: Partial<AgentQuestionPolicy>;
+}
+
+/** Layer the dashboard-managed overlay JSON on top of the base policy. */
+function applyOverlay(base: PipelinePolicy, projectSlug: string, home: string): PipelinePolicy {
   const overlayPath = join(home, 'projects', projectSlug, 'pipeline-policy.overlay.json');
-  if (existsSync(overlayPath)) {
-    try {
-      const overlay = JSON.parse(readFileSync(overlayPath, 'utf-8')) as { cost?: Record<string, unknown> };
-      if (overlay.cost && typeof overlay.cost === 'object') {
-        const cost = (policy.cost ??= {}) as NonNullable<PipelinePolicy['cost']>;
-        const ov = overlay.cost as { onBreach?: 'ask' | 'auto-approve' | 'auto-reject'; autoApproveBelow?: number; graceWindowSeconds?: number; limits?: { perRun?: number; perProjectDaily?: number } };
-        if (ov.onBreach) cost.onBreach = ov.onBreach;
-        if (typeof ov.autoApproveBelow === 'number') cost.autoApproveBelow = ov.autoApproveBelow;
-        if (typeof ov.graceWindowSeconds === 'number') cost.graceWindowSeconds = ov.graceWindowSeconds;
-        if (ov.limits) {
-          const lim = (cost.limits ??= {});
-          if (typeof ov.limits.perRun === 'number') lim.perRun = ov.limits.perRun;
-          if (typeof ov.limits.perProjectDaily === 'number') lim.perProjectDaily = ov.limits.perProjectDaily;
-        }
-      }
-    } catch { /* malformed overlay — ignore, fall back to YAML */ }
+  if (!existsSync(overlayPath)) return base;
+  let overlay: RawOverlay;
+  try {
+    overlay = JSON.parse(readFileSync(overlayPath, 'utf-8')) as RawOverlay;
+  } catch {
+    return base;
+  }
+  const out: PipelinePolicy = { ...base };
+  if (typeof overlay.enabled === 'boolean') out.enabled = overlay.enabled;
+  if (overlay.defaults && typeof overlay.defaults === 'object') {
+    out.defaults = { ...base.defaults, ...overlay.defaults } as PolicyDefaults;
+  }
+  if (overlay.cost && typeof overlay.cost === 'object') {
+    const baseCost: CostPolicy = base.cost ?? {};
+    const merged: CostPolicy = { ...baseCost, ...overlay.cost };
+    if (overlay.cost.limits || baseCost.limits) {
+      merged.limits = { ...(baseCost.limits ?? {}), ...(overlay.cost.limits ?? {}) };
+    }
+    out.cost = merged;
+  }
+  if (overlay.notifications && typeof overlay.notifications === 'object') {
+    out.notifications = { ...(base.notifications ?? {}), ...overlay.notifications };
+  }
+  if (overlay.qa && typeof overlay.qa === 'object') {
+    out.qa = { ...(base.qa ?? {}), ...overlay.qa };
+  }
+  return out;
+}
+
+export function loadPolicy(projectSlug: string, anvilHome?: string): PipelinePolicy {
+  const home = anvilHome ?? defaultAnvilHome();
+  const yamlPath = join(home, 'projects', projectSlug, 'pipeline-policy.yaml');
+
+  let policy: PipelinePolicy;
+  if (existsSync(yamlPath)) {
+    const raw = readFileSync(yamlPath, 'utf-8');
+    policy = shapePolicy(parseYaml(raw));
+    // Yaml authors who never wrote `enabled` get the default-on behaviour.
+    if (policy.enabled === undefined) policy.enabled = true;
+  } else {
+    policy = BUILTIN_DEFAULT_POLICY;
   }
 
-  return policy;
+  return applyOverlay(policy, projectSlug, home);
 }
 
 export function defaultPolicy(): PipelinePolicy {
-  return {
-    version: POLICY_SCHEMA_VERSION,
-    defaults: { pauseAfter: ['plan'] },
-    paths: [],
-    cost: { onBreach: 'ask' },
-  };
+  return BUILTIN_DEFAULT_POLICY;
 }
 
 export function evaluatePolicy(policy: PipelinePolicy, input: PolicyEvaluationInput): PolicyDecision {
+  if (policy.enabled === false) {
+    return { pause: false, reason: 'disabled', matchedRules: [], reviewers: [] };
+  }
+
   const matchedRules: string[] = [];
   const reviewers = new Set<string>();
 

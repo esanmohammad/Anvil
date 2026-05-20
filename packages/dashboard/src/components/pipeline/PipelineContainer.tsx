@@ -6,6 +6,7 @@ import { OutputPanel } from '../output/OutputPanel.js';
 import type { ActivityEntry } from '../output/ActivityLine.js';
 import type { ChangeEntry } from '../output/OutputPanel.js';
 import { usePipelineState } from './usePipelineState.js';
+import { StageQuestionsPanel } from './StageQuestionsPanel.js';
 
 // ---------------------------------------------------------------------------
 // Raw content cleaner
@@ -42,6 +43,13 @@ function cleanRawContent(text: string): string {
  * Right panel (flex): Conversation-style output + tabs
  */
 
+export interface StageQuestion {
+  index: number;
+  text: string;
+  answer?: string;
+  answeredAt?: string;
+}
+
 export interface RepoState {
   repoName: string;
   agentId: string | null;
@@ -65,6 +73,8 @@ export interface PipelineStageData {
   resolvedModel?: string;
   /** Permission classes enforced for this stage's tool executor. */
   permissionClasses?: ('read' | 'write' | 'exec')[];
+  /** Stage-level Q&A — the agent paused to ask questions. */
+  questions?: StageQuestion[];
 }
 
 export interface PipelineData {
@@ -103,6 +113,8 @@ export interface PipelineContainerProps {
   onRunAgain?: () => void;
   onSendInput?: (agentIdOrText: string, text?: string) => void;
   onApproveGate?: (stage: number) => void;
+  /** Live WS for the Q&A panel to send `provide-stage-answer` messages. */
+  ws?: WebSocket | null;
 }
 
 export function PipelineContainer({
@@ -117,6 +129,7 @@ export function PipelineContainer({
   onRunAgain: _onRunAgain,
   onSendInput,
   onApproveGate,
+  ws,
 }: PipelineContainerProps) {
   const { selectedStage, setSelectedStage } = usePipelineState();
   const [userSelected, setUserSelected] = React.useState(false);
@@ -430,22 +443,36 @@ export function PipelineContainer({
         </div>
       )}
 
-      {/* Right panel — Conversation output */}
-      <div style={{ flex: 1, overflow: 'hidden' }}>
-        <OutputPanel
-          key={`${selectedStage ?? 'all'}-${selectedRepo ?? 'all'}`}
-          activities={filteredActivities}
-          rawOutput={filteredRaw}
-          changes={filteredChanges}
-          isRunning={isRunning && (
-            selectedStage == null
-              ? true
-              : pipelineData?.stages?.[selectedStage]?.status === 'running'
-                || pipelineData?.stages?.[selectedStage]?.status === 'waiting'
-          )}
-          onSendInput={onSendInput}
-          inputPlaceholder={inputPlaceholder}
-        />
+      {/* Right panel — Q&A panel + Conversation output */}
+      <div style={{ flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+        {selectedStageData?.questions && selectedStageData.questions.length > 0 && (
+          <div style={{ padding: '8px 12px 0 12px' }}>
+            <StageQuestionsPanel
+              stageIndex={selectedStage ?? currentStage}
+              stageName={selectedStageData.rawName ?? selectedStageData.name}
+              questions={selectedStageData.questions}
+              repoName={selectedRepo}
+              ws={ws ?? null}
+              historyMode={selectedStageData.status === 'completed'}
+            />
+          </div>
+        )}
+        <div style={{ flex: 1, overflow: 'hidden' }}>
+          <OutputPanel
+            key={`${selectedStage ?? 'all'}-${selectedRepo ?? 'all'}`}
+            activities={filteredActivities}
+            rawOutput={filteredRaw}
+            changes={filteredChanges}
+            isRunning={isRunning && (
+              selectedStage == null
+                ? true
+                : pipelineData?.stages?.[selectedStage]?.status === 'running'
+                  || pipelineData?.stages?.[selectedStage]?.status === 'waiting'
+            )}
+            onSendInput={onSendInput}
+            inputPlaceholder={inputPlaceholder}
+          />
+        </div>
       </div>
       </div>
     </div>

@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-core-pipeline",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Core pipeline runner for Anvil — typed Step<I,O> graph, EventBus, StepRegistry, lifecycle hooks. Replaces cli's monolithic orchestrator if-tree.",
   "type": "module",
   "license": "MIT",
@@ -22,14 +22,17 @@
   "scripts": {
     "build": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; true",
     "dev": "tsc -b --watch",
-    "test": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; node --test dist/__tests__/*.test.js"
+    "test": "tsc -b && mkdir -p dist/routing && cp src/routing/*.yaml dist/routing/ 2>/dev/null; node --test dist/__tests__/*.test.js",
+    "lint:stages": "tsc -b && node scripts/lint-stages.js"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.2.0",
-    "@esankhan3/anvil-memory-core": "^0.2.0",
+    "@esankhan3/anvil-agent-core": "^0.3.0",
+    "@esankhan3/anvil-memory-core": "^0.3.0",
+    "better-sqlite3": "^11.7.0",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.15.2"
   },
   "repository": {

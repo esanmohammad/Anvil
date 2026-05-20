@@ -62,6 +62,8 @@ import { restoreIncompletePipelines } from './setup/restore-incomplete.js';
 import { createInitSender } from './setup/init-payload.js';
 import { registerGracefulShutdown } from './setup/graceful-shutdown.js';
 import { listenAndReturnHandle } from './setup/server-listen.js';
+import { bootDurable } from './setup/durable.js';
+import { STAGES } from './pipeline-runner-types.js';
 import { WS_OPEN, type WsClient } from './setup/ws-client.js';
 import { createStaticHandler } from './http/static.js';
 import { loadRunsSync, readStateFile } from './runs/io.js';
@@ -875,6 +877,21 @@ export async function startDashboardServer(
     broadcastActiveRuns,
   });
   stopHandlers.push(detachAgentRouter);
+
+  // Durable execution boot — Pattern-1 migration + orphan takeover
+  // + auto-resume dispatch + daily vacuum. Moved to
+  // `./setup/durable.ts`. Returns a stop fn registered with the
+  // shutdown chain (vacuum interval). Auto-resume runs are
+  // fire-and-forget. Skips cleanly when ANVIL_DURABLE_DISABLED=1.
+  const stagesByName: Record<string, number> = {};
+  for (let i = 0; i < STAGES.length; i++) stagesByName[STAGES[i].name] = i;
+  const durableBoot = await bootDurable({
+    stagesByName,
+    startPipeline: (project, feature, options) => {
+      startPipeline(project, feature, options as Parameters<typeof startPipeline>[2]);
+    },
+  });
+  stopHandlers.push(() => { void durableBoot.stop(); });
 
   // Terminal block — start listening, mount socket.io, return the
   // dashboard handle. Body moved to `./setup/server-listen.ts`.

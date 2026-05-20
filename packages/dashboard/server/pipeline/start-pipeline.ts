@@ -211,6 +211,7 @@ export function createStartPipeline(deps: StartPipelineDeps): StartPipelineFn {
       deps.projectLoader,
       deps.featureStore,
       {
+        runId: pipelineRunId,
         project,
         feature,
         model: options?.model ?? 'sonnet',
@@ -285,17 +286,20 @@ export function createStartPipeline(deps: StartPipelineDeps): StartPipelineFn {
         const policy = loadPolicy(info.project, deps.anvilHome);
         if (!policy) return;
         // Map the runner's fine-grained stage taxonomy onto the policy's
-        // 5-stage taxonomy. Without this, stages like `validate` fall back
-        // to `implement` and silently re-trigger any path-rule that lists
-        // `implement` in pauseAfter — pausing the pipeline forever.
-        const stageAsPipelineStage = ((): 'plan' | 'implement' | 'review' | 'test' | 'ship' => {
+        // 5-stage taxonomy. Critical: the `plan` bucket fires ONLY after
+        // `tasks` — the last plan-stage. Mapping earlier plan-stages
+        // (clarify/requirements/etc.) to `plan` would pause as soon as
+        // clarify finishes, before the user has any plan to review.
+        // Earlier plan-stages return `null` here (no policy check).
+        const stageAsPipelineStage = ((): 'plan' | 'implement' | 'review' | 'test' | 'ship' | null => {
           switch (info.stageName) {
             case 'clarify':
             case 'requirements':
             case 'repo-requirements':
             case 'specs':
+              return null; // policy hook skips mid-plan stages
             case 'tasks':
-              return 'plan';
+              return 'plan'; // last plan-stage — this is where pauseAfter:['plan'] fires
             case 'build':
               return 'implement';
             case 'test':
@@ -307,6 +311,7 @@ export function createStartPipeline(deps: StartPipelineDeps): StartPipelineFn {
               return 'implement';
           }
         })();
+        if (stageAsPipelineStage === null) return;
         const decision = evaluatePolicy(policy, {
           stage: stageAsPipelineStage,
           touchedFiles: info.touchedFiles ?? [],
@@ -589,6 +594,15 @@ export function createStartPipeline(deps: StartPipelineDeps): StartPipelineFn {
             // "build → qwen3:14b" badges and 🔒/📝/⚡ permission glyphs.
             resolvedModel: s.resolvedModel,
             permissionClasses: s.permissionClasses,
+            // Stage Q&A — agent's `<questions>...</questions>` block parsed
+            // into a typed list. PipelineContainer mounts StageQuestionsPanel
+            // when this is non-empty. Dropping this field was a silent
+            // regression: pipeline-stages.ts populated `s.questions` and
+            // emitted `stage-question` events, but the wire-state mapper
+            // omitted the field — frontend never got the questions, the
+            // answer panel never appeared, the runner sat in
+            // `ctx.waitForSignal` forever.
+            ...(s.questions && s.questions.length > 0 ? { questions: s.questions } : {}),
           })),
           startedAt: pipelineState.startedAt,
           cost: { inputTokens: 0, outputTokens: 0, estimatedCost: pipelineState.totalCost },

@@ -313,18 +313,25 @@ export class KnowledgeIndexer {
     writeFileSync(chunksPath, JSON.stringify(uniqueChunks));
     log(`Saved ${uniqueChunks.length} chunks to ${chunksPath}`);
 
-    // 11b. Save deleted files list (for incremental embedding cleanup)
-    const allDeletedFiles: Array<{ repoName: string; filePath: string }> = [];
+    // 11b. Save stale files list (for incremental embedding cleanup).
+    // Includes both deleted AND modified files: chunk.id is position-keyed
+    // (chunker.ts:179), so an in-place edit at the same line range produces
+    // an identical id and the embedder's id-set filter would otherwise leave
+    // the old vector in LanceDB unchanged. Listing modified files here lets
+    // embedChunks() wipe their old chunks before re-embedding.
+    const allStaleFiles: Array<{ repoName: string; filePath: string }> = [];
     for (const repo of reposToIndex) {
       const result = repoChunkResults.get(repo.name);
-      if (result?.deletedFiles) {
-        for (const f of result.deletedFiles) {
-          allDeletedFiles.push({ repoName: repo.name, filePath: f });
-        }
+      if (!result) continue;
+      for (const f of result.deletedFiles ?? []) {
+        allStaleFiles.push({ repoName: repo.name, filePath: f });
+      }
+      for (const f of result.changedFiles ?? []) {
+        allStaleFiles.push({ repoName: repo.name, filePath: f });
       }
     }
     const deletedPath = join(basePath, 'deleted_files.json');
-    writeFileSync(deletedPath, JSON.stringify(allDeletedFiles));
+    writeFileSync(deletedPath, JSON.stringify(allStaleFiles));
 
     // 12. Save per-repo metadata
     for (const repo of reposToIndex) {
@@ -427,7 +434,7 @@ export class KnowledgeIndexer {
         byRepo.set(d.repoName, list);
       }
       for (const [repoName, filePaths] of byRepo) {
-        log(`Removing chunks for ${filePaths.length} deleted files from ${repoName}...`);
+        log(`Removing stale chunks for ${filePaths.length} changed/deleted files from ${repoName}...`);
         await vectorStore.deleteFileChunks(project, repoName, filePaths);
       }
     }

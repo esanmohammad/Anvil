@@ -52,6 +52,7 @@ const iconMap: Record<string, React.ComponentType<{ size?: number; strokeWidth?:
   'plan': Map,
   'cost-breaches': DollarSign,
   'memory': Brain,
+  'policy': Shield,
   'settings': Settings,
 };
 

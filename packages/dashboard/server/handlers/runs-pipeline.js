@@ -40,7 +40,43 @@ export function runsPipelineRoutes() {
         }),
         'resume-pipeline': route({
             input: Z.ResumePipeline,
-            handle: async (input, deps) => doResume(input, deps),
+            handle: async (input, deps) => {
+                // Disambiguate: the same `resume-pipeline` action serves TWO
+                // distinct flows. (a) Pause-flow — `<PlanReviewModal>` posts a
+                // `decision: {action, note, editedArtifact?, rerunFromStage?}`
+                // for the reviewer's verdict and the server forwards to
+                // `handleResumePipeline` (pauseStore). (b) Replay flow — the
+                // RunDetail Replay button sends `runId` (or `featureSlug`) with
+                // NO `decision` and we re-run from the last checkpoint.
+                const decision = input.decision;
+                if (decision && typeof decision === 'object') {
+                    const store = deps.extras.pauseStore;
+                    if (!store)
+                        return;
+                    const { handleResumePipeline } = await import('../pipeline-pause-handlers.js');
+                    const env = handleResumePipeline(store, input, deps.user ?? deps.extras.defaultUser);
+                    deps.ws.send(JSON.stringify(env));
+                    // Best-effort durable signal so a crashed worker resuming this
+                    // run replays the reviewer decision rather than re-prompting.
+                    const runId = input.runId;
+                    if (runId) {
+                        const { getDurableStore } = await import('../durable-store-singleton.js');
+                        const durableStore = getDurableStore();
+                        const state = store.get(runId);
+                        const stageLabel = state?.stage ?? 'plan';
+                        if (durableStore) {
+                            void durableStore
+                                .enqueueSignal(runId, `reviewer-decision-${stageLabel}`, { decision })
+                                .catch(() => { });
+                        }
+                        if (state)
+                            deps.services.pipeline.emit('pipeline.resumed', { pause: state });
+                    }
+                    return;
+                }
+                // Fallback — Replay button.
+                return doResume(input, deps);
+            },
         }),
         'spawn-agent': route({
             input: Z.SpawnAgent,
@@ -100,35 +136,42 @@ export function runsPipelineRoutes() {
                 const run = activeRuns.get(runId);
                 if (!run)
                     return;
-                // 1. Flip status + broadcast IMMEDIATELY so the UI reflects the
-                //    stop before the kill chain unwinds.
+                // 1. Remove from activeRuns + broadcast IMMEDIATELY so the UI
+                //    reflects the stop before the (potentially slow) kill chain
+                //    unwinds. The runner's pipeline body may be stuck in an
+                //    await with no AbortSignal — cancel() flips a flag but
+                //    can't break the await. Don't make the user wait for that.
                 run.status = 'failed';
+                activeRuns.delete(runId);
                 deps.services.runs.emit('run.stopped', { runId });
                 broadcastActiveRuns?.();
-                // 2. Cancel the runner first.
-                if (run.type === 'build') {
-                    try {
-                        getRunner?.()?.cancel();
+                // 2. Cancel the runner + kill agents in the background. If kill
+                //    blocks (mid-HTTP-request, slow adapter teardown), the UI
+                //    is already updated; this is fire-and-forget cleanup.
+                queueMicrotask(() => {
+                    if (run.type === 'build') {
+                        try {
+                            getRunner?.()?.cancel();
+                        }
+                        catch { /* ok */ }
                     }
-                    catch { /* ok */ }
-                }
-                // 3. Kill every spawned agent mapped to this run.
-                const toKill = new Set();
-                if (run.agentId)
-                    toKill.add(run.agentId);
-                if (agentToRunId) {
-                    for (const [agentId, rid] of agentToRunId.entries()) {
-                        if (rid === runId)
-                            toKill.add(agentId);
+                    const toKill = new Set();
+                    if (run.agentId)
+                        toKill.add(run.agentId);
+                    if (agentToRunId) {
+                        for (const [agentId, rid] of agentToRunId.entries()) {
+                            if (rid === runId)
+                                toKill.add(agentId);
+                        }
                     }
-                }
-                for (const agentId of toKill) {
-                    try {
-                        handle?.kill(agentId);
+                    for (const agentId of toKill) {
+                        try {
+                            handle?.kill(agentId);
+                        }
+                        catch { /* already dead */ }
+                        agentToRunId?.delete(agentId);
                     }
-                    catch { /* already dead */ }
-                    agentToRunId?.delete(agentId);
-                }
+                });
                 // Persist quick-action stop record (build runs are persisted by
                 // the pipeline-fail handler via cancel()).
                 if (run.type !== 'build') {
@@ -168,8 +211,7 @@ export function runsPipelineRoutes() {
                     }
                     catch { /* */ }
                 }
-                activeRuns.delete(runId);
-                broadcastActiveRuns?.();
+                // activeRuns.delete already happened above; just refresh history.
                 broadcastRuns?.();
             },
         }),

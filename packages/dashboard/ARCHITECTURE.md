@@ -345,3 +345,198 @@ exit code, not the IDE markers.
   NOT use `Pipeline.run()` for end-to-end orchestration yet — the
   `Pipeline.run()` resume support required for that move is
   tracked in `CORE-PIPELINE-CONSOLIDATION-PLAN.md`.
+
+## 13. Durable execution + policy (v0.3.0)
+
+### Server boot wiring
+
+```
+dashboard-server.ts startup
+  ▼
+createDashboardStores({anvilHome})           ← every store
+  ▼
+mountSocketServer({coexistWithRawWs:true})
+  ▼
+attachLegacyBridge + attachServicesBridge
+  ▼
+bootDurable({startPipeline, stagesByName})    ← NEW (setup/durable.ts)
+  │  runDurableMigration(store, {onTakeover})  Phase D3+F4 sweep
+  │  dispatchTakenOverRuns(store, ids, …)      Phase G1 auto-resume
+  │  scheduleDurableVacuum(store)              Phase F3 retention
+  ▼
+listenAndReturnHandle({...})                  ← serves HTTP+WS
+```
+
+### Per-run lease wiring (pipeline-runner.ts)
+
+```
+runner.run()
+  ▼
+durableStore = getDurableStore()              singleton, ~/.anvil/durable.db
+durableHolder = durableHolderId()             `${pid}@${hostname}`
+  ▼
+durableStore.createRun({runId, project, feature, ...})
+durableStore.acquireLease(runId, durableHolder, 60_000)
+durableStore.updateRunStatus(runId, 'running', null)
+durableHookHandle = attachDurableLogHook(bus, store, runId, holder)
+leaseManager = new LeaseManager({store, runId, holder, ttlMs:60_000})
+leaseManager.on('lost', () => this.cancel())  ← peer takeover signal
+  ▼
+Pipeline.run({durableStore, durableHolder, ...})
+  ▼
+on terminal status:
+  durableStore.updateRunStatus(runId, 'completed'|'failed'|'cancelled')
+  durableStore.releaseLease(runId, holder)
+  leaseManager.stop()
+  durableHookHandle.unsubscribe()
+```
+
+### Q&A signal wiring
+
+```
+StageQuestionsPanel.tsx
+  ws.send({action:'provide-stage-answer', stageIndex, repoName?,
+           questionIndex, text})
+        │
+        ▼
+handlers/durable.ts:49 (Zod-validated)
+  runner.provideStageAnswer(stageIndex, repoName, questionIndex, text)
+        │
+        ▼
+PipelineRunner.provideStageAnswer
+  questions[i].answer = text                   ← state mutation
+  broadcastState()                             ← wire 'state' event
+  stageInputResolvers.get(key).resolve(...)    ← in-process unblock
+  durableStore.enqueueSignal(
+    runId,
+    stageAnswerChannel(stageIndex, repoName),  ← per-(stage,repo) channel
+    answersBlock)                              ← cross-process replay
+        ▲
+        │
+Step body in pipeline-stages.ts:
+  await Promise.race([
+    ctx.waitForSignal<string>(stageAnswerChannel(idx, repoName)),
+    new Promise(resolve => deps.setStageInputResolver(idx, repoName, resolve)),
+  ])
+```
+
+`stageAnswerChannel(stageIndex, repoName)` returns
+`stage-answer-<idx>` for project-level, `stage-answer-<idx>:<repo>`
+per-repo. Both halves use the helper from `pipeline-runner.ts`.
+
+### Policy + pause flow
+
+```
+After-stage hook (start-pipeline.ts:282)
+  ▼
+loadPolicy(project, anvilHome)
+  │  v0.3.0: returns BUILTIN_DEFAULT_POLICY when no yaml exists.
+  │  Default has `enabled:false` so vanilla runs never pause.
+  ▼
+stageAsPipelineStage = mapStageToPolicy(stage.name)
+  ▼
+evaluatePolicy(policy, {stage, touchedFiles, riskTier, confidence})
+  │  decision.pause → true | false
+  ▼
+if pause:
+  pauseStore.pause({runId, project, stage, reason, reviewers, timeoutHours})
+  services.pipeline.emit('pipeline.paused', {pause})
+        │  ↓ legacy bridge → wire 'pipeline-paused' → socket.io emit
+        ▼
+Frontend (usePausedRuns hook)
+   activePause = pauses.find(p.runId === urlRunId)
+   <PausedBanner data={activePause} />
+        │
+        ▼ user clicks Review
+   <PlanReviewModal />
+   User chooses Approve | Reject | Modify | Iterate | Rerun
+        │
+        ▼
+   ws.send({action:'resume-pipeline', runId,
+            decision: {action, note?, editedArtifact?, rerunFromStage?}})
+        │
+        ▼
+handlers/runs-pipeline.ts:58 (disambiguates on msg.decision)
+   handleResumePipeline(pauseStore, msg, user)
+        │
+        ▼
+After-stage hook's polling loop (setInterval, 1s)
+   detects status !== 'paused-awaiting-user' → resolves
+        │
+        ▼
+Post-resolve actions:
+   action==='cancel'           → throw → run fails
+   final.resumeDecision.note   → runner.setReviewNote(note)
+   action==='modify-artifact'  → runner.applyArtifactEdit(stageIndex, edited)
+   action==='rerun-from'       → runner.requestRerunFromStage(target)
+   default                     → next stage runs
+```
+
+### Stage name → policy taxonomy
+
+| Pipeline stage name | Policy taxonomy |
+|---|---|
+| `clarify` | `plan` |
+| `requirements` | `plan` |
+| `repo-requirements` | `plan` |
+| `specs` | `plan` |
+| `tasks` | `plan` |
+| `build` | `implement` |
+| `test` | `test` |
+| `validate` | `test` |
+| `ship` | `ship` |
+
+### RunId alignment (v0.3.0)
+
+A run has ONE id used everywhere:
+
+```
+start-pipeline.ts:180 → pipelineRunId = 'build-<base36>'
+   ↓ passed as config.runId
+new PipelineRunner(..., {runId: pipelineRunId, ...})
+   ↓ used as this.state.runId
+durableStore.createRun({runId: pipelineRunId})
+pauseStore.pause({runId: pipelineRunId})
+auditLog.record({runId: pipelineRunId})
+activeRuns.set(pipelineRunId, ...)
+URL: /run/${pipelineRunId}
+```
+
+(Pre-v0.3.0 the runner generated its own `run-<base36>` so pauses,
+durable events, and audit logs lived under a *different* id than
+the activeRuns map + URL. PausedBanner could never resolve. Fixed
+by threading `config.runId` through the constructor — see
+`PipelineConfig.runId?: string` in `pipeline-runner-types.ts`.)
+
+### Frontend surfaces added (v0.3.0)
+
+| Component | Purpose | Wire actions |
+|---|---|---|
+| `src/components/policy/PolicyPage.tsx` | `/policy` route — master toggle, pause stages, auto-approve thresholds, Q&A budget | `get-pipeline-policy`, `update-pipeline-policy` |
+| `src/components/policy/usePolicy.ts` | Hook that loads + saves overlay JSON | same |
+| `src/components/policy/policy-copy.ts` | Centralised copy strings | — |
+| `src/components/history/DurableTimeline.tsx` | Per-run event log under `RunDetail → Durable execution log` disclosure | `get-durable-timeline` |
+| `src/components/pipeline/StageQuestionsPanel.tsx` | In-flight agent Q&A cards | `provide-stage-answer` |
+| `src/components/pipeline/PausedBanner.tsx` | Orange bar at top of run view when pause is active | — (state) |
+| `src/components/pipeline/PlanReviewModal.tsx` | Approve / Reject / Modify / Iterate / Rerun modal | `resume-pipeline` (with `decision`) |
+
+### Server WS handlers added (v0.3.0)
+
+| Action | File | Behavior |
+|---|---|---|
+| `get-durable-timeline` | `handlers/durable.ts` | Returns `{run, events}` from durable store |
+| `provide-stage-answer` | `handlers/durable.ts` | Routes to `runner.provideStageAnswer` + enqueues durable signal |
+| `resume-pipeline` (pause variant) | `handlers/runs-pipeline.ts:58` | Dispatches on `msg.decision`: pause-flow vs replay-flow |
+| `cancel-pipeline-pause` | `handlers/pauses.ts:34` (pre-existing) | Forwards to `handleCancelPause` |
+| `get-pipeline-policy` / `update-pipeline-policy` | `handlers/cost.ts:101,116` (pre-existing) | Loads + saves overlay JSON |
+| `list-replay-queue` | `handlers/incidents.ts:37` (pre-existing) | Snapshot from auto-replay queue |
+
+### Env knobs
+
+| Env | Default | Effect |
+|---|---|---|
+| `ANVIL_DURABLE_DISABLED=1` | unset | Skip durable persistence entirely |
+| `ANVIL_DURABLE_AUTO_TAKEOVER=0` | unset | Don't claim orphan leases at boot |
+| `ANVIL_DURABLE_AUTO_RESUME=0` | unset | Don't dispatch resumes after takeover |
+| `ANVIL_DURABLE_VACUUM_DISABLED=1` | unset | Skip retention sweep |
+| `ANVIL_DURABLE_RETENTION_DAYS` | `30` | Days before terminal runs get vacuumed |

@@ -115,6 +115,14 @@ export function providerOfModelId(modelId: string): ProviderName {
 
 // ── Per-repo agent tracking ─────────────────────────────────────────────
 
+/** A question an agent asked during a stage, with the user's answer if provided. */
+export interface StageQuestion {
+  index: number;            // 0-based position in the question list
+  text: string;             // the agent's question
+  answer?: string;          // undefined until user answers; trimmed string after
+  answeredAt?: string;      // ISO timestamp
+}
+
 export interface RepoAgentState {
   repoName: string;
   agentId: string | null;
@@ -122,6 +130,8 @@ export interface RepoAgentState {
   cost: number;
   artifact: string;
   error: string | null;
+  /** Per-repo Q&A — populated when the agent for this repo is in mid-Q&A. */
+  questions?: StageQuestion[];
 }
 
 // ── Pipeline state ──────────────────────────────────────────────────────
@@ -171,6 +181,8 @@ export interface PipelineStageState {
   resolvedModel?: string;
   /** Tool-permission classes ('read' / 'write' / 'exec'). */
   permissionClasses?: ('read' | 'write' | 'exec')[];
+  /** Stage-level Q&A — populated when the agent asks questions before producing the artifact. */
+  questions?: StageQuestion[];
 }
 
 export interface PipelineRunState {
@@ -206,6 +218,14 @@ export interface PipelineConfig {
   project: string;
   feature: string;
   model: string;
+  /**
+   * Optional run id. When omitted, the runner generates `run-<base36>`.
+   * Callers (the dashboard) pass the same id used for the activeRuns
+   * map + frontend URL (`build-<base36>`) so pauses, durable events,
+   * audit logs, and the frontend's `urlRunId` filter all line up on
+   * one identity.
+   */
+  runId?: string;
   /** Cost-aware tier — overrides single model with per-stage routing. */
   modelTier?: ModelTier;
   /** Base branch to checkout/PR against (default: auto-detect main/master). */
@@ -227,12 +247,6 @@ export interface PipelineConfig {
   skipShip?: boolean;
   /** Deploy after shipping. */
   deploy?: 'local' | 'remote' | false;
-  /**
-   * Phase D — plan binding for the run. When present, every stage
-   * receives `ctx.shared.planBinding` so build / validate / ship can
-   * verify their output against the approved plan + stamp PR bodies.
-   */
-  planBinding?: PlanBinding;
   /** Explicit repo list (overrides auto-detection). */
   repos?: string[];
   // ── Resume support ────────────────────────────────────────────────────
@@ -243,6 +257,12 @@ export interface PipelineConfig {
   /** What went wrong in the previous run. */
   failureContext?: string;
   actionType?: 'feature' | 'bugfix' | 'fix' | 'spike' | 'review';
+  /**
+   * Phase D — plan binding for the run. When present, every stage
+   * receives `ctx.shared.planBinding` so build / validate / ship can
+   * verify their output against the approved plan + stamp PR bodies.
+   */
+  planBinding?: PlanBinding;
 }
 
 // ── Checkpoint — persisted pipeline state for crash recovery ───────────
@@ -328,6 +348,16 @@ export function findInterruptedPipelines(anvilHome: string): PipelineCheckpoint[
  * Hook fired after each stage completes. Returning a rejected promise
  * cancels the pipeline; resolving with `{ pause: true }` suspends
  * execution until `resume()` is called.
+ *
+ * The `waitForReviewerDecision` callback is the durable-signal-aware
+ * pause primitive (Phase F1 of the durable execution rollout). When
+ * the after-stage hook needs to block the pipeline pending a
+ * reviewer decision, it MUST call this callback rather than
+ * polling — the callback is wired to `ctx.waitForSignal(channel)`
+ * when durable mode is on, falling back to caller-supplied polling
+ * when off. Crash-recovery: a reviewer decision recorded before the
+ * crash returns immediately on replay; the user doesn't have to
+ * re-decide.
  */
 export interface AfterStageHook {
   (info: {
@@ -341,5 +371,12 @@ export interface AfterStageHook {
     touchedFiles?: string[];
     riskTier?: 'low' | 'med' | 'high';
     confidence?: number;
+    /**
+     * Block until a reviewer decision lands on the named channel.
+     * Returns the decision payload (caller-supplied shape) or null on
+     * timeout / cancellation. Idempotent on replay — a previously
+     * recorded decision returns immediately.
+     */
+    waitForReviewerDecision?: (channel: string) => Promise<unknown>;
   }): Promise<void>;
 }

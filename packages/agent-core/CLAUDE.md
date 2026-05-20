@@ -146,6 +146,28 @@ belong in ADRs, not here.
   `Set<ChildProcess>` instead of a single `child` field, so parallel
   spawns (per-repo backend + frontend, per-task build) don't trample
   each other's process handles.
+- Per-provider fetch dispatcher pool (`src/fetch-pool.ts`) — every
+  network-talking adapter passes `dispatcher: getFetchPool(provider)`
+  on its `fetch()` call and calls `recycleFetchPoolOnFailure(provider, err)`
+  in the `catch` block. Pools are bounded-keep-alive `undici.Agent`s
+  with `keepAliveTimeout: 4s`, `keepAliveMaxTimeout: 10s`,
+  `connections: 32`. Per-provider isolation means a zombie socket on
+  Anthropic's pool (after laptop sleep/wake or VPN flip) does NOT
+  poison Gemini / OpenCode / Ollama. The recycle is fire-and-forget +
+  coalesced: 10 concurrent failures = 1 new agent, not 10. Trigger
+  patterns: `fetch failed | ECONNRESET | socket hang up | other side
+  closed | EPIPE | ETIMEDOUT | UND_ERR_SOCKET` (network-layer only —
+  real upstream 503/429 land in `!response.ok` and never recycle).
+  Pool keys: `'anthropic' | 'opencode' | 'openrouter' | 'openai' |
+  'gemini' | 'ollama' | 'unknown'`. ADK Claude shares `'anthropic'`
+  with single-shot Claude API (same host, same TLS). Inspect state
+  via `getPoolMetrics()`. Tests: `src/__tests__/fetch-pool.test.ts`
+  (9 unit) + `fetch-pool.integration.test.ts` (proves heal-on-failure
+  end-to-end with a real HTTP server killed mid-flight). Background:
+  Node's global undici dispatcher retained zombie sockets after OS
+  sleep events, burning every chain-walker entry simultaneously with
+  `TypeError: fetch failed` until process restart. See
+  `docs/FETCH-POOL-MANAGEMENT-PLAN.md` for the full rationale.
 
 Public barrel: `src/index.ts` re-exports everything.
 
@@ -205,6 +227,36 @@ cost loader resolves the JSON via `fileURLToPath(import.meta.url)`.
   to fail the whole stage instead of burning that one chain entry.
   Now the walker hops to the next rung; the bad id is still bad on the
   next run, but the run completes.
+- **Fetch pool wiring (adapter author contract).** Every adapter that
+  calls `fetch()` MUST pass a dispatcher and recycle on network failure:
+
+  ```ts
+  import { getFetchPool, recycleFetchPoolOnFailure } from './fetch-pool.js';
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body,
+      signal,
+      // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+      dispatcher: getFetchPool(this.poolId),
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    void recycleFetchPoolOnFailure(this.poolId, err);   // fire-and-forget heal
+    throw new UpstreamError(0, `fetch failed: ${err.message}`, {
+      provider: this.provider, retryable: true,
+    });
+  }
+  ```
+
+  Two lines per fetch site — the throw still happens so the chain walker
+  burns this entry, but the *next* request to the same provider gets a
+  fresh socket pool. Without the recycle a single network blip turns
+  every subsequent fetch into `TypeError: fetch failed` until the
+  process restarts.
 
 ### Telemetry
 

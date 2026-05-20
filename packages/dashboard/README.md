@@ -19,18 +19,32 @@ browser tab and you get:
 - **Pipeline view** — kick off a feature, watch the 9 stages walk
   in real time, see every spawned agent's tool calls, file edits,
   and shell output as they happen.
-- **Active runs** — every pipeline in flight, with cost ticking up
-  per call, model fallbacks called out, and an interrupt button
-  that actually works.
+- **Active runs** — every pipeline in flight, with optimistic
+  insert on click (no "did I press Build?" gap), model fallbacks
+  called out, and an interrupt button that actually works.
 - **Run history** — every previous run with diffs, PR URLs,
   reviewer verdicts, and a one-click resume from any failed stage.
+  Each run exposes a **Durable execution log** disclosure that
+  renders every persisted step + effect for incident postmortems.
 - **Knowledge graph** — force-directed view of your project graph
   (the one `@anvil/knowledge-core` builds), filterable by repo and
   community, click-through to source.
 - **Memory inspector** — query the five-type memory store live,
   see what got proposed, what got ratified, what got drift-flagged.
-- **Pipeline policy editor** — model-per-stage routing in a UI; no
-  YAML edit needed.
+- **Pipeline policy editor** at `/policy` — *new in 0.3.0*. Master
+  toggle, per-stage pause checkboxes (plan, implement, test, ship),
+  auto-approve thresholds on risk + confidence, Q&A budget per
+  stage. Cost limits + notifications scaffolded as "Coming Soon".
+- **In-flight agent Q&A** — *new in 0.3.0*. When an agent asks
+  clarifying questions, an inline Q&A card surfaces with a draft
+  area per question; answers flow into the durable signal channel
+  so a crashed worker resumes without re-asking.
+- **Paused-run banner + review modal** — *new in 0.3.0*. Orange
+  banner at the top of the run view whenever the policy fires a
+  pause. Click Review for an Approve / Reject / Modify-artifact /
+  Iterate-with-note / Rerun-from-stage modal. Decisions enqueue a
+  durable signal so the agent picks back up exactly where it left
+  off, even across a process restart.
 - **Settings** — provider keys, OTel endpoint, Ollama host, all
   written to `~/.anvil/.env` from the browser.
 
@@ -119,15 +133,38 @@ indexed repos. Three different fronts, one knowledge stack.
 ## What lives in this package
 
 ### Server
-- **`server/dashboard-server.ts`** — single-process HTTP + WS host.
-  ~50 WebSocket message types, instantiates the `AgentManager` /
-  `MemoryStore` / `PipelineRunner` / `PipelinePauseStore`, owns the
-  `prUrls` / `costLedger` / `runStore` rollups, scans the feature
-  store for prior PR URLs on boot.
+- **`server/dashboard-server.ts`** — boot orchestrator (~890 LOC
+  after the Phase 1–11 decomposition). Wires `AgentManager` /
+  `MemoryStore` / `PipelineRunner` / pause store / services, mounts
+  socket.io, builds the handler registry, calls `bootDurable` last.
+- **`server/setup/`** — boot wiring extracted out of
+  `dashboard-server.ts`: `stores.ts` (the `DashboardStores` bundle),
+  `auto-replay.ts`, `restore-incomplete.ts`, `sleeptime.ts`,
+  `graceful-shutdown.ts`, **`durable.ts` (new in 0.3.0 — migration
+  + auto-resume + vacuum)**.
 - **`server/pipeline-runner.ts`** — per-run orchestrator. Walks
   the 9 stages, fans out per-repo, runs the validate-fix loop,
-  broadcasts state over WS. Delegates every spawn, prompt build,
-  and shell op to a Step factory or pure helper under `steps/`.
+  broadcasts state over WS. **v0.3.0**: acquires a TTL'd lease in
+  the durable store + attaches `attachDurableLogHook` + threads
+  `durableStore` into `Pipeline.run()`.
+- **`server/durable-*.ts`** — *new in 0.3.0*. `durable-store-singleton.ts`
+  (SQLite handle at `~/.anvil/durable.db`), `durable-migration.ts`
+  (Pattern-1 sweep + orphan takeover), `durable-vacuum.ts` (daily
+  retention), `durable-resume-queue.ts` (auto-replay reclaimed runs),
+  `auto-replay-queue.ts` (bug→test job queue), `replay-pipeline.ts`,
+  `replay-store.ts`.
+- **`server/pipeline-policy*.ts`** — Policy YAML reader, validator,
+  evaluator, overlay merger. `BUILTIN_DEFAULT_POLICY` ships with
+  `enabled:false` so first-run is pause-free; opt-in via the UI.
+- **`server/pipeline-pause-*.ts`** — `pipeline-pause-store.ts`,
+  `pipeline-pause-handlers.ts`, `pipeline-pause-sweeper.ts`,
+  `pipeline-pause-types.ts`. Backing store + handlers for the
+  paused-run banner + review modal.
+- **`server/handlers/`** — typed handler registry (one file per
+  domain). v0.3.0 added `handlers/durable.ts` (`get-durable-timeline`,
+  `provide-stage-answer`) and extended `handlers/runs-pipeline.ts`'s
+  `resume-pipeline` to disambiguate pause-flow vs replay-flow on
+  `msg.decision`.
 - **`server/steps/`** — Step factories + helpers. Adding a stage
   starts here.
 - **`server/provider-registry.ts`** — visibility layer for the
@@ -187,6 +224,32 @@ dashboard's `extractPRUrls` scanner picks it up. URLs land in the
 active run's `prUrls: Set<string>` and surface in the run-history
 detail view as soon as `gh` returns.
 
+### Durable execution &nbsp;<sub><i>new in 0.3.0</i></sub>
+Every run acquires a TTL'd lease in `~/.anvil/durable.db` and
+heartbeats it at `ttl/3`. Every step + every `ctx.effect()` call
+records to the SQLite event log. Kill the dashboard mid-run and
+relaunch: the boot daemon's orphan scan finds the expired lease,
+claims it, and the auto-resume queue replays the workflow from
+the durable cursor — recorded effects return cached results, no
+double agent spawns, no re-prompting the user for Q&A answers
+they already gave. Opt out per env: `ANVIL_DURABLE_DISABLED=1`,
+`ANVIL_DURABLE_AUTO_TAKEOVER=0`, `ANVIL_DURABLE_AUTO_RESUME=0`,
+`ANVIL_DURABLE_VACUUM_DISABLED=1`, `ANVIL_DURABLE_RETENTION_DAYS=30`.
+
+### Reviewer pause flow &nbsp;<sub><i>new in 0.3.0</i></sub>
+When the policy editor's pause gate fires after a stage,
+`pipeline.paused` flows over socket.io. The frontend's
+`usePausedRuns` hook surfaces an orange `<PausedBanner>` for the
+matching run + opens `<PlanReviewModal>` on Review. Approve /
+Reject / Modify-artifact / Iterate-with-note / Rerun-from-stage —
+each decision lands on `pauseStore.resume()`, unblocks the
+after-stage hook's 1s polling loop, and triggers
+`runner.applyArtifactEdit` / `setReviewNote` /
+`requestRerunFromStage` as appropriate. The decision is also
+enqueued as a durable signal so a crashed process resuming the
+run picks back up at the post-decision step, not the pre-decision
+pause.
+
 ---
 
 ## Things that don't exist (intentionally)
@@ -209,7 +272,10 @@ detail view as soon as `gh` returns.
 
 The canonical interface for running Anvil pipelines as of MVP 2.
 The CLI's `init` / `doctor` / `dashboard` commands are the front
-door; everything else flows through here.
+door; everything else flows through here. v0.3.0 added durable
+execution wiring, multi-process race arbitration, the `/policy`
+editor, in-flight Q&A cards, the paused-run banner + review modal,
+and the durable execution log viewer.
 
 ---
 

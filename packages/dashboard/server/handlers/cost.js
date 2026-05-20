@@ -131,14 +131,30 @@ export function costRoutes() {
                     mkdirSync(projDir, { recursive: true });
                 const overlayPath = join(projDir, 'pipeline-policy.overlay.json');
                 const existing = existsSync(overlayPath) ? JSON.parse(readFileSync(overlayPath, 'utf-8')) : {};
-                const merged = {
-                    ...existing,
-                    cost: {
+                // Persist the FULL patch surface: enabled + defaults (pauseAfter etc.)
+                // + qa + notifications + cost. Previously this handler only wrote
+                // `cost` and silently dropped everything else, so toggling "Pause
+                // for human review" + checking Plan in the UI never reached disk
+                // and the pipeline kept blowing through stages.
+                const merged = { ...existing };
+                if (patch.enabled !== undefined)
+                    merged.enabled = patch.enabled;
+                if (patch.defaults) {
+                    merged.defaults = { ...(existing.defaults ?? {}), ...patch.defaults };
+                }
+                if (patch.qa) {
+                    merged.qa = { ...(existing.qa ?? {}), ...patch.qa };
+                }
+                if (patch.notifications) {
+                    merged.notifications = { ...(existing.notifications ?? {}), ...patch.notifications };
+                }
+                if (patch.cost) {
+                    merged.cost = {
                         ...(existing.cost ?? {}),
                         ...cost,
                         limits: { ...(existing.cost?.limits ?? {}), ...(cost.limits ?? {}) },
-                    },
-                };
+                    };
+                }
                 writeFileSync(overlayPath, JSON.stringify(merged, null, 2), 'utf-8');
                 // Push fresh snapshot so any meters reading limits see new ceilings.
                 try {

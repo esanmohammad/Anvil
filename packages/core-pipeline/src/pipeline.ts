@@ -40,8 +40,11 @@
  *     Steps that need per-repo failure tolerance handle it inside `run()`.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import { InMemoryArtifactStore } from './artifacts.js';
 import type {
+  EffectOptions,
   EventBus,
   LlmHandles,
   MemoryHandles,
@@ -54,6 +57,9 @@ import type {
   StepRetryPolicy,
   StepSkipContext,
 } from './types.js';
+import type { DurableStore } from './durable/store.js';
+import { EffectRuntime } from './durable/effect-runtime.js';
+import { DeterminismViolationError } from './durable/types.js';
 
 export interface PipelineDeps {
   registry: StepRegistry;
@@ -115,11 +121,37 @@ export interface PipelineDeps {
    * `__anvilRewind` flow.
    */
   rewindTo?: string;
+  /**
+   * Optional `DurableStore` — when supplied, every step gets an
+   * effect runtime that records `ctx.effect` calls into the
+   * durable log, and on resume those calls return recorded
+   * results without re-running. See
+   * `docs/durable-execution-plan.md` §F for the replay protocol.
+   *
+   * When omitted, `ctx.effect`/`now`/`uuid`/`random`/`sleep`/
+   * `waitForSignal` become trivial wrappers — `effect(name, fn)`
+   * just calls `fn()`, `now()` returns `Date.now()`, etc. The
+   * walker behaviour is byte-identical to the pre-D2 contract.
+   * Phase D2 of the durable execution rollout.
+   */
+  durableStore?: DurableStore;
+  /**
+   * Identity of the holding process — used by the durable log
+   * hook + lease arbitration. Defaults to `${pid}@${hostname}`.
+   * Phase D2.
+   */
+  durableHolder?: string;
 }
 
 export class Pipeline {
   private readonly artifacts = new InMemoryArtifactStore();
   private readonly shared: Record<string, unknown>;
+  /**
+   * Per-step recorded output, populated as steps complete. Used by
+   * the compensation walker (Phase D4) to feed each step's
+   * `step.compensate(ctx, output)` hook the right value.
+   */
+  private readonly stepOutputs = new Map<string, unknown>();
 
   constructor(private readonly deps: PipelineDeps) {
     this.shared = deps.initialShared ?? {};
@@ -134,7 +166,8 @@ export class Pipeline {
   }
 
   async run(): Promise<PipelineRunResult> {
-    const { registry, bus, runId, signal, resumeFromStep, completedSteps: priorCompleted, rewindTo } = this.deps;
+    const { registry, bus, runId, signal, resumeFromStep, completedSteps: priorCompleted, rewindTo, durableStore } = this.deps;
+    console.log(`[trace] ${runId} pipeline.run entry`);
     const now = this.deps.now ?? Date.now;
     const startedAt = now();
     const completedSteps: string[] = [];
@@ -153,9 +186,22 @@ export class Pipeline {
 
     // Resolve the skip set from resumeFromStep + completedSteps + rewindTo.
     const orderedSteps = registry.steps();
-    const skipReason: Map<string, 'completed' | 'resume' | 'rewind'> = new Map();
+    const skipReason: Map<string, 'completed' | 'resume' | 'rewind' | 'replay-completed'> = new Map();
     if (priorCompleted) {
       for (const id of priorCompleted) skipReason.set(id, 'completed');
+    }
+
+    // Durable replay: every step that has `step:completed` in the
+    // log on entry skips with reason 'replay-completed'. This is
+    // additive to priorCompleted/resumeFromStep — replay survives
+    // even when the caller didn't pass those flags.
+    if (durableStore) {
+      const events = await durableStore.readEvents(runId);
+      for (const ev of events) {
+        if (ev.kind === 'step:completed' && ev.stepId) {
+          skipReason.set(ev.stepId, 'replay-completed');
+        }
+      }
     }
 
     if (resumeFromStep) {
@@ -193,6 +239,7 @@ export class Pipeline {
     }
     const skipSet = new Set<string>(skipReason.keys());
 
+    console.log(`[trace] ${runId} before pipeline:started emit (listeners may include await:true)`);
     await this.emit(bus, {
       hook: 'pipeline:started',
       runId,
@@ -200,19 +247,27 @@ export class Pipeline {
       payload: { stepCount: orderedSteps.length },
     });
 
+    console.log(`[trace] ${runId} pipeline:started emitted, entering step loop (${orderedSteps.length} steps)`);
     for (const step of orderedSteps) {
       if (signal?.aborted) {
         status = 'aborted';
         break;
       }
+      console.log(`[trace] ${runId} step iter: ${step.id} (skip=${skipSet.has(step.id)})`);
 
       if (skipSet.has(step.id)) {
+        const reason = skipReason.get(step.id) ?? (resumeFromStep ? 'resume' : 'completed');
+        // Don't double-record `step:skipped` for replay-completed
+        // steps — the original `step:completed` is already in the
+        // durable log. Emit the event for in-process consumers
+        // (audit log, dashboard) but skip the durable hook will
+        // see the duplicate runId+stepId and elide.
         await this.emit(bus, {
           hook: 'step:skipped',
           runId,
           stepId: step.id,
           ts: this.iso(now),
-          payload: { reason: skipReason.get(step.id) ?? (resumeFromStep ? 'resume' : 'completed') },
+          payload: { reason },
         });
         // Track in completedSteps so the result reflects what the run "saw".
         completedSteps.push(step.id);
@@ -248,11 +303,37 @@ export class Pipeline {
         }
       }
 
+      // Phase D4: durable version check. On replay (durableStore
+      // present) compare the step's declared version against the
+      // recorded version of any prior `step:started` event for this
+      // step. A bumped version invalidates the recorded effects;
+      // the user must rerun from the affected stage.
+      if (durableStore) {
+        const events = await durableStore.readEvents(runId);
+        const priorStarted = events.find(
+          (e) => e.kind === 'step:started' && e.stepId === step.id,
+        );
+        const priorVersion =
+          priorStarted && typeof priorStarted.payload === 'object' && priorStarted.payload !== null
+            ? (priorStarted.payload as { version?: number }).version
+            : undefined;
+        const currentVersion = step.version ?? 1;
+        if (priorVersion !== undefined && priorVersion !== currentVersion) {
+          throw new DeterminismViolationError(
+            runId,
+            step.id,
+            'version-mismatch',
+            `step "${step.id}" replayed at version=${currentVersion} but log records version=${priorVersion}`,
+          );
+        }
+      }
+
       await this.emit(bus, {
         hook: 'step:started',
         runId,
         stepId: step.id,
         ts: this.iso(now),
+        payload: { version: step.version ?? 1 },
       });
 
       const stepStart = now();
@@ -261,12 +342,14 @@ export class Pipeline {
         const stepDurationMs = now() - stepStart;
         completedSteps.push(step.id);
         prevOutput = out;
+        // Track output for compensation (D4).
+        this.stepOutputs.set(step.id, out);
         await this.emit(bus, {
           hook: 'step:completed',
           runId,
           stepId: step.id,
           ts: this.iso(now),
-          payload: { durationMs: stepDurationMs },
+          payload: { durationMs: stepDurationMs, version: step.version ?? 1 },
         });
       } catch (err) {
         failedStep = step.id;
@@ -300,9 +383,55 @@ export class Pipeline {
         payload: { completedSteps, failedStep, durationMs, costUsd },
         error: this.serializeError(lastError),
       });
+      // Phase D4: compensation walk. After a non-success terminal
+      // status, walk the completed steps in reverse and invoke
+      // each step's `compensate(ctx, output)` hook if defined.
+      // Compensation effects flow through the same EffectRuntime,
+      // so a crash mid-rollback resumes the rollback (not the
+      // forward path) on the next process — that's what makes
+      // Pattern-2 compensation durable.
+      await this.runCompensationWalk(orderedSteps, completedSteps, failedStep, prevOutput);
     }
 
     return { runId, status, completedSteps, failedStep, durationMs, costUsd };
+  }
+
+  /**
+   * Reverse-walk completed steps, invoking compensate(ctx, output)
+   * on each step that defines one. Errors during compensation are
+   * recorded but don't halt the walk — best-effort rollback.
+   */
+  private async runCompensationWalk(
+    orderedSteps: ReadonlyArray<Step<unknown, unknown>>,
+    completedIds: string[],
+    failedStepId: string | undefined,
+    prevOutput: unknown,
+  ): Promise<void> {
+    const { bus, runId } = this.deps;
+    const now = this.deps.now ?? Date.now;
+    // Reverse order, skipping the step that actually failed (it
+    // never produced an output to roll back).
+    const toCompensate = [...completedIds].reverse().filter((id) => id !== failedStepId);
+    for (const id of toCompensate) {
+      const step = orderedSteps.find((s) => s.id === id);
+      if (!step?.compensate) continue;
+      const output = this.stepOutputs.get(id);
+      if (output === undefined) continue;
+      try {
+        const ctx = await this.buildContext(step, prevOutput);
+        await step.compensate(ctx, output);
+      } catch (err) {
+        // Best-effort: surface as a fire-and-forget event but keep walking.
+        bus.emitFireAndForget({
+          hook: 'step:failed',
+          runId,
+          stepId: step.id,
+          ts: this.iso(now),
+          payload: { phase: 'compensate' },
+          error: this.serializeError(err),
+        });
+      }
+    }
   }
 
   private async runStepWithSubSteps(
@@ -408,7 +537,7 @@ export class Pipeline {
     fanoutOpts?: { repoName?: string },
   ): Promise<unknown> {
     const policy = step.retryPolicy;
-    const ctx = this.buildContext(step, input, fanoutOpts);
+    const ctx = await this.buildContext(step, input, fanoutOpts);
     if (!policy || policy.attempts <= 0) {
       return step.run(ctx);
     }
@@ -443,12 +572,12 @@ export class Pipeline {
     throw lastErr;
   }
 
-  private buildContext<I>(
+  private async buildContext<I>(
     step: Step<I, unknown>,
     input: unknown,
     fanoutOpts?: { repoName?: string },
-  ): StepContext<I> {
-    const { runId, workspaceDir, repoPaths, memory, llm, bus, signal } = this.deps;
+  ): Promise<StepContext<I>> {
+    const { runId, workspaceDir, repoPaths, memory, llm, bus, signal, durableStore } = this.deps;
     const sig = signal ?? new AbortController().signal;
     const artifactsView = this.artifacts;
     const emit = (artifactId: string, data: unknown): void => {
@@ -461,6 +590,48 @@ export class Pipeline {
         payload: { artifactId, data },
       });
     };
+
+    let effectFn: StepContext<I>['effect'];
+    let nowFn: StepContext<I>['now'];
+    let uuidFn: StepContext<I>['uuid'];
+    let randomFn: StepContext<I>['random'];
+    let sleepFn: StepContext<I>['sleep'];
+    let waitForSignalFn: StepContext<I>['waitForSignal'];
+
+    if (durableStore) {
+      const recorded = await durableStore.readEffectEvents(runId, step.id);
+      // Phase F6: per-repo scope filter. When the walker is in
+      // per-repo fanout mode, parallel runtimes share `step.id`
+      // but each effect key embeds the repo name (e.g.
+      // `specs:spawn-service-a`). Each runtime sees only the
+      // effects matching its repoName so the per-step idx
+      // counter stays in sync across replays.
+      const repoName = fanoutOpts?.repoName;
+      const runtime = new EffectRuntime({
+        store: durableStore,
+        runId,
+        stepId: step.id,
+        recordedEffects: recorded,
+        signal: sig,
+        ...(repoName
+          ? { effectFilter: (pair) => effectKeyMatchesScope(pair.started.effectKey, repoName) }
+          : {}),
+      });
+      effectFn = (name, fn, opts) => runtime.effect(name, fn, opts);
+      nowFn = () => runtime.now();
+      uuidFn = () => runtime.uuid();
+      randomFn = () => runtime.random();
+      sleepFn = (ms) => runtime.sleep(ms);
+      waitForSignalFn = (channel) => runtime.waitForSignal(channel);
+    } else {
+      effectFn = passthroughEffect;
+      nowFn = passthroughNow;
+      uuidFn = passthroughUuid;
+      randomFn = passthroughRandom;
+      sleepFn = passthroughSleep;
+      waitForSignalFn = passthroughWaitForSignal;
+    }
+
     return {
       runId,
       workspaceDir,
@@ -474,6 +645,12 @@ export class Pipeline {
       memory,
       llm,
       signal: sig,
+      effect: effectFn,
+      now: nowFn,
+      uuid: uuidFn,
+      random: randomFn,
+      sleep: sleepFn,
+      waitForSignal: waitForSignalFn,
     };
   }
 
@@ -523,6 +700,64 @@ export function makePipelineEvent<P>(
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Phase F6 — match an effectKey against a per-repo scope token.
+ * Effect keys produced by the dashboard's pipeline-stages embed the
+ * repo name as a `-` / `:`-delimited token, e.g.
+ *   specs:spawn-service-a            → matches scope "service-a"
+ *   build:write-service-a            → matches "service-a"
+ *   build:spawn-task-service-a-T1    → matches "service-a" (followed by "-T1")
+ *   build:repo-data                  → matches "data" but NOT "data-x"
+ *
+ * We use boundary-aware substring matching: the scope must appear
+ * surrounded by `-`, `:`, or string boundaries on both sides so
+ * "a" doesn't spuriously match "service-a", and "data" doesn't
+ * match "metadata".
+ *
+ * System primitives (`__anvil_*`) and signals (`__signal:*`) are
+ * scope-shared — they ride along on whichever per-repo runtime
+ * happens to call them.
+ */
+function effectKeyMatchesScope(key: string | null | undefined, scope: string): boolean {
+  if (!key) return false;
+  if (key.startsWith('__anvil_')) return true;
+  if (key.startsWith('__signal:')) return true;
+  // Find scope token at any position with delimited boundaries.
+  let idx = key.indexOf(scope);
+  while (idx >= 0) {
+    const before = idx === 0 ? '' : key[idx - 1];
+    const afterIdx = idx + scope.length;
+    const after = afterIdx >= key.length ? '' : key[afterIdx];
+    const isBoundary = (c: string) => c === '' || c === '-' || c === ':';
+    if (isBoundary(before) && isBoundary(after)) return true;
+    idx = key.indexOf(scope, idx + 1);
+  }
+  return false;
+}
+
+// ── Non-durable mode passthroughs (Phase D2) ──────────────────────
+async function passthroughEffect<T>(_name: string, fn: () => Promise<T>, _opts?: EffectOptions): Promise<T> {
+  return fn();
+}
+async function passthroughNow(): Promise<number> {
+  return Date.now();
+}
+async function passthroughUuid(): Promise<string> {
+  return randomUUID();
+}
+async function passthroughRandom(): Promise<number> {
+  return Math.random();
+}
+async function passthroughSleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
+async function passthroughWaitForSignal<T>(_channel: string): Promise<T> {
+  throw new Error(
+    'StepContext.waitForSignal called without a durable store. '
+      + 'Pass `durableStore` to Pipeline.run() to enable durable signal channels.',
+  );
 }
 
 function computeBackoff(policy: StepRetryPolicy, attempt: number): number {

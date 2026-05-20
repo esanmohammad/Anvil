@@ -47,6 +47,11 @@ const DEFAULT_MAX_ITERATIONS = 32;
  */
 export { UpstreamError } from './upstream-error.js';
 import { UpstreamError as _UpstreamError } from './upstream-error.js';
+import {
+  getFetchPool,
+  recycleFetchPoolOnFailure,
+  type ProviderId,
+} from './fetch-pool.js';
 
 // ───────────────────────────────────────────────────────────────────────
 // Pricing fallbacks for well-known OpenRouter slugs. OpenRouter itself
@@ -445,6 +450,7 @@ export class OpenRouterAdapter implements ModelAdapter {
       body.max_tokens = config.maxOutputTokens;
     }
 
+    const poolId = this.provider as ProviderId;
     let response: Response;
     try {
       response = await fetch(url, {
@@ -456,6 +462,8 @@ export class OpenRouterAdapter implements ModelAdapter {
         },
         body: JSON.stringify(body),
         signal,
+        // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+        dispatcher: getFetchPool(poolId),
       });
     } catch (err) {
       // Network-layer failures (DNS, connection refused, TLS handshake,
@@ -466,6 +474,9 @@ export class OpenRouterAdapter implements ModelAdapter {
       // Honor caller-driven aborts (signal.aborted) — those are not
       // retryable; the run was intentionally cancelled.
       if (signal?.aborted) throw err;
+      // Fire-and-forget pool recycle — heals zombie sockets for the next
+      // chain entry. We still throw so the walker advances.
+      void recycleFetchPoolOnFailure(poolId, err);
       const msg = err instanceof Error ? err.message : String(err);
       throw new _UpstreamError(0, `fetch failed: ${msg}`, { provider: this.provider, retryable: true });
     }

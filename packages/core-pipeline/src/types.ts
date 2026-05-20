@@ -16,8 +16,28 @@ export interface Step<I, O> {
   id: string;
   /** Human label; not load-bearing. */
   name?: string;
+  /**
+   * Schema version. Recorded on `step:started`; mismatch on replay
+   * surfaces `DeterminismViolationError(reason: 'version-mismatch')`.
+   * Default `1`. Bump when the step's effect order or input/output
+   * shape changes in a way that invalidates prior recorded events.
+   *
+   * Phase D4 of the durable execution rollout
+   * (`docs/durable-execution-plan.md` §F).
+   */
+  version?: number;
   /** Run this step against `ctx.input`; return the result for downstream steps. */
   run(ctx: StepContext<I>): Promise<O>;
+  /**
+   * Optional rollback hook. Invoked during compensation walk after
+   * the run transitions to `failed` / `cancelled`. Receives the
+   * step's recorded output so external effects can be unwound. Same
+   * effect-runtime contract as `run()` — every external touch must
+   * go through `ctx.effect`.
+   *
+   * Phase D4 of the durable execution rollout.
+   */
+  compensate?(ctx: StepContext<I>, output: O): Promise<void>;
   /**
    * Optional retry policy for transient failures. Driven by Step error
    * classification — same shape as the LLM router's RetryPolicy but applied
@@ -110,6 +130,60 @@ export interface StepContext<I> {
   llm?: LlmHandles;
   /** Aborts the run on .signal. */
   signal: AbortSignal;
+  // ── Durable execution surface (Phase D2+) ──────────────────────────
+  /**
+   * Run a side effect once per workflow execution. Result is recorded
+   * in the durable log; on replay the recorded result is returned
+   * without re-running `fn`.
+   *
+   * `name` MUST be unique within the step body, stable across
+   * replays. Multiple calls with the same name (e.g. inside a loop)
+   * are disambiguated by a per-step counter (`idx`) maintained by
+   * the runtime.
+   *
+   * When the engine is running in non-durable mode (no
+   * `durableStore` passed to `Pipeline.run`), `effect` becomes a
+   * thin wrapper: it just runs `fn()` and returns the result. Step
+   * bodies don't need to branch on the mode.
+   *
+   * Throws on cancellation. On non-retryable failure, the effect is
+   * recorded as `failed` and the same error is replayed.
+   *
+   * See `docs/durable-execution-plan.md` §E for the full contract.
+   */
+  effect<T>(name: string, fn: () => Promise<T>, opts?: EffectOptions): Promise<T>;
+  /** Deterministic clock (`Date.now()`-equivalent). Recorded once; replays return the recorded value. */
+  now(): Promise<number>;
+  /** Deterministic UUID. */
+  uuid(): Promise<string>;
+  /** Deterministic `Math.random()`-equivalent. Returns a value in `[0, 1)`. */
+  random(): Promise<number>;
+  /** Durable timer — survives crashes; on replay returns immediately if the deadline already elapsed. */
+  sleep(ms: number): Promise<void>;
+  /**
+   * Wait for an external signal (reviewer decision, Q&A answer,
+   * etc.). Persisted; on replay returns the recorded payload
+   * without blocking. The dashboard / cli enqueues signals via
+   * `DurableStore.enqueueSignal(...)`.
+   */
+  waitForSignal<T = unknown>(channel: string): Promise<T>;
+}
+
+/** Per-call options for `ctx.effect`. */
+export interface EffectOptions {
+  /** Caller-supplied retry policy. Same shape as `Step.retryPolicy`. */
+  retry?: StepRetryPolicy;
+  /**
+   * External-system idempotency key. Hashed into the recorded
+   * input_hash so external duplicates collapse on the receiving
+   * side. Optional — internal effects without external visibility
+   * don't need one.
+   */
+  idempotencyKey?: string;
+  /** Soft timeout in ms — fires `EffectTimeoutError` to the step body. */
+  timeoutMs?: number;
+  /** When true, store the full result in the event payload (small enough not to need a blob). Default false. */
+  smallResult?: boolean;
 }
 
 export interface StepRetryPolicy {

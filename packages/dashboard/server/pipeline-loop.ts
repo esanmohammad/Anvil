@@ -60,8 +60,10 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
     if (rendered) stageState.prevArtifact = rendered;
   });
 
+  console.log(`[trace] ${opts.runId} entered runPipelineLoop`);
   while (true) {
     if (opts.isCancelled()) break;
+    console.log(`[trace] ${opts.runId} loop iter top`);
     const registry = buildStandardStepRegistry({
       skipIfByStage: {
         requirements: () => opts.config.planSeed != null,
@@ -112,6 +114,7 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
         initialShared,
         ...(rewindToStep ? { rewindTo: rewindToStep } : {}),
       });
+      console.log(`[trace] ${opts.runId} calling pipeline.run()`);
       // Pipeline.run() returns `{status:'success'|'failed', ...}` and
       // does NOT re-throw on step failure — it emits `pipeline:failed`,
       // sets `status:'failed'` on its return value, and resolves

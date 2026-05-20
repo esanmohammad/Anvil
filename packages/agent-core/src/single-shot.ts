@@ -34,6 +34,11 @@ import { spawn, execSync, ChildProcess } from 'node:child_process';
 import { withInvokeSpan } from './telemetry/instrument.js';
 import { GenAi } from './telemetry/attributes.js';
 import { calculateCostBreakdown } from './cost.js';
+import {
+  getFetchPool,
+  recycleFetchPoolOnFailure,
+  type ProviderId,
+} from './fetch-pool.js';
 
 // ── Env-var aliasing ───────────────────────────────────────────────────────
 
@@ -446,7 +451,29 @@ async function runViaApi(
       });
     }
 
-    const response = await fetch(url, { method: 'POST', headers, body, signal: controller.signal });
+    const poolId: ProviderId = isAnthropic
+      ? 'anthropic'
+      : config.llmProvider === 'gemini'
+      ? 'gemini'
+      : config.llmProvider === 'openai'
+      ? 'openai'
+      : 'unknown';
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body,
+        signal: controller.signal,
+        // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
+        dispatcher: getFetchPool(poolId),
+      });
+    } catch (err) {
+      if (controller.signal.aborted) throw err;
+      void recycleFetchPoolOnFailure(poolId, err);
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`LLM API fetch failed (${poolId}): ${msg}`);
+    }
     if (!response.ok) {
       const errBody = await response.text().catch(() => '');
       throw new Error(`LLM API error ${response.status}: ${errBody.slice(0, 500)}`);

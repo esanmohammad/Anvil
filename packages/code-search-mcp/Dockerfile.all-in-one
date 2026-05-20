@@ -1,0 +1,214 @@
+# syntax=docker/dockerfile:1.7
+# code-search-mcp — all-in-one image
+#
+# Bundles: Node 20 + @esankhan3/code-search-mcp (latest from npm) + Ollama
+#          + pre-pulled bge-m3 (embedder) + qwen2.5-coder:7b (reranker)
+#          + gh CLI (for github: sources) + the resolved config baked in.
+#
+# Image size: ~7 GB (mostly model weights — qwen2.5-coder:7b ~5 GB, bge-m3 ~600 MB).
+# Glibc base required (LanceDB native bindings ship only -gnu variants).
+#
+# Build for host arch:
+#   docker build -f Dockerfile.all-in-one -t code-search-mcp:all .
+#
+# Cross-build (e.g. amd64 image from arm Mac):
+#   docker buildx build --platform linux/amd64 \
+#     -f Dockerfile.all-in-one -t code-search-mcp:all --load .
+#
+# Run against local repos (preferred):
+#   docker run --rm -it \
+#     -p 4000:4000 \
+#     -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+#     -e PROJECT_NAME=prototyping \
+#     -e INDEX_TARGET=/repos \
+#     -v ~/prototyping:/repos:ro \
+#     -v code-search-data:/data \
+#     -v code-search-models:/var/lib/ollama \
+#     code-search-mcp:all
+#
+# Run against the DTSL GitHub org (all repos):
+#   docker run --rm -it \
+#     -p 4000:4000 \
+#     -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+#     -e GITHUB_TOKEN=$GITHUB_TOKEN \
+#     -e PROJECT_NAME=dtsl \
+#     -e INDEX_TARGET=github:DTSL \
+#     -v code-search-data:/data \
+#     -v code-search-models:/var/lib/ollama \
+#     code-search-mcp:all
+#
+# Same, but filter to repos matching a regex (use this for big orgs):
+#   -e INDEX_TARGET=github:DTSL/^(observability|cell-architecture).*
+#
+# GITHUB_TOKEN needs `repo` + `read:org` scope for private repos in DTSL.
+#
+# Skip startup indexing (just serve an existing /data volume):
+#   docker run ... -e INDEX_TARGET=none ...
+#
+# Endpoints: /health /ready /status /metrics /admin/api/status /mcp /index
+
+FROM node:22-bookworm-slim
+
+ENV OLLAMA_HOST=0.0.0.0:11434 \
+    OLLAMA_MODELS=/var/lib/ollama \
+    CODE_SEARCH_PORT=4000 \
+    CODE_SEARCH_HOST=0.0.0.0 \
+    CODE_SEARCH_TRANSPORT=streamable-http \
+    CODE_SEARCH_AUTH_MODE=none \
+    CODE_SEARCH_DATA_DIR=/data \
+    ANVIL_HOME=/data \
+    PROJECT_NAME=prototyping \
+    INDEX_TARGET=/repos
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git tini gnupg && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+RUN mkdir -p -m 755 /etc/apt/keyrings && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null && \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @esankhan3/code-search-mcp@latest && \
+    npm cache clean --force
+
+# Pre-pull models inside the layer so first container start is hot.
+# Boot ollama, wait for /api/tags, pull, then stop. Single RUN = single layer.
+RUN set -eu; \
+    mkdir -p "$OLLAMA_MODELS"; \
+    ollama serve > /tmp/ollama-bootstrap.log 2>&1 & \
+    OLLAMA_PID=$!; \
+    for i in $(seq 1 60); do \
+      if curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then break; fi; \
+      sleep 1; \
+    done; \
+    ollama pull bge-m3; \
+    ollama pull qwen2.5-coder:7b; \
+    kill "$OLLAMA_PID" 2>/dev/null || true; \
+    wait "$OLLAMA_PID" 2>/dev/null || true
+
+RUN mkdir -p /root/.code-search && cat > /root/.code-search/config.yaml <<'YAML'
+embedding:
+  provider: ollama
+  model: bge-m3
+  dimensions: 1024
+  ollama_host: http://127.0.0.1:11434
+
+reranker:
+  provider: ollama
+  model: qwen2.5-coder:7b
+  base_url: http://127.0.0.1:11434
+  timeout_ms: 30000
+
+retrieval:
+  max_chunks: 12
+  max_tokens: 12000
+
+indexing:
+  auto_index: true
+  debounce_ms: 500
+
+llm:
+  mode: api
+  model: adk:claude-opus-4-7
+YAML
+
+# Entrypoint orchestrates ollama + (optional) initial index + serve.
+# PID1 is tini; cleanup() forwards SIGTERM to children so `docker stop` is graceful.
+RUN cat > /usr/local/bin/entrypoint.sh <<'BASH' && chmod +x /usr/local/bin/entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+OLLAMA_PID=
+SERVE_PID=
+
+cleanup() {
+  [[ -n "$SERVE_PID"  ]] && kill -TERM "$SERVE_PID"  2>/dev/null || true
+  [[ -n "$OLLAMA_PID" ]] && kill -TERM "$OLLAMA_PID" 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup TERM INT
+
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "[entrypoint] WARN: ANTHROPIC_API_KEY unset — repo profiling will fall back to LLM_MODE=none."
+fi
+
+echo "[entrypoint] starting ollama on $OLLAMA_HOST"
+ollama serve > /var/log/ollama.log 2>&1 &
+OLLAMA_PID=$!
+
+for i in $(seq 1 60); do
+  if curl -sf http://127.0.0.1:11434/api/tags > /dev/null 2>&1; then
+    echo "[entrypoint] ollama ready"
+    break
+  fi
+  if [[ $i -eq 60 ]]; then
+    echo "[entrypoint] FATAL: ollama did not become ready within 60s"
+    cleanup
+    exit 1
+  fi
+  sleep 1
+done
+
+if [[ -n "${INDEX_TARGET:-}" && "${INDEX_TARGET}" != "none" ]]; then
+  if [[ "$INDEX_TARGET" == github:* ]]; then
+    ORG_SPEC="${INDEX_TARGET#github:}"
+    ORG="${ORG_SPEC%%/*}"
+    WORKSPACE="/root/.code-search/$ORG"
+    mkdir -p "$WORKSPACE"
+    echo "[entrypoint] cloning github source $INDEX_TARGET into $WORKSPACE"
+    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+      echo "[entrypoint] WARN: GITHUB_TOKEN unset — only public repos will clone"
+    else
+      echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null || true
+    fi
+    PATTERN=""
+    if [[ "$ORG_SPEC" == */* ]]; then PATTERN="${ORG_SPEC#*/}"; fi
+    gh repo list "$ORG" --limit 1000 --json name,nameWithOwner --jq \
+      ".[] | select((\"$PATTERN\" == \"\") or (.name | test(\"$PATTERN\"))) | .nameWithOwner" \
+      | while read -r FULL; do
+          REPO="${FULL#*/}"
+          if [[ -d "$WORKSPACE/$REPO/.git" ]]; then
+            echo "[entrypoint] updating $REPO"
+            git -C "$WORKSPACE/$REPO" fetch --quiet && \
+              git -C "$WORKSPACE/$REPO" pull --quiet --ff-only || true
+          else
+            echo "[entrypoint] cloning $FULL"
+            gh repo clone "$FULL" "$WORKSPACE/$REPO" -- --depth=1 --filter=blob:none --quiet || true
+          fi
+        done
+    INDEX_PATH="$WORKSPACE"
+  else
+    INDEX_PATH="$INDEX_TARGET"
+  fi
+  echo "[entrypoint] initial index: $INDEX_PATH as project=$PROJECT_NAME"
+  code-search --project "$PROJECT_NAME" index "$INDEX_PATH" || \
+    echo "[entrypoint] initial index returned non-zero; continuing into serve"
+else
+  echo "[entrypoint] INDEX_TARGET=none — skipping initial index"
+fi
+
+echo "[entrypoint] starting code-search-mcp --serve --port $CODE_SEARCH_PORT --project $PROJECT_NAME"
+code-search-mcp --serve --port "$CODE_SEARCH_PORT" --project "$PROJECT_NAME" &
+SERVE_PID=$!
+
+wait -n
+RC=$?
+cleanup
+exit $RC
+BASH
+
+VOLUME ["/data", "/repos", "/var/lib/ollama"]
+EXPOSE 4000 11434
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+  CMD curl -fsS http://localhost:4000/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
