@@ -13,3 +13,15 @@ export {
   type RebuildResult,
   type NamespaceQueryOpts,
 } from './hybrid-store.js';
+export {
+  MemoryVectorStore,
+  setEmbedder,
+  getEmbedder,
+  type Embedder,
+  type VectorHit,
+} from './vector-store.js';
+export {
+  InjectionLog,
+  type InjectionRecord,
+  type HitStats,
+} from './injection-log.js';

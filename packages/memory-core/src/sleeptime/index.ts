@@ -10,15 +10,23 @@ export {
 export {
   contentDigest,
   findNearestDuplicate,
+  jaccardSimilarity,
   type NearestDuplicate,
 } from './dedupe.js';
 export {
   ratifyProposal,
   defaultDecide,
+  llmDedupeDecide,
+  DEDUPE_JUDGE_SYSTEM_PROMPT,
+  parseDedupeJudgeOutput,
   type RatifyArgs,
   type RatifyOutcome,
   type RatificationDecision,
   type RatificationKind,
+  type DedupeJudge,
+  type DedupeJudgeRequest,
+  type DedupeJudgeVerdict,
+  type LlmDedupeOptions,
 } from './ratify.js';
 export {
   consolidate,

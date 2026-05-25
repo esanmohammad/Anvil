@@ -154,13 +154,30 @@ export interface BuiltinToolExecutorOpts {
   /** Names of tools the executor advertises + permits. Anything outside
    *  the set is rejected at both listSchemas() and execute(). */
   allowedTools: Iterable<string>;
+  /**
+   * Wave 5 — optional memory recall callback. When wired, and when
+   * `recall_memory` is in `allowedTools`, the executor advertises it
+   * AND routes calls to this function. Without the callback, the
+   * tool isn't listed (so the agent never learns it exists).
+   * Returns the stringified JSON the model sees.
+   *
+   * Bounded by `recallBudget` (default 3) — additional calls return
+   * a "budget exhausted" sentinel so the agent can't loop on recall.
+   */
+  recallMemory?: (query: string, opts: { kind?: string; subtype?: string; limit?: number }) => Promise<string>;
+  /** Cap on `recall_memory` invocations per executor instance. Default 3. */
+  recallBudget?: number;
 }
 
 export class BuiltinToolExecutor implements ToolExecutor {
   private readonly allowed: Set<string>;
+  private readonly recallMemory?: (query: string, opts: { kind?: string; subtype?: string; limit?: number }) => Promise<string>;
+  private recallBudget: number;
 
   constructor(opts: BuiltinToolExecutorOpts) {
     this.allowed = new Set(opts.allowedTools);
+    this.recallMemory = opts.recallMemory;
+    this.recallBudget = opts.recallBudget ?? 3;
   }
 
   listSchemas(): ToolSchema[] {
@@ -168,10 +185,39 @@ export class BuiltinToolExecutor implements ToolExecutor {
     for (const [name, def] of Object.entries(SCHEMAS)) {
       if (this.allowed.has(name)) out.push(def.schema);
     }
+    if (this.recallMemory && this.allowed.has('recall_memory')) {
+      out.push(RECALL_MEMORY_SCHEMA);
+    }
     return out;
   }
 
   async execute(call: ToolCall, ctx: ExecCtx): Promise<ToolResult> {
+    if (call.name === 'recall_memory') {
+      if (!this.recallMemory || !this.allowed.has('recall_memory')) {
+        return { isError: true, content: `Tool "recall_memory" is not permitted in this stage.` };
+      }
+      if (this.recallBudget <= 0) {
+        return {
+          isError: true,
+          content: 'recall_memory budget exhausted for this stage. Use what was already injected.',
+        };
+      }
+      this.recallBudget -= 1;
+      try {
+        const args = call.arguments ?? {};
+        const query = requireString(args.query, 'query');
+        const opts = {
+          kind: typeof args.kind === 'string' ? args.kind : undefined,
+          subtype: typeof args.subtype === 'string' ? args.subtype : undefined,
+          limit: typeof args.limit === 'number' ? Math.min(20, Math.max(1, args.limit)) : 5,
+        };
+        const content = await this.recallMemory(query, opts);
+        return { isError: false, content };
+      } catch (err) {
+        return { isError: true, content: errorMessage(err) };
+      }
+    }
+
     if (!this.allowed.has(call.name)) {
       return { isError: true, content: `Tool "${call.name}" is not permitted in this stage.` };
     }
@@ -186,6 +232,26 @@ export class BuiltinToolExecutor implements ToolExecutor {
     }
   }
 }
+
+const RECALL_MEMORY_SCHEMA: ToolSchema = {
+  name: 'recall_memory',
+  description:
+    'Search project memory for past lessons / patterns / PR episodes. Returns top-N matches ranked by hybrid retrieval (BM25 + vector + 1-hop graph expansion). Bounded budget per stage — use deliberately.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Natural-language query (e.g., "authentication patterns", "error handling for OOM")' },
+      kind: { type: 'string', enum: ['semantic', 'episodic', 'profile'], description: 'Filter by memory kind (optional)' },
+      subtype: {
+        type: 'string',
+        enum: ['fix-pattern', 'success', 'approach', 'flaky-test', 'performance', 'manual'],
+        description: 'Filter by semantic subtype (optional)',
+      },
+      limit: { type: 'integer', description: 'Max results (1-20, default 5)' },
+    },
+    required: ['query'],
+  },
+};
 
 // ───────────────────────────────────────────────────────────────────────
 // Handlers

@@ -1286,4 +1286,32 @@ export const UnsubscribeCost = z
 export const ListPendingBreaches = z
     .object({ action: z.literal('list-pending-breaches') })
     .passthrough();
+// ── Memory inspector + plan suggestions (Wave 3 / Wave 4 / Tier 4) ─────
+export const GetMemoryOverview = z
+    .object({
+    action: z.literal('get-memory-overview'),
+    project: z.string().min(1),
+})
+    .passthrough();
+export const SearchMemory = z
+    .object({
+    action: z.literal('search-memory'),
+    project: z.string().min(1),
+    query: z.string().min(1),
+    limit: z.number().int().positive().max(50).optional(),
+})
+    .passthrough();
+export const GetPlanSuggestions = z
+    .object({
+    action: z.literal('get-plan-suggestions'),
+    project: z.string().min(1),
+    intent: z.string().min(1),
+})
+    .passthrough();
+export const GetMemoryInjections = z
+    .object({
+    action: z.literal('get-memory-injections'),
+    runId: z.string().min(1),
+})
+    .passthrough();
 //# sourceMappingURL=schemas.js.map

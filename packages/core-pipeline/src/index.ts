@@ -443,8 +443,9 @@ export type { ChainFallbackOptions, BurnInfo } from './routing/with-fallback.js'
 export { runWithChainFallback, isRetryableUpstreamError } from './routing/with-fallback.js';
 
 // — Stage logic owned by core-pipeline
-export type { StageContext, StageOutput, StageTokens } from './stages/types.js';
+export type { StageContext, StageOutput, StageTokens, FeatureScope } from './stages/types.js';
 export { emptyStageTokens } from './stages/types.js';
+export { parseFeatureScope } from './stages/parse-scope.js';
 export type { StageDefinition, StagePersona } from './stages/registry.js';
 export { STAGES, STAGE_NAMES, getStage, getStageByIndex } from './stages/registry.js';
 export type { ShipPromptInput } from './stages/ship.js';

@@ -14,7 +14,9 @@ import {
 } from '../routing/stage-permissions.js';
 
 const READ_ONLY = ['glob', 'grep', 'list', 'read_file'];
-const FULL = ['bash', 'edit', 'glob', 'grep', 'list', 'read_file', 'write_file'];
+// Wave 5 — build now carries `recall_memory` (the agent-callable
+// hybridSearch tool). Bounded by a 3-call budget inside the executor.
+const FULL = ['bash', 'edit', 'glob', 'grep', 'list', 'read_file', 'recall_memory', 'write_file'];
 
 describe('STAGE_TOOL_PERMISSIONS — canonical pipeline stages', () => {
   it('clarify is read-only', () => {
@@ -26,31 +28,35 @@ describe('STAGE_TOOL_PERMISSIONS — canonical pipeline stages', () => {
     assert.deepEqual(STAGE_TOOL_PERMISSIONS.specs, ['read']);
     assert.deepEqual(STAGE_TOOL_PERMISSIONS.tasks, ['read']);
   });
-  it('implementation stages (build/validate/ship) are full read+write+exec', () => {
-    assert.deepEqual(STAGE_TOOL_PERMISSIONS.build, ['read', 'write', 'exec']);
-    assert.deepEqual(STAGE_TOOL_PERMISSIONS.validate, ['read', 'write', 'exec']);
+  it('implementation stages (build/validate) carry full read+write+exec plus recall (Wave 5); ship stays no-recall', () => {
+    assert.deepEqual(STAGE_TOOL_PERMISSIONS.build, ['read', 'write', 'exec', 'recall']);
+    assert.deepEqual(STAGE_TOOL_PERMISSIONS.validate, ['read', 'write', 'exec', 'recall']);
     assert.deepEqual(STAGE_TOOL_PERMISSIONS.ship, ['read', 'write', 'exec']);
   });
 });
 
 describe('STAGE_TOOL_PERMISSIONS — ad-hoc commands', () => {
-  it('fix and fix-loop are full', () => {
-    assert.deepEqual(STAGE_TOOL_PERMISSIONS.fix, ['read', 'write', 'exec']);
-    assert.deepEqual(STAGE_TOOL_PERMISSIONS['fix-loop'], ['read', 'write', 'exec']);
+  it('fix and fix-loop are full plus recall (Wave 5)', () => {
+    assert.deepEqual(STAGE_TOOL_PERMISSIONS.fix, ['read', 'write', 'exec', 'recall']);
+    assert.deepEqual(STAGE_TOOL_PERMISSIONS['fix-loop'], ['read', 'write', 'exec', 'recall']);
   });
-  it('review, research, plan are read-only', () => {
-    assert.deepEqual(STAGE_TOOL_PERMISSIONS.review, ['read']);
-    assert.deepEqual(STAGE_TOOL_PERMISSIONS.research, ['read']);
+  it('review, research carry read + recall; plan stays read-only', () => {
+    assert.deepEqual(STAGE_TOOL_PERMISSIONS.review, ['read', 'recall']);
+    assert.deepEqual(STAGE_TOOL_PERMISSIONS.research, ['read', 'recall']);
     assert.deepEqual(STAGE_TOOL_PERMISSIONS.plan, ['read']);
   });
 });
 
 describe('allowedToolsForStage', () => {
   it('returns deduped sorted tool list for read-only stages', () => {
+    // `clarify` is pure read; `research` carries recall (Wave 5).
     assert.deepEqual(allowedToolsForStage('clarify'), READ_ONLY);
-    assert.deepEqual(allowedToolsForStage('research'), READ_ONLY);
+    assert.deepEqual(
+      allowedToolsForStage('research'),
+      ['glob', 'grep', 'list', 'read_file', 'recall_memory'],
+    );
   });
-  it('returns full set for build', () => {
+  it('returns full set for build (Wave 5 adds recall_memory)', () => {
     assert.deepEqual(allowedToolsForStage('build'), FULL);
   });
   it('falls back to read-only for unknown stage (fail-closed)', () => {
@@ -59,9 +65,9 @@ describe('allowedToolsForStage', () => {
 });
 
 describe('permissionClassesForStage', () => {
-  it('returns the class list for known stages', () => {
-    assert.deepEqual(permissionClassesForStage('build'), ['read', 'write', 'exec']);
-    assert.deepEqual(permissionClassesForStage('research'), ['read']);
+  it('returns the class list for known stages (Wave 5 adds recall)', () => {
+    assert.deepEqual(permissionClassesForStage('build'), ['read', 'write', 'exec', 'recall']);
+    assert.deepEqual(permissionClassesForStage('research'), ['read', 'recall']);
   });
   it('falls back to read for unknown stages', () => {
     assert.deepEqual(permissionClassesForStage('eldritch-stage'), ['read']);
@@ -70,6 +76,6 @@ describe('permissionClassesForStage', () => {
     const a = permissionClassesForStage('build');
     a.push('read');
     const b = permissionClassesForStage('build');
-    assert.deepEqual(b, ['read', 'write', 'exec']);
+    assert.deepEqual(b, ['read', 'write', 'exec', 'recall']);
   });
 });

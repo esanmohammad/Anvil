@@ -18,6 +18,7 @@
  */
 
 import { existsSync, mkdirSync, appendFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 import type { PipelineRunState } from '../pipeline-runner.js';
@@ -113,15 +114,16 @@ export function createPostRunPersister(
       try {
         const { recordPrEpisode } = await import('@esankhan3/anvil-memory-core');
         for (const prUrl of prUrls) {
+          const payload = enrichPrEpisodePayload(prUrl);
           recordPrEpisode(
             deps.memoryStore.unwrap(),
             {
               prUrl,
               intent: state.feature,
               plan: state.featureSlug,
-              filesChanged: [],
-              commitShas: [],
-              testsAdded: [],
+              filesChanged: payload.filesChanged,
+              commitShas: payload.commitShas,
+              testsAdded: payload.testsAdded,
               ciStatus: 'pending',
               durationMs: Date.now() - new Date(state.startedAt ?? Date.now()).getTime(),
               costUsd: state.totalCost ?? 0,
@@ -138,7 +140,12 @@ export function createPostRunPersister(
     }
 
     // 4b. Reflect-on-run
-    const reflectionMode = (process.env.ANVIL_REFLECTION ?? 'always').toLowerCase();
+    // Default `on-success` (changed from `always` 2026-05-21): failed-run
+    // reflection is high-noise because the model speculates about causes
+    // it couldn't see; ~half of dashboard runs in the wild fail or cancel,
+    // so this cuts reflection LLM cost in half with negligible signal
+    // loss. Operators who want failure analysis set ANVIL_REFLECTION=always.
+    const reflectionMode = (process.env.ANVIL_REFLECTION ?? 'on-success').toLowerCase();
     const reflectionDisabled = ['off', '0', 'false', 'no'].includes(reflectionMode);
     const shouldReflect = !reflectionDisabled &&
       (reflectionMode !== 'on-success' || state.status === 'completed');
@@ -179,5 +186,147 @@ export function createPostRunPersister(
         console.warn('[dashboard] reflectOnRun failed:', err);
       }
     }
+
+    // 5. Wave 4 — memory hit detection. Scan the run's combined stage
+    //    outputs for substring matches against any memory injected into
+    //    this run. Hits get `used=1` on the injection log AND a confidence
+    //    + decay-strength bump on the memory itself, so high-value
+    //    memories rank higher in future retrievals.
+    try {
+      detectMemoryHits(deps.memoryStore, state);
+    } catch (err) {
+      console.warn('[dashboard] memory hit detection failed:', err);
+    }
   };
+}
+
+/**
+ * Substring-match injected memories against the agent's accumulated
+ * stage outputs. On match: flip the injection log's `used=1` AND apply
+ * a retrieval bonus to the memory's confidence + decay strength.
+ *
+ * Tier 3 future-work: when embeddings are populated, switch to cosine
+ * similarity. Substring catches the high-confidence cases (literal
+ * pattern reuse, error-message echoes); cosine would catch the
+ * paraphrased reuse.
+ */
+function detectMemoryHits(memoryStore: MemoryStore, state: PipelineRunState): void {
+  const store = memoryStore.unwrap();
+  // Wave 1 — injections are now recorded per stage. Pull every injection
+  // for this run (union across stages); dedupe by memory id since the
+  // same memory may have been injected to multiple stages.
+  const records = store.injections.forRun(state.runId);
+  if (records.length === 0) return;
+  const uniqueIds = Array.from(new Set(records.map((r) => r.memoryId)));
+
+  // Build the run's text corpus: per-stage outputs + errors + repo notes.
+  const corpus = buildRunCorpus(state);
+  if (!corpus.trim()) return;
+
+  let hits = 0;
+  for (const id of uniqueIds) {
+    const m = store.findById(id);
+    if (!m) continue;
+    if (memoryReusedInCorpus(m.content, corpus)) {
+      // markUsed scopes to (runId, memoryId) — flips `used=1` for ALL
+      // stages of this run that injected this memory.
+      store.injections.markUsed(state.runId, id);
+      store.applyRetrievalHit(id);
+      hits += 1;
+    }
+  }
+  if (hits > 0) {
+    console.log(
+      `[dashboard] memory hits run=${state.runId}: ${hits}/${uniqueIds.length} reused`,
+    );
+  }
+}
+
+function buildRunCorpus(state: PipelineRunState): string {
+  const parts: string[] = [];
+  for (const s of state.stages) {
+    if (s.error) parts.push(s.error);
+    for (const r of s.repos) {
+      if (r.error) parts.push(r.error);
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Returns true when `corpus` literally contains a recognizable signature
+ * from a memory's content. We extract distinctive substrings (>= 12 chars)
+ * from the content's normalized form — short tokens (≤ 11 chars) match
+ * too freely (e.g. "error", "test"), bloating hit rates. A single match
+ * of any signature is a hit.
+ */
+function memoryReusedInCorpus(content: unknown, corpus: string): boolean {
+  const text =
+    typeof content === 'string' ? content : (() => {
+      try { return JSON.stringify(content) ?? ''; } catch { return ''; }
+    })();
+  if (!text) return false;
+
+  // Split into candidate signatures: phrases on whitespace, dedupe.
+  // We're looking for substrings rare enough that random matches are
+  // unlikely. ≥12 chars after trimming punctuation; cap at 8 sigs/memory.
+  const signatures = new Set<string>();
+  for (const raw of text.split(/[\n.,;]+/g)) {
+    const trimmed = raw.trim();
+    if (trimmed.length >= 12) signatures.add(trimmed);
+    if (signatures.size >= 8) break;
+  }
+  if (signatures.size === 0) return false;
+
+  const corpusLower = corpus.toLowerCase();
+  for (const sig of signatures) {
+    if (corpusLower.includes(sig.toLowerCase())) return true;
+  }
+  return false;
+}
+
+/**
+ * Enrich the PR-episode payload by querying `gh pr view` for the files
+ * and commits that landed in the PR. Returns empty arrays on any failure
+ * (gh CLI missing, network blip, malformed URL, rate limit) — the episode
+ * still gets recorded with intent + plan, just without the file/commit
+ * signal that makes per-file BM25 retrieval surgical.
+ *
+ * Hard 5-second cap on each gh subprocess so a hung shell doesn't block
+ * post-run cleanup.
+ */
+function enrichPrEpisodePayload(
+  prUrl: string,
+): { filesChanged: string[]; commitShas: string[]; testsAdded: string[] } {
+  const empty = { filesChanged: [], commitShas: [], testsAdded: [] };
+
+  // Extract `<owner>/<repo>#<num>` argument shape for `gh pr view`.
+  // `gh` accepts the URL directly, so just pass it through.
+  const filesChanged = safeGhJson<Array<{ path: string }>>(
+    ['pr', 'view', prUrl, '--json', 'files', '--jq', '.files'],
+  )?.map((f) => f.path) ?? [];
+  const commitShas = safeGhJson<Array<{ oid: string }>>(
+    ['pr', 'view', prUrl, '--json', 'commits', '--jq', '.commits'],
+  )?.map((c) => c.oid) ?? [];
+  const testsAdded = filesChanged.filter(
+    (p) => /(?:^|\/)__tests__\/|\.test\.[jt]sx?$|\.spec\.[jt]sx?$/.test(p),
+  );
+
+  // If both gh calls failed, return all-empty to keep telemetry honest —
+  // no point reporting partial results that look like the PR is empty.
+  if (filesChanged.length === 0 && commitShas.length === 0) return empty;
+  return { filesChanged, commitShas, testsAdded };
+}
+
+function safeGhJson<T>(args: string[]): T | null {
+  try {
+    const out = execFileSync('gh', args, {
+      encoding: 'utf8',
+      timeout: 5_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return JSON.parse(out) as T;
+  } catch {
+    return null;
+  }
 }

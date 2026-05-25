@@ -157,6 +157,17 @@ export interface SpawnConfig {
    * Per AGENT-PROCESS-CONSOLIDATION-ADR §C4.
    */
   workspaceDir?: string;
+  /**
+   * Wave 5 — optional callback enabling the `recall_memory` builtin.
+   * When wired AND `'recall_memory'` is in `allowedTools`, the agent
+   * can search project memory mid-run. Bounded by a 3-call budget
+   * enforced inside BuiltinToolExecutor. Callers (dashboard) wire a
+   * project-scoped `hybridSearch` here.
+   */
+  recallMemory?: (
+    query: string,
+    opts: { kind?: string; subtype?: string; limit?: number },
+  ) => Promise<string>;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

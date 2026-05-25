@@ -70,7 +70,7 @@ export interface DashboardStageState {
   /** Phase 8 — model id resolved by the registry-driven resolver. */
   resolvedModel?: string;
   /** Phase 8 — tool-permission classes for this stage. */
-  permissionClasses?: ('read' | 'write' | 'exec')[];
+  permissionClasses?: ('read' | 'write' | 'exec' | 'recall')[];
   /**
    * Stage Q&A — populated when the agent's first response is a
    * `<questions>...</questions>` block. Frontend's PipelineContainer

@@ -3,7 +3,7 @@ import React from 'react';
 export interface RepoTabsProps {
   repos: Array<{
     name: string;
-    status: 'pending' | 'running' | 'completed' | 'failed';
+    status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
     cost?: number;
     agentId?: string;
   }>;
@@ -16,6 +16,8 @@ const statusDotColor: Record<string, string> = {
   running: 'var(--color-success)',
   completed: 'var(--color-success)',
   failed: 'var(--color-error)',
+  // Skipped = scoped out of this run; greyed-out dot signals "intentionally not run".
+  skipped: 'var(--border-default)',
 };
 
 export function RepoTabs({ repos, selectedRepo, onSelectRepo }: RepoTabsProps) {
@@ -63,7 +65,7 @@ export function RepoTabs({ repos, selectedRepo, onSelectRepo }: RepoTabsProps) {
 
 interface TabProps {
   label: string;
-  status?: 'pending' | 'running' | 'completed' | 'failed';
+  status?: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   cost?: number;
   isSelected: boolean;
   onClick: () => void;
@@ -72,6 +74,7 @@ interface TabProps {
 function Tab({ label, status, cost, isSelected, onClick }: TabProps) {
   const dotColor = status ? statusDotColor[status] : undefined;
   const isRunning = status === 'running';
+  const isSkipped = status === 'skipped';
 
   return (
     <button
@@ -91,9 +94,11 @@ function Tab({ label, status, cost, isSelected, onClick }: TabProps) {
         fontSize: 'var(--text-xs)',
         fontWeight: isSelected ? 600 : 400,
         color: isSelected ? 'var(--text-primary)' : 'var(--text-secondary)',
+        opacity: isSkipped ? 0.45 : 1,
         whiteSpace: 'nowrap',
-        transition: 'color 120ms ease, border-color 120ms ease',
+        transition: 'color 120ms ease, border-color 120ms ease, opacity 120ms ease',
       }}
+      title={isSkipped ? 'Out of scope — skipped by feature scope decision' : undefined}
     >
       {/* Status dot */}
       {dotColor && (

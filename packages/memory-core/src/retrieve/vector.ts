@@ -1,16 +1,14 @@
 /**
- * Vector retrieval (Phase 8 stub) — semantic recall over per-memory
- * embeddings. The store schema reserves `embedding_id`; sleeptime
- * (Phase 10) will embed memory content via `@esankhan3/anvil-knowledge-core/embedder`
- * and persist into LanceDB. Until then, this module returns an empty
- * array so the hybrid fusion path stays consistent.
- *
- * Why ship a stub now: callers (`hybridSearch`, `injectMemories`) can
- * already wire vector results into RRF fusion without conditionals.
- * When Phase 10 lands, only the body of `vectorSearch` flips on.
+ * Vector retrieval — semantic recall over per-memory embeddings stored
+ * in LanceDB. Returns `[]` when (a) no embedder is configured, (b)
+ * `@lancedb/lancedb` isn't installed, or (c) no memories have been
+ * embedded yet. Callers (`hybridSearch`, etc.) blend results into RRF
+ * fusion regardless — the absence of vector hits degrades hybrid
+ * retrieval gracefully to BM25 + graph.
  */
 
 import type { HybridMemoryStore } from '../storage/hybrid-store.js';
+import { getEmbedder } from '../storage/vector-store.js';
 import type { Memory, MemoryNamespace } from '../types.js';
 
 export interface VectorOptions {
@@ -18,17 +16,36 @@ export interface VectorOptions {
   limit?: number;
 }
 
-/**
- * Phase 8: returns []. Phase 10 will populate from LanceDB.
- *
- * Marked async even though the stub is synchronous — the LanceDB API
- * is async, so callers should already await this to avoid a churn-y
- * signature change later.
- */
 export async function vectorSearch(
-  _store: HybridMemoryStore,
-  _query: string,
-  _opts: VectorOptions = {},
+  store: HybridMemoryStore,
+  query: string,
+  opts: VectorOptions = {},
 ): Promise<Memory[]> {
-  return [];
+  const embedder = getEmbedder();
+  if (!embedder) return [];
+  const vectorStore = store.vectorStore;
+  if (!vectorStore) return [];
+
+  let queryVec: number[];
+  try {
+    queryVec = await embedder(query);
+  } catch {
+    return [];
+  }
+
+  const hits = await vectorStore.search({
+    vector: queryVec,
+    namespace: opts.namespace,
+    limit: opts.limit ?? 20,
+  });
+  if (hits.length === 0) return [];
+
+  // Hydrate full Memory<T> rows from the SQLite hot index, preserving
+  // distance-rank order.
+  const out: Memory[] = [];
+  for (const hit of hits) {
+    const m = store.findById(hit.id);
+    if (m) out.push(m);
+  }
+  return out;
 }

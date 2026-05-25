@@ -95,6 +95,15 @@ export interface AdapterRequest {
    *  tool call starts/ends. Routed up to the agent's `activity` stream so
    *  the dashboard shows MCP work in the activity panel. */
   mcpProgress?: (ev: McpActivityEvent) => void;
+  /** Wave 5 — memory recall callback. When the spawn site wires this
+   *  AND `recall_memory` is in `allowedTools`, the executor advertises
+   *  the tool to the agent. Caller (the dashboard) composes a
+   *  project-scoped `hybridSearch` and returns the JSON the model sees.
+   *  Bounded by a per-spawn budget enforced inside BuiltinToolExecutor. */
+  recallMemory?: (
+    query: string,
+    opts: { kind?: string; subtype?: string; limit?: number },
+  ) => Promise<string>;
 }
 
 /** Subset of `McpClientPool` consumed via `AdapterRequest`. Avoids a
@@ -157,5 +166,6 @@ export function buildAdapterRequest(
     project: spec.project,
     runId: spec.runId,
     workspaceDir: spec.workspaceDir,
+    recallMemory: spec.recallMemory,
   };
 }

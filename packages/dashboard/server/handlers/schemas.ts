@@ -1576,3 +1576,40 @@ export type ListPipelinePausesInput = z.infer<typeof ListPipelinePauses>;
 export type GetPipelinePauseInput = z.infer<typeof GetPipelinePause>;
 export type UnsubscribeCostInput = z.infer<typeof UnsubscribeCost>;
 export type ListPendingBreachesInput = z.infer<typeof ListPendingBreaches>;
+
+// ── Memory inspector + plan suggestions (Wave 3 / Wave 4 / Tier 4) ─────
+
+export const GetMemoryOverview = z
+  .object({
+    action: z.literal('get-memory-overview'),
+    project: z.string().min(1),
+  })
+  .passthrough();
+export type GetMemoryOverviewInput = z.infer<typeof GetMemoryOverview>;
+
+export const SearchMemory = z
+  .object({
+    action: z.literal('search-memory'),
+    project: z.string().min(1),
+    query: z.string().min(1),
+    limit: z.number().int().positive().max(50).optional(),
+  })
+  .passthrough();
+export type SearchMemoryInput = z.infer<typeof SearchMemory>;
+
+export const GetPlanSuggestions = z
+  .object({
+    action: z.literal('get-plan-suggestions'),
+    project: z.string().min(1),
+    intent: z.string().min(1),
+  })
+  .passthrough();
+export type GetPlanSuggestionsInput = z.infer<typeof GetPlanSuggestions>;
+
+export const GetMemoryInjections = z
+  .object({
+    action: z.literal('get-memory-injections'),
+    runId: z.string().min(1),
+  })
+  .passthrough();
+export type GetMemoryInjectionsInput = z.infer<typeof GetMemoryInjections>;

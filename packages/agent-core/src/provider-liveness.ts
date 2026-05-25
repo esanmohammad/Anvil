@@ -173,16 +173,19 @@ async function probe(provider: ProviderName): Promise<boolean> {
 }
 
 async function probeOllama(): Promise<boolean> {
-  const baseUrl = (process.env.OLLAMA_HOST ?? 'http://localhost:11434').replace(/\/+$/, '');
+  // Default to 127.0.0.1 (not 'localhost') to skip macOS's IPv6→IPv4
+  // fallback, which can blow past the 2s timeout when Ollama only
+  // binds IPv4.
+  const baseUrl = (process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434').replace(/\/+$/, '');
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 2000);
     const res = await fetch(`${baseUrl}/api/tags`, {
-      signal: ctrl.signal,
+      // AbortSignal.timeout is honored more reliably by undici than a
+      // manual AbortController + setTimeout, especially when a request
+      // is queued waiting for a pool slot or a stale keep-alive socket.
+      signal: AbortSignal.timeout(2000),
       // @ts-expect-error — undici dispatcher accepted by Node fetch at runtime
       dispatcher: getFetchPool('ollama'),
     });
-    clearTimeout(timer);
     return res.ok;
   } catch (err) {
     // Probe failure isn't propagated, but it IS a signal the pool may

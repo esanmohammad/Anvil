@@ -132,9 +132,14 @@ belong in ADRs, not here.
   `setLivenessTtlMs`, `prefetchLiveness`, `isProviderAlive`,
   `pickAliveModelFromChainSync`, `pickAliveModelFromChain`. The TTL
   defaults to 30s (configurable via the registry's `walker.liveness_ttl_ms`).
-  Probes: Ollama hits `localhost:11434/api/tags`; cloud providers are
-  env-var-presence only (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`,
-  `OPENCODE_API_KEY`, etc.). Both cli and dashboard share one cache.
+  Probes: Ollama hits `127.0.0.1:11434/api/tags` (IPv4 literal, not
+  `localhost` — macOS's IPv6→IPv4 fallback can outrun the 2s
+  `AbortSignal.timeout` when Ollama only binds v4) bounded by
+  `AbortSignal.timeout(2000)` (more reliably honored by undici than a
+  manual `AbortController + setTimeout` when a request is stuck on a
+  stale keep-alive socket); cloud providers are env-var-presence only
+  (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY`,
+  etc.). Both cli and dashboard share one cache.
 - Empty-output retryable throws — the three agentic adapters (`claude`,
   `openrouter` / `opencode`, `ollama`) throw `503 retryable
   UpstreamError` when the run completes with empty final text. The
@@ -151,7 +156,12 @@ belong in ADRs, not here.
   on its `fetch()` call and calls `recycleFetchPoolOnFailure(provider, err)`
   in the `catch` block. Pools are bounded-keep-alive `undici.Agent`s
   with `keepAliveTimeout: 4s`, `keepAliveMaxTimeout: 10s`,
-  `connections: 32`. Per-provider isolation means a zombie socket on
+  `connections: 32`, `bodyTimeout: 0`, `headersTimeout: 0` (no
+  dispatcher-level I/O ceilings — every adapter already owns its own
+  per-call `AbortSignal`, which is the single source of truth for
+  cancellation; the earlier 30s/60s ceilings spuriously fired
+  `TypeError: fetch failed` on premium-model first-byte latency and
+  long inter-chunk SSE pauses). Per-provider isolation means a zombie socket on
   Anthropic's pool (after laptop sleep/wake or VPN flip) does NOT
   poison Gemini / OpenCode / Ollama. The recycle is fire-and-forget +
   coalesced: 10 concurrent failures = 1 new agent, not 10. Trigger

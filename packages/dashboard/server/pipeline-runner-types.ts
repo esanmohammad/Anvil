@@ -13,7 +13,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ResolverTier } from '@esankhan3/anvil-agent-core';
 import type { ProviderName } from '@esankhan3/anvil-agent-core';
-import type { PlanBinding } from '@esankhan3/anvil-core-pipeline';
+import type { PlanBinding, FeatureScope } from '@esankhan3/anvil-core-pipeline';
 
 /** Dashboard's local alias for agent-core's `ResolverTier`. */
 export type ModelTier = ResolverTier;
@@ -126,7 +126,13 @@ export interface StageQuestion {
 export interface RepoAgentState {
   repoName: string;
   agentId: string | null;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  /**
+   * 'skipped' marks repos that are out of scope per the feature.scope
+   * artifact emitted by the requirements stage. UI renders these as
+   * greyed-out rows so the user sees the scope decision instead of
+   * watching them sit at 'pending' forever.
+   */
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   cost: number;
   artifact: string;
   error: string | null;
@@ -179,8 +185,8 @@ export interface PipelineStageState {
   tokens?: StageTokenStats;
   /** Model id resolved for this stage by the registry-driven resolver. */
   resolvedModel?: string;
-  /** Tool-permission classes ('read' / 'write' / 'exec'). */
-  permissionClasses?: ('read' | 'write' | 'exec')[];
+  /** Tool-permission classes ('read' / 'write' / 'exec' / 'recall'). */
+  permissionClasses?: ('read' | 'write' | 'exec' | 'recall')[];
   /** Stage-level Q&A — populated when the agent asks questions before producing the artifact. */
   questions?: StageQuestion[];
 }
@@ -197,6 +203,12 @@ export interface PipelineRunState {
   totalCost: number;
   model: string;
   repoNames: string[];
+  /**
+   * Optional feature scope decided by the requirements stage. When
+   * present, downstream per-repo stages and ship only act on
+   * `targetRepos`. Absent = every repo runs (historical default).
+   */
+  featureScope?: FeatureScope;
   waitingForInput: boolean;
   /** Run-level token aggregate. cacheHitRatio = cacheReadTokens / (inputTokens + cacheReadTokens). */
   tokens?: StageTokenStats & { cacheHitRatio: number };

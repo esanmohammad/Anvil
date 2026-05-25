@@ -80,10 +80,15 @@ describe('stage → permissions → executor — full chain', () => {
 
   it('permissionClassesForStage maps to the same tool set listSchemas advertises', () => {
     const stages = ['clarify', 'requirements', 'build', 'validate', 'review', 'research'];
+    // Wave 5: `recall_memory` is advertised only when both `recall_memory`
+    // is in `allowedTools` AND the executor was constructed with a
+    // recallMemory callback. Wire a no-op stub so schemas + tool list
+    // contract holds for stages that permit recall.
+    const recallStub = async () => '[]';
     for (const stage of stages) {
       const tools = allowedToolsForStage(stage);
       const classes = permissionClassesForStage(stage);
-      const exec = new BuiltinToolExecutor({ allowedTools: tools });
+      const exec = new BuiltinToolExecutor({ allowedTools: tools, recallMemory: recallStub });
       const advertised = exec.listSchemas().map((s) => s.name).sort();
       assert.deepEqual(advertised, tools, `${stage}: schemas mismatch`);
       assert.ok(classes.length > 0, `${stage}: should map to at least one class`);

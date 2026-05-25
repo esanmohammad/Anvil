@@ -40,20 +40,47 @@ export interface ReflectionEnqueueResult {
   };
 }
 
+/**
+ * Per-subtype TTL table — different memory shapes age at different rates.
+ * fix-pattern is load-bearing for the convention-promotion 3-strike loop,
+ * so it lives long. flaky-test is short because tests get fixed fast.
+ * `manual` is user-authored or surprise-derived → durable.
+ *
+ * An explicit `opts.ttlDays` override always wins for the legacy
+ * "everything uses 90 days" caller shape (preserved for tests).
+ */
+const SUBTYPE_TTL_DAYS: Record<SemanticSubtype, number> = {
+  'fix-pattern': 180,
+  success:        90,
+  approach:       60,
+  'flaky-test':   30,
+  performance:   180,
+  manual:        365,
+};
+
+const PROCEDURAL_TTL_DAYS = 365;
+
+function resolveExpires(
+  now: string,
+  ttlDays: number,
+): string {
+  return ttlDays >= 0
+    ? new Date(Date.parse(now) + ttlDays * 86_400_000).toISOString()
+    : '9999-12-31T00:00:00.000Z';
+}
+
 export function reflectIntoProposals(
   queue: ProposalQueue,
   reflection: ReflectionResult,
   opts: ReflectIntoProposalsOptions,
 ): ReflectionEnqueueResult {
   const now = opts.now ?? new Date().toISOString();
-  const ttlDays = opts.ttlDays ?? 90;
-  const expiresAt =
-    ttlDays >= 0
-      ? new Date(Date.parse(now) + ttlDays * 86_400_000).toISOString()
-      : '9999-12-31T00:00:00.000Z';
+  // Override wins; otherwise per-subtype defaults from SUBTYPE_TTL_DAYS.
+  const override = opts.ttlDays;
 
   const proposalIds: string[] = [];
 
+  const fixTtl = override ?? SUBTYPE_TTL_DAYS['fix-pattern'];
   for (const f of reflection.failures) {
     const m = buildSemantic({
       content: formatFailure(f),
@@ -62,12 +89,13 @@ export function reflectIntoProposals(
       ns: opts.namespace,
       runId: opts.runId,
       now,
-      expiresAt,
-      ttlDays,
+      expiresAt: resolveExpires(now, fixTtl),
+      ttlDays: fixTtl,
     });
     proposalIds.push(queue.enqueue(m, `reflection:failure:${opts.runId}`).id);
   }
 
+  const successTtl = override ?? SUBTYPE_TTL_DAYS.success;
   for (const s of reflection.successes) {
     const m = buildSemantic({
       content: formatSuccess(s),
@@ -76,12 +104,13 @@ export function reflectIntoProposals(
       ns: opts.namespace,
       runId: opts.runId,
       now,
-      expiresAt,
-      ttlDays,
+      expiresAt: resolveExpires(now, successTtl),
+      ttlDays: successTtl,
     });
     proposalIds.push(queue.enqueue(m, `reflection:success:${opts.runId}`).id);
   }
 
+  const manualTtl = override ?? SUBTYPE_TTL_DAYS.manual;
   for (const su of reflection.surprises) {
     const m = buildSemantic({
       content: formatSurprise(su),
@@ -90,20 +119,21 @@ export function reflectIntoProposals(
       ns: opts.namespace,
       runId: opts.runId,
       now,
-      expiresAt,
-      ttlDays,
+      expiresAt: resolveExpires(now, manualTtl),
+      ttlDays: manualTtl,
     });
     proposalIds.push(queue.enqueue(m, `reflection:surprise:${opts.runId}`).id);
   }
 
+  const procTtl = override ?? PROCEDURAL_TTL_DAYS;
   for (const sp of reflection.skillProposals) {
     const m = buildProcedural({
       skill: sp,
       ns: opts.namespace,
       runId: opts.runId,
       now,
-      expiresAt,
-      ttlDays,
+      expiresAt: resolveExpires(now, procTtl),
+      ttlDays: procTtl,
     });
     proposalIds.push(queue.enqueue(m, `reflection:skill:${opts.runId}`).id);
   }

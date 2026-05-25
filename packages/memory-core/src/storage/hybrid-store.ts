@@ -13,8 +13,13 @@
  * hot index. A single stderr warning informs the user.
  */
 
+import { dirname, join } from 'node:path';
 import { JsonlAppendLog } from './jsonl-store.js';
 import { SqliteHotIndex, type SearchOpts } from './sqlite-store.js';
+
+function deriveVectorDbPath(sqlitePath: string): string {
+  return join(dirname(sqlitePath), 'memory_vectors.lance');
+}
 import {
   HardRejectError,
   scrub,
@@ -47,6 +52,9 @@ export interface NamespaceQueryOpts {
   includeInvalidated?: boolean;
 }
 
+import { MemoryVectorStore } from './vector-store.js';
+import { InjectionLog } from './injection-log.js';
+
 export interface OpenHybridOptions {
   jsonlPath: string;
   sqlitePath: string;
@@ -58,6 +66,13 @@ export interface OpenHybridOptions {
    * (`ANVIL_MEMORY_SCRUB=1` regex; `=0` off; `=llm` regex+classifier).
    */
   scrubber?: ScrubOptions;
+  /**
+   * Optional path for the LanceDB vector index. When set, hybrid
+   * retrieval can fuse semantic vector hits with BM25 + graph. Defaults
+   * to `<sqlitePath>/../memory_vectors.lance` when omitted; pass
+   * `null` to opt out entirely.
+   */
+  vectorDbPath?: string | null;
 }
 
 export interface RebuildResult {
@@ -69,15 +84,31 @@ export class HybridMemoryStore {
   readonly jsonl: JsonlAppendLog;
   readonly sqlite: SqliteHotIndex;
   readonly scrubberOpts: ScrubOptions | undefined;
+  /**
+   * Optional LanceDB-backed semantic recall layer. Lazily initialized
+   * (LanceDB import + table open) on first use. `null` when explicitly
+   * disabled via `vectorDbPath: null` at construction; in that case
+   * vector retrieval degrades to no-op.
+   */
+  readonly vectorStore: MemoryVectorStore | null;
+  /**
+   * Wave-4 injection log — what memories were injected into which (run,
+   * stage) and whether the agent's output ended up using them. Lives on
+   * the same SQLite database as the memory rows (idx in `schema.ts`).
+   */
+  readonly injections: InjectionLog;
 
   constructor(
     jsonl: JsonlAppendLog,
     sqlite: SqliteHotIndex,
     scrubberOpts?: ScrubOptions,
+    vectorStore: MemoryVectorStore | null = null,
   ) {
     this.jsonl = jsonl;
     this.sqlite = sqlite;
     this.scrubberOpts = scrubberOpts;
+    this.vectorStore = vectorStore;
+    this.injections = new InjectionLog(sqlite.db);
   }
 
   /**
@@ -87,7 +118,14 @@ export class HybridMemoryStore {
   static open(opts: OpenHybridOptions): HybridMemoryStore {
     const jsonl = new JsonlAppendLog(opts.jsonlPath);
     const sqlite = new SqliteHotIndex(opts.sqlitePath);
-    const store = new HybridMemoryStore(jsonl, sqlite, opts.scrubber);
+    // Default vector-db path: sibling of sqlitePath. Pass `null` to opt out
+    // (useful for unit tests that don't want the LanceDB dependency probe).
+    const vectorDbPath =
+      opts.vectorDbPath === null
+        ? null
+        : (opts.vectorDbPath ?? deriveVectorDbPath(opts.sqlitePath));
+    const vectorStore = vectorDbPath ? new MemoryVectorStore(vectorDbPath) : null;
+    const store = new HybridMemoryStore(jsonl, sqlite, opts.scrubber, vectorStore);
     if (!opts.skipAutoRebuild && jsonl.exists() && sqlite.count() === 0) {
       const records = jsonl.readAll();
       if (records.length > 0) {
@@ -150,6 +188,46 @@ export class HybridMemoryStore {
 
   findById(id: string): Memory | null {
     return this.sqlite.findById(id);
+  }
+
+  /**
+   * Wave 2 — find memories code-bound to a specific file path.
+   * Delegates to the SQLite index; tolerates relative vs absolute path
+   * differences via a LIKE-suffix fallback. See `sqlite-store.ts`.
+   */
+  findByCodeBindingFile(
+    filePath: string,
+    opts: { namespace?: MemoryNamespace; limit?: number } = {},
+  ): Memory[] {
+    return this.sqlite.findByCodeBindingFile(filePath, opts);
+  }
+
+  /**
+   * Reward a memory for being used by an agent. Bumps `decay.strength`
+   * (+5, capped at 100), `confidence` (+2, capped at 100), and
+   * `rehearseCount` (+1). Caller is `dashboard/server/pipeline/post-run.ts`
+   * after hit detection (Wave 4). Idempotent at the row level; multiple
+   * calls in one run keep the row capped at 100. Returns the updated
+   * memory (or null when the row is gone).
+   */
+  applyRetrievalHit(id: string, now: string = new Date().toISOString()): Memory | null {
+    const m = this.sqlite.findById(id);
+    if (!m) return null;
+    const updated: Memory = {
+      ...m,
+      confidence: Math.min(100, m.confidence + 2),
+      decay: {
+        ...m.decay,
+        strength: Math.min(100, m.decay.strength + 5),
+        rehearseCount: m.decay.rehearseCount + 1,
+        lastAccessed: now,
+      },
+    };
+    // Bypass the scrubber + jsonl append — we're updating numeric counters,
+    // not content. Jsonl audit trail intentionally doesn't track decay churn
+    // (too noisy); only structural changes (add / invalidate / supersede).
+    this.sqlite.upsert(updated);
+    return updated;
   }
 
   searchByTags(tags: string[], opts?: SearchOpts): Memory[] {

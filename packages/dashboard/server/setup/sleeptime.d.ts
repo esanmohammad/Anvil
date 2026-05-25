@@ -2,18 +2,21 @@
  * Sleeptime memory consolidation pump (Phase 3 round-6 extraction
  * from `dashboard-server.ts`).
  *
- * Walks pending proposals (from `reflectOnRun`) every N ms and
- * ratifies them via memory-core's `defaultDecide` (hash-dedupe →
- * MERGE-INTO else ADD). Cancellable via the returned `stop()` fn.
- * `ANVIL_SLEEPTIME_INTERVAL_MS=0` disables; default is 30 minutes.
+ * Per tick, two passes per project:
+ *   1. Consolidation — walks pending proposals (from `reflectOnRun`)
+ *      and ratifies via memory-core's `defaultDecide`. fix-pattern
+ *      ratifications also trigger convention-core's `checkAndPromote`
+ *      (3-strike rule promotion).
+ *   2. Drift sweep — `verifyCodeBindings` re-hashes every code-bound
+ *      memory; structurally-changed files trigger `downweight`,
+ *      missing files also downweight (NOT invalidate — see risk
+ *      mitigation in MEMORY-CORE-COMPLETENESS-PLAN.md §7: a
+ *      `mv src/foo src/bar` would mass-invalidate otherwise).
  *
- * Wrapped decideFn: when a `semantic:fix-pattern` proposal ratifies
- * (add or merge-into), parse the failure into error/fix and call
- * convention-core's `checkAndPromote`. Three occurrences of the same
- * normalized error promote to a rule in
- * `<conventionsDir>/<project>/rules.json`, closing the
- * lesson → convention loop.
+ * `ANVIL_SLEEPTIME_INTERVAL_MS=0` disables both passes; default 30 min.
+ * `ANVIL_DRIFT_SWEEP_DISABLED=1` disables drift sweep only.
  */
+import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import type { MemoryStore } from '../memory-store.js';
 import type { ProjectLoader } from '../project-loader.js';
 export interface ConventionPaths {
@@ -29,6 +32,11 @@ export interface SleeptimeDeps {
         error: string;
         fix: string;
     };
+    /**
+     * Optional — when present, near-duplicate ratification routes through an
+     * LLM judge (Tier 2.3). Absent dep degrades to legacy hash-only behavior.
+     */
+    agentManager?: AgentManager;
 }
 export interface SleeptimeHandle {
     /** Null when sleeptime is disabled (interval ≤ 0). */

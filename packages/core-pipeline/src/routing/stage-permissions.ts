@@ -24,12 +24,16 @@
  * future loosening or tightening is a deliberate, traceable change.
  */
 
-export type ToolClass = 'read' | 'write' | 'exec';
+export type ToolClass = 'read' | 'write' | 'exec' | 'recall';
 
 const ALL_TOOLS_BY_CLASS: Readonly<Record<ToolClass, readonly string[]>> = {
   read: ['read_file', 'grep', 'glob', 'list'],
   write: ['write_file', 'edit'],
   exec: ['bash'],
+  // Wave 5 — agent-driven memory recall via memory-core's hybridSearch.
+  // Listed as its own class so it can be enabled selectively (read-only
+  // stages don't need it; implementation stages benefit most).
+  recall: ['recall_memory'],
 };
 
 /**
@@ -48,21 +52,24 @@ export const STAGE_TOOL_PERMISSIONS: Readonly<Record<string, readonly ToolClass[
   specs:                  ['read'],
   tasks:                  ['read'],
   // Implementation stages: full agentic — read/write/exec inside cwd.
-  build:                  ['read', 'write', 'exec'],
+  // `recall` gives the agent on-demand memory access (Wave 5 / 3-call
+  // budget enforced inside BuiltinToolExecutor).
+  build:                  ['read', 'write', 'exec', 'recall'],
   // Dashboard test-spec stage: writes test files; validate runs them.
   // Read + write only — tests should not need shell access at this stage.
-  test:                   ['read', 'write'],
-  validate:               ['read', 'write', 'exec'],
+  test:                   ['read', 'write', 'recall'],
+  validate:               ['read', 'write', 'exec', 'recall'],
   ship:                   ['read', 'write', 'exec'],
 
   // — Ad-hoc commands —
-  fix:                    ['read', 'write', 'exec'],
+  fix:                    ['read', 'write', 'exec', 'recall'],
   // Inline auto-fix loop within validate stage; same scope as fix.
-  'fix-loop':             ['read', 'write', 'exec'],
+  'fix-loop':             ['read', 'write', 'exec', 'recall'],
   // review and research are read-only by design — they investigate and
-  // report back; they never mutate code.
-  review:                 ['read'],
-  research:               ['read'],
+  // report back; they never mutate code. Recall enabled so review can
+  // surface past review-outcome episodes when judging a diff.
+  review:                 ['read', 'recall'],
+  research:               ['read', 'recall'],
   plan:                   ['read'],
   // Reflection: distillation only — no tools, no workspace access.
   // Reads run trace from the prompt, emits JSON proposals.

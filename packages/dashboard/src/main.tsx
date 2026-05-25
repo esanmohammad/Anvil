@@ -192,7 +192,7 @@ function toPipelineData(pipeline: DashboardPipeline | null): PipelineData | null
       repos: s.repos?.map((r) => ({
         repoName: r.repoName,
         agentId: r.agentId,
-        status: r.status as 'pending' | 'running' | 'completed' | 'failed',
+        status: r.status as 'pending' | 'running' | 'completed' | 'failed' | 'skipped',
         cost: r.cost,
         error: r.error,
       })),

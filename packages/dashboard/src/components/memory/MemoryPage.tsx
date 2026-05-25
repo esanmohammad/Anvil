@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { Brain, Search, Check, X, AlertCircle } from 'lucide-react';
 import { RowSkeleton, useLoadingState } from '../common/Skeleton.js';
+import { MemoryInsightsPanel } from './MemoryInsightsPanel.js';
 
 export interface MemoryPageProps {
   project: string | null;
@@ -69,7 +70,7 @@ export function MemoryPage({ project, ws }: MemoryPageProps) {
   const [config, setConfig] = useState<MemoryConfig | null>(null);
   const [search, setSearch] = useState('');
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<'items' | 'proposals'>('items');
+  const [tab, setTab] = useState<'items' | 'proposals' | 'insights'>('items');
   const { loading, loaded, errored: loadError, reset: resetLoading } = useLoadingState();
 
   const fetchMemories = useCallback(() => {
@@ -195,7 +196,7 @@ export function MemoryPage({ project, ws }: MemoryPageProps) {
 
       {/* Tabs */}
       <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid var(--separator)', marginBottom: 16 }}>
-        {(['items', 'proposals'] as const).map((id) => (
+        {(['items', 'proposals', 'insights'] as const).map((id) => (
           <button
             key={id}
             onClick={() => setTab(id)}
@@ -304,6 +305,11 @@ export function MemoryPage({ project, ws }: MemoryPageProps) {
             <ProposalRow key={p.id} proposal={p} onRatify={handleRatify} onReject={handleReject} />
           ))}
         </div>
+      )}
+
+      {/* Insights tab — Wave 3 + Wave 4 telemetry */}
+      {tab === 'insights' && (
+        <MemoryInsightsPanel project={project} ws={ws} />
       )}
     </div>
   );

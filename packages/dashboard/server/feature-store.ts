@@ -287,4 +287,13 @@ export class FeatureStore implements FeatureStoreLike {
     // Update lastRunId on the feature record
     this.updateFeature(project, slug, { lastRunId: runId });
   }
+
+  /**
+   * Read a previously-recorded run summary. Returns null when the file
+   * is absent or malformed — callers fall through to "no prior state."
+   */
+  readRun<T = unknown>(project: string, slug: string, runId: string): T | null {
+    const runPath = join(this.getFeatureDir(project, slug), 'runs', `${runId}.json`);
+    return readJsonSync<T>(runPath);
+  }
 }
