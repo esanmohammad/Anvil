@@ -70,12 +70,14 @@ export async function prepareRun(deps: RunnerPrepDeps): Promise<RunnerPrepResult
   const isResume = deps.config.resumeFromStage != null && !!deps.config.featureSlug;
 
   // Feature record — resume by slug or create new.
+  let priorRunId: string | null = null;
   if (isResume) {
     let featureRecord = deps.featureStore.getFeature(deps.config.project, deps.config.featureSlug!);
     if (!featureRecord) {
       featureRecord = deps.featureStore.createFeature(deps.config.project, deps.config.feature, deps.config.model);
     }
     deps.state.featureSlug = deps.config.featureSlug!;
+    priorRunId = featureRecord.lastRunId;
   } else {
     const featureRecord = deps.featureStore.createFeature(deps.config.project, deps.config.feature, deps.config.model);
     deps.state.featureSlug = featureRecord.slug;
@@ -100,6 +102,114 @@ export async function prepareRun(deps: RunnerPrepDeps): Promise<RunnerPrepResult
       `[pipeline] Resuming from stage ${resumeStage} (${STAGES[resumeStage]?.name}), `
       + `loaded ${prevArtifact.length} chars of prior context`,
     );
+
+    // Rehydrate feature scope so scoped resume preserves the decision.
+    // Silent fall-through on read/parse failure — every repo runs,
+    // matching the historical resume behavior.
+    try {
+      const raw = deps.featureStore.readArtifact(
+        deps.config.project,
+        deps.state.featureSlug,
+        'feature.scope.json',
+      );
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (
+          parsed
+          && typeof parsed === 'object'
+          && Array.isArray((parsed as { targetRepos?: unknown }).targetRepos)
+          && typeof (parsed as { rationale?: unknown }).rationale === 'string'
+        ) {
+          const scope = parsed as { targetRepos: string[]; rationale: string };
+          if (scope.targetRepos.length > 0) {
+            deps.state.featureScope = scope;
+            // Re-apply the 'skipped' status to out-of-scope repos for
+            // stages that haven't started yet — bootstrap initialized
+            // every per-stage repos[] as 'pending', so without this
+            // pass the UI would show off-scope repos as awaiting work
+            // until they sit there silently.
+            const targetSet = new Set(scope.targetRepos);
+            for (const s of deps.state.stages) {
+              if (s.perRepo) {
+                for (const r of s.repos) {
+                  if (!targetSet.has(r.repoName) && r.status === 'pending') {
+                    r.status = 'skipped';
+                  }
+                }
+              }
+            }
+            console.log(
+              `[pipeline] Rehydrated feature.scope: [${scope.targetRepos.join(', ')}] — ${scope.rationale}`,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[pipeline] feature.scope.json rehydrate failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Restore cost + per-repo state from the prior run's summary so
+    // the resume UI shows the historical $ values instead of $0.00
+    // for stages that completed before the resume point. Silent
+    // fall-through on missing/malformed run JSON.
+    if (priorRunId) {
+      try {
+        type PriorRunStage = {
+          name: string;
+          cost?: number;
+          repos?: Array<{
+            repoName: string;
+            status?: string;
+            cost?: number;
+            artifact?: string;
+            error?: string | null;
+          }>;
+        };
+        type PriorRunRecord = {
+          totalCost?: number;
+          stages?: PriorRunStage[];
+        };
+        const prior = deps.featureStore.readRun<PriorRunRecord>(
+          deps.config.project,
+          deps.state.featureSlug,
+          priorRunId,
+        );
+        if (prior?.stages) {
+          let restoredTotal = 0;
+          for (let i = 0; i < resumeStage && i < deps.state.stages.length; i++) {
+            const priorStage = prior.stages.find((s) => s.name === deps.state.stages[i].name);
+            if (!priorStage) continue;
+            const stage = deps.state.stages[i];
+            if (typeof priorStage.cost === 'number') {
+              stage.cost = priorStage.cost;
+              restoredTotal += priorStage.cost;
+            }
+            if (priorStage.repos && stage.perRepo) {
+              for (const pr of priorStage.repos) {
+                const existing = stage.repos.find((r) => r.repoName === pr.repoName);
+                if (!existing) continue;
+                if (typeof pr.cost === 'number') existing.cost = pr.cost;
+                if (typeof pr.artifact === 'string') existing.artifact = pr.artifact;
+                if (typeof pr.error === 'string' || pr.error === null) existing.error = pr.error;
+                if (
+                  pr.status === 'completed'
+                  || pr.status === 'failed'
+                  || pr.status === 'skipped'
+                ) {
+                  existing.status = pr.status;
+                }
+              }
+            }
+          }
+          deps.state.totalCost = restoredTotal;
+          console.log(
+            `[pipeline] Restored prior-run cost from ${priorRunId}: $${restoredTotal.toFixed(4)} across ${resumeStage} completed stage(s)`,
+          );
+        }
+      } catch (err) {
+        console.warn(`[pipeline] prior-run state restore failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   // Hybrid retriever prefetch — failures are non-fatal.

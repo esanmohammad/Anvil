@@ -53,7 +53,7 @@ export interface StageQuestion {
 export interface RepoState {
   repoName: string;
   agentId: string | null;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   cost: number;
   error: string | null;
 }

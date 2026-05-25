@@ -73,3 +73,19 @@ export function emptyStageTokens(): StageTokens {
     cacheWriteTokens: 0,
   };
 }
+
+/**
+ * Per-feature scope decision emitted by the `requirements` stage.
+ *
+ * When present, downstream per-repo stages (specs/tasks/build/test/
+ * validate) and ship only act on the repos in `targetRepos`. When
+ * absent (LLM didn't emit / parse failed / user supplied explicit
+ * `config.repos`), every repo runs — preserving the historical
+ * default.
+ */
+export interface FeatureScope {
+  /** Non-empty strict subset of the run's available repoNames. */
+  targetRepos: string[];
+  /** 1-2 sentences from the LLM for audit + UI surfacing. */
+  rationale: string;
+}

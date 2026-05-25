@@ -157,6 +157,68 @@ describe('reflectIntoProposals', () => {
     }
   });
 
+  it('applies per-subtype TTL defaults (fix-pattern: 180d, success: 90d, manual: 365d, procedural: 365d)', () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      const ns: MemoryNamespace = { scope: 'project', projectId: 'demo' };
+      const now = '2026-05-21T00:00:00.000Z';
+      reflectIntoProposals(
+        queue,
+        {
+          failures: [{ what: 'x', rootCause: 'y', fix: 'z' }],
+          successes: [{ pattern: 'p', appliesWhen: 'w' }],
+          surprises: [{ what: 's', whySurprising: 'r' }],
+          skillProposals: [{ name: 'k', description: 'd', body: 'b' }],
+        },
+        { namespace: ns, runId: 'r', now },
+      );
+      const pending = queue.listPending({ namespace: ns });
+      const byKey = new Map(
+        pending.map((p) => [`${p.candidate.kind}/${p.candidate.subtype ?? '-'}`, p.candidate]),
+      );
+      assert.equal(byKey.get('semantic/fix-pattern')?.ttlDays, 180);
+      assert.equal(byKey.get('semantic/success')?.ttlDays, 90);
+      assert.equal(byKey.get('semantic/manual')?.ttlDays, 365);
+      assert.equal(byKey.get('procedural/-')?.ttlDays, 365);
+      // expiresAt = now + ttlDays
+      assert.equal(
+        byKey.get('semantic/fix-pattern')?.expiresAt,
+        new Date(Date.parse(now) + 180 * 86_400_000).toISOString(),
+      );
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('honors explicit ttlDays override across all subtypes', () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      const ns: MemoryNamespace = { scope: 'project', projectId: 'demo' };
+      reflectIntoProposals(
+        queue,
+        {
+          failures: [{ what: 'a', rootCause: 'b', fix: 'c' }],
+          successes: [{ pattern: 'p', appliesWhen: 'w' }],
+          surprises: [],
+          skillProposals: [],
+        },
+        { namespace: ns, runId: 'r', ttlDays: 7 },
+      );
+      const pending = queue.listPending({ namespace: ns });
+      for (const p of pending) {
+        assert.equal(p.candidate.ttlDays, 7);
+      }
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('attaches file:<path> tag when filePath is provided', () => {
     const dir = tempDir();
     try {

@@ -36,4 +36,5 @@ export * from './reflect/index.js';
 export * from './episode/index.js';
 export * from './inspector/index.js';
 export * from './migrate/index.js';
+export { embedMemory, embedMemoriesBatch } from './embed.js';
 export { VERSION } from './version.js';

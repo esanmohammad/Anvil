@@ -41,6 +41,17 @@ export interface AgentManagerRunnerOptions {
         status: number | string;
         message: string;
     }) => void;
+    /**
+     * Wave 5 — optional callback that powers the agent's `recall_memory`
+     * tool. When set AND the stage's permissions include `recall`, the
+     * BuiltinToolExecutor advertises the tool to the model. The callback
+     * is bounded by a 3-call budget per spawn enforced inside the executor.
+     */
+    recallMemory?: (query: string, opts: {
+        kind?: string;
+        subtype?: string;
+        limit?: number;
+    }) => Promise<string>;
 }
 export declare class AgentManagerRunner implements AgentRunner {
     private readonly opts;

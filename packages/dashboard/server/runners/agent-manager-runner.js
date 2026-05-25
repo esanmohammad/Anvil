@@ -48,6 +48,7 @@ export class AgentManagerRunner {
                     : [...disallowedToolsForPersona(req.persona)],
                 allowedTools: req.allowedTools ? [...req.allowedTools] : undefined,
                 maxOutputTokens: req.maxOutputTokens,
+                recallMemory: this.opts.recallMemory,
             },
             isCancelled: this.opts.isCancelled,
             onSpawn: (agentId) => this.opts.onSpawn?.(agentId, req),

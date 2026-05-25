@@ -356,7 +356,7 @@ export class PipelineRunner extends EventEmitter {
       projectYaml: this.projectYaml,
       projectInfo: this.projectInfo,
       repoPaths: this.repoPaths,
-      getStableMemoryBlock: () => this.promptCache.getStableMemoryBlock(),
+      getStableMemoryBlock: (stageName?: string) => this.promptCache.getStableMemoryBlock(stageName),
       getStableConventionsBlock: () => this.promptCache.getStableConventionsBlock(),
       getStableProjectYamlSlice: (n) => this.promptCache.getStableProjectYamlSlice(n),
       getStableKbBlock: (tier, repoName) => this.promptCache.getStableKbBlock(tier, repoName),
@@ -515,6 +515,29 @@ export class PipelineRunner extends EventEmitter {
       await this.promptCache.warmConventions().catch((err: unknown) => {
         console.warn('[pipeline] convention warm failed:', err);
       });
+      // Warm the hybrid-search memory block ONCE per run, in parallel with
+      // the rest of run-prep. The sync `getStableMemoryBlock()` reads from
+      // this cache; if warm fails, it transparently falls back to BM25.
+      await this.promptCache.warmMemoryBlock().catch((err: unknown) => {
+        console.warn('[pipeline] memory warm failed:', err);
+      });
+      // Wave 4 + Wave 1 — record the per-stage set of memories that
+      // landed in each stage's prompt block. Post-run hit detection
+      // (`post-run.ts`) scans the run's outputs against ALL injections
+      // for this run, so per-stage granularity isn't load-bearing for
+      // hit detection — but it powers the inspector panel that shows
+      // which stage consumed which memories.
+      try {
+        const byStage = this.promptCache.getAllInjectedMemoryIds();
+        const injections = this.memoryStore.unwrap().injections;
+        for (const [stageName, ids] of byStage) {
+          if (ids.length > 0) {
+            injections.record(this.state.runId, stageName, [...ids]);
+          }
+        }
+      } catch (err) {
+        console.warn('[pipeline] memory injection log failed:', err);
+      }
 
       const { isResume, resumeStage, prevArtifact } = await prepareRun({
         config: this.config,
@@ -533,6 +556,29 @@ export class PipelineRunner extends EventEmitter {
         state: this.state,
         broadcast: () => this.broadcastState(),
         prefetchProviderLiveness: () => this.prefetchProviderLiveness(),
+      });
+
+      // Wave 2 — once the `tasks` stage completes, read the planned-files
+      // list off the feature manifest and surface it to the prompt cache.
+      // The build stage's memory block will re-warm with code-bound
+      // memories surfaced first. Triggered ONCE per run.
+      const touchedFilesHook = this.pipelineBus.on('step:completed', (event) => {
+        if (event.stepId !== 'tasks') return;
+        try {
+          const manifest = this.manifestStore.read(this.state.project, this.state.featureSlug);
+          const filesPlanned = manifest?.filesPlanned?.value ?? [];
+          const paths = filesPlanned
+            .map((f) => f.path)
+            .filter((p): p is string => typeof p === 'string' && p.length > 0);
+          if (paths.length > 0) {
+            this.promptCache.setTouchedFiles(paths);
+            console.log(
+              `[pipeline] memory targeting: ${paths.length} touched file(s) → build stage re-warm`,
+            );
+          }
+        } catch (err) {
+          console.warn('[pipeline] touched-files hook failed:', err);
+        }
       });
 
       // Phase D3: durable store integration. Open the singleton,
@@ -712,6 +758,7 @@ export class PipelineRunner extends EventEmitter {
       agentManager: this.agentManager,
       projectLoader: this.projectLoader,
       featureStore: this.featureStore,
+      memoryStore: this.memoryStore,
       getPromptContext: () => this.getPromptContext(),
       reviewer: this.reviewer,
       setReviewNote: (note) => this.setReviewNote(note),

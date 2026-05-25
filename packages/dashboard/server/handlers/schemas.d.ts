@@ -2962,4 +2962,57 @@ export type ListPipelinePausesInput = z.infer<typeof ListPipelinePauses>;
 export type GetPipelinePauseInput = z.infer<typeof GetPipelinePause>;
 export type UnsubscribeCostInput = z.infer<typeof UnsubscribeCost>;
 export type ListPendingBreachesInput = z.infer<typeof ListPendingBreaches>;
+export declare const GetMemoryOverview: z.ZodObject<{
+    action: z.ZodLiteral<"get-memory-overview">;
+    project: z.ZodString;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    action: z.ZodLiteral<"get-memory-overview">;
+    project: z.ZodString;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    action: z.ZodLiteral<"get-memory-overview">;
+    project: z.ZodString;
+}, z.ZodTypeAny, "passthrough">>;
+export type GetMemoryOverviewInput = z.infer<typeof GetMemoryOverview>;
+export declare const SearchMemory: z.ZodObject<{
+    action: z.ZodLiteral<"search-memory">;
+    project: z.ZodString;
+    query: z.ZodString;
+    limit: z.ZodOptional<z.ZodNumber>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    action: z.ZodLiteral<"search-memory">;
+    project: z.ZodString;
+    query: z.ZodString;
+    limit: z.ZodOptional<z.ZodNumber>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    action: z.ZodLiteral<"search-memory">;
+    project: z.ZodString;
+    query: z.ZodString;
+    limit: z.ZodOptional<z.ZodNumber>;
+}, z.ZodTypeAny, "passthrough">>;
+export type SearchMemoryInput = z.infer<typeof SearchMemory>;
+export declare const GetPlanSuggestions: z.ZodObject<{
+    action: z.ZodLiteral<"get-plan-suggestions">;
+    project: z.ZodString;
+    intent: z.ZodString;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    action: z.ZodLiteral<"get-plan-suggestions">;
+    project: z.ZodString;
+    intent: z.ZodString;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    action: z.ZodLiteral<"get-plan-suggestions">;
+    project: z.ZodString;
+    intent: z.ZodString;
+}, z.ZodTypeAny, "passthrough">>;
+export type GetPlanSuggestionsInput = z.infer<typeof GetPlanSuggestions>;
+export declare const GetMemoryInjections: z.ZodObject<{
+    action: z.ZodLiteral<"get-memory-injections">;
+    runId: z.ZodString;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    action: z.ZodLiteral<"get-memory-injections">;
+    runId: z.ZodString;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    action: z.ZodLiteral<"get-memory-injections">;
+    runId: z.ZodString;
+}, z.ZodTypeAny, "passthrough">>;
+export type GetMemoryInjectionsInput = z.infer<typeof GetMemoryInjections>;
 //# sourceMappingURL=schemas.d.ts.map

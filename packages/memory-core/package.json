@@ -30,6 +30,9 @@
     "better-sqlite3": "^11.7.0",
     "ulid": "^2.3.0"
   },
+  "optionalDependencies": {
+    "@lancedb/lancedb": "^0.27.2"
+  },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.15.2"

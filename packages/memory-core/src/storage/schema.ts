@@ -100,4 +100,21 @@ CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY,
   applied_at TEXT NOT NULL
 );
+
+-- ── Memory injection log (Wave 4) ──────────────────────────────────────
+-- Tracks which memories were injected into which (run, stage) prompts,
+-- and whether the agent's subsequent output used them. Updated by:
+--   recordInjection(run, stage, memoryIds) — at warm time
+--   markUsed(run, memoryId)               — post-run after hit detection
+-- Hit ratio per kind/subtype rolls up via a JOIN against the memory table.
+CREATE TABLE IF NOT EXISTS memory_injection (
+  run_id      TEXT NOT NULL,
+  stage       TEXT NOT NULL,
+  memory_id   TEXT NOT NULL,
+  injected_at TEXT NOT NULL,
+  used        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (run_id, stage, memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_injection_memory ON memory_injection(memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_injection_run ON memory_injection(run_id);
 `;

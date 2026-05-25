@@ -232,6 +232,55 @@ export class SqliteHotIndex {
     return row.n;
   }
 
+  /**
+   * Return the most recent N memories in id-descending order. Used by
+   * vector backfill (`embedMemoriesBatch`) to embed the newest first
+   * so the freshest signal lands in retrieval. ULID id sort doubles as
+   * chronological since ULIDs encode timestamp.
+   */
+  recentForBackfill(limit: number): Memory[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM memory WHERE invalid_at IS NULL ORDER BY id DESC LIMIT ?`)
+      .all(limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.rowToMemory(r));
+  }
+
+  /**
+   * Wave 2 — find memories code-bound to a specific file path. Used by
+   * the implement stage's prompt-context-cache to surface memories
+   * about the file the agent is about to edit, regardless of BM25
+   * rank. Filters by namespace if provided. Falls back to substring
+   * match when the file path contains common prefixes — many bindings
+   * are stored as relative paths but callers pass absolute.
+   */
+  findByCodeBindingFile(
+    filePath: string,
+    opts: { namespace?: { scope: string; projectId?: string; repoId?: string; userId?: string }; limit?: number } = {},
+  ): Memory[] {
+    const limit = opts.limit ?? 8;
+    const ns = opts.namespace;
+    const params: Array<string | number> = [];
+    let sql = `SELECT * FROM memory WHERE invalid_at IS NULL AND (code_file = ? OR code_file LIKE ?)`;
+    params.push(filePath);
+    params.push(`%/${filePath}`); // absolute-vs-relative tolerance
+    if (ns) {
+      sql += ` AND namespace_scope = ?`;
+      params.push(ns.scope);
+      if (ns.projectId !== undefined) {
+        sql += ` AND namespace_project = ?`;
+        params.push(ns.projectId);
+      }
+      if (ns.repoId !== undefined) {
+        sql += ` AND namespace_repo = ?`;
+        params.push(ns.repoId);
+      }
+    }
+    sql += ` ORDER BY strength DESC, id DESC LIMIT ?`;
+    params.push(limit);
+    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.rowToMemory(r));
+  }
+
   close(): void {
     this.db.close();
   }

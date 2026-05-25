@@ -510,7 +510,9 @@ The chain walker is reactive (post-failure burn) **plus** proactive
 pipeline start and probes every distinct provider in
 `~/.anvil/models.yaml`'s `models:` array (auto-derived — no hardcoded
 list). Cloud probes are env-var-presence only (`ANTHROPIC_API_KEY`,
-`OPENCODE_API_KEY`, etc.); Ollama hits `localhost:11434/api/tags`;
+`OPENCODE_API_KEY`, etc.); Ollama hits `127.0.0.1:11434/api/tags`
+(IPv4 literal — `localhost` triggers macOS's IPv6→IPv4 fallback that
+can blow past the 2s `AbortSignal.timeout` when Ollama only binds v4);
 ADK probes the union of Anthropic+Gemini keys (it dispatches to
 either). Probe results cache for `walker.liveness_ttl_ms` (default
 30000ms; set to 0 to disable caching). Probe + chain-walker live in

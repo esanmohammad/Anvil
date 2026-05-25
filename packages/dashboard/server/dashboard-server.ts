@@ -57,6 +57,7 @@ import { createReviewSpawn } from './pipeline/review-spawn.js';
 import { createStartPipeline, type StartPipelineFn } from './pipeline/start-pipeline.js';
 import { createCostBreachRouter } from './pipeline/cost-breach-router.js';
 import { startSleeptimeConsolidator } from './setup/sleeptime.js';
+import { installMemoryEmbedder } from './memory-embedder.js';
 import { startAutoReplayPump } from './setup/auto-replay.js';
 import { restoreIncompletePipelines } from './setup/restore-incomplete.js';
 import { createInitSender } from './setup/init-payload.js';
@@ -838,11 +839,22 @@ export async function startDashboardServer(
   // The factory honors `ANVIL_SLEEPTIME_INTERVAL_MS=0` (disabled) and
   // returns `{ stop: null }` in that case so we skip the
   // stop-handler registration.
+  // Tier 3: wire the memory-core embedder so hybridSearch can fuse
+  // semantic vector hits when LanceDB is installed. Fire-and-forget:
+  // `auto` probes Ollama and falls back to the local Transformers.js
+  // model (Semble-style). The first vector-retrieval call may race the
+  // installer on a cold boot — `vectorSearch` returns [] until the
+  // embedder is set, so worst case is one hybrid-search-without-vectors.
+  void installMemoryEmbedder().catch((err) => {
+    console.warn('[dashboard] memory embedder install failed:', err);
+  });
+
   const sleeptime = startSleeptimeConsolidator({
     memoryStore,
     projectLoader,
     conventionPaths: CONVENTION_PATHS,
     parseFixPatternContent,
+    agentManager,
   });
   if (sleeptime.stop) {
     const stopFn = sleeptime.stop;

@@ -31,6 +31,14 @@ export interface NearestDuplicate {
   memory: Memory;
   /** True iff the BM25 winner has the same content digest. */
   exact: boolean;
+  /**
+   * Token-level Jaccard similarity between candidate and top BM25 hit on
+   * normalized words. 0.0 = no overlap, 1.0 = identical tokens. Used by
+   * `llmDedupeDecide` to gate the LLM judge invocation: similarity above
+   * threshold but below `exact` is the only case where a judge call
+   * earns its cost.
+   */
+  similarity: number;
 }
 
 export function findNearestDuplicate(
@@ -53,5 +61,28 @@ export function findNearestDuplicate(
   return {
     memory: top,
     exact: contentDigest(top) === candidateDigest,
+    similarity: jaccardSimilarity(text, asText(top.content)),
   };
+}
+
+function asText(content: unknown): string {
+  return typeof content === 'string' ? content : JSON.stringify(content);
+}
+
+/** Tokenize on word boundaries, lowercase, dedupe. */
+function tokenize(text: string): Set<string> {
+  return new Set(
+    (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter((t) => t.length >= 3),
+  );
+}
+
+/** |A ∩ B| / |A ∪ B|, 0 if both empty. */
+export function jaccardSimilarity(a: string, b: string): number {
+  const A = tokenize(a);
+  const B = tokenize(b);
+  if (A.size === 0 && B.size === 0) return 0;
+  let intersect = 0;
+  for (const t of A) if (B.has(t)) intersect++;
+  const union = A.size + B.size - intersect;
+  return union === 0 ? 0 : intersect / union;
 }

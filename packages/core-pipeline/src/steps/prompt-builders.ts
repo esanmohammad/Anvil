@@ -125,7 +125,7 @@ export interface PromptBuilderContext {
   repoPaths: Record<string, string>;
 
   // ── Cache getters (memoised at run scope by caller) ───────────────────
-  getStableMemoryBlock: () => string;
+  getStableMemoryBlock: (stageName?: string) => string;
   getStableConventionsBlock: () => string;
   getStableProjectYamlSlice: (maxLen: number) => string;
   getStableKbBlock: (tier: KbTier, repoName?: string) => { content: string; sourceLabel: string };
@@ -257,7 +257,7 @@ export function buildProjectPrompt(
       ? ctx.repoNames.join(', ')
       : '(single-repo or monorepo)';
 
-    const memoryBlock = ctx.getStableMemoryBlock();
+    const memoryBlock = ctx.getStableMemoryBlock(stage.name);
 
     const tier = ctx.getLockedKbTier(stage);
     const kb = tier === 'none'
@@ -402,7 +402,7 @@ export function buildRepoProjectPrompt(
     : `Repository: ${repoName}`;
 
   if (personaPrompt) {
-    const memoryBlock = ctx.getStableMemoryBlock();
+    const memoryBlock = ctx.getStableMemoryBlock(stage.name);
     const tier = ctx.getLockedKbTier(stage);
     const kb = tier === 'none'
       ? { content: '', sourceLabel: 'none' }
@@ -577,8 +577,15 @@ export function buildStagePrompt(
     : '';
 
   switch (stage.name) {
-    case 'requirements':
-      return `${feature}${repoList}${reviewBlock}\n\nProduce high-level requirements for this feature across the entire project. Identify which repositories need changes and why. Include success criteria.${prev}${resumeCtx}`;
+    case 'requirements': {
+      const repoArr = ctx.repoNames.length > 0
+        ? `[${ctx.repoNames.map((r) => `"${r}"`).join(', ')}]`
+        : '[]';
+      const scopeBlock = ctx.repoNames.length > 1
+        ? `\n\nAt the end of your output, append a fenced JSON block in this EXACT format (no other prose after it):\n\n\`\`\`json\n{\n  "targetRepos": ["<repo>", ...],\n  "rationale": "<one-sentence explanation of why other repos are excluded, or 'all repos required' if every repo needs changes>"\n}\n\`\`\`\n\n\`targetRepos\` MUST be a non-empty subset of: ${repoArr}. Include only the repos that need code changes for THIS feature. If every repo needs changes, list every repo. Be conservative — when in doubt, include the repo.`
+        : '';
+      return `${feature}${repoList}${reviewBlock}\n\nProduce high-level requirements for this feature across the entire project. Identify which repositories need changes and why. Include success criteria.${prev}${resumeCtx}${scopeBlock}`;
+    }
     case 'ship': {
       const shipPrompt = buildShipUserPrompt({
         feature: ctx.feature,

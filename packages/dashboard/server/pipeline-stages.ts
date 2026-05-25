@@ -60,6 +60,7 @@ import {
   parseStageQuestions,
   serializeAgentRunResult,
   artifactIdempotencyKey,
+  parseFeatureScope,
   type ParsedTask,
   type PromptBuilderContext,
   type StepContext,
@@ -86,6 +87,7 @@ import type { ReviewerControl } from './reviewer-control.js';
 import type { PlanRiskCache } from './manifest-bridge.js';
 import type { ProjectLoader } from './project-loader.js';
 import type { FeatureStore } from './feature-store.js';
+import type { MemoryStore } from './memory-store.js';
 import {
   STAGES,
   PLAN_DERIVED_STAGES,
@@ -127,6 +129,8 @@ export interface StageOpsDeps {
   agentManager: AgentManager;
   projectLoader: ProjectLoader;
   featureStore: FeatureStore;
+  /** Wave 5 — memory store handle for the recall_memory tool callback. */
+  memoryStore: MemoryStore;
 
   // Prompt context
   getPromptContext: () => PromptBuilderContext;
@@ -184,6 +188,41 @@ export interface StageOpsDeps {
   fixLoopAgentByRepo: Map<string, string>;
   getFixLoopAgentSingle: () => string | null;
   setFixLoopAgentSingle: (id: string | null) => void;
+}
+
+/**
+ * Resolve the effective repo list for a given stage given the run's
+ * feature scope. Order of precedence:
+ *
+ *   1. User pre-selected `config.repos` at Build time → state.repoNames
+ *      (user intent always wins; ignore LLM scoping entirely).
+ *   2. Stages BEFORE scope is decided (`clarify`, `requirements`) →
+ *      state.repoNames (the scope artifact doesn't exist yet).
+ *   3. `state.featureScope` present → state.repoNames ∩ targetRepos.
+ *   4. No scope present → state.repoNames (historical default).
+ *
+ * Never mutates `state.repoNames` — the UI still needs the full list
+ * to render out-of-scope repos as 'skipped' (vs. invisible).
+ */
+function effectiveRepoNames(deps: StageOpsDeps, stageName: string): string[] {
+  if (deps.config.repos && deps.config.repos.length > 0) return deps.state.repoNames;
+  if (stageName === 'clarify' || stageName === 'requirements') return deps.state.repoNames;
+  const scope = deps.state.featureScope;
+  if (!scope || scope.targetRepos.length === 0) return deps.state.repoNames;
+  return deps.state.repoNames.filter((r) => scope.targetRepos.includes(r));
+}
+
+/**
+ * Build a `PromptBuilderContext` whose `repoNames` is scoped for the
+ * given stage. The base context (from `deps.getPromptContext()`) keeps
+ * every other field intact — this is a shallow override on `repoNames`
+ * only.
+ */
+function scopedPromptContext(deps: StageOpsDeps, stageName: string): PromptBuilderContext {
+  const base = deps.getPromptContext();
+  const scoped = effectiveRepoNames(deps, stageName);
+  if (scoped.length === base.repoNames.length) return base;
+  return { ...base, repoNames: scoped };
 }
 
 /** Reset stage state for indices [fromIndex .. toIndex] for replay. */
@@ -260,6 +299,37 @@ export function makeAgentRunner(deps: StageOpsDeps, stageName: string): AgentMan
         message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
         level: 'warn',
       });
+    },
+    // Wave 5 — project-scoped recall_memory callback. Hits memory-core's
+    // hybridSearch over the run's project namespace; returns compact JSON
+    // the model can consume. Budget enforcement lives inside the executor.
+    recallMemory: async (query, opts) => {
+      try {
+        const { hybridSearch } = await import('@esankhan3/anvil-memory-core');
+        const store = deps.memoryStore.unwrap();
+        const hits = await hybridSearch(store, query, {
+          namespace: { scope: 'project', projectId: deps.config.project },
+          limit: opts.limit ?? 5,
+        });
+        const filtered = hits.filter((m) => {
+          if (opts.kind && m.kind !== opts.kind) return false;
+          if (opts.subtype && m.subtype !== opts.subtype) return false;
+          return true;
+        });
+        const trimmed = filtered.map((m) => ({
+          id: m.id,
+          kind: m.kind,
+          subtype: m.subtype,
+          content: m.content,
+          tags: m.tags,
+          createdAt: m.provenance.createdAt,
+        }));
+        return JSON.stringify(trimmed, null, 2);
+      } catch (err) {
+        return JSON.stringify({
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
   });
 }
@@ -382,7 +452,11 @@ async function runPerRepoStage(
   prevArtifact: string,
   ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-  const repos = deps.state.repoNames;
+  // Honor feature.scope — out-of-scope repos already marked 'skipped'
+  // by P4. We iterate only the in-scope subset so the dispatch loop
+  // doesn't spawn agents for skipped repos. The full `state.repoNames`
+  // stays intact for UI rendering.
+  const repos = effectiveRepoNames(deps, stage.name);
 
   if (repos.length === 0) {
     return runSingleStage(deps, index, stage, prevArtifact, ctx);
@@ -398,13 +472,17 @@ async function runPerRepoStage(
   for (let r = 0; r < repos.length; r++) {
     const repoName = repos[r];
     const repoPath = deps.repoPaths()[repoName] || join(deps.workspaceDir, repoName);
-    const repoIdx = r;
+    // Lookup is BY NAME, not filtered index — when scope is in effect
+    // the filtered loop index drifts from the original `stages[i].repos[]`
+    // order (which mirrors state.repoNames). Same applies to every
+    // `repos[repoIdx]` read further down.
+    const repoIdx = deps.state.stages[index].repos.findIndex((rr) => rr.repoName === repoName);
 
-    if (deps.state.stages[index].repos[r]) {
-      deps.state.stages[index].repos[r].status = 'running';
+    if (repoIdx >= 0 && deps.state.stages[index].repos[repoIdx]) {
+      deps.state.stages[index].repos[repoIdx].status = 'running';
     }
 
-    const projectPrompt = buildRepoProjectPromptHelper(deps.getPromptContext(), stage, repoName);
+    const projectPrompt = buildRepoProjectPromptHelper(scopedPromptContext(deps, stage.name), stage, repoName);
 
     if (stage.name === 'build' && stage.persona === 'engineer') {
       promises.push(
@@ -434,7 +512,7 @@ async function runPerRepoStage(
       continue;
     }
 
-    const prompt = buildRepoStagePromptHelper(deps.getPromptContext(), stage, repoName, prevArtifact);
+    const prompt = buildRepoStagePromptHelper(scopedPromptContext(deps, stage.name), stage, repoName, prevArtifact);
 
     const runner = makeAgentRunner(deps, stage.name);
     promises.push(
@@ -492,11 +570,19 @@ async function runPerRepoStage(
         }
 
         const repoState = deps.state.stages[index].repos[repoIdx];
+        const repoCost = result.costUsd ?? 0;
         if (repoState) {
           repoState.status = 'completed';
-          repoState.cost = result.costUsd ?? 0;
+          repoState.cost = repoCost;
           repoState.artifact = result.output;
         }
+        // Live aggregation — bump the run-level totalCost the moment
+        // this repo finishes so the dashboard's top-of-screen total
+        // ticks up across the stage instead of jumping at the end.
+        // The post-stage block at the end of runOneStage skips its
+        // `totalCost += result.cost` for per-repo stages to avoid
+        // double-counting.
+        deps.state.totalCost += repoCost;
         deps.broadcast();
         deps.checkpoint();
 
@@ -620,6 +706,10 @@ async function runBuildForRepo(
     repoStateDone.cost = result.cost;
     repoStateDone.artifact = result.artifact;
   }
+  // Same live-aggregation rule as the inline per-repo path: bump
+  // totalCost the moment this build repo finishes; the post-stage
+  // block skips for per-repo so this isn't double-counted.
+  deps.state.totalCost += result.cost;
   deps.broadcast();
   deps.checkpoint();
   if (ctx) {
@@ -830,8 +920,9 @@ async function runSingleStage(
     return runStageWithQA(deps, index, stage, prevArtifact, qa.max, ctx);
   }
 
-  const prompt = buildStagePromptHelper(deps.getPromptContext(), stage, prevArtifact);
-  const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
+  const scopedCtx = scopedPromptContext(deps, stage.name);
+  const prompt = buildStagePromptHelper(scopedCtx, stage, prevArtifact);
+  const projectPrompt = buildProjectPromptHelper(scopedCtx, stage);
 
   const runner = makeAgentRunner(deps, stage.name);
   const runReq = {
@@ -877,8 +968,9 @@ async function runTestGenStage(
   stageIndex: number,
   ctx?: StepContext<string>,
 ): Promise<string> {
-  const repoNames = deps.state.repoNames.length
-    ? deps.state.repoNames
+  const scopedRepos = effectiveRepoNames(deps, 'test');
+  const repoNames = scopedRepos.length
+    ? scopedRepos
     : Object.keys(deps.repoPaths());
   const repoLocalPaths: Record<string, string> = {};
   for (const r of repoNames) repoLocalPaths[r] = deps.repoPaths()[r] ?? join(deps.workspaceDir, r);
@@ -915,8 +1007,11 @@ async function runFixLoop(
   ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const buildStage = STAGES.find((s) => s.name === 'build')!;
+  // Fix-loop runs against build's effective set — no point fixing a
+  // repo the build never touched.
+  const fixRepos = effectiveRepoNames(deps, 'build');
   const repoPaths: Record<string, string> = {};
-  for (const repoName of deps.state.repoNames) {
+  for (const repoName of fixRepos) {
     repoPaths[repoName] = deps.repoPaths()[repoName] || join(deps.workspaceDir, repoName);
   }
   const session = makeAgentSession(deps);
@@ -927,7 +1022,7 @@ async function runFixLoop(
     allowedTools: deps.allowedToolsForCurrentStage('fix-loop'),
     maxOutputTokens: maxOutputTokensForStage('build'),
     workspaceDir: deps.workspaceDir,
-    repoNames: deps.state.repoNames,
+    repoNames: fixRepos,
     repoPaths,
     validateArtifact,
     attempt,
@@ -1097,11 +1192,12 @@ export async function runOneStage(
 
     if (stage.name === 'build') {
       const branchName = `anvil/${deps.state.featureSlug}`;
-      console.log(`[pipeline] Creating feature branch "${branchName}" in all repos...`);
+      const branchRepos = effectiveRepoNames(deps, 'build');
+      console.log(`[pipeline] Creating feature branch "${branchName}" in ${branchRepos.length} repo(s)...`);
       createFeatureBranchesHelper({
         featureSlug: deps.state.featureSlug,
         repoPaths: deps.repoPaths(),
-        repoNames: deps.state.repoNames,
+        repoNames: branchRepos,
         workspaceDir: deps.workspaceDir,
         onLog: (level, message) => {
           if (level === 'info') console.log(`[pipeline] ${message}`);
@@ -1111,8 +1207,9 @@ export async function runOneStage(
     }
     if (stage.name === 'validate') {
       console.log('[pipeline] Running post-build guards (format + lint auto-fix)...');
-      const reposForGuards = deps.state.repoNames.length > 0
-        ? deps.state.repoNames.map((r) => ({ name: r, path: deps.repoPaths()[r] || join(deps.workspaceDir, r) }))
+      const guardRepos = effectiveRepoNames(deps, 'validate');
+      const reposForGuards = guardRepos.length > 0
+        ? guardRepos.map((r) => ({ name: r, path: deps.repoPaths()[r] || join(deps.workspaceDir, r) }))
         : [{ name: deps.config.project, path: deps.workspaceDir }];
       runPostBuildGuards({
         repos: reposForGuards,
@@ -1150,7 +1247,12 @@ export async function runOneStage(
       deps.state.stages[i].artifact = result.artifact;
       deps.state.stages[i].cost = result.cost;
       deps.state.stages[i].tokens = result.tokens;
-      deps.state.totalCost += result.cost;
+      // Per-repo stages already incremented totalCost incrementally
+      // as each repo finished (see `runPerRepoStage` + `runBuildForRepo`).
+      // Adding `result.cost` again here would double-count.
+      if (!stage.perRepo) {
+        deps.state.totalCost += result.cost;
+      }
       deps.aggregateRunTokens(result.tokens);
       deps.logCacheTelemetry(stage.name, result.tokens);
       prevArtifact = result.artifact;
@@ -1311,6 +1413,67 @@ export async function runOneStage(
         detectReposFn(deps.depsForBootstrap());
       }
 
+      // Feature scope decision — only applies when (a) requirements
+      // just completed, (b) the user didn't pre-select repos at Build
+      // time (user intent wins), and (c) more than one repo is in
+      // play. Failure to parse / validate falls through silently
+      // (every repo runs, the historical default).
+      if (
+        stage.name === 'requirements'
+        && !deps.isCancelled()
+        && !(deps.config.repos && deps.config.repos.length > 0)
+        && deps.state.repoNames.length > 1
+        && !deps.state.featureScope
+      ) {
+        const scope = parseFeatureScope(result.artifact, deps.state.repoNames);
+        if (scope) {
+          deps.state.featureScope = scope;
+          // Mark off-scope repos as 'skipped' on every per-repo stage
+          // so the UI surfaces the decision instead of showing them
+          // as silently-stuck 'pending'.
+          const targetSet = new Set(scope.targetRepos);
+          for (const s of deps.state.stages) {
+            if (s.perRepo) {
+              for (const r of s.repos) {
+                if (!targetSet.has(r.repoName) && r.status === 'pending') {
+                  r.status = 'skipped';
+                }
+              }
+            }
+          }
+          // Persist for resume — feature-store sidecar.
+          try {
+            deps.featureStore.writeArtifact(
+              deps.config.project,
+              deps.state.featureSlug,
+              'feature.scope.json',
+              JSON.stringify(scope, null, 2),
+            );
+          } catch (err) {
+            console.warn('[pipeline] failed to persist feature.scope.json:', err);
+          }
+          // Loud surfacing: console, activity feed (project-event),
+          // and an artifact-written event so the scope sidecar shows
+          // up in the run's artifact stream alongside REQUIREMENTS.md.
+          const skipped = deps.state.repoNames.filter((r) => !targetSet.has(r));
+          const msg = `requirements: scoped to [${scope.targetRepos.join(', ')}] of [${deps.state.repoNames.join(', ')}] — skipped [${skipped.join(', ')}] (${scope.rationale})`;
+          console.log(`[pipeline] ${msg}`);
+          deps.emit('project-event', {
+            source: 'feature-scope',
+            message: msg,
+            level: 'info',
+          });
+          deps.emit('artifact-written', {
+            stage: 'requirements',
+            file: 'feature.scope.json',
+            summary: `Scoped to ${scope.targetRepos.length}/${deps.state.repoNames.length} repo(s)`,
+            content: JSON.stringify(scope, null, 2),
+          });
+          deps.broadcast();
+          deps.checkpoint();
+        }
+      }
+
       if (stage.name === 'validate' && !deps.isCancelled()) {
         let validateArtifact = result.artifact;
         let fixAttempts = 0;
@@ -1331,7 +1494,8 @@ export async function runOneStage(
           validateArtifact = revalidateResult.artifact;
           deps.state.stages[i].artifact = validateArtifact;
           deps.state.stages[i].cost += revalidateResult.cost;
-          deps.state.totalCost += revalidateResult.cost;
+          // totalCost is already incremented per-repo inside runPerRepoStage —
+          // adding revalidateResult.cost here would double-count.
           deps.aggregateRunTokens(revalidateResult.tokens);
           deps.logCacheTelemetry(`${stage.name}:revalidate-${fixAttempts}`, revalidateResult.tokens);
           deps.broadcast();

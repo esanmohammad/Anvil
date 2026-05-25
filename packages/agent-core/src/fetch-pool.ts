@@ -37,8 +37,17 @@ const POOL_OPTS: Agent.Options = {
   keepAliveMaxTimeout: 10_000,
   connections: 32,
   pipelining: 1,
-  bodyTimeout: 60_000,
-  headersTimeout: 30_000,
+  // No dispatcher-level I/O timeouts — every caller already owns its
+  // own per-call AbortSignal (run()'s AbortController for agentic
+  // adapters; AbortSignal.timeout(...) for short probes). The previous
+  // 30s headers / 60s body ceilings were appropriate for short REST
+  // calls but hostile to LLM streaming: premium reasoning models can
+  // take >30s to first byte and pause >60s between SSE chunks, both
+  // of which manifest as `TypeError: fetch failed` that the chain
+  // walker can't distinguish from a real network failure.
+  // 0 = no timeout; the per-call signal is the single source of truth.
+  bodyTimeout: 0,
+  headersTimeout: 0,
 };
 
 const pools = new Map<ProviderId, PoolEntry>();

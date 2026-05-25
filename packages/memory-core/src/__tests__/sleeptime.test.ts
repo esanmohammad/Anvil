@@ -28,10 +28,13 @@ import {
   contentDigest,
   defaultDecide,
   findNearestDuplicate,
+  jaccardSimilarity,
+  llmDedupeDecide,
+  parseDedupeJudgeOutput,
   ratifyProposal,
   MEMORY_LINK_RELATIONS,
 } from '../index.js';
-import type { Memory, MemoryNamespace } from '../index.js';
+import type { DedupeJudge, Memory, MemoryNamespace } from '../index.js';
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'anvil-memory-sleeptime-'));
@@ -363,5 +366,198 @@ describe('consolidate', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ── jaccardSimilarity + llmDedupeDecide ──────────────────────────────────
+
+describe('jaccardSimilarity', () => {
+  it('returns 1 for identical token sets', () => {
+    assert.equal(jaccardSimilarity('parser oom detected', 'parser oom detected'), 1);
+  });
+  it('returns 0 for disjoint tokens', () => {
+    assert.equal(jaccardSimilarity('foo bar', 'qux baz'), 0);
+  });
+  it('returns the right fraction for partial overlap', () => {
+    // A = {parser, oom, detected}, B = {parser, memory, leak}
+    // intersect=1, union=5 → 0.2
+    assert.equal(jaccardSimilarity('parser oom detected', 'parser memory leak'), 0.2);
+  });
+  it('ignores short tokens (<3 chars)', () => {
+    // "a b c parser" → {parser} after tokenization
+    assert.equal(jaccardSimilarity('a b c parser', 'parser'), 1);
+  });
+});
+
+describe('llmDedupeDecide', () => {
+  it('returns add when no nearest duplicate exists', async () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      const proposal = queue.enqueue(fakeMemory({ content: 'novel fact' }), 'reason');
+      let judgeInvocations = 0;
+      const judge: DedupeJudge = async () => {
+        judgeInvocations++;
+        return { verdict: 'same', reason: 'should not be called' };
+      };
+      const decision = await llmDedupeDecide(store, proposal, judge);
+      assert.equal(decision.kind, 'add');
+      assert.equal(judgeInvocations, 0);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fast-paths merge-into on exact content-digest match (no judge call)', async () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      const existing = fakeMemory({ content: 'duplicate parser oom detected' });
+      store.add(existing);
+      const proposal = queue.enqueue(
+        fakeMemory({ content: 'duplicate parser oom detected' }),
+        'reason',
+      );
+      let judgeInvocations = 0;
+      const judge: DedupeJudge = async () => {
+        judgeInvocations++;
+        return { verdict: 'same', reason: 'unused' };
+      };
+      const decision = await llmDedupeDecide(store, proposal, judge);
+      assert.equal(decision.kind, 'merge-into');
+      assert.equal(decision.targetId, existing.id);
+      assert.equal(judgeInvocations, 0);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('skips judge when similarity is below threshold', async () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      store.add(fakeMemory({ content: 'completely different earlier memory' }));
+      const proposal = queue.enqueue(
+        fakeMemory({ content: 'unrelated topic entirely' }),
+        'reason',
+      );
+      let judgeInvocations = 0;
+      const judge: DedupeJudge = async () => {
+        judgeInvocations++;
+        return { verdict: 'same', reason: 'unused' };
+      };
+      const decision = await llmDedupeDecide(store, proposal, judge, {
+        similarityThreshold: 0.9,
+      });
+      assert.equal(decision.kind, 'add');
+      assert.equal(judgeInvocations, 0);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('routes to judge when similarity is above threshold; "same" → merge', async () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      const existing = fakeMemory({ content: 'parser ran out of memory during build' });
+      store.add(existing);
+      const proposal = queue.enqueue(
+        fakeMemory({ content: 'parser memory exhausted during build' }),
+        'reason',
+      );
+      let judgeInvocations = 0;
+      const judge: DedupeJudge = async () => {
+        judgeInvocations++;
+        return { verdict: 'same', reason: 'both describe OOM in parser' };
+      };
+      const decision = await llmDedupeDecide(store, proposal, judge, {
+        similarityThreshold: 0.3,
+      });
+      assert.equal(decision.kind, 'merge-into');
+      assert.equal(decision.targetId, existing.id);
+      assert.equal(judgeInvocations, 1);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('routes to judge; "superseded" → supersede with targetId', async () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      const existing = fakeMemory({ content: 'parser uses synchronous file read' });
+      store.add(existing);
+      const proposal = queue.enqueue(
+        fakeMemory({ content: 'parser uses streaming async file read' }),
+        'reason',
+      );
+      const judge: DedupeJudge = async () => ({
+        verdict: 'superseded',
+        reason: 'streaming replaces sync',
+      });
+      const decision = await llmDedupeDecide(store, proposal, judge, {
+        similarityThreshold: 0.3,
+      });
+      assert.equal(decision.kind, 'supersede');
+      assert.equal(decision.targetId, existing.id);
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('judge throwing falls back to add (no crash)', async () => {
+    const dir = tempDir();
+    try {
+      const store = open(dir);
+      const queue = new ProposalQueue(store.sqlite);
+      store.add(fakeMemory({ content: 'parser oom build memory' }));
+      const proposal = queue.enqueue(
+        fakeMemory({ content: 'parser oom build memory issue' }),
+        'reason',
+      );
+      const judge: DedupeJudge = async () => {
+        throw new Error('judge offline');
+      };
+      const decision = await llmDedupeDecide(store, proposal, judge, {
+        similarityThreshold: 0.3,
+      });
+      assert.equal(decision.kind, 'add');
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('parseDedupeJudgeOutput', () => {
+  it('parses clean JSON', () => {
+    const out = parseDedupeJudgeOutput('{"verdict":"same","reason":"identical"}');
+    assert.equal(out.verdict, 'same');
+    assert.equal(out.reason, 'identical');
+  });
+  it('parses JSON embedded in prose', () => {
+    const out = parseDedupeJudgeOutput(
+      'Thinking... {"verdict":"superseded","reason":"x replaces y"} done.',
+    );
+    assert.equal(out.verdict, 'superseded');
+  });
+  it('defaults to unrelated on malformed JSON', () => {
+    const out = parseDedupeJudgeOutput('not json at all');
+    assert.equal(out.verdict, 'unrelated');
+  });
+  it('defaults to unrelated on invalid verdict value', () => {
+    const out = parseDedupeJudgeOutput('{"verdict":"made-up","reason":"x"}');
+    assert.equal(out.verdict, 'unrelated');
   });
 });

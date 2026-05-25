@@ -45,6 +45,16 @@ export interface AgentManagerRunnerOptions {
   onTruncation?: (agentName: string, outputTokens: number) => void;
   /** Optional callback fired when a model gets burned mid-run. */
   onBurn?: (info: { stageName: string; model: string; status: number | string; message: string }) => void;
+  /**
+   * Wave 5 — optional callback that powers the agent's `recall_memory`
+   * tool. When set AND the stage's permissions include `recall`, the
+   * BuiltinToolExecutor advertises the tool to the model. The callback
+   * is bounded by a 3-call budget per spawn enforced inside the executor.
+   */
+  recallMemory?: (
+    query: string,
+    opts: { kind?: string; subtype?: string; limit?: number },
+  ) => Promise<string>;
 }
 
 export class AgentManagerRunner implements AgentRunner {
@@ -84,6 +94,7 @@ export class AgentManagerRunner implements AgentRunner {
           : [...disallowedToolsForPersona(req.persona)],
         allowedTools: req.allowedTools ? [...req.allowedTools] : undefined,
         maxOutputTokens: req.maxOutputTokens,
+        recallMemory: this.opts.recallMemory,
       },
       isCancelled: this.opts.isCancelled,
       onSpawn: (agentId) => this.opts.onSpawn?.(agentId, req),

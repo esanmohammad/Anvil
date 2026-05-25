@@ -465,7 +465,10 @@ function buildBuiltinExecutor(req: AdapterRequest): ToolExecutorLike | undefined
   const allowed = req.allowedTools && req.allowedTools.length > 0
     ? req.allowedTools
     : ['read_file', 'grep', 'glob', 'list'];
-  return new BuiltinToolExecutor({ allowedTools: allowed });
+  return new BuiltinToolExecutor({
+    allowedTools: allowed,
+    recallMemory: req.recallMemory,
+  });
 }
 
 /**
@@ -490,7 +493,10 @@ function buildMergedExecutor(req: AdapterRequest): ToolExecutorLike | undefined 
   const allowed = req.allowedTools && req.allowedTools.length > 0
     ? req.allowedTools
     : ['read_file', 'grep', 'glob', 'list'];
-  const builtin = new BuiltinToolExecutor({ allowedTools: allowed });
+  const builtin = new BuiltinToolExecutor({
+    allowedTools: allowed,
+    recallMemory: req.recallMemory,
+  });
   if (!req.mcpPool) return builtin;
   const pool = req.mcpPool as unknown as McpClientPool;
   const merged = new MergedToolExecutor({
