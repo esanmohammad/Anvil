@@ -26,8 +26,10 @@ import Database, { type Database as DB, type Statement } from 'better-sqlite3';
 import type { DurableStore, VacuumStats } from './store.js';
 import {
   DurableStoreUnavailableError,
+  type AssistantPartialRecord,
   type EffectEventPair,
   type EventRecord,
+  type NewAssistantPartialRecord,
   type NewEventRecord,
   type NewRunRecord,
   type RunRecord,
@@ -91,6 +93,23 @@ CREATE TABLE IF NOT EXISTS signals (
 
 CREATE INDEX IF NOT EXISTS idx_signals_pending
   ON signals(run_id, channel, consumed, id);
+
+CREATE TABLE IF NOT EXISTS assistant_partials (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+  step_id     TEXT NOT NULL,
+  turn_uuid   TEXT NOT NULL,
+  seq         INTEGER NOT NULL,
+  partial_id  TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  invalidated INTEGER NOT NULL DEFAULT 0,
+  ts          TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_partials_turn
+  ON assistant_partials(run_id, step_id, turn_uuid, seq);
+CREATE INDEX IF NOT EXISTS idx_partials_step
+  ON assistant_partials(run_id, step_id, id);
 `;
 
 const SCHEMA_VERSION = '1';
@@ -115,6 +134,13 @@ interface PreparedStmts {
   selectSignals: Statement;
   selectSignalsByChannel: Statement;
   vacuumRuns: Statement;
+  insertPartial: Statement;
+  selectMaxPartialSeq: Statement;
+  selectPartialsByTurn: Statement;
+  selectPartialsByStep: Statement;
+  invalidatePartialsRun: Statement;
+  invalidatePartialsStep: Statement;
+  invalidatePartialsTurn: Statement;
 }
 
 export interface SQLiteDurableStoreOptions {
@@ -211,6 +237,37 @@ export class SQLiteDurableStore implements DurableStore {
          WHERE status IN ('completed', 'failed', 'cancelled')
            AND updated_at < ?
       `),
+      insertPartial: this.db.prepare(`
+        INSERT INTO assistant_partials
+          (run_id, step_id, turn_uuid, seq, partial_id, payload, invalidated, ts)
+        VALUES (@runId, @stepId, @turnUuid, @seq, @partialId, @payload, 0, @ts)
+      `),
+      selectMaxPartialSeq: this.db.prepare(`
+        SELECT COALESCE(MAX(seq), 0) AS m FROM assistant_partials
+         WHERE run_id = ? AND step_id = ? AND turn_uuid = ?
+      `),
+      // Order by `id` (global insertion order), NOT `seq` (per-turn) so a
+      // step-wide read across turns surfaces the genuinely-most-recent
+      // partial last. The caller takes the last row.
+      selectPartialsByTurn: this.db.prepare(`
+        SELECT * FROM assistant_partials
+         WHERE run_id = ? AND step_id = ? AND turn_uuid = ? AND invalidated = 0
+         ORDER BY id
+      `),
+      selectPartialsByStep: this.db.prepare(`
+        SELECT * FROM assistant_partials
+         WHERE run_id = ? AND step_id = ? AND invalidated = 0
+         ORDER BY id
+      `),
+      invalidatePartialsRun: this.db.prepare(
+        'UPDATE assistant_partials SET invalidated = 1 WHERE run_id = ?',
+      ),
+      invalidatePartialsStep: this.db.prepare(
+        'UPDATE assistant_partials SET invalidated = 1 WHERE run_id = ? AND step_id = ?',
+      ),
+      invalidatePartialsTurn: this.db.prepare(
+        'UPDATE assistant_partials SET invalidated = 1 WHERE run_id = ? AND step_id = ? AND turn_uuid = ?',
+      ),
     };
   }
 
@@ -352,6 +409,60 @@ export class SQLiteDurableStore implements DurableStore {
     return ordered.map((k) => byKey.get(k)!);
   }
 
+  async appendAssistantPartial(partial: NewAssistantPartialRecord): Promise<AssistantPartialRecord> {
+    const ts = this.iso();
+    return this.db.transaction(() => {
+      const max = this.stmts.selectMaxPartialSeq.get(
+        partial.runId, partial.stepId, partial.turnUuid,
+      ) as { m: number };
+      const seq = (max?.m ?? 0) + 1;
+      const partialId = `${partial.runId}:${partial.stepId}:${partial.turnUuid}:${seq}`;
+      this.stmts.insertPartial.run({
+        runId: partial.runId,
+        stepId: partial.stepId,
+        turnUuid: partial.turnUuid,
+        seq,
+        partialId,
+        payload: JSON.stringify(partial.payload ?? null),
+        ts,
+      });
+      return {
+        runId: partial.runId,
+        stepId: partial.stepId,
+        turnUuid: partial.turnUuid,
+        seq,
+        partialId,
+        payload: partial.payload ?? null,
+        invalidated: false,
+        ts,
+      };
+    })();
+  }
+
+  async readAssistantPartials(
+    runId: string,
+    stepId: string,
+    turnUuid?: string,
+  ): Promise<AssistantPartialRecord[]> {
+    const rows = (turnUuid !== undefined
+      ? this.stmts.selectPartialsByTurn.all(runId, stepId, turnUuid)
+      : this.stmts.selectPartialsByStep.all(runId, stepId)) as PartialRow[];
+    return rows.map(partialRowToRecord);
+  }
+
+  async invalidatePartials(runId: string, stepId?: string, turnUuid?: string): Promise<void> {
+    if (turnUuid !== undefined) {
+      if (stepId === undefined) {
+        throw new Error('invalidatePartials: turnUuid requires stepId');
+      }
+      this.stmts.invalidatePartialsTurn.run(runId, stepId, turnUuid);
+    } else if (stepId !== undefined) {
+      this.stmts.invalidatePartialsStep.run(runId, stepId);
+    } else {
+      this.stmts.invalidatePartialsRun.run(runId);
+    }
+  }
+
   async enqueueSignal(runId: string, channel: string, payload: unknown): Promise<void> {
     this.stmts.insertSignal.run({
       runId,
@@ -371,6 +482,36 @@ export class SQLiteDurableStore implements DurableStore {
       return safeParse(row.payload);
     });
     return consume();
+  }
+
+  async consumeSignalAndRecord(
+    runId: string,
+    channel: string,
+    effect: { stepId: string; effectKey: string; effectIdx: number },
+  ): Promise<unknown | null> {
+    // One transaction: pop the signal AND append its effect:completed
+    // receipt. A crash either commits both or neither — never the torn
+    // "consumed but unrecorded" state that hung replay.
+    const tx = this.db.transaction(() => {
+      const row = this.stmts.selectNextSignal.get(runId, channel) as
+        | { id: number; payload: string }
+        | undefined;
+      if (!row) return null;
+      this.stmts.consumeSignal.run(row.id);
+      const seq = ((this.stmts.selectMaxSeq.get(runId) as { m: number })?.m ?? 0) + 1;
+      this.stmts.insertEvent.run({
+        runId,
+        seq,
+        kind: 'effect:completed',
+        stepId: effect.stepId,
+        effectKey: effect.effectKey,
+        effectIdx: effect.effectIdx,
+        payload: row.payload, // already a JSON string in the signals table
+        ts: this.iso(),
+      });
+      return safeParse(row.payload);
+    });
+    return tx();
   }
 
   async readSignals(runId: string, channel?: string): Promise<SignalRecord[]> {
@@ -450,6 +591,18 @@ interface SignalRow {
   ts: string;
 }
 
+interface PartialRow {
+  id: number;
+  run_id: string;
+  step_id: string;
+  turn_uuid: string;
+  seq: number;
+  partial_id: string;
+  payload: string;
+  invalidated: number;
+  ts: string;
+}
+
 function rowToRecord(row: RunRow): RunRecord {
   return {
     runId: row.run_id,
@@ -476,6 +629,19 @@ function eventRowToRecord(row: EventRow): EventRecord {
     effectKey: row.effect_key,
     effectIdx: row.effect_idx,
     payload: safeParse(row.payload),
+    ts: row.ts,
+  };
+}
+
+function partialRowToRecord(row: PartialRow): AssistantPartialRecord {
+  return {
+    runId: row.run_id,
+    stepId: row.step_id,
+    turnUuid: row.turn_uuid,
+    seq: row.seq,
+    partialId: row.partial_id,
+    payload: safeParse(row.payload),
+    invalidated: row.invalidated === 1,
     ts: row.ts,
   };
 }

@@ -11,6 +11,7 @@ import {
   Pipeline,
   buildStandardStepRegistry,
   type EventBus,
+  type DurableStore,
 } from '@esankhan3/anvil-core-pipeline';
 import { runOneStage as runOneStageFn, type StageOpsDeps } from './pipeline-stages.js';
 import { renderPlanDerivedArtifact as renderPlanDerivedArtifactBridge } from './manifest-bridge.js';
@@ -31,6 +32,23 @@ export interface PipelineLoopOpts {
   resumeStage: number;
   initialPrevArtifact: string;
   isCancelled: () => boolean;
+  /**
+   * Cancellation signal (aborted by PipelineRunner.cancel). Threaded into
+   * `Pipeline` → `ctx.signal` → `EffectRuntime` so a durable
+   * `ctx.waitForSignal` poll exits on cancel (finding 4). Passed on every
+   * pass, including rewinds.
+   */
+  signal?: AbortSignal;
+  /**
+   * §H3 BUG-1 Fix A — the module-singleton durable store. When threaded, the
+   * dashboard `Pipeline` builds a REAL effect runtime: `ctx.effect` records +
+   * replays (effect-granularity crash-resume) and `ctx.waitForSignal` waits on
+   * the durable signal queue (durable Q&A / reviewer-pause across restarts).
+   * Without it (`undefined`) `ctx.effect` is a passthrough no-op and
+   * `ctx.waitForSignal` throws — the pre-Fix-A behavior.
+   */
+  durableStore?: DurableStore;
+  durableHolder?: string;
 }
 
 export interface PipelineLoopResult {
@@ -71,11 +89,29 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
         specs: () => opts.config.planSeed != null,
         tasks: () => opts.config.planSeed != null,
       },
-      runStage: async (stageName) => {
+      runStage: async (stageName, _prevArtifact, ctx) => {
         const idx = STAGES.findIndex((s) => s.name === stageName);
         if (idx < 0) throw new Error(`Unknown stage in registry: ${stageName}`);
+        // H3: forward the walker's StepContext as the dedicated `turnCtx`
+        // (7th arg) so the stage body records turn-level sub-effects durably +
+        // crash-resume skips completed turns. The legacy `ctx` param (6th)
+        // stays undefined — exactly as before. Undefined in non-durable mode.
+        //
+        // §H3 Fix A rewind guard (complete form): on a REWIND pass, pass
+        // turnCtx=undefined so EVERY turn recorder goes inert (buildTurnWiring/
+        // buildSessionTurnWiring return EMPTY → NullTurnRecorder). The Pipeline
+        // durableStore is already dropped on rewind (below), but the per-repo /
+        // clarify / QA recorders bind to the module-SINGLETON store via
+        // getDurableStore() INDEPENDENTLY of the Pipeline store — so without
+        // this they'd re-read the forward pass's recorded turns and either
+        // replay them STALE (ignoring the reviewer's note) or trip a
+        // DeterminismViolation when the changed prompt re-hashes. Nulling the
+        // ctx makes rewound stages truly re-run fresh (the documented v1
+        // "rewind degrades to stage-granularity" semantic).
+        const turnCtx = rewindToStep ? undefined : ctx;
         const ctrl = await runOneStageFn(
           opts.stageOps, idx, stageState.isResume, stageState.resumeStage, stageState.prevArtifact,
+          undefined, turnCtx,
         );
         stageState.prevArtifact = ctrl.prevArtifact;
         if (ctrl.control === 'cancelled') {
@@ -104,6 +140,17 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
       const initialShared: Record<string, unknown> = {};
       if (opts.config.planBinding) initialShared.planBinding = opts.config.planBinding;
       if (opts.config.planSeed) initialShared.planSeed = opts.config.planSeed;
+      // §H3 BUG-1 Fix A — go durable on the FORWARD pass only. A reviewer
+      // rewind re-runs steps whose effects are ALREADY in the durable log
+      // under the same stepId; replaying those would return stale results or
+      // trip a DeterminismViolation (the input changed). The store has no
+      // effect-invalidation primitive, so the safe guard is to run rewind
+      // re-invokes in PASSTHROUGH (durableStore omitted): the rewound steps
+      // re-run fresh — exactly the pre-Fix-A behavior — while the initial
+      // forward pass + crash-resume keep effect-granularity durability. The
+      // `rewindTo` skip-logic skips pre-rewind steps on its own, so dropping
+      // the store here doesn't un-skip already-completed work.
+      const durableForThisPass = opts.durableStore && !rewindToStep;
       const pipeline = new Pipeline({
         registry,
         bus: opts.bus,
@@ -112,7 +159,9 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
         initialInput: stageState.prevArtifact,
         repoPaths: opts.repoPaths(),
         initialShared,
+        ...(opts.signal ? { signal: opts.signal } : {}),
         ...(rewindToStep ? { rewindTo: rewindToStep } : {}),
+        ...(durableForThisPass ? { durableStore: opts.durableStore, durableHolder: opts.durableHolder } : {}),
       });
       console.log(`[trace] ${opts.runId} calling pipeline.run()`);
       // Pipeline.run() returns `{status:'success'|'failed', ...}` and
@@ -125,7 +174,13 @@ export async function runPipelineLoop(opts: PipelineLoopOpts): Promise<PipelineL
       // control-flow markers (`__anvilFailReturn`) by setting
       // `pipelineEarlyReturn = true` on `status === 'failed'`.
       const result = await pipeline.run();
-      if (result.status === 'failed') {
+      // Any non-success terminal status (failed OR aborted) marks an early
+      // return so pipeline-runner doesn't fall through to its "completed"
+      // branch. `aborted` became reachable once the cancel AbortSignal is
+      // threaded into the Pipeline (finding 4) — previously only `failed`
+      // could occur, so the old `=== 'failed'` guard would have shown green
+      // over an aborted stage.
+      if (result.status !== 'success') {
         pipelineEarlyReturn = true;
       }
       break;

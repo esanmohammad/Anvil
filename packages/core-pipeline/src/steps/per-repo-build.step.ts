@@ -8,7 +8,7 @@
  */
 
 import type { Step, StepContext } from '../types.js';
-import type { AgentRunner } from '../agent-runner.js';
+import type { AgentRunner, AgentRunRequest } from '../agent-runner.js';
 import {
   parseTasks,
   runTasksWithDependencyGraph,
@@ -37,6 +37,18 @@ export interface RunBuildForRepoOptions {
   isCancelled: () => boolean;
   onProjectEvent?: (level: 'info' | 'warn', message: string) => void;
   allowedTools?: string[];
+  /**
+   * H3 per-task durable turn wiring (ADR §2.4). Build fans tasks out
+   * concurrently (`maxConcurrent`), so each task needs its OWN scoped
+   * recorder + prefill resolver — keyed `[repo, taskId]` — to keep turn
+   * sub-effects' idx sequences deterministic per task on replay. Called
+   * once per task with `task.id`, and once with `null` for the no-task
+   * fallback (scoped `[repo]`). Omitted → NullTurnRecorder (pre-H3).
+   */
+  makeTurnWiring?: (taskId: string | null) => Promise<{
+    turnRecorder?: AgentRunRequest['turnRecorder'];
+    resolvePrefill?: AgentRunRequest['resolvePrefill'];
+  }>;
 }
 
 export interface RunBuildForRepoResult {
@@ -97,6 +109,9 @@ export async function runBuildForOneRepo(
     async (task) => {
       if (opts.isCancelled()) throw new Error('Pipeline cancelled');
       const prompt = opts.buildPerTaskPrompt(task);
+      // Per-task durable turn wiring — scoped [repo, taskId] so racing
+      // tasks don't share an idx counter (§2.4).
+      const wiring = opts.makeTurnWiring ? await opts.makeTurnWiring(task.id) : {};
       const r = await opts.runner.run({
         persona: opts.persona,
         projectPrompt: opts.projectPrompt,
@@ -108,6 +123,8 @@ export async function runBuildForOneRepo(
         maxOutputTokens: opts.maxOutputTokens,
         model: opts.model,
         repoName: opts.repoName,
+        turnRecorder: wiring.turnRecorder,
+        resolvePrefill: wiring.resolvePrefill,
       });
       return {
         artifact: r.output,
@@ -162,6 +179,8 @@ export async function runBuildForOneRepo(
 async function runBuildFallback(
   opts: RunBuildForRepoOptions,
 ): Promise<RunBuildForRepoResult> {
+  // No tasks → one agent run for the repo; scope [repo] (null taskId).
+  const wiring = opts.makeTurnWiring ? await opts.makeTurnWiring(null) : {};
   const r = await opts.runner.run({
     persona: opts.persona,
     projectPrompt: opts.projectPrompt,
@@ -173,6 +192,8 @@ async function runBuildFallback(
     maxOutputTokens: opts.maxOutputTokens,
     model: opts.model,
     repoName: opts.repoName,
+    turnRecorder: wiring.turnRecorder,
+    resolvePrefill: wiring.resolvePrefill,
   });
   return {
     artifact: r.output,

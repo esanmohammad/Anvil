@@ -99,7 +99,7 @@ export {
   readCheckpoint,
   findInterruptedPipelines,
 };
-import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper, attachDurableLogHook, LeaseManager } from '@esankhan3/anvil-core-pipeline';
+import { InMemoryEventBus, formatStageAnswers as formatStageAnswersHelper, attachDurableLogHook, LeaseManager, rollupStepCostAcrossSubsteps, rollupIsEmpty } from '@esankhan3/anvil-core-pipeline';
 import { attachPipelineHooks } from './pipeline-hooks.js';
 import { runPipelineLoop } from './pipeline-loop.js';
 import { getDurableStore, durableHolderId } from './durable-store-singleton.js';
@@ -137,6 +137,22 @@ function stageInputKey(stageIndex: number, repoName: string | null): string {
  */
 export function stageAnswerChannel(stageIndex: number, repoName: string | null): string {
   return repoName ? `stage-answer-${stageIndex}:${repoName}` : `stage-answer-${stageIndex}`;
+}
+
+/**
+ * Durable signal channel for a single clarify Q&A answer. Clarify asks
+ * its questions one at a time (`runClarifyQALoop`), so the channel is
+ * per-(stageIndex, questionIndex) — answering Q2 must not satisfy Q1's
+ * wait. Mirrors `stageAnswerChannel` but for the interactive clarify
+ * path, which previously had ONLY an in-process resolver (no durable
+ * backstop, so a dropped/misrouted answer hung the stage forever).
+ *
+ * Producer: `provideInput` in this file (enqueues alongside the
+ * in-process resolve). Consumer: `runClarifyStage`'s `inputResolver`
+ * race in `pipeline-stages.ts`.
+ */
+export function clarifyAnswerChannel(stageIndex: number, questionIndex: number): string {
+  return `clarify-answer-${stageIndex}:${questionIndex}`;
 }
 
 export class PipelineRunner extends EventEmitter {
@@ -224,6 +240,15 @@ export class PipelineRunner extends EventEmitter {
   // For interactive clarify — resolves when user provides input
   private inputResolve: ((text: string) => void) | null = null;
 
+  // Durable backstop for the in-flight clarify question. While clarify
+  // awaits an answer, `runClarifyStage` registers the question's signal
+  // channel here via `setActiveClarifyChannel`; `provideInput` enqueues
+  // the answer as a durable signal on it so the answer survives an
+  // in-process resolver miss (wrong/cleared runner ref, unarmed
+  // resolver) AND a crash mid-wait. Null when no clarify question is
+  // pending. See `clarifyAnswerChannel`.
+  private activeClarifyChannel: string | null = null;
+
   /**
    * Per-(stageIndex, repoName?) input resolvers for stage Q&A. The
    * resolver fires once every question for the stage has an answer; the
@@ -233,6 +258,14 @@ export class PipelineRunner extends EventEmitter {
    * Key: `${stageIndex}|${repoName ?? '__'}`.
    */
   private stageInputResolvers = new Map<string, (text: string) => void>();
+
+  /**
+   * Aborted by `cancel()` and threaded into `Pipeline` → `ctx.signal` →
+   * `EffectRuntime`, so a durable `ctx.waitForSignal` poll exits on cancel
+   * instead of leaking a 250 ms-interval poller for the life of the
+   * process (finding 4).
+   */
+  private readonly abortController = new AbortController();
 
   /** Project Q&A policy snapshot — set by the dashboard before run() starts. */
   private qaPolicy: { enabled?: boolean; maxQuestionsPerStage?: number } | undefined;
@@ -399,16 +432,50 @@ export class PipelineRunner extends EventEmitter {
 
   /** Provide user input (for interactive clarify or any waiting stage) */
   provideInput(text: string): void {
+    // Durable mirror: when a clarify question is awaiting, also enqueue the
+    // answer as a durable signal on its per-question channel. The clarify
+    // wait races this signal against the in-process resolver below, so the
+    // answer still lands even if the in-process resolver is missing (Defect
+    // 1: misrouted/cleared resolver silently dropped the answer and hung the
+    // stage). Enqueue BEFORE resolving so the signal is durable even if the
+    // synchronous resolve path throws.
+    const clarifyChannel = this.activeClarifyChannel;
+    if (clarifyChannel) {
+      this.activeClarifyChannel = null;
+      const store = getDurableStore();
+      if (store) {
+        void store
+          .enqueueSignal(this.state.runId, clarifyChannel, text)
+          .catch((err) => {
+            console.warn(
+              `[pipeline-runner] clarify enqueueSignal failed for ${clarifyChannel}: ${err instanceof Error ? err.message : err}`,
+            );
+          });
+      }
+    }
     if (this.inputResolve) {
       this.inputResolve(text);
       this.inputResolve = null;
       this.state.waitingForInput = false;
       this.broadcastState();
+    } else if (clarifyChannel) {
+      // No in-process resolver, but we DID enqueue a durable signal above —
+      // the clarify wait's `ctx.waitForSignal` will consume it. Fail loud so
+      // this path is no longer a silent black hole.
+      console.warn(
+        `[pipeline-runner] provideInput: no in-process resolver armed for run ${this.state.runId}; ` +
+        `delivered via durable signal on ${clarifyChannel}`,
+      );
     } else {
       // Fallback: send input to current agent via --resume
       const agentId = this.getCurrentAgentId();
       if (agentId) {
         this.agentManager.sendInput(agentId, text);
+      } else {
+        console.warn(
+          `[pipeline-runner] provideInput dropped input for run ${this.state.runId} — ` +
+          `no in-process resolver, no pending clarify channel, no active agent`,
+        );
       }
     }
   }
@@ -492,6 +559,18 @@ export class PipelineRunner extends EventEmitter {
       this.inputResolve('');
       this.inputResolve = null;
     }
+    this.activeClarifyChannel = null;
+    // finding 4 — drain the per-(stage,repo) Q&A resolvers too. A stage
+    // paused on `runStageWithQA` awaits a Promise.race of its in-process
+    // resolver (held here) against `ctx.waitForSignal`; the legacy single
+    // `inputResolve` above never covered this map, so a cancel during Q&A
+    // left the race pending forever. Resolving with '' trips the stage's
+    // cancellation guard (empty answersBlock → empty artifact) so it
+    // unwinds cleanly.
+    for (const resolve of this.stageInputResolvers.values()) resolve('');
+    this.stageInputResolvers.clear();
+    // Abort the durable signal poll (and any other ctx.signal consumer).
+    this.abortController.abort();
     this.state.status = 'cancelled';
     this.state.waitingForInput = false;
     this.broadcastState();
@@ -581,6 +660,50 @@ export class PipelineRunner extends EventEmitter {
         }
       });
 
+      // §H3 per-model step cost. On each completed step, roll up the
+      // turn-level cost recorded under the step's effect keys (main +
+      // `${stepId}:session`) and surface it so the dashboard can render a
+      // per-model breakdown + a cross-model continuation marker.
+      //
+      // NB: this hook reads the module-singleton store + emits `step-cost`
+      // (→ pipeline.step-cost → the CostMeter's per-model breakdown +
+      // continuation marker). §H3 Fix A now ALSO threads the same singleton
+      // into the Pipeline (forward pass), so `pipeline.ts`'s step:completed
+      // cost enrichment ALSO fires and adds `costByModel` to that payload —
+      // but that's read by the scalar-cost subscriber for `costUsd` only, NOT
+      // the per-model breakdown, so there is NO double-count (different field +
+      // channel; identical values from the same store). This hook stays the
+      // sole source of the per-model CostMeter + the `continuation` marker.
+      // Single-stage (passthrough ctx runtime) records no turn effects → the
+      // rollup is EMPTY → skipped, scalar cost untouched.
+      const stepCostStore = getDurableStore();
+      const stepCostHook = stepCostStore
+        ? this.pipelineBus.on('step:completed', async (event) => {
+            const stepId = event.stepId;
+            if (!stepId) return;
+            try {
+              const rollup = await rollupStepCostAcrossSubsteps(
+                stepCostStore,
+                this.state.runId,
+                stepId,
+              );
+              if (rollupIsEmpty(rollup)) return;
+              this.emit('step-cost', {
+                runId: this.state.runId,
+                stepId,
+                costByModel: rollup.costByModel,
+                prefillReinjectionUsd: rollup.prefillReinjectionUsd,
+                totalCostUsd: rollup.totalCostUsd,
+                continuation: rollup.continuation,
+              });
+            } catch (err) {
+              console.warn(
+                `[pipeline] step-cost rollup failed for ${stepId}: ${err instanceof Error ? err.message : err}`,
+              );
+            }
+          })
+        : null;
+
       // Phase D3: durable store integration. Open the singleton,
       // create/upsert a `runs` row for this runId, attach the
       // durable-log hook so step:* events are persisted, and
@@ -598,7 +721,19 @@ export class PipelineRunner extends EventEmitter {
             feature: this.config.feature,
             featureSlug: this.state.featureSlug,
           });
-          await durableStore.acquireLease(this.state.runId, durableHolder, 60_000);
+          const leaseOk = await durableStore.acquireLease(this.state.runId, durableHolder, 60_000);
+          if (!leaseOk) {
+            // The lease is held by a non-expired holder. On the realistic
+            // resume paths (Replay of a failed/paused run; auto-resume of
+            // an orphan whose lease this process just took over) the lease
+            // is free, so this is rare. We proceed (preserving prior
+            // behaviour) but surface it — full lease-status validation for
+            // the multi-process case is a known durable-resume follow-up.
+            console.warn(
+              `[pipeline-runner] ${this.state.runId}: durable lease held by another holder; ` +
+                `proceeding, but a peer may still be running this run.`,
+            );
+          }
           await durableStore.updateRunStatus(this.state.runId, 'running', null);
           durableHookHandle = attachDurableLogHook(
             this.pipelineBus,
@@ -642,10 +777,12 @@ export class PipelineRunner extends EventEmitter {
           resumeStage,
           initialPrevArtifact: prevArtifact,
           isCancelled: () => this.cancelled,
+          signal: this.abortController.signal,
           ...(durableStore ? { durableStore, durableHolder } : {}),
         });
       } finally {
         hooksHandle.detach();
+        stepCostHook?.();
         durableHookHandle?.unsubscribe();
         if (leaseManager) {
           await leaseManager.stop();
@@ -778,6 +915,7 @@ export class PipelineRunner extends EventEmitter {
       handleOutputTruncation: (agentName, outputTokens) => handleOutputTruncationFn(this.depsForTelemetry(), agentName, outputTokens),
       writePerRepoTelemetry: (stage, repo, stats) => writePerRepoTelemetryFn(this.depsForTelemetry(), stage, repo, stats),
       setInputResolve: (resolve) => { this.inputResolve = resolve; },
+      setActiveClarifyChannel: (channel) => { this.activeClarifyChannel = channel; },
       getQAPolicy: () => this.qaPolicy,
       setStageInputResolver: (stageIndex, repoName, resolve) => {
         const key = stageInputKey(stageIndex, repoName);

@@ -77,4 +77,39 @@ export type {
   ProviderId as FetchPoolProviderId,
   PoolMetrics as FetchPoolMetrics,
 } from './fetch-pool.js';
+export {
+  TurnRecorder,
+  createNullTurnRecorder,
+  createNullEffectRuntime,
+  createNullPartialSink,
+} from './turn-recorder/index.js';
+export type {
+  AssistantPartial,
+  AssistantStartRequest,
+  AssistantTurn,
+  EffectRuntimeLike,
+  EffectInvokeOptions,
+  NeutralToolResult,
+  PartialReason,
+  PartialSink,
+  Prefill,
+  PrefillToolUse,
+  PrefillTurn,
+  Provenance,
+  ProvenanceSegment,
+  RecordedToolUse,
+  TurnRecorderDeps,
+  TurnTokenUsage,
+} from './turn-recorder/types.js';
+export { contentHashFromArgs } from './turn-recorder/hash.js';
+export { stripForTarget } from './prefill/strip.js';
+export type { StripContext } from './prefill/strip.js';
+export { translateToolResult } from './prefill/translate.js';
+export type { TranslatedToolResult } from './prefill/translate.js';
+export {
+  truncatePrefillForBudget,
+  DEFAULT_MAX_INPUT_TOKENS,
+  DEFAULT_MARGIN_TOKENS,
+} from './prefill/truncate.js';
+export type { TruncatePrefillArgs } from './prefill/truncate.js';
 export { VERSION } from './version.js';

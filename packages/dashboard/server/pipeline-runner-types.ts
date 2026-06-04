@@ -222,6 +222,19 @@ export interface PipelineRunnerEvents {
   'pipeline-complete': (state: PipelineRunState) => void;
   'pipeline-fail': (state: PipelineRunState) => void;
   'waiting-for-input': (stageIndex: number, agentId: string) => void;
+  /**
+   * §H3 per-model step cost — fired on each `step:completed` when the step
+   * recorded turn-level effects, carrying the §2.6 rollup so the dashboard
+   * can surface a per-model breakdown + cross-model continuation marker.
+   */
+  'step-cost': (data: {
+    runId: string;
+    stepId: string;
+    costByModel: Record<string, import('@esankhan3/anvil-core-pipeline').ModelCost>;
+    prefillReinjectionUsd: number;
+    totalCostUsd: number;
+    continuation: import('@esankhan3/anvil-core-pipeline').StepContinuation | null;
+  }) => void;
 }
 
 // ── Config ──────────────────────────────────────────────────────────────

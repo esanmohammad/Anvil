@@ -17,6 +17,7 @@ import type {
 } from './types.js';
 import type { ResultMessage } from './stream-format.js';
 import { UpstreamError, synthesizeStatusFromCli } from './upstream-error.js';
+import { createNullTurnRecorder } from './turn-recorder/index.js';
 
 // ---------------------------------------------------------------------------
 // Pricing table — [inputPer1M, outputPer1M]
@@ -150,6 +151,28 @@ export class ClaudeAdapter implements ModelAdapter {
       args.push('--mcp-config', config.mcpConfigPath);
     }
 
+    // §H4 cross-vendor turn recording — record this exchange so a later
+    // resume (possibly a different provider) can reconstruct prior turns via
+    // `reconstructSessionHistory`. claude-cli runs its own tool loop opaquely,
+    // so the turn is recorded as a single text exchange (no per-tool effects).
+    // Deliberately NO replay-skip: claude pipes rich stream-json (tool_result
+    // frames carry PR URLs); re-running it on a same-runId resume preserves
+    // that full output, whereas re-emitting only the recorded text would drop
+    // it. The single assistant-start key is the deterministic prompt hash, so
+    // replay matches without a DeterminismViolation. NullTurnRecorder no-ops
+    // without a durable recorder.
+    const recorder = config.turnRecorder ?? createNullTurnRecorder({
+      runId: config.sessionId,
+      stepId: config.stage,
+    });
+    const { turn } = await recorder.startTurn({
+      model: config.model,
+      provider: 'claude',
+      system: config.projectPrompt,
+      messages: [{ role: 'user', content: config.userPrompt }],
+      userPrompt: config.userPrompt,
+    });
+
     // ---- Spawn ------------------------------------------------------------
     const child = spawn(bin, args, {
       cwd: config.workingDir,
@@ -272,6 +295,17 @@ export class ClaudeAdapter implements ModelAdapter {
         { provider: 'claude', retryable: true },
       );
     }
+
+    // §H4 — record the completed turn (assistant-end). Only on success: the
+    // empty-output / missing-result cases threw above, so we never persist an
+    // empty assistant-end.
+    await recorder.endTurn(
+      turn,
+      fullOutput,
+      lastStopReason ?? 'end_turn',
+      { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens },
+      { segments: [{ model: config.model, provider: 'claude', range: [0, fullOutput.length], source: 'live' }] },
+    );
 
     return {
       output: fullOutput,

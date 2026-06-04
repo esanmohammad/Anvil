@@ -45,7 +45,6 @@ import { join } from 'node:path';
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 import type { WalkerConfig } from '@esankhan3/anvil-agent-core';
 import {
-  runWithChainFallback,
   combinePerRepoArtifacts,
   runBuildForOneRepo,
   hasValidationFailures as hasValidationFailuresHelper,
@@ -73,9 +72,10 @@ import {
   deployProject,
   createFeatureBranches as createFeatureBranchesHelper,
 } from './steps/workspace-ops.js';
+import { buildTurnWiring, buildSessionTurnWiring } from './durable-turn-wiring.js';
 import { AgentManagerRunner } from './runners/agent-manager-runner.js';
 import { AgentManagerSession } from './runners/agent-manager-session.js';
-import { stageAnswerChannel } from './pipeline-runner.js';
+import { stageAnswerChannel, clarifyAnswerChannel } from './pipeline-runner.js';
 import { renderPlanDerivedArtifact as renderPlanDerivedArtifactBridge } from './manifest-bridge.js';
 import { extractAndUpdateManifest as extractAndUpdateManifestBridge } from './manifest-bridge.js';
 import { clearManifestFieldsForStages as clearManifestFieldsForStagesBridge } from './manifest-bridge.js';
@@ -177,6 +177,14 @@ export interface StageOpsDeps {
 
   // Clarify input resolver (writable slot)
   setInputResolve: (resolve: ((text: string) => void) | null) => void;
+  /**
+   * Register (or clear, with `null`) the durable signal channel for the
+   * clarify question currently awaiting an answer. `provideInput` reads
+   * this to enqueue the answer as a durable signal alongside the
+   * in-process resolve — the backstop that keeps a dropped answer from
+   * hanging clarify forever.
+   */
+  setActiveClarifyChannel: (channel: string | null) => void;
 
   // Stage Q&A controls.
   /** Read the project's Q&A policy block — disabled by default returns undefined. */
@@ -250,8 +258,21 @@ export function resetStagesForRerun(deps: StageOpsDeps, fromIndex: number, toInd
   }
 }
 
-/** Construct a multi-turn `AgentManagerSession` (clarify + fix-loop). */
-export function makeAgentSession(deps: StageOpsDeps): AgentManagerSession {
+/**
+ * Construct a multi-turn `AgentManagerSession`.
+ *
+ * `turnCtx` (the H3 durable turn channel) flips the session into BURN-AWARE
+ * mode: per-phase chain-fallback + a session-spanning turn recorder (under a
+ * dedicated `${stage}:session` substep) + coarse `ctx.effect` per-phase wraps
+ * for crash-resume. clarify + QA pass it. fix-loop passes `undefined` (THIN
+ * mode — the step body owns its per-repo fallback + recorder, threaded via
+ * the AgentRunRequest).
+ */
+export function makeAgentSession(
+  deps: StageOpsDeps,
+  turnCtx?: StepContext<string>,
+  sessionOpts?: { coarseWrap?: boolean },
+): AgentManagerSession {
   return new AgentManagerSession({
     agentManager: deps.agentManager,
     project: deps.config.project,
@@ -259,6 +280,27 @@ export function makeAgentSession(deps: StageOpsDeps): AgentManagerSession {
     isCancelled: () => deps.isCancelled(),
     resolveModel: (stageName) => deps.resolveModelForStage(stageName),
     onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
+    fallback: turnCtx
+      ? {
+          ctx: turnCtx,
+          resolveModel: (stageName) => deps.resolveModelForStage(stageName),
+          burnedModels: deps.runtimeBurnedModels,
+          maxAttempts: deps.walkerConfig().max_attempts,
+          onBurn: ({ model, status }) => {
+            deps.runtimeBurnedModels.add(model);
+            deps.emit('project-event', {
+              source: 'routing',
+              message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
+              level: 'warn',
+            });
+          },
+          buildWiring: buildSessionTurnWiring(turnCtx),
+          warn: (message) => deps.emit('project-event', { source: 'routing', message, level: 'warn' }),
+          // fix-loop runs N per-repo sessions in parallel over one ctx → skip
+          // the coarse wrap (idx race); clarify/QA (single session) keep it.
+          coarseWrap: sessionOpts?.coarseWrap,
+        }
+      : undefined,
   });
 }
 
@@ -334,6 +376,28 @@ export function makeAgentRunner(deps: StageOpsDeps, stageName: string): AgentMan
   });
 }
 
+/**
+ * Shared `.catch` handler for a durable `ctx.waitForSignal` raced against an
+ * in-process resolver (used by both clarify and the planning-stage Q&A).
+ *
+ * When durable is disabled (ANVIL_DURABLE_DISABLED) the Pipeline gets no store
+ * → `ctx.waitForSignal` is the passthrough that THROWS — that specific
+ * rejection is swallowed (defer to the in-process resolver). A cancellation
+ * abort of the durable wait is likewise swallowed (matched on the error tag,
+ * message substring as fallback). Both return a never-settling promise so the
+ * losing branch of the `Promise.race` can't surface as an unhandled rejection
+ * after the resolver wins. A genuine durable-wait failure (store error /
+ * DeterminismViolation) propagates so the stage fails LOUD rather than hanging.
+ */
+function deferToInProcessResolver(err: unknown): Promise<string> {
+  const msg = err instanceof Error ? err.message : String(err);
+  const cancelled = (err as { __anvilSignalCancelled?: boolean })?.__anvilSignalCancelled === true;
+  if (msg.includes('without a durable store') || cancelled || msg.includes('cancelled while waiting')) {
+    return new Promise<string>(() => { /* never settles — resolver wins the race */ });
+  }
+  return Promise.reject(err instanceof Error ? err : new Error(msg));
+}
+
 // ── Interactive Clarify (one question at a time) ─────────────────────
 
 async function runClarifyStage(
@@ -341,12 +405,21 @@ async function runClarifyStage(
   index: number,
   ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-  const session = makeAgentSession(deps);
-  const runOnce = (model: string) => runClarifyForProject({
+  // H3 burn-aware session: per-phase chain-fallback + a session-spanning turn
+  // recorder + coarse `${stage}:session:pN` ctx.effect crash-resume wraps all
+  // live INSIDE the session now (`ctx` → fallback config). So clarify calls
+  // runClarifyForProject ONCE — no outer runWithChainFallback / coarse wrap.
+  // Burn during EXPLORE continues from its partial (cross-model where the
+  // next model is prefill-capable); SYNTHESIZE (resume) carries the full prior
+  // conversation (§Tier 2): claude uses native --resume; a non-claude model
+  // spawns fresh with reconstructed `priorMessages` (the completed explore +
+  // Q&A turns), composing with the current phase's prefill.
+  const session = makeAgentSession(deps, ctx);
+  const result = await runClarifyForProject({
     agentSession: session,
     project: deps.config.project,
     workspaceDir: deps.workspaceDir,
-    model,
+    model: deps.resolveModelForStage('clarify'),
     allowedTools: deps.allowedToolsForCurrentStage('clarify'),
     maxOutputTokens: maxOutputTokensForStage('clarify'),
     explorePrompt: buildClarifyExplorePromptHelper(deps.getPromptContext()),
@@ -359,7 +432,7 @@ async function runClarifyStage(
       deps.emit('project-event', {
         source: 'pipeline',
         stage: 'clarify',
-        message: `[clarify] clarifier agent spawned (model: ${model}) — awaiting first response…`,
+        message: `[clarify] clarifier agent spawned — awaiting first response…`,
       });
     },
     onTruncation: (agentName, outputTokens) => deps.handleOutputTruncation(agentName, outputTokens),
@@ -397,39 +470,29 @@ async function runClarifyStage(
       deps.state.waitingForInput = false;
       deps.broadcast();
     },
-    inputResolver: () => new Promise<string>((resolve) => {
-      deps.setInputResolve(resolve);
-    }),
-  });
-
-  // Phase E1: wrap the chain-fallback in ctx.effect when a durable
-  // store is wired. Effect name includes the model identifier so a
-  // chain rotation between runs surfaces as DeterminismViolationError
-  // (caller reruns from-stage with the same chain). The system effect
-  // is the *outer* runWithChainFallback call — each model attempt
-  // inside the chain stays a single recorded effect.
-  const result = await runWithChainFallback(
-    {
-      stageName: 'clarify',
-      maxAttempts: deps.walkerConfig().max_attempts,
-      resolveModel: () => deps.resolveModelForStage('clarify'),
-      onBurn: ({ model, status }) => {
-        deps.runtimeBurnedModels.add(model);
-        console.warn(`[pipeline] clarify: ${model} hit ${status} (retryable); burning + falling back`);
-        deps.emit('project-event', {
-          source: 'routing',
-          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
-          level: 'warn',
-        });
-      },
+    inputResolver: (_question, qIndex) => {
+      // Dual-path answer wait (mirrors `runStageWithQA`). The in-process
+      // resolver (fired by `provideInput` via the WS `send-input` handler) is
+      // the live fast path. The durable signal on `clarifyAnswerChannel` is
+      // the backstop: `provideInput` enqueues the answer there too, so a
+      // dropped/misrouted in-process resolve still lands AND the wait survives
+      // a crash. Registering the channel arms `provideInput`'s enqueue for
+      // THIS question; it's per-(stage, question) so answering Q2 can't
+      // satisfy Q1. Without a durable store (`ctx` undefined / disabled),
+      // `ctx.waitForSignal` throws the passthrough → swallowed → in-process
+      // resolver wins (legacy behaviour preserved).
+      const inProcess = new Promise<string>((resolve) => {
+        deps.setInputResolve(resolve);
+      });
+      if (!ctx) return inProcess;
+      const channel = clarifyAnswerChannel(index, qIndex);
+      deps.setActiveClarifyChannel(channel);
+      return Promise.race([
+        ctx.waitForSignal<string>(channel).catch(deferToInProcessResolver),
+        inProcess,
+      ]);
     },
-    ctx
-      ? (model) => ctx.effect(
-          `clarify:run-for-project:${model}`,
-          async () => serializeAgentRunResult(await runOnce(model) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runOnce>>,
-        )
-      : runOnce,
-  );
+  });
 
   return {
     artifact: result.artifact,
@@ -451,6 +514,24 @@ async function runPerRepoStage(
   stage: StageDefinition,
   prevArtifact: string,
   ctx?: StepContext<string>,
+  /**
+   * H3 durable turn channel (see runOneStage). Each repo's agent run gets
+   * a per-repo SCOPED EffectRuntime (scopeTokens [repo]) so the concurrent
+   * Promise.all fan-out doesn't share one idx counter — turn sub-effects
+   * stay deterministic per repo on replay. Build's per-TASK path is NOT
+   * covered here (it needs per-task isolation inside the scheduler) and
+   * stays inert. Undefined → byte-identical pre-H3.
+   */
+  turnCtx?: StepContext<string>,
+  /**
+   * Extra scope token appended after [repoName] for the turn recorder, so a
+   * stage RE-RUN within one run (the validate→fix→REVALIDATE loop) records
+   * under a DISTINCT effect prefix (`repo:revalidate-N:`) instead of colliding
+   * with the initial run's `repo:turn:0:*` (a fresh scoped runtime would read
+   * the initial turns back → idempotency-hash mismatch → DeterminismViolation).
+   * The `validate` rollup is prefix-tolerant, so all runs still sum together.
+   */
+  scopeSuffix?: string,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   // Honor feature.scope — out-of-scope repos already marked 'skipped'
   // by P4. We iterate only the in-scope subset so the dispatch loop
@@ -459,7 +540,9 @@ async function runPerRepoStage(
   const repos = effectiveRepoNames(deps, stage.name);
 
   if (repos.length === 0) {
-    return runSingleStage(deps, index, stage, prevArtifact, ctx);
+    // Single-repo fallback is effectively single-stage (sequential) →
+    // hand it the durable turn ctx.
+    return runSingleStage(deps, index, stage, prevArtifact, turnCtx);
   }
 
   const promises: Promise<{
@@ -486,7 +569,7 @@ async function runPerRepoStage(
 
     if (stage.name === 'build' && stage.persona === 'engineer') {
       promises.push(
-        runBuildForRepo(deps, index, repoIdx, stage, repoName, repoPath, projectPrompt, ctx)
+        runBuildForRepo(deps, index, repoIdx, stage, repoName, repoPath, projectPrompt, ctx, turnCtx)
           .then((res) => ({
             repoName,
             artifact: res.artifact,
@@ -517,6 +600,15 @@ async function runPerRepoStage(
     const runner = makeAgentRunner(deps, stage.name);
     promises.push(
       (async () => {
+        // H3: per-repo durable turn recording. scopeTokens [repoName] →
+        // an isolated EffectRuntime + idx sequence for THIS repo, so racing
+        // repos don't collide under the shared step id. resolvePrefill
+        // reads this repo's partial back on a burn.
+        const wiring = await buildTurnWiring({
+          ctx: turnCtx,
+          eventStepId: stage.name,
+          scopeTokens: scopeSuffix ? [repoName, scopeSuffix] : [repoName],
+        });
         let result;
         try {
           const runOnce = async () => {
@@ -529,6 +621,8 @@ async function runPerRepoStage(
               allowedTools: deps.allowedToolsForCurrentStage(stage.name),
               maxOutputTokens: maxOutputTokensForStage(stage.name),
               repoName,
+              turnRecorder: wiring.turnRecorder,
+              resolvePrefill: wiring.resolvePrefill,
             });
             if (!r.output || r.output.trim().length < 50) {
               const err = new Error(
@@ -653,21 +747,19 @@ async function runBuildForRepo(
   repoPath: string,
   projectPrompt: string,
   ctx?: StepContext<string>,
+  /**
+   * H3 durable turn channel (per-task isolation). Build fans tasks out
+   * concurrently within a repo (maxConcurrent) AND repos run concurrently,
+   * so each task gets a recorder scoped `[repo, taskId]` (fallback `[repo]`)
+   * via `makeTurnWiring`. This REPLACES the old single-effect-per-task /
+   * per-repo wraps (which nested + were never durably exercised). Undefined
+   * → NullTurnRecorder (byte-identical pre-H3).
+   */
+  turnCtx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const repoArtifacts = loadRepoArtifactsFn(deps.depsForArtifactIO(), repoName);
 
   const runner = makeAgentRunner(deps, stage.name);
-  // Phase F2: per-task wrapper threads ctx.effect into the
-  // dependency-graph scheduler so each task spawn is its own
-  // recorded effect. The wrapper closes over ctx + repoName
-  // so the effect name disambiguates per-(repo, task).
-  const wrapTaskRun = ctx
-    ? <R>(taskId: string, fn: () => Promise<R>) => ctx.effect(
-        `build:spawn-task-${repoName}-${taskId}`,
-        async () => serializeAgentRunResult(await fn() as unknown as Record<string, unknown>) as unknown as R,
-        { idempotencyKey: `${ctx.runId}:${repoName}:${taskId}` },
-      )
-    : undefined;
   const buildOpts = {
     runner,
     project: deps.config.project,
@@ -686,19 +778,17 @@ async function runBuildForRepo(
     onProjectEvent: (level: 'info' | 'warn' | 'error', message: string) => {
       deps.emit('project-event', { source: 'pipeline', message, level });
     },
-    ...(wrapTaskRun ? { wrapTaskRun } : {}),
+    // Per-task durable wiring: scope [repo, taskId] (task) or [repo]
+    // (fallback). The scoped recorder's turn:N:* sub-effects become the
+    // top-level effects for that task — no outer wrap to nest inside.
+    makeTurnWiring: (taskId: string | null) =>
+      buildTurnWiring({
+        ctx: turnCtx,
+        eventStepId: 'build',
+        scopeTokens: taskId ? [repoName, taskId] : [repoName],
+      }),
   };
-  // Phase E5: durable wrap for per-repo build. Idempotency key
-  // includes the runId + repo to scope replay to this run.
-  // Per-task granularity is a future refinement (would require
-  // threading ctx through runBuildForOneRepo in core-pipeline).
-  const result = ctx
-    ? await ctx.effect(
-        `build:repo-${repoName}`,
-        async () => serializeAgentRunResult(await runBuildForOneRepo(buildOpts) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runBuildForOneRepo>>,
-        { idempotencyKey: `${ctx.runId}:${repoName}:build` },
-      )
-    : await runBuildForOneRepo(buildOpts);
+  const result = await runBuildForOneRepo(buildOpts);
 
   const repoStateDone = deps.state.stages[stageIndex].repos[repoIdx];
   if (repoStateDone) {
@@ -783,7 +873,12 @@ async function runStageWithQA(
   const projectPrompt = buildProjectPromptHelper(deps.getPromptContext(), stage);
   const qaPrompt = STAGE_QA_PROMPT_HEADER(maxQuestions) + baseUserPrompt;
 
-  const session = makeAgentSession(deps);
+  // H3 burn-aware session: per-phase chain-fallback + session-spanning turn
+  // recorder + coarse `${stage}:session:pN` ctx.effect crash-resume wraps live
+  // INSIDE the session (`ctx` → fallback config). The session's start() does
+  // its own coarse wrap, so we no longer wrap here; the durable Q&A wait
+  // (ctx.waitForSignal) stays between p0 (start) and p1 (resume).
+  const session = makeAgentSession(deps, ctx);
   const startReq = {
     persona: stage.persona,
     projectPrompt,
@@ -794,15 +889,7 @@ async function runStageWithQA(
     disallowedTools: disallowedToolsForPersona(stage.persona),
     maxOutputTokens: maxOutputTokensForStage(stage.name),
   };
-  // Phase E2: durable wrap for the Q&A session start. On replay the
-  // recorded first.output (questions or artifact) returns directly,
-  // skipping the agent spawn.
-  const first = ctx
-    ? await ctx.effect(
-        `${stage.name}:session-start`,
-        async () => serializeAgentRunResult(await session.start(startReq) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof session.start>>,
-      )
-    : await session.start(startReq);
+  const first = await session.start(startReq);
 
   if (first.agentId) {
     deps.state.stages[index].agentId = first.agentId;
@@ -842,21 +929,23 @@ async function runStageWithQA(
   }
   deps.emit('waiting-for-input', index, first.agentId ?? null);
 
-  // Phase E9: dual-path answer wait. When durable mode is on,
-  // ctx.waitForSignal reads from the durable signals queue (which
-  // `provideStageAnswer` populates alongside the in-process
-  // resolver Map for back-compat). This lets Q&A survive a
-  // process crash mid-wait — on replay the recorded answer
-  // payload returns without re-prompting the user.
-  //
-  // Non-durable mode keeps the resolver-Map behaviour unchanged.
-  // Project-level wait (no repoName). The channel name is built via the
-  // shared `stageAnswerChannel` helper so producer + consumer stay aligned
-  // when a future per-repo Q&A wait site is added — pass the repoName
-  // through both sides and the channel auto-suffixes with `:<repo>`.
+  // Dual-path answer wait. §H3 Fix A: on the FORWARD pass the dashboard
+  // Pipeline now runs WITH the module-singleton durable store, so
+  // `ctx.waitForSignal` reads the durable signals queue (Q&A survives a crash
+  // mid-wait WITHIN the process; cross-restart resume currently mints a fresh
+  // runId — see ADR §4.3.2 Fix A follow-up). When durable is disabled
+  // (ANVIL_DURABLE_DISABLED) the Pipeline gets no store → `ctx.waitForSignal`
+  // is the passthrough that THROWS — ONLY that specific rejection is swallowed
+  // (defer to the in-process resolver); a REAL durable rejection (store error /
+  // DeterminismViolation) propagates so the stage fails LOUD rather than
+  // hanging forever on the resolver. The in-process resolver (fired
+  // synchronously by provideStageAnswer alongside the signal enqueue) is the
+  // live answer path and normally wins the race. `stageAnswerChannel` keeps
+  // producer + consumer aligned (auto-suffixes `:<repo>` for a future per-repo Q&A).
+  // `deferToInProcessResolver` (module scope) is shared with clarify's Q&A wait.
   const answersBlock = ctx
     ? await Promise.race([
-        ctx.waitForSignal<string>(stageAnswerChannel(index, null)),
+        ctx.waitForSignal<string>(stageAnswerChannel(index, null)).catch(deferToInProcessResolver),
         new Promise<string>((resolve) => {
           deps.setStageInputResolver(index, null, resolve);
         }),
@@ -885,16 +974,11 @@ async function runStageWithQA(
   deps.state.waitingForInput = false;
   deps.broadcast();
 
-  // Phase E2: durable wrap for Q&A session resume. On replay the
-  // recorded artifact returns directly; the answers block was
-  // already in the recorded session-start payload so the agent
-  // doesn't see it twice.
-  const second = ctx
-    ? await ctx.effect(
-        `${stage.name}:session-resume`,
-        async () => serializeAgentRunResult(await session.sendInput(first.sessionId, answersBlock) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof session.sendInput>>,
-      )
-    : await session.sendInput(first.sessionId, answersBlock);
+  // Resume = phase p1. The session's sendInput does its own coarse
+  // `${stage}:session:p1` ctx.effect (crash-resume) + per-phase fallback.
+  // The answers block was already woven into the conversation by p0's
+  // recorded turns, so replay returns the recorded artifact directly.
+  const second = await session.sendInput(first.sessionId, answersBlock);
 
   return {
     artifact: second.output,
@@ -917,6 +1001,10 @@ async function runSingleStage(
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const qa = isQAEnabled(deps, stage.name);
   if (qa.enabled) {
+    // Q&A is a multi-turn session (start → durable wait → sendInput). The
+    // burn-aware session (turnCtx) records per-phase turns under `:session`,
+    // wraps each phase in a coarse ctx.effect for crash-resume, and keeps
+    // the durable Q&A wait between p0 and p1.
     return runStageWithQA(deps, index, stage, prevArtifact, qa.max, ctx);
   }
 
@@ -925,6 +1013,13 @@ async function runSingleStage(
   const projectPrompt = buildProjectPromptHelper(scopedCtx, stage);
 
   const runner = makeAgentRunner(deps, stage.name);
+  // H3 cutover: replace the single outer `${stage}:spawn-agent` effect
+  // with turn-level recording. The recorder emits turn:N:* sub-effects
+  // through ctx, so crash-resume skips completed turns + chain-fallback
+  // continues a burned model from its partial. resolvePrefill reads that
+  // partial back. Single-stage path → no scope tokens (one sequential
+  // agent). Non-durable (ctx undefined) → wiring is empty → unchanged.
+  const wiring = await buildTurnWiring({ ctx, eventStepId: stage.name });
   const runReq = {
     persona: stage.persona,
     projectPrompt,
@@ -934,15 +1029,10 @@ async function runSingleStage(
     allowedTools: deps.allowedToolsForCurrentStage(stage.name),
     disallowedTools: disallowedToolsForPersona(stage.persona),
     maxOutputTokens: maxOutputTokensForStage(stage.name),
+    turnRecorder: wiring.turnRecorder,
+    resolvePrefill: wiring.resolvePrefill,
   };
-  // Phase E2/E4: durable wrap for single-stage agent spawns
-  // (requirements when Q&A disabled, tasks, validate-without-fanout).
-  const result = ctx
-    ? await ctx.effect(
-        `${stage.name}:spawn-agent`,
-        async () => serializeAgentRunResult(await runner.run(runReq) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runner.run>>,
-      )
-    : await runner.run(runReq);
+  const result = await runner.run(runReq);
 
   if (result.agentId) {
     deps.state.stages[index].agentId = result.agentId;
@@ -1001,10 +1091,11 @@ async function runTestGenStage(
 
 async function runFixLoop(
   deps: StageOpsDeps,
-  _validateStageIndex: number,
+  validateStageIndex: number,
   validateArtifact: string,
   attempt: number,
-  ctx?: StepContext<string>,
+  ctx: StepContext<string> | undefined,
+  fixSessions: Map<string, AgentManagerSession>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
   const buildStage = STAGES.find((s) => s.name === 'build')!;
   // Fix-loop runs against build's effective set — no point fixing a
@@ -1014,11 +1105,36 @@ async function runFixLoop(
   for (const repoName of fixRepos) {
     repoPaths[repoName] = deps.repoPaths()[repoName] || join(deps.workspaceDir, repoName);
   }
-  const session = makeAgentSession(deps);
-  const runFixOnce = (model: string) => runFixLoopStep({
-    agentSession: session,
+
+  // §H3 fix-loop turn recording (per-repo step-body fallback). Each repo (and
+  // the single-repo path) gets its OWN burn-aware session: per-phase
+  // chain-fallback + a per-repo-scoped turn recorder (cost/provenance) +
+  // cross-attempt resume — moving the fallback INTO the per-repo loop (was a
+  // step-level outer `runWithChainFallback`, which couldn't carry a per-repo
+  // prefill/recorder). Sessions are cached across attempts (`fixSessions`,
+  // owned by the validate while-loop) so each recorder's turn counter stays
+  // monotonic across `sendInput` resumes. `coarseWrap:false` — the sessions run
+  // in parallel over one shared `ctx`, so the per-repo `ownRuntime` recorder is
+  // the isolation boundary (a coarse `ctx.effect` per repo would race). When
+  // `ctx` is undefined (non-durable) the session is inert (NullTurnRecorder),
+  // byte-identical to the legacy thin path. The enclosing stage label
+  // ('validate') makes fix-loop turns roll up under the validate step's
+  // `step:completed` cost (the runner reads `validate` + `validate:session`).
+  const sessionStage = STAGES[validateStageIndex]?.name ?? 'validate';
+  const sessionForRepo = (repoName: string | null): AgentManagerSession => {
+    const key = repoName ?? '__single__';
+    let session = fixSessions.get(key);
+    if (!session) {
+      session = makeAgentSession(deps, ctx, { coarseWrap: false });
+      fixSessions.set(key, session);
+    }
+    return session;
+  };
+
+  const result = await runFixLoopStep({
+    sessionForRepo,
     project: deps.config.project,
-    model,
+    model: deps.resolveModelForStage('fix-loop'),
     allowedTools: deps.allowedToolsForCurrentStage('fix-loop'),
     maxOutputTokens: maxOutputTokensForStage('build'),
     workspaceDir: deps.workspaceDir,
@@ -1026,6 +1142,10 @@ async function runFixLoop(
     repoPaths,
     validateArtifact,
     attempt,
+    sessionStage,
+    // Record under the enclosing 'validate' step (sessionStage) so cost rolls
+    // up there, but keep burn-fallback on the 'fix-loop' model chain.
+    fallbackStage: 'fix-loop',
     priorByRepo: deps.fixLoopAgentByRepo,
     priorSingleId: deps.getFixLoopAgentSingle(),
     buildProjectPromptForBuildStage: () => buildProjectPromptHelper(deps.getPromptContext(), buildStage),
@@ -1033,33 +1153,6 @@ async function runFixLoop(
       buildRepoProjectPromptHelper(deps.getPromptContext(), buildStage, repoName),
     isCancelled: () => deps.isCancelled(),
   });
-  // Phase E6: durable wrap for fix-loop attempts. Effect name
-  // includes the attempt number so successive fix iterations
-  // record distinct events; the per-step idx counter would also
-  // disambiguate, but the explicit attempt index is more
-  // diagnostic in the durable log.
-  const result = await runWithChainFallback(
-    {
-      stageName: 'fix-loop',
-      maxAttempts: deps.walkerConfig().max_attempts,
-      resolveModel: () => deps.resolveModelForStage('fix-loop'),
-      onBurn: ({ model, status }) => {
-        deps.runtimeBurnedModels.add(model);
-        console.warn(`[pipeline] fix-loop: ${model} hit ${status} (retryable); burning + falling back`);
-        deps.emit('project-event', {
-          source: 'routing',
-          message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
-          level: 'warn',
-        });
-      },
-    },
-    ctx
-      ? (model) => ctx.effect(
-          `validate:fix-attempt-${attempt}:${model}`,
-          async () => serializeAgentRunResult(await runFixOnce(model) as unknown as Record<string, unknown>) as unknown as Awaited<ReturnType<typeof runFixOnce>>,
-        )
-      : runFixOnce,
-  );
   if (result.newSingleId !== null) {
     deps.setFixLoopAgentSingle(result.newSingleId);
   }
@@ -1098,6 +1191,19 @@ export async function runOneStage(
    * Phase E1+ of the effect-site conversion plan.
    */
   ctx?: StepContext<string>,
+  /**
+   * H3 cutover — durable turn-level recording channel. SEPARATE from
+   * `ctx` (which the dashboard loop still leaves undefined, so every
+   * pre-existing `ctx.effect` / `ctx.waitForSignal` site in this body
+   * keeps its exact pre-H3 behavior). `turnCtx` is forwarded ONLY to the
+   * sequential single-stage path, which runs one agent at a time and is
+   * therefore replay-safe. The per-repo (parallel → shared idx), build
+   * (nested repo+task wraps) and session (multi-turn) paths need per-unit
+   * EffectRuntime isolation before they can emit interleaved turn
+   * sub-effects deterministically; until that lands they receive neither
+   * `ctx` nor `turnCtx`. See docs/TURN-LEVEL-DURABLE-RESUME-ADR.md §2.4.
+   */
+  turnCtx?: StepContext<string>,
 ): Promise<{
   control: 'continue' | 'next' | 'cancelled' | 'fail-early-return' | 'rewind';
   rewindTo?: number;
@@ -1166,7 +1272,9 @@ export async function runOneStage(
         return { control: 'continue', prevArtifact };
       }
       try {
-        const artifact = await runTestGenStage(deps, i, ctx);
+        // H3 staged activation: test-gen has its own per-spawn effect
+        // path; keep it inert (undefined) until ported. See dispatch note.
+        const artifact = await runTestGenStage(deps, i, undefined);
         deps.state.stages[i].status = 'completed';
         deps.state.stages[i].artifact = artifact;
         deps.state.stages[i].completedAt = new Date().toISOString();
@@ -1232,12 +1340,21 @@ export async function runOneStage(
     try {
       let result: { artifact: string; cost: number; tokens: StageTokenStats };
 
+      // H3 cutover — staged activation. `ctx` carries durable turn-level
+      // recording. It is forwarded ONLY to the single-stage path, which is
+      // SEQUENTIAL (one agent at a time) and therefore replay-safe. The
+      // per-repo path (parallel Promise.all → shared idx counter) and the
+      // session paths (multi-turn clarify/fix-loop) require per-unit
+      // EffectRuntime isolation before they can safely emit interleaved
+      // turn sub-effects; until that lands they run with ctx=undefined,
+      // i.e. byte-identical to pre-H3. See docs/TURN-LEVEL-DURABLE-RESUME-ADR.md §2.4.
       if (stage.name === 'clarify') {
-        result = await runClarifyStage(deps, i, ctx);
+        result = await runClarifyStage(deps, i, turnCtx);
       } else if (stage.perRepo && deps.state.repoNames.length > 0) {
-        result = await runPerRepoStage(deps, i, stage, prevArtifact, ctx);
+        result = await runPerRepoStage(deps, i, stage, prevArtifact, undefined, turnCtx);
       } else {
-        result = await runSingleStage(deps, i, stage, prevArtifact, ctx);
+        // Only the sequential single-stage path gets the durable turn ctx.
+        result = await runSingleStage(deps, i, stage, prevArtifact, turnCtx);
       }
 
       if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
@@ -1478,19 +1595,29 @@ export async function runOneStage(
         let validateArtifact = result.artifact;
         let fixAttempts = 0;
         const MAX_FIX_ATTEMPTS = 3;
+        // §H3: per-repo burn-aware fix-loop sessions, cached ACROSS attempts so
+        // each repo's turn recorder stays monotonic over `sendInput` resumes.
+        const fixSessions = new Map<string, AgentManagerSession>();
 
         while (fixAttempts < MAX_FIX_ATTEMPTS && hasValidationFailuresHelper(validateArtifact)) {
           fixAttempts++;
           console.log(`[pipeline] Validation failed — fix attempt ${fixAttempts}/${MAX_FIX_ATTEMPTS}`);
 
-          const fixResult = await runFixLoop(deps, i, validateArtifact, fixAttempts, ctx);
+          // §H3: fix-loop now records turn-level cost/provenance via per-repo
+          // burn-aware sessions (turnCtx threaded). The revalidate per-repo
+          // fan-out already records via `turnCtx`.
+          const fixResult = await runFixLoop(deps, i, validateArtifact, fixAttempts, turnCtx, fixSessions);
           deps.state.totalCost += fixResult.cost;
           deps.aggregateRunTokens(fixResult.tokens);
           deps.logCacheTelemetry(`${stage.name}:fix-${fixAttempts}`, fixResult.tokens);
 
           if (deps.isCancelled()) return { control: 'cancelled', prevArtifact };
 
-          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact, ctx);
+          // §H3 blocker fix: the revalidate records under a DISTINCT effect
+          // prefix per attempt (`repo:revalidate-N:`) so its scoped runtime
+          // doesn't read the initial validate's `repo:turn:0:*` back and trip
+          // a DeterminismViolation. The validate rollup is prefix-tolerant.
+          const revalidateResult = await runPerRepoStage(deps, i, stage, fixResult.artifact, undefined, turnCtx, `revalidate-${fixAttempts}`);
           validateArtifact = revalidateResult.artifact;
           deps.state.stages[i].artifact = validateArtifact;
           deps.state.stages[i].cost += revalidateResult.cost;

@@ -541,6 +541,12 @@ export type {
   VacuumStats,
   SQLiteDurableStoreOptions,
   LintViolation,
+  ModelCost,
+  StepCostRollup,
+  StepContinuation,
+  AssistantPartialRecord,
+  NewAssistantPartialRecord,
+  ThrowingSpyOptions,
 } from './durable/index.js';
 export {
   DeterminismViolationError,
@@ -559,6 +565,20 @@ export {
   seedStoreFromLog,
   throwingSpy,
   countingSpy,
+  DURABLE_WRITE_OPS,
+  // H3 turn-level resume + cost rollup + per-repo/task isolation primitive.
+  readCompletedTurns,
+  nextTurnSeed,
+  buildPrefillFromPartial,
+  reconstructSessionHistory,
+  estimatePrefillTokens,
+  rollupStepCostByModel,
+  rollupStepCostAcrossSubsteps,
+  mergeRollups,
+  rollupIsEmpty,
+  EffectRuntime,
+  createScopedEffectRuntime,
+  effectKeyMatchesScope,
 } from './durable/index.js';
 
 // — Stage Q&A primitives (used by clarify + per-stage questions panel)

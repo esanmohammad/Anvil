@@ -36,6 +36,11 @@ import type {
   ToolSchema,
 } from './types.js';
 import { emitContent, emitResult, emitToolResult, emitToolUse } from './stream-format.js';
+import { TurnRecorder, createNullTurnRecorder } from './turn-recorder/index.js';
+import type { NeutralToolResult, Provenance, TurnTokenUsage } from './turn-recorder/types.js';
+import { contentHashFromArgs } from './turn-recorder/hash.js';
+import { materializePrefill, materializePriorTurns } from './prefill/translate.js';
+import { stripForTarget } from './prefill/strip.js';
 
 const DEFAULT_MAX_ITERATIONS = 32;
 
@@ -138,6 +143,19 @@ interface AccumulatedToolCall {
   id: string;
   type: 'function';
   function: { name: string; arguments: string };
+}
+
+/**
+ * Live, mutable working state for one streamed turn. `consumeSSE` writes
+ * into this as deltas arrive, so the `run()` catch block can read the
+ * partial assistant text + in-flight tool_calls when the stream dies
+ * mid-output (v2 ADR §2.1.1 / §2.5 partial flush). Without surfacing
+ * this, the streamed text lived in a `consumeSSE` local that vanished
+ * on throw and `flushPartial` would persist an empty string.
+ */
+interface TurnAccumulator {
+  text: string;
+  toolCalls: Map<number, AccumulatedToolCall>;
 }
 
 interface ChatMessage {
@@ -268,10 +286,47 @@ export class OpenRouterAdapter implements ModelAdapter {
 
     const messages: ChatMessage[] = [];
     if (config.projectPrompt) messages.push({ role: 'system', content: config.projectPrompt });
+    // §Tier 2 stateful resume: re-present COMPLETED prior turns BEFORE this
+    // phase's user message so a non-claude session keeps full conversation
+    // context across start→sendInput. materializePriorTurns emits clean
+    // target-format messages (no vendor keys), so no stripForTarget is
+    // needed. Empty/undefined → byte-identical to the single-turn path.
+    if (config.priorMessages?.length) {
+      messages.push(...(materializePriorTurns(config.priorMessages, this.provider) as ChatMessage[]));
+    }
     messages.push({ role: 'user', content: config.userPrompt });
+
+    // Prefill continuation (v2 ADR §2.3): a prior chain entry burned
+    // mid-stream. Re-present its completed tool calls + partial
+    // assistant text in this provider's wire shape so this model
+    // continues from the exact character instead of regenerating. The
+    // recorded tool results are replayed (not re-executed) — their
+    // side effects already happened on the burned model. Strip applies
+    // any cross-vendor field removal; materialize emits OpenAI-compat
+    // shape (this adapter family).
+    if (config.prefill) {
+      const materialized = materializePrefill(config.prefill, this.provider) as ChatMessage[];
+      const safe = stripForTarget(materialized, {
+        sourceProvider: config.prefill.sourceProvider,
+        targetProvider: this.provider,
+      }) as ChatMessage[];
+      messages.push(...safe);
+    }
 
     const tools = config.toolExecutor ? mapSchemasToOpenAI(config.toolExecutor.listSchemas()) : undefined;
     const maxIter = config.maxToolIterations ?? DEFAULT_MAX_ITERATIONS;
+
+    // Turn-level durable recorder (v2 ADR §2.5). Defaults to a no-op
+    // recorder when the caller hasn't injected a real one — structural
+    // calls happen either way, persistence is gated on whether a real
+    // EffectRuntime + partial sink were threaded through the bridge.
+    // This is NOT a feature flag: it's the bridge between un-ported and
+    // ported call sites during the H1→H4 cutover. Once the pipeline
+    // injects a real recorder everywhere, this fallback drops out.
+    const recorder = config.turnRecorder ?? createNullTurnRecorder({
+      runId: config.sessionId,
+      stepId: config.stage,
+    });
 
     let aggregatedText = '';
     let totalIn = 0;
@@ -281,10 +336,127 @@ export class OpenRouterAdapter implements ModelAdapter {
     let openRouterCost = 0;
     let stopReason: string | undefined;
     let providerFinishReason: string | undefined;
+    // Track the current turn for catch-block flushPartial. -1 means
+    // we never opened a turn (catch fired before startTurn). `activeAcc`
+    // is the live accumulator runOneTurn writes into, so the catch reads
+    // whatever streamed before a mid-turn throw. `activeTurnSseComplete`
+    // flips true the instant runOneTurn returns (the SSE finished); the
+    // catch flushes a partial ONLY when this is false — i.e. the stream
+    // itself was interrupted, NOT when a post-stream step (endTurn, tool
+    // dispatch, an effect-runtime determinism error) throws after the
+    // turn's text was already fully received. Without this guard the
+    // catch would persist a "partial" carrying the COMPLETE turn text
+    // and mislabel its reason (review finding: spurious partial flush).
+    let activeTurnIdx = -1;
+    let activeAcc: TurnAccumulator | null = null;
+    let activeTurnSseComplete = false;
+    // §H3 burn sentinel: the provider-native messages appended SO FAR in the
+    // active turn (assistant msg + tool-result msgs). On a mid-stream burn the
+    // catch records these into a `stopReason:'burned'` assistant-end so replay
+    // re-appends them verbatim before re-burning. Reset at each live turn; []
+    // for the common case (runOneTurn burns before any message is appended).
+    let activeHistoryDelta: unknown[] = [];
 
     try {
       for (let iter = 0; iter < maxIter; iter++) {
-        const turn = await this.runOneTurn(apiKey, messages, tools, config, output, abortController.signal);
+        // The prefill (§2.3) is consumed on the FIRST turn only — it's the
+        // continuation handed by the chain walker after a burn. Turns 1+
+        // of this same adapter run are fresh, un-prefilled generations.
+        const turnPrefill = iter === 0 ? config.prefill : undefined;
+
+        const { turn: turnIdx, replayed } = await recorder.startTurn({
+          model: config.model,
+          provider: this.provider,
+          system: config.projectPrompt,
+          messages: messages.slice(),
+          prefill: turnPrefill,
+          // §Tier 2: record this phase's user prompt so a stateful resume can
+          // reconstruct prior turns WITH their prompts. Every turn of one
+          // run() carries the same prompt; reconstruction de-dupes per phase.
+          userPrompt: config.userPrompt,
+        });
+        activeTurnIdx = turnIdx;
+
+        // ── H3 replay-skip ────────────────────────────────────────────
+        // This turn's `assistant-end` is already in the durable log (a
+        // prior process ran it). Skip the upstream call entirely; re-append
+        // the EXACT recorded native history so the next turn's
+        // assistant-start hash matches, and re-issue runTool/endTurn in
+        // order so the replay cursor advances over the recorded sub-effects
+        // (exec never fires — recorded tool_results are returned verbatim).
+        if (replayed) {
+          activeTurnSseComplete = true; // no live SSE happened this turn
+
+          // §H3 burned-turn replay: this turn burned mid-stream live (its
+          // assistant-end is a `stopReason:'burned'` sentinel). Re-issue its
+          // recorded tool sub-effects in order (advancing the replay cursor;
+          // exec NEVER fires — recorded results are returned verbatim),
+          // re-record the sentinel end, then re-throw a retryable upstream
+          // error so the chain walker burns this model and continues to the
+          // next exactly as it did live. This keeps the model→turn mapping
+          // deterministic regardless of whether the transient error cleared.
+          if (replayed.stopReason === 'burned') {
+            for (const m of replayed.historyDelta) messages.push(m as ChatMessage);
+            for (const tu of replayed.toolUses) {
+              await recorder.runTool(
+                turnIdx, tu.name, tu.arguments, tu.idempotencyKey,
+                async () => { throw new Error(`replay invariant: exec ran for recorded burned-turn tool ${tu.name}`); },
+              );
+            }
+            await recorder.endTurn(
+              turnIdx, replayed.text, 'burned',
+              replayed.usage, replayed.provenance, replayed.historyDelta,
+            );
+            throw new _UpstreamError(
+              503,
+              `${this.provider} replayed burn for "${config.model}" (deterministic chain re-derivation)`,
+              { provider: this.provider, retryable: true },
+            );
+          }
+
+          aggregatedText += replayed.text;
+          totalIn += replayed.usage.inputTokens;
+          totalOut += replayed.usage.outputTokens;
+          totalCachedReadTokens += replayed.usage.cacheReadTokens ?? 0;
+          if (replayed.text) emitContent(output, replayed.text);
+
+          if (replayed.toolUses.length === 0 || !config.toolExecutor) {
+            stopReason = replayed.stopReason;
+            await recorder.endTurn(
+              turnIdx, replayed.text, replayed.stopReason,
+              replayed.usage, replayed.provenance, replayed.historyDelta,
+            );
+            break;
+          }
+
+          for (const m of replayed.historyDelta) messages.push(m as ChatMessage);
+          for (const tu of replayed.toolUses) {
+            emitToolUse(output, tu.name, tu.arguments, tu.id);
+            const r = await recorder.runTool(
+              turnIdx, tu.name, tu.arguments, tu.idempotencyKey,
+              async () => { throw new Error(`replay invariant: exec ran for recorded tool ${tu.name}`); },
+            );
+            const rc = typeof r.content === 'string' ? r.content : JSON.stringify(r.content);
+            emitToolResult(output, { toolUseId: tu.id, content: rc, isError: !r.ok });
+          }
+          await recorder.endTurn(
+            turnIdx, replayed.text, replayed.stopReason,
+            replayed.usage, replayed.provenance, replayed.historyDelta,
+          );
+          if (abortController.signal.aborted) { stopReason = 'aborted'; break; }
+          continue;
+        }
+
+        activeTurnSseComplete = false;
+        activeHistoryDelta = [];
+        const acc: TurnAccumulator = { text: '', toolCalls: new Map() };
+        activeAcc = acc;
+
+        const turn = await this.runOneTurn(apiKey, messages, tools, config, output, abortController.signal, acc);
+        // SSE finished cleanly for this turn — any throw past this point
+        // (endTurn, tool dispatch, effect determinism) is NOT a mid-stream
+        // burn, so the catch must not flush a spurious partial.
+        activeTurnSseComplete = true;
         aggregatedText += turn.text;
         totalIn += turn.inputTokens;
         totalOut += turn.outputTokens;
@@ -293,8 +465,21 @@ export class OpenRouterAdapter implements ModelAdapter {
         openRouterCost += turn.cost;
         if (turn.finishReason) providerFinishReason = turn.finishReason;
 
+        // §2.6 prefill cost: when this turn re-injected a prior model's
+        // text, carve out those tokens so the cost rollup can bill them to
+        // a separate reinjection bucket (sourceTokens is the durable count
+        // model A reported). §2.7 provenance: two segments when prefilled.
+        const usage: TurnTokenUsage = {
+          inputTokens: turn.inputTokens,
+          outputTokens: turn.outputTokens,
+          cacheReadTokens: turn.cachedReadTokens,
+          ...(turnPrefill ? { prefilledInputTokens: turnPrefill.sourceTokens } : {}),
+        };
+        const provenance = buildProvenance(config.model, this.provider, turn.text, turnPrefill);
+
         if (turn.toolCalls.length === 0 || !config.toolExecutor) {
           stopReason = turn.toolCalls.length === 0 ? 'end_turn' : 'tools_unsupported';
+          await recorder.endTurn(turnIdx, turn.text, stopReason, usage, provenance);
           break;
         }
 
@@ -316,7 +501,12 @@ export class OpenRouterAdapter implements ModelAdapter {
         // reasoning fields entirely — they're strict on unknown sibling
         // fields. Subclasses override `stripReasoningEcho()` to return
         // true and skip the echo. See anomalyco/opencode #14716.
-        messages.push({
+        // §H3 historyDelta: capture the EXACT native messages appended this
+        // turn so crash-resume re-appends them verbatim (recorded in
+        // assistant-end). Order matters — assistant message first, then
+        // each tool-result message — and must mirror the live push order.
+        const historyDelta: unknown[] = activeHistoryDelta;
+        const assistantMsg: ChatMessage = {
           role: 'assistant',
           content: turn.text || null,
           ...(this.stripReasoningEcho()
@@ -325,22 +515,54 @@ export class OpenRouterAdapter implements ModelAdapter {
               ? { reasoning_details: turn.reasoningDetails }
               : (turn.reasoning ? { reasoning: turn.reasoning } : {})),
           tool_calls: turn.toolCalls,
-        });
+        };
+        messages.push(assistantMsg);
+        historyDelta.push(assistantMsg);
 
         for (const tc of turn.toolCalls) {
           const args = parseArgs(tc.function.arguments);
           const call: ToolCall = { id: tc.id, name: tc.function.name, arguments: args };
           emitToolUse(output, call.name, args, tc.id);
 
-          const result = await invokeTool(config.toolExecutor, call, config.workingDir, abortController.signal);
-          emitToolResult(output, { toolUseId: tc.id, content: result.content, isError: result.isError });
+          const idempotencyKey = contentHashFromArgs({ name: call.name, arguments: args });
+          const neutralResult: NeutralToolResult = await recorder.runTool(
+            turnIdx,
+            call.name,
+            args,
+            idempotencyKey,
+            async () => {
+              const r = await invokeTool(config.toolExecutor!, call, config.workingDir, abortController.signal);
+              return {
+                toolUseId: tc.id,
+                toolName: call.name,
+                ok: !r.isError,
+                content: r.content,
+              };
+            },
+          );
 
-          messages.push({
+          const resultContent = typeof neutralResult.content === 'string'
+            ? neutralResult.content
+            : JSON.stringify(neutralResult.content);
+          emitToolResult(output, { toolUseId: tc.id, content: resultContent, isError: !neutralResult.ok });
+
+          const toolMsg: ChatMessage = {
             role: 'tool',
-            content: result.content,
+            content: resultContent,
             tool_call_id: tc.id,
-          });
+          };
+          messages.push(toolMsg);
+          historyDelta.push(toolMsg);
         }
+
+        await recorder.endTurn(
+          turnIdx,
+          turn.text,
+          turn.toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+          usage,
+          provenance,
+          historyDelta,
+        );
 
         if (abortController.signal.aborted) {
           stopReason = 'aborted';
@@ -348,6 +570,55 @@ export class OpenRouterAdapter implements ModelAdapter {
         }
       }
       if (stopReason === undefined) stopReason = 'iteration_limit';
+    } catch (err) {
+      // Best-effort partial flush: capture whatever the current turn
+      // managed to stream before the throw. NullTurnRecorder no-ops
+      // this; real recorders durably persist it for the chain walker
+      // to read. We swallow no errors — the upstream throw proceeds
+      // after the (synchronous) flushPartial returns.
+      //
+      // §2.1.1 truncation rule: only count tool_use blocks whose
+      // streamed `arguments` parse as clean JSON. A tool call cut off
+      // mid-args (unparseable) is NOT counted and NOT replayed — model
+      // B re-decides whether to call it. `text` is whatever streamed.
+      if (activeTurnIdx >= 0 && activeAcc && !activeTurnSseComplete) {
+        // Only a genuine mid-stream interruption gets a partial. By the
+        // time we flush, any non-abort failure is an upstream/network
+        // interruption (a socket drop surfaces as a bare TypeError from
+        // consumeSSE's reader, NOT an UpstreamError — so the old
+        // `err.name === 'UpstreamError'` check mislabeled those as
+        // 'timeout'). Collapse to abort-vs-upstream.
+        const reason: 'abort' | 'upstream' = abortController.signal.aborted ? 'abort' : 'upstream';
+        recorder.flushPartial(
+          activeTurnIdx,
+          activeAcc.text,
+          countParsedToolUses(activeAcc.toolCalls),
+          reason,
+        );
+        // §H3 burn sentinel: record a `stopReason:'burned'` assistant-end for
+        // the interrupted turn so crash-resume replays it deterministically.
+        // On replay startTurn sees this end → the replay-skip branch re-issues
+        // the recorded tool sub-effects (advancing the cursor), re-appends
+        // historyDelta, then re-throws so chain-fallback re-derives the SAME
+        // model→turn mapping it had live — independent of whether the
+        // transient upstream error has since cleared. Without it a recovered
+        // model would complete the turn live (writing a NEW assistant-end) and
+        // collide with the recorded continuation turn → DeterminismViolation.
+        // Only genuine upstream burns get a sentinel; an abort (cancellation)
+        // must stay resumable as a fresh turn. usage:{} so the per-model cost
+        // rollup prices the burn via the partial (output estimate), not twice.
+        if (reason === 'upstream') {
+          await recorder.endTurn(
+            activeTurnIdx,
+            activeAcc.text,
+            'burned',
+            { inputTokens: 0, outputTokens: 0 },
+            { segments: [] },
+            activeHistoryDelta,
+          );
+        }
+      }
+      throw err;
     } finally {
       this.activeControllers.delete(abortController);
     }
@@ -423,6 +694,10 @@ export class OpenRouterAdapter implements ModelAdapter {
     config: ModelAdapterConfig,
     output: NodeJS.WritableStream,
     signal: AbortSignal,
+    /** Live working state — written as deltas stream so a mid-stream
+     *  throw still leaves the partial text/tool_calls readable by the
+     *  caller's catch block. */
+    acc: TurnAccumulator,
   ): Promise<{
     text: string;
     reasoning: string;
@@ -487,7 +762,7 @@ export class OpenRouterAdapter implements ModelAdapter {
     }
     if (!response.body) throw new _UpstreamError(0, `${this.provider} returned no response body`, { provider: this.provider });
 
-    return this.consumeSSE(response, output);
+    return this.consumeSSE(response, output, signal, acc);
   }
 
   /**
@@ -498,6 +773,8 @@ export class OpenRouterAdapter implements ModelAdapter {
   private async consumeSSE(
     response: Response,
     output: NodeJS.WritableStream,
+    signal: AbortSignal,
+    acc: TurnAccumulator,
   ): Promise<{
     text: string;
     reasoning: string;
@@ -510,7 +787,6 @@ export class OpenRouterAdapter implements ModelAdapter {
     cost: number;
     finishReason: string | undefined;
   }> {
-    let text = '';
     let reasoning = '';
     const reasoningDetails: ReasoningDetail[] = [];
     let inputTokens = 0;
@@ -519,7 +795,9 @@ export class OpenRouterAdapter implements ModelAdapter {
     let reasoningTokens = 0;
     let cost = 0;
     let finishReason: string | undefined;
-    const toolCallsByIndex = new Map<number, AccumulatedToolCall>();
+    // Text + tool_calls live on the shared accumulator (not locals) so a
+    // mid-stream throw leaves them readable by run()'s catch (§2.1 / §2.5).
+    const toolCallsByIndex = acc.toolCalls;
 
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
@@ -546,6 +824,14 @@ export class OpenRouterAdapter implements ModelAdapter {
       buffer = lines.pop() ?? '';
 
       for (const line of lines) {
+        // Abort latch (§2.1.2): once the per-call signal has aborted,
+        // drop every remaining delta. A pull-reader normally rejects on
+        // abort, but a final frame can still be buffered in `lines` from
+        // the last successful read() — this guarantees post-abort deltas
+        // never mutate the accumulator (which would corrupt the partial
+        // we're about to flush).
+        if (signal.aborted) break;
+
         const trimmed = line.trim();
         if (!trimmed || trimmed.startsWith(':')) continue;          // empty / SSE comment
         if (!trimmed.startsWith('data: ')) continue;
@@ -562,7 +848,7 @@ export class OpenRouterAdapter implements ModelAdapter {
         const choice = chunk.choices?.[0];
         const delta = choice?.delta;
         if (delta?.content) {
-          text += delta.content;
+          acc.text += delta.content;
           pendingText += delta.content;
           // Split the accumulated buffer on newlines so the flush is
           // always anchored at a natural line boundary; emit each
@@ -643,7 +929,7 @@ export class OpenRouterAdapter implements ModelAdapter {
       .map(([, v]) => v);
 
     return {
-      text,
+      text: acc.text,
       reasoning,
       reasoningDetails: reasoningDetails.filter(Boolean),
       toolCalls,
@@ -708,4 +994,57 @@ function countToolCalls(messages: ChatMessage[]): number {
     if (m.role === 'assistant' && m.tool_calls) n += m.tool_calls.length;
   }
   return n;
+}
+
+/**
+ * §2.1.1 mid-`tool_use` truncation rule. Counts only the streamed
+ * tool_calls whose `arguments` parse as clean, complete JSON AND that
+ * carry a non-empty name. A tool call cut off mid-args (e.g. the stream
+ * died at `{"path": "src/fo`) is unparseable and excluded — it must NOT
+ * be replayed against partial JSON; the next model re-decides. Empty
+ * `arguments` is treated as the valid empty-object call `{}`.
+ */
+function countParsedToolUses(toolCalls: Map<number, AccumulatedToolCall>): number {
+  let n = 0;
+  for (const tc of toolCalls.values()) {
+    if (!tc.function.name) continue;
+    const raw = tc.function.arguments;
+    if (raw === '' ) { n += 1; continue; }
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed !== null && typeof parsed === 'object') n += 1;
+    } catch {
+      // unparseable / truncated args — drop per §2.1.1
+    }
+  }
+  return n;
+}
+
+/**
+ * §2.7 provenance. Without a prefill: one `live` segment covering the
+ * model's full output. WITH a prefill (a chain-fallback resume): two
+ * segments over the LOGICAL combined text — `[0, prefill.len)` attributed
+ * to the source model as `prefill`, `[prefill.len, prefill.len+live.len)`
+ * attributed to the live model. Ranges are CHARACTER offsets, contiguous
+ * and non-overlapping (replay reads them back verbatim). An empty live
+ * continuation yields a zero-width live segment, which is valid.
+ */
+function buildProvenance(
+  model: string,
+  provider: ProviderName,
+  liveText: string,
+  prefill?: { text: string; sourceProvider: ProviderName; sourceModel?: string },
+): Provenance {
+  if (prefill && prefill.text.length > 0) {
+    const cut = prefill.text.length;
+    return {
+      segments: [
+        { model: prefill.sourceModel ?? 'unknown', provider: prefill.sourceProvider, range: [0, cut], source: 'prefill' },
+        { model, provider, range: [cut, cut + liveText.length], source: 'live' },
+      ],
+    };
+  }
+  return {
+    segments: [{ model, provider, range: [0, liveText.length], source: 'live' }],
+  };
 }

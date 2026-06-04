@@ -216,6 +216,52 @@ function toPipelineData(pipeline: DashboardPipeline | null): PipelineData | null
 }
 
 let activityIdCounter = 0;
+/** §H3 — one step's per-model rollup as carried by `pipeline-step-cost`. */
+interface StepCostByModelUi {
+  costByModel: Record<string, {
+    model: string;
+    provider?: string;
+    costUsd: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    prefilledInputTokens: number;
+  }>;
+  prefillReinjectionUsd: number;
+  totalCostUsd: number;
+}
+
+/**
+ * Aggregate a run's per-step rollups into one per-model breakdown. Summed
+ * across steps (last-wins per step is handled upstream by keying on stepId),
+ * so a run that burned model A on one stage and continued on B shows both
+ * models with their combined spend + the total re-injection cost.
+ */
+function aggregateRunModelCost(
+  steps: Record<string, StepCostByModelUi> | undefined,
+): {
+  costByModel: Record<string, { model: string; costUsd: number; prefilledInputTokens: number }>;
+  prefillReinjectionUsd: number;
+  totalCostUsd: number;
+} {
+  const costByModel: Record<string, { model: string; costUsd: number; prefilledInputTokens: number }> = {};
+  let prefillReinjectionUsd = 0;
+  let totalCostUsd = 0;
+  if (steps) {
+    for (const step of Object.values(steps)) {
+      prefillReinjectionUsd += step.prefillReinjectionUsd ?? 0;
+      totalCostUsd += step.totalCostUsd ?? 0;
+      for (const m of Object.values(step.costByModel)) {
+        const b = costByModel[m.model] ?? (costByModel[m.model] = { model: m.model, costUsd: 0, prefilledInputTokens: 0 });
+        b.costUsd += m.costUsd;
+        b.prefilledInputTokens += m.prefilledInputTokens ?? 0;
+      }
+    }
+  }
+  return { costByModel, prefillReinjectionUsd, totalCostUsd };
+}
+
 function toActivityEntry(entry: AgentOutputEntry): ActivityEntry {
   const kind = entry.kind ?? (entry.type === 'stderr' ? 'stderr' : 'text');
   let tool: string | undefined = entry.tool;
@@ -328,6 +374,11 @@ function App() {
   const [breachModalOpen, setBreachModalOpen] = useState<boolean>(false);
   const [breachDismissed, setBreachDismissed] = useState<boolean>(false);
   const [runCost, setRunCost] = useState<{ runId: string; usd: number; limitUsd?: number; perStageUsd: Record<string, number> } | null>(null);
+  // §H3 per-model step cost, keyed runId → stepId → rollup. Accumulated from
+  // `pipeline-step-cost` pushes; aggregated per-run at render for the
+  // CostMeter breakdown. Keyed by runId so entries are naturally scoped and
+  // stale runs never bleed into the viewed run.
+  const [runStepCosts, setRunStepCosts] = useState<Record<string, Record<string, StepCostByModelUi>>>({});
   // Local UI state for the paused-run review modal. The pause data itself
   // comes from the usePausedRuns hook below — this only tracks whether the
   // user clicked "Review" on the banner.
@@ -554,6 +605,30 @@ function App() {
           const runId = snap.runId;
           const run = snap.run;
           setRunCost(() => ({ runId, usd: run.usd, limitUsd: run.limitUsd, perStageUsd: run.perStageUsd }));
+        }
+        break;
+      }
+
+      case 'pipeline-step-cost': {
+        // §H3 per-model step cost. Keyed by stepId so a re-run of a stage
+        // (reviewer rewind) replaces — not double-counts — that step's bucket.
+        const p = (msg.payload && typeof msg.payload === 'object'
+          ? msg.payload as { runId?: string; stepId?: string } & StepCostByModelUi
+          : null);
+        if (p?.runId && p.stepId) {
+          const runId = p.runId;
+          const stepId = p.stepId;
+          setRunStepCosts((prev) => ({
+            ...prev,
+            [runId]: {
+              ...(prev[runId] ?? {}),
+              [stepId]: {
+                costByModel: p.costByModel ?? {},
+                prefillReinjectionUsd: p.prefillReinjectionUsd ?? 0,
+                totalCostUsd: p.totalCostUsd ?? 0,
+              },
+            },
+          }));
         }
         break;
       }
@@ -1318,6 +1393,11 @@ function App() {
         }
 
         const showStageSpend = runCost && runCost.runId === urlRunId && Object.values(runCost.perStageUsd).some((v) => v > 0);
+        // §H3 per-model breakdown for the viewed run (turn-level rollup).
+        const runModelCost = aggregateRunModelCost(urlRunId ? runStepCosts[urlRunId] : undefined);
+        const hasModelBreakdown = Object.keys(runModelCost.costByModel).length > 0;
+        const meterTotalUsd = runCost && runCost.runId === urlRunId ? runCost.usd : runModelCost.totalCostUsd;
+        const meterLimitUsd = runCost && runCost.runId === urlRunId ? (runCost.limitUsd ?? 0) : 0;
         return (
           <div style={{ height: '100%', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
             {activePause && (
@@ -1327,15 +1407,25 @@ function App() {
                 onCancel={() => pausedRunsState.resume(activePause.pause.runId, 'cancel')}
               />
             )}
-            {showStageSpend && runCost && (
+            {(showStageSpend || hasModelBreakdown) && (
               <div style={{
                 padding: '8px 16px', borderBottom: '1px solid var(--separator)',
-                display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0,
+                display: 'flex', alignItems: 'flex-start', gap: 16, flexShrink: 0,
                 background: 'var(--bg-elevated-1)',
               }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <StageSpendPanel perStageUsd={runCost.perStageUsd} totalUsd={runCost.usd} defaultCollapsed />
-                </div>
+                {showStageSpend && runCost && (
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <StageSpendPanel perStageUsd={runCost.perStageUsd} totalUsd={runCost.usd} defaultCollapsed />
+                  </div>
+                )}
+                {hasModelBreakdown && (
+                  <CostMeter
+                    totalUsd={meterTotalUsd}
+                    limitUsd={meterLimitUsd}
+                    costByModel={runModelCost.costByModel}
+                    prefillReinjectionUsd={runModelCost.prefillReinjectionUsd}
+                  />
+                )}
               </div>
             )}
             {runActivities.length === 0 ? (

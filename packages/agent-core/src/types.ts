@@ -219,6 +219,34 @@ export interface ModelAdapterConfig {
    * ADR §C5.
    */
   mcpConfigPath?: string;
+  /**
+   * Turn-level durable recorder (v2 ADR §2.5). When supplied by the
+   * caller, the adapter splits its LLM invocation into per-turn
+   * sub-effects (`assistant-start` / `tool_use:N` / `tool_result:N` /
+   * `assistant-end`) recorded against the caller's `EffectRuntime`.
+   * When absent, adapters construct a `NullTurnRecorder` internally —
+   * structural calls still happen so the code path is the same, but
+   * nothing is persisted. This is sequencing, NOT a feature flag:
+   * adapter ports happen one phase at a time; un-ported adapters keep
+   * their current path until their phase lands.
+   */
+  turnRecorder?: import('./turn-recorder/index.js').TurnRecorder;
+  /**
+   * Prefill from a prior model that burned mid-stream (v2 ADR §2.3).
+   * When present, the adapter materializes the trailing-assistant +
+   * recorded tool-result history into its provider's wire format and
+   * continues from the exact character where the prior model stopped.
+   */
+  prefill?: import('./turn-recorder/index.js').Prefill;
+  /**
+   * §Tier 2 — COMPLETED prior turns of a stateful session, reconstructed
+   * from the durable log. Spliced (materialized into this provider's wire
+   * format) BEFORE the new user message so a non-claude session resume
+   * re-presents the full conversation instead of starting fresh. Claude
+   * uses native `--resume` and is gated out at the bridge. Empty/undefined
+   * → unchanged single-turn behavior.
+   */
+  priorMessages?: import('./turn-recorder/index.js').PrefillTurn[];
 }
 
 // `toolExecutor` is structurally typed here to keep `types.ts` free of

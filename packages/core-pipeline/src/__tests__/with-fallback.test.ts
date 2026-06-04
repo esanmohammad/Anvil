@@ -90,6 +90,99 @@ describe('runWithChainFallback', () => {
   });
 });
 
+describe('runWithChainFallback — prefix-aware resume (H2 §2.3/§2.4)', () => {
+  it('passes prefill resolved after a burn into the NEXT attempt', async () => {
+    const seenPrefill: Array<unknown> = [];
+    const sequence = ['m1', 'm2'];
+    let i = 0;
+    const out = await runWithChainFallback<string, { text: string }>(
+      {
+        stageName: 's',
+        resolveModel: (excl) => sequence.find((s) => !excl.has(s))!,
+        // Simulate reading the burned model's partial from the store.
+        resolvePrefill: async ({ burnedModel, attemptIndex }) => ({
+          text: `partial-from-${burnedModel}@${attemptIndex}`,
+        }),
+      },
+      async (model, prefill) => {
+        seenPrefill.push(prefill);
+        i += 1;
+        if (i < 2) throw new TestUpstream(503, true);
+        return `done:${model}`;
+      },
+    );
+    assert.equal(out, 'done:m2');
+    // First attempt: no prefill. Second attempt: prefill from m1's burn.
+    assert.equal(seenPrefill[0], undefined);
+    assert.deepEqual(seenPrefill[1], { text: 'partial-from-m1@1' });
+  });
+
+  it('falls back to a prefill-less retry when resolvePrefill throws', async () => {
+    const seenPrefill: Array<unknown> = [];
+    const sequence = ['m1', 'm2'];
+    let i = 0;
+    const out = await runWithChainFallback<string, { text: string }>(
+      {
+        stageName: 's',
+        resolveModel: (excl) => sequence.find((s) => !excl.has(s))!,
+        resolvePrefill: async () => { throw new Error('store read failed'); },
+      },
+      async (model, prefill) => {
+        seenPrefill.push(prefill);
+        i += 1;
+        if (i < 2) throw new TestUpstream(503, true);
+        return `done:${model}`;
+      },
+    );
+    assert.equal(out, 'done:m2');
+    assert.equal(seenPrefill[1], undefined, 'failed prefill read → clean retry, not a failed run');
+  });
+
+  it('passes the resolved nextModel into resolvePrefill (§2.3.3 truncation budget)', async () => {
+    const infos: Array<{ burnedModel: string; attemptIndex: number; nextModel?: string }> = [];
+    const sequence = ['m1', 'm2'];
+    let i = 0;
+    const out = await runWithChainFallback<string, { text: string }>(
+      {
+        stageName: 's',
+        resolveModel: (excl) => sequence.find((s) => !excl.has(s))!,
+        resolvePrefill: async (info) => {
+          infos.push(info);
+          return { text: 'p' };
+        },
+      },
+      async (model) => {
+        i += 1;
+        if (i < 2) throw new TestUpstream(503, true);
+        return `done:${model}`;
+      },
+    );
+    assert.equal(out, 'done:m2');
+    assert.equal(infos.length, 1, 'resolvePrefill called once (after the single burn)');
+    assert.deepEqual(infos[0], { burnedModel: 'm1', attemptIndex: 1, nextModel: 'm2' },
+      'resolver sees the burned model AND the target it will be served to');
+  });
+
+  it('never resolves a prefill when none is wired (legacy behavior)', async () => {
+    const seenPrefill: Array<unknown> = [];
+    const sequence = ['m1', 'm2'];
+    let i = 0;
+    await runWithChainFallback(
+      {
+        stageName: 's',
+        resolveModel: (excl) => sequence.find((s) => !excl.has(s))!,
+      },
+      async (model, prefill) => {
+        seenPrefill.push(prefill);
+        i += 1;
+        if (i < 2) throw new TestUpstream(503, true);
+        return `done:${model}`;
+      },
+    );
+    assert.deepEqual(seenPrefill, [undefined, undefined]);
+  });
+});
+
 describe('isRetryableUpstreamError', () => {
   it('matches explicit retryable=true', () => {
     assert.equal(isRetryableUpstreamError(new TestUpstream(503, true)), true);

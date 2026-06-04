@@ -67,6 +67,11 @@ export function roomsForEvent(ev) {
             : ['global'];
     })
         .with({ kind: 'pipeline.waiting-for-input' }, () => ['global'])
+        .with({ kind: 'pipeline.step-cost' }, ({ payload }) => [
+        'global',
+        'cost',
+        `run:${payload.runId}`,
+    ])
         // ── Cost ─────────────────────────────────────────────────────────
         .with({ kind: 'cost.breach' }, () => ['global', 'cost'])
         .with({ kind: 'cost.snapshot' }, ({ payload }) => {

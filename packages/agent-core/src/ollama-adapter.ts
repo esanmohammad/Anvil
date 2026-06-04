@@ -36,6 +36,9 @@ import { emitContent, emitResult, emitToolResult, emitToolUse } from './stream-f
 import { LocalExecutor, localExecutor } from './router/local-executor.js';
 import { UpstreamError } from './upstream-error.js';
 import { getFetchPool, recycleFetchPoolOnFailure } from './fetch-pool.js';
+import { TurnRecorder, createNullTurnRecorder } from './turn-recorder/index.js';
+import { contentHashFromArgs } from './turn-recorder/hash.js';
+import type { NeutralToolResult, Provenance, TurnTokenUsage } from './turn-recorder/types.js';
 
 const DEFAULT_MAX_ITERATIONS = 32;
 const DEFAULT_CONTEXT_WINDOW = 16_384;
@@ -221,6 +224,23 @@ export class OllamaAdapter implements ModelAdapter {
     let totalDurMs = 0;
     let stopReason: string | undefined;
 
+    // §H4 cross-vendor turn recording — mirrors the OpenRouter agentic port
+    // (startTurn → replay-skip → live tool-loop with runTool → endTurn, plus a
+    // burned-sentinel on a mid-turn upstream burn). Records every turn so a
+    // later resume can reconstruct history; HONORS `replayed` on a same-runId
+    // resume so the recorded tool effects re-issue in order (exec never fires)
+    // instead of re-running live and tripping a DeterminismViolation. NullTurn-
+    // Recorder no-ops without a durable recorder.
+    const recorder = config.turnRecorder ?? createNullTurnRecorder({
+      runId: config.sessionId,
+      stepId: config.stage,
+    });
+    let activeTurnIdx = -1;
+    // false while runOneTurn is streaming → a throw here is a mid-stream burn
+    // (record a sentinel). true once it returns → a later throw (endTurn /
+    // determinism) must propagate untouched, never get a spurious sentinel.
+    let activeTurnComplete = true;
+
     try {
       for (let iter = 0; iter < maxIter; iter++) {
         // Bound conversation history before each turn. Drops oldest
@@ -229,24 +249,111 @@ export class OllamaAdapter implements ModelAdapter {
         // If trimming can't bring history below num_ctx, escalate.
         trimHistoryIfNeeded(messages, numCtx, config.model);
 
+        const { turn: turnIdx, replayed } = await recorder.startTurn({
+          model: config.model,
+          provider: 'ollama',
+          system: config.projectPrompt,
+          messages: messages.slice(),
+          userPrompt: config.userPrompt,
+        });
+        activeTurnIdx = turnIdx;
+
+        // ── H3 replay-skip ────────────────────────────────────────────
+        // This turn's assistant-end is already in the durable log. Skip the
+        // upstream call; re-append the EXACT recorded native history (so the
+        // next turn's assistant-start hash matches) and re-issue runTool in
+        // order so the replay cursor advances (exec never fires — recorded
+        // tool_results return verbatim).
+        if (replayed) {
+          // Burned sentinel: this turn burned mid-stream live. Re-issue its
+          // recorded sub-effects (none for ollama — burns happen before any
+          // runTool), re-record the sentinel, then re-throw a retryable
+          // upstream error so the chain walker re-derives the SAME model→turn
+          // mapping it had live, independent of whether the error cleared.
+          if (replayed.stopReason === 'burned') {
+            for (const m of replayed.historyDelta) messages.push(m as ChatMessage);
+            for (const tu of replayed.toolUses) {
+              await recorder.runTool(
+                turnIdx, tu.name, tu.arguments, tu.idempotencyKey,
+                async () => { throw new Error(`replay invariant: exec ran for recorded burned-turn tool ${tu.name}`); },
+              );
+            }
+            await recorder.endTurn(
+              turnIdx, replayed.text, 'burned',
+              replayed.usage, replayed.provenance, replayed.historyDelta,
+            );
+            throw new UpstreamError(
+              503,
+              `ollama replayed burn for "${config.model}" (deterministic chain re-derivation)`,
+              { provider: 'ollama', retryable: true },
+            );
+          }
+
+          aggregatedText += replayed.text;
+          totalIn += replayed.usage.inputTokens;
+          totalOut += replayed.usage.outputTokens;
+          if (replayed.text) emitContent(output, replayed.text);
+
+          if (replayed.toolUses.length === 0 || !config.toolExecutor) {
+            stopReason = replayed.stopReason;
+            await recorder.endTurn(
+              turnIdx, replayed.text, replayed.stopReason,
+              replayed.usage, replayed.provenance, replayed.historyDelta,
+            );
+            break;
+          }
+
+          for (const m of replayed.historyDelta) messages.push(m as ChatMessage);
+          for (const tu of replayed.toolUses) {
+            emitToolUse(output, tu.name, tu.arguments, tu.id);
+            const r = await recorder.runTool(
+              turnIdx, tu.name, tu.arguments, tu.idempotencyKey,
+              async () => { throw new Error(`replay invariant: exec ran for recorded tool ${tu.name}`); },
+            );
+            const rc = typeof r.content === 'string' ? r.content : JSON.stringify(r.content);
+            emitToolResult(output, { toolUseId: tu.id, content: rc, isError: !r.ok });
+          }
+          await recorder.endTurn(
+            turnIdx, replayed.text, replayed.stopReason,
+            replayed.usage, replayed.provenance, replayed.historyDelta,
+          );
+          if (abortController.signal.aborted) { stopReason = 'aborted'; break; }
+          continue;
+        }
+
+        // ── live ──────────────────────────────────────────────────────
+        activeTurnComplete = false;
         const turn = await this.runOneTurn(messages, tools, numCtx, config, output, abortController.signal);
+        activeTurnComplete = true;
         aggregatedText += turn.text;
         totalIn += turn.inputTokens;
         totalOut += turn.outputTokens;
         totalDurMs += turn.durationMs;
 
+        const usage: TurnTokenUsage = { inputTokens: turn.inputTokens, outputTokens: turn.outputTokens };
+        const provenance: Provenance = {
+          segments: [{ model: config.model, provider: 'ollama', range: [0, turn.text.length], source: 'live' }],
+        };
+
         if (turn.toolCalls.length === 0 || !config.toolExecutor) {
           stopReason = turn.toolCalls.length === 0 ? 'end_turn' : 'tools_unsupported';
+          await recorder.endTurn(turnIdx, turn.text, stopReason, usage, provenance);
           break;
         }
 
         // Append the assistant's tool-call turn to history so the model
-        // sees its own request when we re-prompt with results.
-        messages.push({
+        // sees its own request when we re-prompt with results. Track the
+        // exact native messages appended this turn as `historyDelta` so
+        // crash-resume re-appends them verbatim (order: assistant, then each
+        // tool-result — mirroring the live push order).
+        const historyDelta: unknown[] = [];
+        const assistantMsg: ChatMessage = {
           role: 'assistant',
           content: turn.text,
           tool_calls: turn.toolCalls,
-        });
+        };
+        messages.push(assistantMsg);
+        historyDelta.push(assistantMsg);
 
         // Execute every tool call. Sequential — parallel exec via the
         // builtin executor is safe today (each tool is independent),
@@ -258,15 +365,29 @@ export class OllamaAdapter implements ModelAdapter {
           const call: ToolCall = { id: callId, name: toolCall.function.name, arguments: args };
           emitToolUse(output, call.name, args, callId);
 
-          const result = await invokeTool(config.toolExecutor, call, config.workingDir, abortController.signal);
-          emitToolResult(output, { toolUseId: callId, content: result.content, isError: result.isError });
+          const idempotencyKey = contentHashFromArgs({ name: call.name, arguments: args });
+          const neutralResult: NeutralToolResult = await recorder.runTool(
+            turnIdx, call.name, args, idempotencyKey,
+            async () => {
+              const r = await invokeTool(config.toolExecutor!, call, config.workingDir, abortController.signal);
+              return { toolUseId: callId, toolName: call.name, ok: !r.isError, content: r.content };
+            },
+          );
+          const resultContent = typeof neutralResult.content === 'string'
+            ? neutralResult.content
+            : JSON.stringify(neutralResult.content);
+          emitToolResult(output, { toolUseId: callId, content: resultContent, isError: !neutralResult.ok });
 
-          messages.push({
+          const toolMsg: ChatMessage = {
             role: 'tool',
-            content: result.content,
+            content: resultContent,
             tool_call_id: callId,
-          });
+          };
+          messages.push(toolMsg);
+          historyDelta.push(toolMsg);
         }
+
+        await recorder.endTurn(turnIdx, turn.text, 'tool_use', usage, provenance, historyDelta);
 
         if (abortController.signal.aborted) {
           stopReason = 'aborted';
@@ -274,6 +395,22 @@ export class OllamaAdapter implements ModelAdapter {
         }
       }
       if (stopReason === undefined) stopReason = 'iteration_limit';
+    } catch (err) {
+      // §H3 burn sentinel: a mid-stream upstream burn (runOneTurn threw before
+      // returning). Record a `stopReason:'burned'` assistant-end for the
+      // active turn so a same-runId resume replays it deterministically
+      // (re-throws here) and the chain walker re-derives the identical
+      // model→turn mapping. ollama records no tool effects until runOneTurn
+      // returns, so the burned turn carries empty historyDelta + toolUses.
+      // Only genuine mid-stream burns (NOT aborts, NOT post-turn throws like a
+      // DeterminismViolation) get a sentinel.
+      if (activeTurnIdx >= 0 && !activeTurnComplete && !abortController.signal.aborted) {
+        await recorder.endTurn(
+          activeTurnIdx, '', 'burned',
+          { inputTokens: 0, outputTokens: 0 }, { segments: [] }, [],
+        );
+      }
+      throw err;
     } finally {
       this.activeControllers.delete(abortController);
     }

@@ -28,6 +28,8 @@ export type StartPipelineFn = (
   options?: {
     resumeFromStage?: number;
     featureSlug?: string;
+    /** Reuse the orphan's original runId so its durable log replays. */
+    resumeRunId?: string;
   },
 ) => void | Promise<void>;
 
@@ -128,6 +130,10 @@ export async function dispatchTakenOverRuns(
       await startPipeline(run.project, run.feature, {
         resumeFromStage,
         featureSlug: run.featureSlug,
+        // The orphan-claimed runId IS the original — reuse it so the
+        // durable log we just read back is the one `Pipeline.run()`
+        // replays (effect-granularity crash-resume, Fix A finding 7).
+        resumeRunId: runId,
       });
       stats.dispatched += 1;
       // Serial dispatch — wait for the runner to claim the active slot.

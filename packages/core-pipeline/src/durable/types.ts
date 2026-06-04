@@ -124,6 +124,43 @@ export interface EffectEventPair {
 }
 
 // ---------------------------------------------------------------------------
+// Assistant partials (v2 ADR §2.2 — turn-level durable resume)
+// ---------------------------------------------------------------------------
+
+/**
+ * Input shape for `appendAssistantPartial`. `payload` is the
+ * `AssistantPartial` from agent-core (text + turnUuid + tool count +
+ * reason); we keep it `unknown` here so core-pipeline's durable layer
+ * stays decoupled from agent-core's exact field set. The stored record
+ * adds `seq`, `partialId`, `invalidated`, and `ts`.
+ *
+ * Scoping: a partial is keyed by (runId, stepId, turnUuid). The chain
+ * walker reads the most-recent non-invalidated partial for a
+ * (runId, stepId) to build the next attempt's prefill. `invalidatePartials`
+ * tombstones partials (sets `invalidated=1`) when a run is
+ * cancelled/failed so a re-run doesn't pick up stale state.
+ */
+export interface NewAssistantPartialRecord {
+  runId: string;
+  stepId: string;
+  turnUuid: string;
+  payload: unknown;
+}
+
+export interface AssistantPartialRecord {
+  runId: string;
+  stepId: string;
+  turnUuid: string;
+  /** Monotonic per (runId, stepId, turnUuid) — preserves write order. */
+  seq: number;
+  /** Unique id for dedup / direct reference. */
+  partialId: string;
+  payload: unknown;
+  invalidated: boolean;
+  ts: string;
+}
+
+// ---------------------------------------------------------------------------
 // Signals
 // ---------------------------------------------------------------------------
 

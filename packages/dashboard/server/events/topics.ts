@@ -79,6 +79,11 @@ export function roomsForEvent(ev: DashboardEvent): Topic[] {
       },
     )
     .with({ kind: 'pipeline.waiting-for-input' }, () => ['global' as Topic])
+    .with({ kind: 'pipeline.step-cost' }, ({ payload }) => [
+      'global' as Topic,
+      'cost' as Topic,
+      `run:${payload.runId}` as Topic,
+    ])
 
     // ── Cost ─────────────────────────────────────────────────────────
     .with({ kind: 'cost.breach' }, () => ['global' as Topic, 'cost' as Topic])

@@ -11,6 +11,14 @@ import React from 'react';
  * parent view (Active Runs). `onClick` opens the breach modal.
  */
 
+/** One model's spend within a run/step (subset of §2.6 ModelCost). */
+export interface CostMeterModelCost {
+  model: string;
+  costUsd: number;
+  /** >0 marks the SUCCESSOR of a cross-model continuation (re-injected prefill). */
+  prefilledInputTokens?: number;
+}
+
 export interface CostMeterProps {
   totalUsd: number;
   limitUsd: number;
@@ -18,6 +26,14 @@ export interface CostMeterProps {
   onClick?: () => void;
   /** Compact variant renders a one-line badge suitable for run lists. */
   compact?: boolean;
+  /**
+   * §H3 per-model spend. When supplied (non-compact), renders a breakdown
+   * list under the bar so a run continued across models shows where the
+   * spend went. The model that received re-injected prefill is tagged "↪".
+   */
+  costByModel?: Record<string, CostMeterModelCost>;
+  /** Itemised cost of re-injecting burned models' text into successors. */
+  prefillReinjectionUsd?: number;
 }
 
 function fmtUsd(n: number): string {
@@ -47,7 +63,16 @@ export function CostMeter({
   projectedUsd,
   onClick,
   compact = false,
+  costByModel,
+  prefillReinjectionUsd,
 }: CostMeterProps): React.ReactElement {
+  // Per-model breakdown rows, highest spend first. Empty unless caller wires
+  // §H3 per-model cost — keeps the meter backward-compatible.
+  const modelRows = costByModel
+    ? Object.values(costByModel)
+        .filter((m) => m.costUsd > 0 || (m.prefilledInputTokens ?? 0) > 0)
+        .sort((a, b) => b.costUsd - a.costUsd)
+    : [];
   const safeLimit = limitUsd > 0 ? limitUsd : 1;
   const pct = totalUsd / safeLimit;
   const fillPct = Math.min(pct, 1);
@@ -165,6 +190,51 @@ export function CostMeter({
           />
         )}
       </div>
+      {modelRows.length > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+            marginTop: 2,
+            fontSize: 'var(--text-xs, 11px)',
+            color: 'var(--text-muted, #888)',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          {modelRows.map((m) => {
+            const isSuccessor = (m.prefilledInputTokens ?? 0) > 0;
+            return (
+              <div
+                key={m.model}
+                style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}
+                title={isSuccessor ? 'Continued a burned model — re-injected its text' : undefined}
+              >
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {isSuccessor && <span aria-hidden="true" style={{ color: colors.fg }}>↪ </span>}
+                  {m.model}
+                </span>
+                <span>{fmtUsd(m.costUsd)}</span>
+              </div>
+            );
+          })}
+          {prefillReinjectionUsd !== undefined && prefillReinjectionUsd > 0 && (
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                gap: 8,
+                color: 'var(--text-tertiary, #666)',
+                fontStyle: 'italic',
+              }}
+              title="Cost of re-presenting a burned model's text to its successor"
+            >
+              <span>prefill re-injection</span>
+              <span>{fmtUsd(prefillReinjectionUsd)}</span>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -29,8 +29,13 @@ export {
 };
 export type { RunFixLoopResult };
 
-/** Legacy options shape — accepts `agentSession` OR `agentManager`. */
+/**
+ * Options shape — accepts a per-repo `sessionForRepo` resolver (the
+ * canonical contract), a single `agentSession` (wrapped for every key), or
+ * a legacy `agentManager` (a thin session is built + reused for all keys).
+ */
 export interface RunFixLoopOptions {
+  sessionForRepo?: (repoName: string | null) => AgentSession;
   agentSession?: AgentSession;
   agentManager?: AgentManager;
   project: string;
@@ -50,12 +55,21 @@ export interface RunFixLoopOptions {
   pollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
   allowedTools?: string[];
+  /** Enclosing stage label for session turn-wiring + spawn (e.g. 'validate'). */
+  sessionStage?: string;
+  /** Stage key for burn-fallback model resolution (e.g. 'fix-loop'). */
+  fallbackStage?: string;
 }
 
 export async function runFixLoop(opts: RunFixLoopOptions): Promise<RunFixLoopResult> {
-  const session = opts.agentSession ?? buildSession(opts);
+  // Prefer the per-repo resolver; else fall back to ONE session reused for
+  // every repo (legacy `agentSession`/`agentManager` callers), built once.
+  let legacySingle: AgentSession | undefined;
+  const sessionForRepo: (repoName: string | null) => AgentSession =
+    opts.sessionForRepo
+    ?? (() => (legacySingle ??= opts.agentSession ?? buildSession(opts)));
   return runFixLoopCanonical({
-    agentSession: session,
+    sessionForRepo,
     project: opts.project,
     model: opts.model,
     maxOutputTokens: opts.maxOutputTokens,
@@ -70,6 +84,8 @@ export async function runFixLoop(opts: RunFixLoopOptions): Promise<RunFixLoopRes
     buildRepoProjectPromptForBuildStage: opts.buildRepoProjectPromptForBuildStage,
     isCancelled: opts.isCancelled,
     allowedTools: opts.allowedTools,
+    sessionStage: opts.sessionStage,
+    fallbackStage: opts.fallbackStage,
   });
 }
 

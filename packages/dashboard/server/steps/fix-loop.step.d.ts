@@ -13,8 +13,13 @@ import { hasValidationFailures, extractRepoSection } from '@esankhan3/anvil-core
 import type { AgentManager } from '@esankhan3/anvil-agent-core';
 export { hasValidationFailures, extractRepoSection, };
 export type { RunFixLoopResult };
-/** Legacy options shape — accepts `agentSession` OR `agentManager`. */
+/**
+ * Options shape — accepts a per-repo `sessionForRepo` resolver (the
+ * canonical contract), a single `agentSession` (wrapped for every key), or
+ * a legacy `agentManager` (a thin session is built + reused for all keys).
+ */
 export interface RunFixLoopOptions {
+    sessionForRepo?: (repoName: string | null) => AgentSession;
     agentSession?: AgentSession;
     agentManager?: AgentManager;
     project: string;
@@ -34,6 +39,10 @@ export interface RunFixLoopOptions {
     pollIntervalMs?: number;
     sleep?: (ms: number) => Promise<void>;
     allowedTools?: string[];
+    /** Enclosing stage label for session turn-wiring + spawn (e.g. 'validate'). */
+    sessionStage?: string;
+    /** Stage key for burn-fallback model resolution (e.g. 'fix-loop'). */
+    fallbackStage?: string;
 }
 export declare function runFixLoop(opts: RunFixLoopOptions): Promise<RunFixLoopResult>;
 export interface FixLoopStepOptions extends Omit<RunFixLoopOptions, 'isCancelled' | 'validateArtifact' | 'attempt'> {

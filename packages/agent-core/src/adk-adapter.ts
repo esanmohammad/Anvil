@@ -46,6 +46,7 @@ import {
 } from './stream-format.js';
 import { registerAnthropicLlm } from './adk-anthropic-llm.js';
 import { UpstreamError, bodyLooksRetryable } from './upstream-error.js';
+import { createNullTurnRecorder } from './turn-recorder/index.js';
 
 const PREFIX = 'adk:';
 
@@ -141,6 +142,53 @@ export class AdkAdapter implements ModelAdapter {
   async run(config: ModelAdapterConfig, output: NodeJS.WritableStream): Promise<ModelAdapterResult> {
     const startedAt = Date.now();
     const upstreamModel = config.model.startsWith(PREFIX) ? config.model.slice(PREFIX.length) : config.model;
+
+    // §H4 cross-vendor turn recording — ADK runs its whole agentic loop
+    // (incl. tool execution) inside `runEphemeral`, opaque to us, so we record
+    // it as ONE turn (no per-tool effects) and HONOR `replayed` on a same-runId
+    // resume by SKIPPING runEphemeral entirely — that avoids re-executing the
+    // loop + its tool side-effects. NullTurnRecorder no-ops without a recorder.
+    const recorder = config.turnRecorder ?? createNullTurnRecorder({
+      runId: config.sessionId,
+      stepId: config.stage,
+    });
+    const { turn, replayed } = await recorder.startTurn({
+      model: config.model,
+      provider: this.provider,
+      system: config.projectPrompt,
+      messages: [{ role: 'user', content: config.userPrompt }],
+      userPrompt: config.userPrompt,
+    });
+    if (replayed) {
+      const u = replayed.usage;
+      const pricing = this.getModelPricing(config.model);
+      const replayCost = pricing
+        ? (u.inputTokens * pricing[0] + u.outputTokens * pricing[1]) / 1_000_000
+        : 0;
+      if (replayed.text) emitContentRaw(output, replayed.text);
+      emitResult(output, {
+        text: replayed.text,
+        costUsd: replayCost,
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        durationMs: 0,
+        cacheReadTokens: u.cacheReadTokens ?? 0,
+        cacheWriteTokens: u.cacheWriteTokens ?? 0,
+      });
+      return {
+        output: replayed.text,
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        costUsd: replayCost,
+        durationMs: 0,
+        provider: this.provider,
+        model: config.model,
+        cacheReadTokens: u.cacheReadTokens ?? 0,
+        cacheWriteTokens: u.cacheWriteTokens ?? 0,
+        toolCallCount: 0,
+        stopReason: replayed.stopReason,
+      };
+    }
 
     const adk = await loadAdk();
 
@@ -307,6 +355,16 @@ export class AdkAdapter implements ModelAdapter {
           { provider: this.provider, retryable: true },
         );
       }
+
+      // §H4 — record the completed turn (only on success; the empty-output
+      // and in-band-error cases threw above, so no empty/burned end is written).
+      await recorder.endTurn(
+        turn,
+        finalText,
+        stopReason,
+        { inputTokens: totalInputTokens, outputTokens: totalOutputTokens, cacheReadTokens, cacheWriteTokens },
+        { segments: [{ model: config.model, provider: this.provider, range: [0, finalText.length], source: 'live' }] },
+      );
 
       const pricing = this.getModelPricing(config.model);
       const costUsd = pricing

@@ -140,9 +140,9 @@
     "test": "echo 'cli has no per-workspace node:test files (knowledge tests moved to @anvil/knowledge-core; hooks integration test runs via root jest)'"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.3.0",
+    "@esankhan3/anvil-agent-core": "^0.4.0",
     "@esankhan3/anvil-convention-core": "^0.3.0",
-    "@esankhan3/anvil-core-pipeline": "^0.3.0",
+    "@esankhan3/anvil-core-pipeline": "^0.4.0",
     "@esankhan3/anvil-knowledge-core": "^0.3.0",
     "@esankhan3/anvil-memory-core": "^0.3.0",
     "commander": "^13.1.0",

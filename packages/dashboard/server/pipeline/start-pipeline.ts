@@ -92,6 +92,17 @@ export interface StartPipelineOptions {
   failureContext?: string;
   clarifySeedArtifact?: string;
   planSeed?: { project: string; slug: string; version: number; plan: Plan };
+  /**
+   * Reuse an existing pipeline runId instead of minting a fresh one.
+   * Threaded by the resume path (Replay button + auto-resume queue) so
+   * `Pipeline.run()` reads the durable event log keyed by the ORIGINAL
+   * runId and replays its `step:completed` + recorded effects. Without
+   * this, resume minted a fresh `build-<ts>` id, so the log lookup hit
+   * an empty set and effect-granularity crash-resume never engaged
+   * (BUG-1 Fix A, finding 7). `createRun` is idempotent on an existing
+   * runId, so re-registering the same id is store-safe.
+   */
+  resumeRunId?: string;
 }
 
 export interface StartPipelineDeps {
@@ -177,7 +188,15 @@ export function createStartPipeline(deps: StartPipelineDeps): StartPipelineFn {
     // user clicks Build and sees Active Runs stay stale for a beat while
     // the runner constructs hooks. Visible activity ID is the same one we
     // pass to activeRuns.set later (replaced rather than re-registered).
-    const pipelineRunId = `build-${Date.now().toString(36)}`;
+    // Resume reuses the ORIGINAL runId so the durable log keyed by it
+    // replays; a fresh user-initiated build mints a new one. See
+    // StartPipelineOptions.resumeRunId.
+    const pipelineRunId = options?.resumeRunId ?? `build-${Date.now().toString(36)}`;
+    if (options?.resumeRunId) {
+      console.log(
+        `[dashboard] resuming with original runId ${pipelineRunId} — durable replay enabled`,
+      );
+    }
     const pipelineActivities: ActivityEntry[] = [];
     // Seed an initial activity so the per-stage panel isn't blank while
     // the runner spins up (workspace bootstrap + manifest load + walker
@@ -717,6 +736,52 @@ export function createStartPipeline(deps: StartPipelineDeps): StartPipelineFn {
         stageName: data.stageName,
         message: data.message,
       });
+    });
+
+    // §H3 per-model step cost. Forward the rollup to the typed event surface
+    // (CostMeter per-model breakdown) AND, when the step was continued across
+    // models, drop a "↪ continued by <successor>" marker into the activity
+    // stream. The handoff is read from the rollup's `continuation` summary
+    // (burned-vs-completed model sets) — NOT from re-injected token volume or
+    // cost — so it fires on the common 429-before-first-delta burn (empty
+    // prefill, zero tokens) and for unpriced successors (zero reinjection $).
+    runner.on('step-cost', (data: {
+      runId: string;
+      stepId: string;
+      costByModel: Record<string, {
+        model: string;
+        provider?: string;
+        costUsd: number;
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheWriteTokens: number;
+        prefilledInputTokens: number;
+      }>;
+      prefillReinjectionUsd: number;
+      totalCostUsd: number;
+      continuation: { successors: string[]; predecessors: string[] } | null;
+    }) => {
+      deps.services.pipeline.emit('pipeline.step-cost', data);
+
+      const cont = data.continuation;
+      if (cont && cont.successors.length > 0 && cont.predecessors.length > 0) {
+        // Only append the re-injection cost when there actually was one (a
+        // non-empty prefill priced against a known model).
+        const reinjected = data.prefillReinjectionUsd > 0
+          ? ` (+$${data.prefillReinjectionUsd.toFixed(4)} re-injected)`
+          : '';
+        const entry: ActivityEntry = {
+          timestamp: Date.now(),
+          stage: data.stepId,
+          type: 'stdout',
+          content: `↪ Continued by ${cont.successors.join(', ')} after ${cont.predecessors.join(', ')} exhausted${reinjected}`,
+          kind: 'provenance',
+        };
+        pipelineActivities.push(entry);
+        deps.pushOutputEntry(entry);
+        deps.services.agents.emit('agent.output', { entries: [entry], runId: pipelineRunId } as never);
+      }
     });
 
     // Show artifacts in changes tab + scan ship artifacts for PR URLs

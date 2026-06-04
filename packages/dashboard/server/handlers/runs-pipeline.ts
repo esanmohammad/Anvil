@@ -333,7 +333,27 @@ async function doResume(
   const slug = checkpoint?.featureSlug ?? prevRun?.featureSlug ?? resumeSlug ?? '';
   const model = cpConfig?.model ?? prevRun?.model ?? input.options?.model ?? 'sonnet';
 
-  console.log(`[dashboard] Resuming "${feature}" from stage ${resumeFrom} (${stages[resumeFrom]?.name ?? 'unknown'}) [source: ${checkpoint ? 'checkpoint' : 'runs-index'}]`);
+  // Recover the ORIGINAL runId so the resumed run reuses the durable
+  // event log instead of minting a fresh `build-<ts>` id (which would
+  // read an empty log and skip effect-granularity replay — Fix A
+  // finding 7). Pair the runId with whichever source drove the
+  // resume-stage derivation: prefer the checkpoint's recorded runId
+  // (it matches `checkpoint.stages`), then the runs-index row, then the
+  // runId the client clicked. `undefined` falls back to a fresh mint.
+  const originalRunId = checkpoint?.runId || prevRun?.id || (runId || undefined);
+
+  // If a caller supplies BOTH a runId and a featureSlug, the checkpoint
+  // (loaded from the slug) wins because its `runId` is paired with the
+  // `stages` that drive resumeFrom. The Replay button sends only one,
+  // so this is just defensive visibility for a future API caller.
+  if (runId && checkpoint?.runId && checkpoint.runId !== runId) {
+    console.warn(
+      `[dashboard] resume: requested runId ${runId} but checkpoint records ` +
+        `${checkpoint.runId}; reusing the checkpoint's runId (its stages drive resume).`,
+    );
+  }
+
+  console.log(`[dashboard] Resuming "${feature}" from stage ${resumeFrom} (${stages[resumeFrom]?.name ?? 'unknown'}) [source: ${checkpoint ? 'checkpoint' : 'runs-index'}, runId: ${originalRunId ?? '<fresh>'}]`);
 
   actions.startPipeline(project, feature, {
     model,
@@ -343,5 +363,6 @@ async function doResume(
     resumeFromStage: resumeFrom,
     featureSlug: slug,
     failureContext,
+    resumeRunId: originalRunId,
   });
 }

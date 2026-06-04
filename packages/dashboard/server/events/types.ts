@@ -179,6 +179,60 @@ export type WaitingForInputEvent = EventEnvelope<'pipeline.waiting-for-input', {
   agentId: string;
 }>;
 
+/**
+ * Per-model cost for one step — a structural mirror of core-pipeline's
+ * `ModelCost`, kept LOCAL so the Vite frontend (which imports this module
+ * via `shared/events.ts`) doesn't pull `@esankhan3/anvil-core-pipeline`
+ * into the browser bundle.
+ */
+export interface StepModelCost {
+  model: string;
+  provider?: string;
+  /** New spend billed to this model (excludes re-injected prefill input). */
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  /** Subset of inputTokens that was re-injected prefill — the marker of a
+   *  cross-model continuation (this bucket is the SUCCESSOR model). */
+  prefilledInputTokens: number;
+}
+
+/**
+ * Cross-model handoff summary for a step — a structural mirror of
+ * core-pipeline's `StepContinuation`, kept LOCAL (browser-safe). Derived
+ * server-side from the burned-vs-completed model sets, so it fires even when
+ * the predecessor burned with empty text (zero re-injected tokens) or the
+ * successor is absent from the price table (zero reinjection cost).
+ */
+export interface StepContinuationInfo {
+  /** Models that completed work and were never burned — the successor(s). */
+  successors: string[];
+  /** Models whose turn burned and was re-issued to a successor. */
+  predecessors: string[];
+}
+
+/**
+ * §H3 per-model step cost. Emitted once per `step:completed` when the step
+ * recorded turn-level effects (per-repo / build / clarify / QA). Carries the
+ * §2.6 rollup so the UI can render a per-model breakdown, plus a
+ * token/price-independent `continuation` summary that drives the cross-model
+ * "↪ continued by X" marker. Steps with no turn effects (e.g. single-stage,
+ * which records via the passthrough ctx runtime in the dashboard) do NOT emit.
+ */
+export type PipelineStepCostEvent = EventEnvelope<'pipeline.step-cost', {
+  runId: string;
+  stepId: string;
+  costByModel: Record<string, StepModelCost>;
+  /** Itemised cost of re-injecting burned models' text into successors. */
+  prefillReinjectionUsd: number;
+  /** Σ per-model new spend + reinjection bucket. */
+  totalCostUsd: number;
+  /** Cross-model handoff in this step, or null if none. */
+  continuation: StepContinuationInfo | null;
+}>;
+
 // ── Cost ─────────────────────────────────────────────────────────────────
 
 export type CostBreachEvent = EventEnvelope<'cost.breach', {
@@ -484,6 +538,7 @@ export type DashboardEvent =
   | PipelineResumedEvent
   | PipelineCancelledEvent
   | WaitingForInputEvent
+  | PipelineStepCostEvent
   | CostBreachEvent
   | CostSnapshotEvent
   | ReviewCreatedEvent

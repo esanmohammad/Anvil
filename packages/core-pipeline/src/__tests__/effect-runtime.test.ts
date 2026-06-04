@@ -268,4 +268,25 @@ describe('EffectRuntime — signals', () => {
     const out = await runtime.waitForSignal('reviewer');
     assert.deepEqual(out, { decision: 'approve' });
   });
+
+  it('waitForSignal aborts when the cancellation signal fires (finding 4)', async () => {
+    const store = new InMemoryDurableStore(() => NOW);
+    await store.createRun({ runId: RUN_ID, project: 'p', feature: 'f', featureSlug: 'f' });
+    const controller = new AbortController();
+    controller.abort();
+    const runtime = new EffectRuntime({
+      store,
+      runId: RUN_ID,
+      stepId: STEP,
+      recordedEffects: [],
+      realNow: () => NOW,
+      // If the abort check didn't fire we'd block here forever; throw to
+      // surface that regression instead of hanging the suite.
+      realSleep: async () => {
+        throw new Error('should have aborted before sleeping');
+      },
+      signal: controller.signal,
+    });
+    await assert.rejects(runtime.waitForSignal('reviewer'), /cancelled while waiting/);
+  });
 });
