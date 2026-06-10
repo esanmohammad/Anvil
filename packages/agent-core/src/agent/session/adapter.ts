@@ -104,6 +104,21 @@ export interface AdapterRequest {
     query: string,
     opts: { kind?: string; subtype?: string; limit?: number },
   ) => Promise<string>;
+  /** Turn-level durable recorder (v2 ADR §2.5). Threaded down into
+   *  `ModelAdapterConfig.turnRecorder` by the bridge. Pipeline-side
+   *  callers (cli's step adapters, dashboard's pipeline-runner) build
+   *  one of these per AgentProcess spawn from the run's EffectRuntime;
+   *  agent-core itself never imports core-pipeline. */
+  turnRecorder?: import('../../turn-recorder/index.js').TurnRecorder;
+  /** Prefill carried from a chain-walker burn (v2 ADR §2.3). When
+   *  present, the bridge forwards it onto `ModelAdapterConfig.prefill`
+   *  so the adapter materializes the trailing-assistant + recorded
+   *  tool-result history into its provider wire format. */
+  prefill?: import('../../turn-recorder/index.js').Prefill;
+  /** §Tier 2 — completed prior turns of a stateful session. Forwarded by
+   *  the bridge onto `ModelAdapterConfig.priorMessages` (claude gated out)
+   *  so a non-claude resume re-presents the full conversation. */
+  priorMessages?: import('../../turn-recorder/index.js').PrefillTurn[];
 }
 
 /** Subset of `McpClientPool` consumed via `AdapterRequest`. Avoids a
@@ -167,5 +182,8 @@ export function buildAdapterRequest(
     runId: spec.runId,
     workspaceDir: spec.workspaceDir,
     recallMemory: spec.recallMemory,
+    turnRecorder: spec.turnRecorder,
+    prefill: spec.prefill,
+    priorMessages: spec.priorMessages,
   };
 }

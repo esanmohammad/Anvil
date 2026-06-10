@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 
 import { createReplay } from '../events/replay.js';
 import { roomsForEvent } from '../events/topics.js';
+import { toLegacyWire } from '../events/wire-translate.js';
 import { envelope, type DashboardEvent, type Topic } from '../events/types.js';
 
 function ev<K extends DashboardEvent['kind']>(
@@ -143,6 +144,35 @@ test('topics: cost.snapshot fans out to global + cost + project (+ run when pres
 test('topics: plan events route to global + plan:<slug>', () => {
   const e = ev('plan.comment-added', { planSlug: 'add-button', comment: {} }, [], 1000);
   assert.deepEqual(roomsForEvent(e), ['global', 'plan:add-button']);
+});
+
+test('§H3 pipeline.step-cost routes to global + cost + run:<id>', () => {
+  const e = ev(
+    'pipeline.step-cost',
+    { runId: 'r1', stepId: 'build', costByModel: {}, prefillReinjectionUsd: 0, totalCostUsd: 0, continuation: null },
+    [],
+    1000,
+  );
+  assert.deepEqual(roomsForEvent(e), ['global', 'cost', 'run:r1']);
+});
+
+test('§H3 pipeline.step-cost legacy wire string is the exact contract the client keys on', () => {
+  // The frontend's WIRE_TO_KIND + main.tsx handleServerMessage both switch on
+  // the literal 'pipeline-step-cost'. That string crosses the package
+  // boundary untyped, so pin it here — a rename in wire-translate.ts that
+  // isn't mirrored client-side would silently drop the per-model cost.
+  const payload = {
+    runId: 'r1',
+    stepId: 'build',
+    costByModel: { sonnet: { model: 'sonnet', costUsd: 0.5, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, prefilledInputTokens: 0 } },
+    prefillReinjectionUsd: 0.01,
+    totalCostUsd: 0.51,
+    continuation: { successors: ['gpt-4o'], predecessors: ['kimi/k2'] },
+  };
+  const wire = toLegacyWire(ev('pipeline.step-cost', payload, [], 1000));
+  assert.ok(wire, 'pipeline.step-cost must translate to a legacy wire message');
+  assert.equal(wire.type, 'pipeline-step-cost');
+  assert.deepEqual(wire.payload, payload);
 });
 
 test('topics: incident events route to global + incident', () => {

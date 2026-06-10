@@ -2,7 +2,7 @@ import React, { useState, useCallback } from 'react';
 import {
   FileText, Pencil, Terminal, Search, FolderOpen, Bot, Brain, Rocket,
   HelpCircle, CheckCircle2, AlertTriangle, ChevronDown, ChevronRight,
-  Globe, Target, Wrench, Database, Plug,
+  Globe, Target, Wrench, Database, Plug, GitBranch,
 } from 'lucide-react';
 import { MarkdownRenderer } from './MarkdownRenderer.js';
 
@@ -17,7 +17,7 @@ import { MarkdownRenderer } from './MarkdownRenderer.js';
 export interface ActivityEntry {
   id: number;
   timestamp: number;
-  kind: 'text' | 'tool_use' | 'thinking' | 'project' | 'result' | 'stderr' | 'tool_result' | 'user-message' | 'artifact' | 'clarify-question' | 'clarify-ack';
+  kind: 'text' | 'tool_use' | 'thinking' | 'project' | 'result' | 'stderr' | 'tool_result' | 'user-message' | 'artifact' | 'clarify-question' | 'clarify-ack' | 'provenance';
   tool?: string;
   summary: string;
   content?: string;
@@ -181,6 +181,28 @@ export function ActivityLine({ entry, lineNumber: _lineNumber, isExpanded, onTog
           <CheckCircle2 size={14} strokeWidth={1.75} />
         )}
         <span>{content}</span>
+      </div>
+    );
+  }
+
+  // Cross-model continuation marker (§H3) — a burned model handed off to a
+  // successor mid-stage. Subtle accent strip with a branch icon.
+  if (entry.kind === 'provenance') {
+    const content = entry.content ?? entry.summary ?? '';
+    return (
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '6px 16px', margin: '4px 16px',
+        fontSize: 12,
+        color: 'var(--accent)',
+        borderLeft: '2px solid var(--accent)',
+        background: 'var(--accent-muted)',
+        borderRadius: 'var(--radius-sm)',
+      }}>
+        <GitBranch size={14} strokeWidth={1.75} style={{ flexShrink: 0 }} />
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {content.replace(/^↪\s*/, '')}
+        </span>
       </div>
     );
   }

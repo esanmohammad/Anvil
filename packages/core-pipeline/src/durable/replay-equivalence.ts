@@ -52,14 +52,48 @@ export async function seedStoreFromLog(
 }
 
 /**
+ * Durable-write operations that are NOT outbound side effects (they
+ * persist to the durable log) and therefore must NOT trip a replay
+ * throwingSpy. Per ADR §4.5: a partial flush or invalidation happening
+ * during replay is bookkeeping, not a re-executed effect. A spy created
+ * with `allow: DURABLE_WRITE_OPS` passes these through when invoked with
+ * the op name as the first argument.
+ */
+export const DURABLE_WRITE_OPS = [
+  'flushPartial',
+  'invalidatePartials',
+  'appendAssistantPartial',
+] as const;
+
+export interface ThrowingSpyOptions {
+  /** Op names (matched against the spy's first string arg) that pass
+   *  through silently instead of throwing. */
+  allow?: readonly string[];
+  message?: string;
+}
+
+/**
  * A spy that throws when called. Used as a stand-in for a runner /
  * writer in pass-2 of a replay-equivalence test — if the stage
  * hits the spy, the effect was NOT replayed, which is a regression.
+ *
+ * Pass a string for a custom message (back-compat) or an options object
+ * to whitelist durable-write op names (§4.5) — e.g.
+ * `throwingSpy({ allow: DURABLE_WRITE_OPS })`. When whitelisting, the
+ * spy treats its first argument as the operation name.
  */
 export function throwingSpy<Args extends unknown[], R>(
-  message = 'replay-equivalence: outbound call should have been replayed from the durable log',
+  opts: string | ThrowingSpyOptions = {},
 ): (...args: Args) => Promise<R> {
-  return (..._args: Args): Promise<R> => {
+  const o = typeof opts === 'string' ? { message: opts } : opts;
+  const allow = new Set(o.allow ?? []);
+  const message = o.message
+    ?? 'replay-equivalence: outbound call should have been replayed from the durable log';
+  return (...args: Args): Promise<R> => {
+    const first = args[0];
+    if (typeof first === 'string' && allow.has(first)) {
+      return Promise.resolve(undefined as R);
+    }
     throw new Error(message);
   };
 }

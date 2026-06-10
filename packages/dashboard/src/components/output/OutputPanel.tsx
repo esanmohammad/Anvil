@@ -72,6 +72,12 @@ export function OutputPanel({
   const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
   const scrollPositions = useRef(new Map<string, number>());
   const prevAgentId = useRef<string | null>(null);
+  // Safety timer for `inputPending`: it normally clears when an advancing
+  // activity arrives, but if the answer is dropped server-side no such
+  // activity ever comes and the box would latch disabled forever (the
+  // canonical "clarify stuck after I answered" lockout). The timer
+  // re-enables the box so the user can always retry.
+  const pendingTimerRef = useRef<number | null>(null);
 
   const isRunning = isRunningProp ?? agent?.status === 'running';
   const showInput = isRunning || agent?.status === 'done' || !!onSendInput;
@@ -153,6 +159,13 @@ export function OutputPanel({
     const text = input.trim();
     setLocalMessages((prev) => [...prev, text]);
     setInputPending(true);
+    // Safety: re-enable the box after 8s even if no advancing activity
+    // arrives, so a dropped/misrouted answer can't lock the user out.
+    if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
+    pendingTimerRef.current = window.setTimeout(() => {
+      pendingTimerRef.current = null;
+      setInputPending(false);
+    }, 8000);
     if (agent) onSendInput(agent.id, text);
     else onSendInput(text);
     setInput('');
@@ -164,10 +177,19 @@ export function OutputPanel({
     if (inputPending && activities.length > 0) {
       const last = activities[activities.length - 1];
       if (last.kind === 'clarify-question' || last.kind === 'clarify-ack' || last.kind === 'text') {
+        if (pendingTimerRef.current) {
+          window.clearTimeout(pendingTimerRef.current);
+          pendingTimerRef.current = null;
+        }
         setInputPending(false);
       }
     }
   }, [activities, inputPending]);
+
+  // Drop the safety timer on unmount.
+  useEffect(() => () => {
+    if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
+  }, []);
 
   // Filter activities — include clarify-question, clarify-ack, user-message for conversation flow, project for integration events
   const allowedKinds = new Set(['tool_use', 'thinking', 'text', 'clarify-question', 'clarify-ack', 'user-message', 'project']);

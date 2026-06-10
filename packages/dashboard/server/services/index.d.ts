@@ -62,6 +62,7 @@ interface PipelineEventMap {
     'pipeline.resumed': PayloadOf<'pipeline.resumed'>;
     'pipeline.cancelled': PayloadOf<'pipeline.cancelled'>;
     'pipeline.waiting-for-input': PayloadOf<'pipeline.waiting-for-input'>;
+    'pipeline.step-cost': PayloadOf<'pipeline.step-cost'>;
     'pipeline.auth-required': PayloadOf<'pipeline.auth-required'>;
     'pipeline.interrupted-snapshot': PayloadOf<'pipeline.interrupted-snapshot'>;
 }

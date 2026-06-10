@@ -9,8 +9,10 @@
 
 import type { DurableStore, VacuumStats } from './store.js';
 import type {
+  AssistantPartialRecord,
   EffectEventPair,
   EventRecord,
+  NewAssistantPartialRecord,
   NewEventRecord,
   NewRunRecord,
   RunRecord,
@@ -26,6 +28,9 @@ export class InMemoryDurableStore implements DurableStore {
   private readonly runs = new Map<string, InMemoryRun>();
   private readonly events = new Map<string, EventRecord[]>();
   private readonly signals = new Map<string, SignalRecord[]>();
+  private readonly partials = new Map<string, AssistantPartialRecord[]>();
+  /** Monotonic counter for partialId minting (deterministic, no uuid). */
+  private partialCounter = 0;
 
   constructor(private readonly clock: () => number = Date.now) {}
 
@@ -52,6 +57,7 @@ export class InMemoryDurableStore implements DurableStore {
     this.runs.set(run.runId, record);
     this.events.set(run.runId, []);
     this.signals.set(run.runId, []);
+    this.partials.set(run.runId, []);
     return { ...record };
   }
 
@@ -175,6 +181,61 @@ export class InMemoryDurableStore implements DurableStore {
     return ordered.map((k) => byKey.get(k)!);
   }
 
+  async appendAssistantPartial(partial: NewAssistantPartialRecord): Promise<AssistantPartialRecord> {
+    let arr = this.partials.get(partial.runId);
+    if (!arr) {
+      // Tolerate partials for runs created outside createRun (some
+      // tests / lightweight callers). Lazily initialise.
+      arr = [];
+      this.partials.set(partial.runId, arr);
+    }
+    // Per (runId, stepId, turnUuid) monotonic seq.
+    const sameTurn = arr.filter(
+      (p) => p.stepId === partial.stepId && p.turnUuid === partial.turnUuid,
+    );
+    const seq = sameTurn.length === 0 ? 1 : sameTurn[sameTurn.length - 1].seq + 1;
+    this.partialCounter += 1;
+    const record: AssistantPartialRecord = {
+      runId: partial.runId,
+      stepId: partial.stepId,
+      turnUuid: partial.turnUuid,
+      seq,
+      partialId: `partial-${this.partialCounter}`,
+      payload: partial.payload,
+      invalidated: false,
+      ts: this.iso(),
+    };
+    arr.push(record);
+    return { ...record };
+  }
+
+  async readAssistantPartials(
+    runId: string,
+    stepId: string,
+    turnUuid?: string,
+  ): Promise<AssistantPartialRecord[]> {
+    const arr = this.partials.get(runId) ?? [];
+    // Insertion order is global-monotonic (push appends), so it already
+    // reflects recency across turns AND per-turn seq order — the caller
+    // takes the last element as "most recent". No explicit sort: sorting
+    // by per-turn `seq` would interleave partials from different turns.
+    return arr
+      .filter((p) =>
+        p.stepId === stepId
+        && !p.invalidated
+        && (turnUuid === undefined || p.turnUuid === turnUuid))
+      .map((p) => ({ ...p }));
+  }
+
+  async invalidatePartials(runId: string, stepId?: string, turnUuid?: string): Promise<void> {
+    const arr = this.partials.get(runId) ?? [];
+    for (const p of arr) {
+      if (stepId !== undefined && p.stepId !== stepId) continue;
+      if (turnUuid !== undefined && p.turnUuid !== turnUuid) continue;
+      p.invalidated = true;
+    }
+  }
+
   async enqueueSignal(runId: string, channel: string, payload: unknown): Promise<void> {
     const arr = this.signals.get(runId);
     if (!arr) throw new Error(`InMemoryDurableStore: unknown run ${runId}`);
@@ -187,6 +248,38 @@ export class InMemoryDurableStore implements DurableStore {
     for (const s of arr) {
       if (s.channel === channel && !s.consumed) {
         s.consumed = true;
+        return s.payload;
+      }
+    }
+    return null;
+  }
+
+  async consumeSignalAndRecord(
+    runId: string,
+    channel: string,
+    effect: { stepId: string; effectKey: string; effectIdx: number },
+  ): Promise<unknown | null> {
+    const arr = this.signals.get(runId);
+    if (!arr) return null;
+    // Fully synchronous (no await between the two mutations) → atomic in
+    // the single-threaded runtime: consume + record can't tear.
+    for (const s of arr) {
+      if (s.channel === channel && !s.consumed) {
+        s.consumed = true;
+        const events = this.events.get(runId);
+        if (events) {
+          const seq = events.length === 0 ? 1 : events[events.length - 1].seq + 1;
+          events.push({
+            runId,
+            seq,
+            kind: 'effect:completed',
+            stepId: effect.stepId,
+            effectKey: effect.effectKey,
+            effectIdx: effect.effectIdx,
+            payload: s.payload,
+            ts: this.iso(),
+          });
+        }
         return s.payload;
       }
     }
@@ -213,6 +306,7 @@ export class InMemoryDurableStore implements DurableStore {
         signalsRemoved += this.signals.get(runId)?.length ?? 0;
         this.events.delete(runId);
         this.signals.delete(runId);
+        this.partials.delete(runId);
         this.runs.delete(runId);
         runsRemoved += 1;
       }

@@ -25,8 +25,15 @@ import {
 } from './validate.step.js';
 
 export interface RunFixLoopOptions {
-  /** Multi-turn agent surface (required). */
-  agentSession: AgentSession;
+  /**
+   * Multi-turn agent surface, resolved PER REPO (null = single-repo mode).
+   * fix-loop fans out across repos in parallel AND resumes across attempts,
+   * so each repo needs its OWN session: a burn-aware session carries that
+   * repo's per-phase chain-fallback + a per-repo-scoped turn recorder
+   * (cost/provenance) + cross-attempt resume. A caller with one session for
+   * everything can return it for every key.
+   */
+  sessionForRepo: (repoName: string | null) => AgentSession;
   project: string;
   /** Resolved model id. */
   model?: string;
@@ -45,6 +52,21 @@ export interface RunFixLoopOptions {
   buildProjectPromptForBuildStage: () => string;
   buildRepoProjectPromptForBuildStage: (repoName: string) => string;
   isCancelled: () => boolean;
+  /**
+   * Stage label for the spawn + (load-bearing) the burn-aware session's turn
+   * wiring `eventStepId` (`${sessionStage}:session`). Must be the ENCLOSING
+   * pipeline step ('validate') so its turn cost/provenance roll up under that
+   * step's `step:completed` (the runner rolls up `validate` + `validate:session`).
+   * Defaults to `fix-${attempt}` (legacy label; not rolled up).
+   */
+  sessionStage?: string;
+  /**
+   * Stage key for burn-fallback MODEL resolution (`routingStage` on the spawn
+   * request). When `sessionStage` is the enclosing step ('validate'), this
+   * keeps the post-burn chain on the 'fix-loop' policy ('tight retry loop —
+   * never escalate to premium') instead of inheriting validate's chain.
+   */
+  fallbackStage?: string;
   /** Tools that the engineer agent must NOT call. */
   disallowedTools?: readonly string[];
   /** Per-stage allow list. */
@@ -91,8 +113,9 @@ export async function runFixLoop(
     const followUp = `Validation still failing in "${repoName}" after your last fix (attempt ${opts.attempt}). Issues:\n\n${issuesBlock}\n\nFix the remaining errors and re-run tests.`;
     const initialPrompt = `The validation stage found issues in "${repoName}" that need to be fixed (attempt ${opts.attempt}):\n\n${issuesBlock}\n\nFix ALL build errors, lint errors, and test failures in this repo. Run the build and tests again to verify. Do NOT make git commits.`;
 
+    const session = opts.sessionForRepo(repoName);
     if (priorId && opts.attempt > 1) {
-      const r = await opts.agentSession.sendInput(priorId, followUp);
+      const r = await session.sendInput(priorId, followUp);
       return {
         artifact: r.output,
         cost: r.costUsd ?? 0,
@@ -102,12 +125,13 @@ export async function runFixLoop(
         cacheWriteTokens: r.cacheWriteTokens ?? 0,
       };
     }
-    const r = await opts.agentSession.start({
+    const r = await session.start({
       persona: 'engineer',
       projectPrompt: opts.buildRepoProjectPromptForBuildStage(repoName),
       userPrompt: initialPrompt,
       workingDir: repoPath,
-      stage: `fix-${opts.attempt}`,
+      stage: opts.sessionStage ?? `fix-${opts.attempt}`,
+      routingStage: opts.fallbackStage,
       model: opts.model,
       allowedTools: opts.allowedTools,
       disallowedTools: opts.disallowedTools ?? ENGINEER_DISALLOWED_TOOLS,
@@ -146,8 +170,9 @@ async function runFixLoopSingle(
   const followUp = `Validation still failing after your last fix (attempt ${opts.attempt}). Issues:\n\n${issuesBlock}\n\nFix the remaining errors and re-run tests.`;
   const initialPrompt = `The validation stage found issues that need to be fixed (attempt ${opts.attempt}):\n\n${issuesBlock}\n\nFix ALL build errors, lint errors, and test failures. Run the build and tests again to verify. Do NOT make git commits.`;
 
+  const session = opts.sessionForRepo(null);
   if (opts.priorSingleId && opts.attempt > 1) {
-    const r = await opts.agentSession.sendInput(opts.priorSingleId, followUp);
+    const r = await session.sendInput(opts.priorSingleId, followUp);
     return {
       artifact: r.output,
       cost: r.costUsd ?? 0,
@@ -158,13 +183,17 @@ async function runFixLoopSingle(
       cacheWriteTokens: r.cacheWriteTokens ?? 0,
     };
   }
-  const r = await opts.agentSession.start({
+  const r = await session.start({
     persona: 'engineer',
     projectPrompt: opts.buildProjectPromptForBuildStage(),
     userPrompt: initialPrompt,
     workingDir: opts.workspaceDir,
-    stage: `fix-${opts.attempt}`,
+    stage: opts.sessionStage ?? `fix-${opts.attempt}`,
+    routingStage: opts.fallbackStage,
     model: opts.model,
+    // Match the per-repo path: a non-Claude agentic model needs write/exec
+    // tools to apply a fix; omitting this falls back to read-only.
+    allowedTools: opts.allowedTools,
     disallowedTools: opts.disallowedTools ?? ENGINEER_DISALLOWED_TOOLS,
     maxOutputTokens: opts.maxOutputTokens,
   });

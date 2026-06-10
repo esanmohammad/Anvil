@@ -79,8 +79,15 @@ export function buildHandlerExtras(deps) {
             }
             else {
                 const child = deps.getActiveChild();
-                if (child?.stdin)
+                if (child?.stdin) {
                     child.stdin.write(text + '\n');
+                }
+                else {
+                    // No active pipeline runner, no named agent, no legacy child stdin —
+                    // the input has nowhere to go. This was previously a silent drop
+                    // (the canonical "I answered clarify but it stayed stuck" symptom).
+                    console.warn('[dashboard] send-input dropped — no active pipeline runner, no agentId, no legacy child stdin');
+                }
             }
         },
         cancelPipeline: () => {

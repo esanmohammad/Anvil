@@ -170,6 +170,32 @@ describe('InMemoryDurableStore — signals', () => {
     assert.deepEqual(await store.consumeSignal('run-1', 'b'), { v: 'b' });
     assert.deepEqual(await store.consumeSignal('run-1', 'a'), { v: 'a' });
   });
+
+  it('consumeSignalAndRecord pops the signal AND writes an effect:completed atomically (finding 5)', async () => {
+    const store = new InMemoryDurableStore(() => NOW);
+    await store.createRun(newRun());
+    await store.enqueueSignal('run-1', 'stage:answer', 'the answer');
+    const payload = await store.consumeSignalAndRecord('run-1', 'stage:answer', {
+      stepId: 'validate',
+      effectKey: '__signal:stage:answer',
+      effectIdx: 3,
+    });
+    assert.equal(payload, 'the answer');
+    const events = await store.readEvents('run-1');
+    const completed = events.find(
+      (e) => e.kind === 'effect:completed' && e.effectKey === '__signal:stage:answer',
+    );
+    assert.ok(completed, 'effect:completed receipt must be written in the same call');
+    assert.equal(completed?.effectIdx, 3);
+    assert.equal(completed?.payload, 'the answer');
+    // Consumed — a second call finds nothing and records nothing.
+    const again = await store.consumeSignalAndRecord('run-1', 'stage:answer', {
+      stepId: 'validate',
+      effectKey: '__signal:stage:answer',
+      effectIdx: 4,
+    });
+    assert.equal(again, null);
+  });
 });
 
 describe('InMemoryDurableStore — vacuum', () => {

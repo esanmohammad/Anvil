@@ -14,6 +14,7 @@ import type {
 import { emitContent, emitThinking, emitResult } from './stream-format.js';
 import { UpstreamError } from './upstream-error.js';
 import { getFetchPool, recycleFetchPoolOnFailure } from './fetch-pool.js';
+import { TurnRecorder, createNullTurnRecorder } from './turn-recorder/index.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 
@@ -106,6 +107,47 @@ export class GeminiAdapter implements ModelAdapter {
 
     if (projectPrompt) {
       body.systemInstruction = { parts: [{ text: projectPrompt }] };
+    }
+
+    // §H4 cross-vendor turn recording. Records this single-shot exchange so
+    // a later (possibly different-provider) resume can reconstruct prior
+    // turns via `reconstructSessionHistory`. NullTurnRecorder no-ops when
+    // the pipeline didn't inject a durable recorder.
+    const recorder = config.turnRecorder ?? createNullTurnRecorder({
+      runId: config.sessionId,
+      stepId: config.stage,
+    });
+    const { turn, replayed } = await recorder.startTurn({
+      model,
+      provider: 'gemini',
+      system: projectPrompt,
+      messages: body.contents,
+      userPrompt,
+    });
+    // Same-runId replay (Fix A): the turn already ran on a prior process —
+    // skip the upstream call and re-present the recorded result verbatim.
+    if (replayed) {
+      const u = replayed.usage;
+      const replayCost = computeCost(model, u.inputTokens, u.outputTokens);
+      if (replayed.text) emitContent(output, replayed.text);
+      emitResult(output, {
+        text: replayed.text,
+        costUsd: replayCost,
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        durationMs: 0,
+      });
+      return {
+        output: replayed.text,
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        costUsd: replayCost,
+        durationMs: 0,
+        provider: 'gemini',
+        model,
+        cacheReadTokens: u.cacheReadTokens ?? 0,
+        reasoningTokens: 0,
+      };
     }
 
     this.abortController = new AbortController();
@@ -226,6 +268,17 @@ export class GeminiAdapter implements ModelAdapter {
         { provider: 'gemini', retryable: true },
       );
     }
+
+    // §H4 — record the completed turn (assistant-end) so a later resume can
+    // reconstruct it. Only on success: an empty/burned turn threw above, so
+    // we never persist an empty assistant-end.
+    await recorder.endTurn(
+      turn,
+      fullText,
+      'end_turn',
+      { inputTokens, outputTokens, cacheReadTokens },
+      { segments: [{ model, provider: 'gemini', range: [0, fullText.length], source: 'live' }] },
+    );
 
     emitResult(output, {
       text: fullText,

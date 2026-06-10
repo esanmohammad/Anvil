@@ -155,9 +155,13 @@ export function dashboardReducer(
     case 'pipeline.resumed':
     case 'pipeline.cancelled':
     case 'pipeline.waiting-for-input':
+    case 'pipeline.step-cost':
       // Pipeline events flow into the run's stage panel — kept in run-scoped
       // state, not the global UI state. Components subscribe to `run:<id>`
-      // and maintain their own state from these events.
+      // and maintain their own state from these events. (`pipeline.step-cost`
+      // is consumed by the legacy `handleServerMessage` path in main.tsx,
+      // which owns the load-bearing per-run cost state — same pattern as
+      // `cost.snapshot`.)
       return state;
 
     // ── State / runs / system ──────────────────────────────────────────
@@ -255,6 +259,7 @@ const WIRE_TO_KIND: Record<string, DashboardEvent['kind']> = {
   'pipeline-resumed': 'pipeline.resumed',
   'pipeline-cancelled': 'pipeline.cancelled',
   'waiting-for-input': 'pipeline.waiting-for-input',
+  'pipeline-step-cost': 'pipeline.step-cost',
   // State
   'state': 'state',
   'prs': 'prs.updated',

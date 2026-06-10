@@ -167,6 +167,17 @@ export interface StepContext<I> {
    * `DurableStore.enqueueSignal(...)`.
    */
   waitForSignal<T = unknown>(channel: string): Promise<T>;
+  /**
+   * H3 turn-level resume seam (ADR §2.5). Peek the recorded payload of a
+   * COMPLETED effect by name WITHOUT advancing the replay cursor or the
+   * per-step idx counter — a pure read over the already-loaded recorded
+   * effects. Returns undefined in non-durable mode or when the effect
+   * hasn't been recorded yet (live execution). The turn-recorder uses it
+   * to detect a finished turn (`turn:N:assistant-end` present) so the
+   * adapter skips the upstream call on crash-resume. Satisfies
+   * agent-core's structural `EffectRuntimeLike.peekRecorded`.
+   */
+  peekRecorded?<T = unknown>(name: string): T | undefined;
 }
 
 /** Per-call options for `ctx.effect`. */

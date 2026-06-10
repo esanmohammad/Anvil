@@ -58,8 +58,14 @@ import type {
   StepSkipContext,
 } from './types.js';
 import type { DurableStore } from './durable/store.js';
-import { EffectRuntime } from './durable/effect-runtime.js';
+import { EffectRuntime, effectKeyMatchesScope } from './durable/effect-runtime.js';
 import { DeterminismViolationError } from './durable/types.js';
+import { rollupStepCostAcrossSubsteps, rollupIsEmpty } from './durable/cost-rollup.js';
+import {
+  computeSkipSetDivergence,
+  hasSkipSetDivergence,
+  formatSkipSetDivergence,
+} from './durable/skip-reconcile.js';
 
 export interface PipelineDeps {
   registry: StepRegistry;
@@ -202,6 +208,35 @@ export class Pipeline {
           skipReason.set(ev.stepId, 'replay-completed');
         }
       }
+
+      // FO1-1b — reconcile the disk-based skip set against the durable
+      // replay-completed set. Both fire for the same steps once resume
+      // reuses the original runId (Fix A finding 7); a divergence means
+      // they disagree about what finished. Durable already won via the
+      // `set()` above (it's the replay source of truth) — the `set()`
+      // calls are idempotent so no step is ever skipped twice (subsumes
+      // finding-3's dedup concern). Here we only make a disagreement
+      // VISIBLE rather than silently masking it.
+      //
+      // Only meaningful when BOTH sources exist for a reused runId:
+      //   - durableCompleted non-empty: an EMPTY durable log means a
+      //     fresh runId was minted (no reuse) — every disk step would
+      //     then falsely read as `onlyDisk`, so suppress the compare.
+      //   - priorCompleted non-empty: no disk side to diff against.
+      //   - not a rewind: rewindTo deliberately drops steps ≥ rewindIdx
+      //     below, so they are not a divergence. (Via the dashboard,
+      //     rewind passes carry no durableStore at all — this guards the
+      //     cli/test callers that may pass both.)
+      const durableCompleted: string[] = [];
+      for (const [id, reason] of skipReason) {
+        if (reason === 'replay-completed') durableCompleted.push(id);
+      }
+      if (!rewindTo && priorCompleted && priorCompleted.length > 0 && durableCompleted.length > 0) {
+        const divergence = computeSkipSetDivergence(priorCompleted, durableCompleted);
+        if (hasSkipSetDivergence(divergence)) {
+          console.warn(formatSkipSetDivergence(runId, divergence));
+        }
+      }
     }
 
     if (resumeFromStep) {
@@ -328,6 +363,15 @@ export class Pipeline {
         }
       }
 
+      // step:started is emitted unconditionally — including when a
+      // reused-runId resume re-runs a previously-failed step. The second
+      // `step:started` in the durable log is intentional (the step
+      // genuinely ran twice) and harmless to replay: effect replay keys
+      // on the unique effectKey with last-write-wins dedup, the version
+      // check above uses `.find` (first match), and resume-stage
+      // derivation is Set-based. It MUST still fire so in-process
+      // subscribers (dashboard stage render, audit log, cost hooks) see
+      // the re-run start.
       await this.emit(bus, {
         hook: 'step:started',
         runId,
@@ -344,12 +388,32 @@ export class Pipeline {
         prevOutput = out;
         // Track output for compensation (D4).
         this.stepOutputs.set(step.id, out);
+        // §2.6 per-model cost rollup. Reads turn:*:assistant-end +
+        // assistant-partial events for this step and buckets cost by
+        // model. Empty (fields omitted) for stages still on the legacy
+        // single-effect path — those report cost via `artifact:emitted`
+        // as before, so this is byte-identical until a stage is ported.
+        let costFields: Record<string, unknown> = {};
+        if (durableStore) {
+          try {
+            const rollup = await rollupStepCostAcrossSubsteps(durableStore, runId, step.id);
+            if (!rollupIsEmpty(rollup)) {
+              costFields = {
+                costByModel: rollup.costByModel,
+                prefillReinjectionUsd: rollup.prefillReinjectionUsd,
+                totalCostUsd: rollup.totalCostUsd,
+              };
+            }
+          } catch {
+            // Cost rollup is best-effort telemetry — never fail a step on it.
+          }
+        }
         await this.emit(bus, {
           hook: 'step:completed',
           runId,
           stepId: step.id,
           ts: this.iso(now),
-          payload: { durationMs: stepDurationMs, version: step.version ?? 1 },
+          payload: { durationMs: stepDurationMs, version: step.version ?? 1, ...costFields },
         });
       } catch (err) {
         failedStep = step.id;
@@ -597,6 +661,7 @@ export class Pipeline {
     let randomFn: StepContext<I>['random'];
     let sleepFn: StepContext<I>['sleep'];
     let waitForSignalFn: StepContext<I>['waitForSignal'];
+    let peekRecordedFn: StepContext<I>['peekRecorded'];
 
     if (durableStore) {
       const recorded = await durableStore.readEffectEvents(runId, step.id);
@@ -623,6 +688,7 @@ export class Pipeline {
       randomFn = () => runtime.random();
       sleepFn = (ms) => runtime.sleep(ms);
       waitForSignalFn = (channel) => runtime.waitForSignal(channel);
+      peekRecordedFn = <T>(name: string) => runtime.peekRecorded<T>(name);
     } else {
       effectFn = passthroughEffect;
       nowFn = passthroughNow;
@@ -630,6 +696,9 @@ export class Pipeline {
       randomFn = passthroughRandom;
       sleepFn = passthroughSleep;
       waitForSignalFn = passthroughWaitForSignal;
+      // Non-durable: nothing recorded → peek always misses → adapter
+      // always runs live (byte-identical to pre-H3).
+      peekRecordedFn = () => undefined;
     }
 
     return {
@@ -651,6 +720,7 @@ export class Pipeline {
       random: randomFn,
       sleep: sleepFn,
       waitForSignal: waitForSignalFn,
+      peekRecorded: peekRecordedFn,
     };
   }
 
@@ -720,23 +790,6 @@ function defaultSleep(ms: number): Promise<void> {
  * scope-shared — they ride along on whichever per-repo runtime
  * happens to call them.
  */
-function effectKeyMatchesScope(key: string | null | undefined, scope: string): boolean {
-  if (!key) return false;
-  if (key.startsWith('__anvil_')) return true;
-  if (key.startsWith('__signal:')) return true;
-  // Find scope token at any position with delimited boundaries.
-  let idx = key.indexOf(scope);
-  while (idx >= 0) {
-    const before = idx === 0 ? '' : key[idx - 1];
-    const afterIdx = idx + scope.length;
-    const after = afterIdx >= key.length ? '' : key[afterIdx];
-    const isBoundary = (c: string) => c === '' || c === '-' || c === ':';
-    if (isBoundary(before) && isBoundary(after)) return true;
-    idx = key.indexOf(scope, idx + 1);
-  }
-  return false;
-}
-
 // ── Non-durable mode passthroughs (Phase D2) ──────────────────────
 async function passthroughEffect<T>(_name: string, fn: () => Promise<T>, _opts?: EffectOptions): Promise<T> {
   return fn();

@@ -12,9 +12,13 @@ import { runFixLoop as runFixLoopCanonical, hasValidationFailures, extractRepoSe
 import { AgentManagerSession } from '../runners/agent-manager-session.js';
 export { hasValidationFailures, extractRepoSection, };
 export async function runFixLoop(opts) {
-    const session = opts.agentSession ?? buildSession(opts);
+    // Prefer the per-repo resolver; else fall back to ONE session reused for
+    // every repo (legacy `agentSession`/`agentManager` callers), built once.
+    let legacySingle;
+    const sessionForRepo = opts.sessionForRepo
+        ?? (() => (legacySingle ??= opts.agentSession ?? buildSession(opts)));
     return runFixLoopCanonical({
-        agentSession: session,
+        sessionForRepo,
         project: opts.project,
         model: opts.model,
         maxOutputTokens: opts.maxOutputTokens,
@@ -29,6 +33,8 @@ export async function runFixLoop(opts) {
         buildRepoProjectPromptForBuildStage: opts.buildRepoProjectPromptForBuildStage,
         isCancelled: opts.isCancelled,
         allowedTools: opts.allowedTools,
+        sessionStage: opts.sessionStage,
+        fallbackStage: opts.fallbackStage,
     });
 }
 function buildSession(opts) {

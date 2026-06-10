@@ -23,7 +23,7 @@
     "smoke": "bash scripts/smoke/run-smoke.sh"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.3.0",
+    "@esankhan3/anvil-agent-core": "^0.4.0",
     "@esankhan3/anvil-knowledge-core": "^0.3.0",
     "@modelcontextprotocol/sdk": "^1.29.0"
   },

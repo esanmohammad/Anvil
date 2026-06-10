@@ -168,6 +168,26 @@ export interface SpawnConfig {
     query: string,
     opts: { kind?: string; subtype?: string; limit?: number },
   ) => Promise<string>;
+  /**
+   * Turn-level durable recorder (v2 ADR §2.5). Forwarded by
+   * `buildAdapterRequest` onto `AdapterRequest.turnRecorder` → the
+   * bridge → `ModelAdapterConfig.turnRecorder`. Built by the step body
+   * from its `ctx.effect` runtime + a DurableStore-backed partial sink.
+   */
+  turnRecorder?: import('../../turn-recorder/index.js').TurnRecorder;
+  /**
+   * Prefill carried from a chain-walker burn (v2 ADR §2.3). Forwarded
+   * the same way so the resumed adapter continues from the prior
+   * model's exact stopping point.
+   */
+  prefill?: import('../../turn-recorder/index.js').Prefill;
+  /**
+   * §Tier 2 — COMPLETED prior turns of a stateful session, reconstructed
+   * from the durable log. Forwarded the same way (→ AdapterRequest →
+   * ModelAdapterConfig.priorMessages) so a non-claude resume re-presents
+   * the full conversation. Claude is gated out at the bridge.
+   */
+  priorMessages?: import('../../turn-recorder/index.js').PrefillTurn[];
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -70,6 +70,10 @@ export function toLegacyWire(ev) {
         type: 'waiting-for-input',
         payload: e.payload,
     }))
+        .with({ kind: 'pipeline.step-cost' }, (e) => ({
+        type: 'pipeline-step-cost',
+        payload: e.payload,
+    }))
         // ── Cost ─────────────────────────────────────────────────────────
         .with({ kind: 'cost.breach' }, (e) => ({
         type: 'cost-breach',

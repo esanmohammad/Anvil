@@ -61,6 +61,17 @@ export interface StartPipelineOptions {
         version: number;
         plan: Plan;
     };
+    /**
+     * Reuse an existing pipeline runId instead of minting a fresh one.
+     * Threaded by the resume path (Replay button + auto-resume queue) so
+     * `Pipeline.run()` reads the durable event log keyed by the ORIGINAL
+     * runId and replays its `step:completed` + recorded effects. Without
+     * this, resume minted a fresh `build-<ts>` id, so the log lookup hit
+     * an empty set and effect-granularity crash-resume never engaged
+     * (BUG-1 Fix A, finding 7). `createRun` is idempotent on an existing
+     * runId, so re-registering the same id is store-safe.
+     */
+    resumeRunId?: string;
 }
 export interface StartPipelineDeps {
     agentManager: AgentManager;

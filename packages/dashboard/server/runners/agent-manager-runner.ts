@@ -17,7 +17,7 @@ import type {
   AgentRunResult,
 } from '@esankhan3/anvil-core-pipeline';
 import { runWithChainFallback } from '@esankhan3/anvil-core-pipeline';
-import type { AgentManager } from '@esankhan3/anvil-agent-core';
+import type { AgentManager, Prefill } from '@esankhan3/anvil-agent-core';
 import { spawnAndWait } from '../steps/agent-spawner.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 
@@ -61,7 +61,7 @@ export class AgentManagerRunner implements AgentRunner {
   constructor(private readonly opts: AgentManagerRunnerOptions) {}
 
   async run(req: AgentRunRequest): Promise<AgentRunResult> {
-    return runWithChainFallback(
+    return runWithChainFallback<AgentRunResult, Prefill>(
       {
         stageName: req.stage,
         maxAttempts: this.opts.maxAttempts,
@@ -70,12 +70,25 @@ export class AgentManagerRunner implements AgentRunner {
           this.opts.burnedModels.add(info.model);
           this.opts.onBurn?.(info);
         },
+        // Turn-level resume (v2 ADR §2.4): the step body wires a resolver
+        // that reads the burned model's recorded partial from the durable
+        // store + applies the §2.3.3 truncation gate. Absent → every
+        // attempt runs prefill-less (pre-H3 behavior).
+        resolvePrefill: req.resolvePrefill,
       },
-      async (model) => this.spawnOnce(req, model),
+      // Prefill (v2 ADR §2.3) arrives from the chain walker after a
+      // burn; thread it onto the spawn so the resumed adapter continues
+      // from the prior model's stopping point. Undefined unless a
+      // `resolvePrefill` is wired (deferred to the per-stage cutover).
+      async (model, prefill) => this.spawnOnce(req, model, prefill),
     );
   }
 
-  private async spawnOnce(req: AgentRunRequest, model: string): Promise<AgentRunResult> {
+  private async spawnOnce(
+    req: AgentRunRequest,
+    model: string,
+    prefill?: AgentRunRequest['prefill'],
+  ): Promise<AgentRunResult> {
     const cwd = req.workingDir || this.opts.workspaceDir;
     const result = await spawnAndWait({
       agentManager: this.opts.agentManager,
@@ -95,6 +108,16 @@ export class AgentManagerRunner implements AgentRunner {
         allowedTools: req.allowedTools ? [...req.allowedTools] : undefined,
         maxOutputTokens: req.maxOutputTokens,
         recallMemory: this.opts.recallMemory,
+        // Turn-level durable resume envelope (v2 ADR §2.5/§2.3).
+        // turnRecorder stays undefined until the per-stage cutover
+        // (H3) builds one from ctx.effect; prefill flows from the
+        // chain walker when resolvePrefill is wired. Use the
+        // walker-supplied `prefill` ONLY — do NOT `?? req.prefill`:
+        // when resolvePrefill throws, the walker intentionally hands
+        // `undefined` for a clean retry, and falling back to a stale
+        // request-seeded prefill would resurrect an already-burned one.
+        turnRecorder: req.turnRecorder,
+        prefill,
       },
       isCancelled: this.opts.isCancelled,
       onSpawn: (agentId) => this.opts.onSpawn?.(agentId, req),

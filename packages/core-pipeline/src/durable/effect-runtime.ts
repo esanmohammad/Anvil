@@ -89,6 +89,29 @@ export class EffectRuntime {
     return this.runEffect(name, fn, opts);
   }
 
+  /**
+   * H3 replay-skip seam (used by the turn-recorder via the structural
+   * `EffectRuntimeLike.peekRecorded`). Returns the recorded
+   * `effect:completed` payload for `name` within this step, or
+   * undefined if no completed row exists yet. PURE READ: it does NOT
+   * touch `idx` or `cursor`, so the normal (name, idx) replay sequence
+   * is unaffected — the caller still issues the real `effect()` calls
+   * in order to advance the cursor.
+   *
+   * Scans the same `filtered` view the replay path uses, so per-repo
+   * fanout (effectFilter) stays correctly scoped. Matches the FIRST
+   * completed pair for the name (effect keys like `turn:N:assistant-end`
+   * are unique per step, so first == only).
+   */
+  peekRecorded<T = unknown>(name: string): T | undefined {
+    for (const pair of this.filtered) {
+      if (pair.started.effectKey === name && pair.completed) {
+        return pair.completed.payload as T;
+      }
+    }
+    return undefined;
+  }
+
   async now(): Promise<number> {
     return this.runEffect(SYS_NOW, async () => this.realNow(), { smallResult: true });
   }
@@ -150,18 +173,27 @@ export class EffectRuntime {
     });
     while (true) {
       if (this.deps.signal?.aborted) {
-        throw new Error('Run cancelled while waiting for signal');
+        // finding 4 — cancellation breaks the poll. The dashboard's
+        // dual-path race resolves its in-process resolver with '' on
+        // cancel (PipelineRunner.cancel drains stageInputResolvers), so
+        // this rejection lands on the already-settled losing branch and
+        // is swallowed by `deferToResolver`. Tag the error so callers can
+        // match on a property instead of the message text.
+        const err = new Error('Run cancelled while waiting for signal');
+        (err as Error & { __anvilSignalCancelled?: boolean }).__anvilSignalCancelled = true;
+        throw err;
       }
-      const payload = await this.deps.store.consumeSignal(this.deps.runId, channel);
+      // finding 5 — atomic consume + effect:completed receipt in one
+      // transaction. Closes the crash-between-consume-and-record window
+      // that consumed the signal, failed to record it, and then hung the
+      // wait forever on replay (effect:started with no completion, queue
+      // already empty).
+      const payload = await this.deps.store.consumeSignalAndRecord(this.deps.runId, channel, {
+        stepId: this.deps.stepId,
+        effectKey: `__signal:${channel}`,
+        effectIdx: idx,
+      });
       if (payload !== null) {
-        await this.deps.store.appendEvent({
-          runId: this.deps.runId,
-          kind: 'effect:completed',
-          stepId: this.deps.stepId,
-          effectKey: `__signal:${channel}`,
-          effectIdx: idx,
-          payload,
-        });
         return payload as T;
       }
       await this.realSleep(250);
@@ -376,6 +408,75 @@ function reconstructErrorFromPayload(payload: unknown): ReplayedEffectError {
   const obj = payload as Record<string, unknown>;
   const message = typeof obj.message === 'string' ? obj.message : 'effect failed';
   return new ReplayedEffectError(message, obj);
+}
+
+/**
+ * True when an effect key belongs to a given scope token, matched at
+ * delimited boundaries (start/end or `-`/`:`). System effects
+ * (`__anvil_*`, `__signal:*`) always match (they're scope-agnostic).
+ *
+ * Moved here from pipeline.ts so per-repo / per-task scoped runtimes
+ * (H3 turn-level resume) and the walker's own fanout share ONE
+ * definition. Re-exported by pipeline.ts for back-compat.
+ */
+export function effectKeyMatchesScope(key: string | null | undefined, scope: string): boolean {
+  if (!key) return false;
+  if (key.startsWith('__anvil_')) return true;
+  if (key.startsWith('__signal:')) return true;
+  let idx = key.indexOf(scope);
+  while (idx >= 0) {
+    const before = idx === 0 ? '' : key[idx - 1];
+    const afterIdx = idx + scope.length;
+    const after = afterIdx >= key.length ? '' : key[afterIdx];
+    const isBoundary = (c: string) => c === '' || c === '-' || c === ':';
+    if (isBoundary(before) && isBoundary(after)) return true;
+    idx = key.indexOf(scope, idx + 1);
+  }
+  return false;
+}
+
+/**
+ * H3 per-repo / per-task isolation (ADR §2.4). Build a fresh
+ * `EffectRuntime` for ONE parallel unit (a repo, or a repo+task) within a
+ * step that fans out concurrently. Each unit gets its own monotonic `idx`
+ * sequence over ONLY the effects whose key carries ALL `scopeTokens`, so
+ * racing units don't share an idx counter (which would make replay
+ * non-deterministic). Reconstructed identically on replay (same
+ * readEffectEvents + same filter) → deterministic per-unit replay.
+ *
+ * The caller MUST name every effect for this unit with the scope tokens
+ * as an EXACT joined PREFIX (e.g. tokens [`service-a`] → keys start with
+ * `service-a:`; tokens [`api`, `t3`] → keys start with `api:t3:`). The
+ * filter matches by strict prefix — NOT the boundary-substring
+ * `effectKeyMatchesScope` used by the walker's own fanout. Strict prefix
+ * is required here so prefix-related repo names don't collide: scope
+ * `api` must NOT admit `api-gateway:...` (`'api-gateway:'` does not start
+ * with `'api:'`). This mirrors the turn-recorder's `effectPrefix`
+ * (`scopeTokens.join(':') + ':'`) and `turn-resume`'s `matchTurn`, so all
+ * three layers agree. With no scope tokens this is a plain runtime over
+ * the whole step (single-stage path).
+ */
+export async function createScopedEffectRuntime(opts: {
+  store: DurableStore;
+  runId: string;
+  stepId: string;
+  /** Scope tokens forming the exact effect-key prefix (e.g. [repo] or [repo, taskId]). */
+  scopeTokens?: readonly string[];
+  signal?: AbortSignal;
+}): Promise<EffectRuntime> {
+  const recorded = await opts.store.readEffectEvents(opts.runId, opts.stepId);
+  const tokens = opts.scopeTokens ?? [];
+  const prefix = tokens.length ? `${tokens.join(':')}:` : '';
+  return new EffectRuntime({
+    store: opts.store,
+    runId: opts.runId,
+    stepId: opts.stepId,
+    recordedEffects: recorded,
+    ...(prefix
+      ? { effectFilter: (pair) => (pair.started.effectKey ?? '').startsWith(prefix) }
+      : {}),
+    signal: opts.signal,
+  });
 }
 
 function defaultSleep(ms: number): Promise<void> {

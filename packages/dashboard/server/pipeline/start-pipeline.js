@@ -48,7 +48,13 @@ export function createStartPipeline(deps) {
         // user clicks Build and sees Active Runs stay stale for a beat while
         // the runner constructs hooks. Visible activity ID is the same one we
         // pass to activeRuns.set later (replaced rather than re-registered).
-        const pipelineRunId = `build-${Date.now().toString(36)}`;
+        // Resume reuses the ORIGINAL runId so the durable log keyed by it
+        // replays; a fresh user-initiated build mints a new one. See
+        // StartPipelineOptions.resumeRunId.
+        const pipelineRunId = options?.resumeRunId ?? `build-${Date.now().toString(36)}`;
+        if (options?.resumeRunId) {
+            console.log(`[dashboard] resuming with original runId ${pipelineRunId} — durable replay enabled`);
+        }
         const pipelineActivities = [];
         // Seed an initial activity so the per-stage panel isn't blank while
         // the runner spins up (workspace bootstrap + manifest load + walker
@@ -568,6 +574,34 @@ export function createStartPipeline(deps) {
                 stageName: data.stageName,
                 message: data.message,
             });
+        });
+        // §H3 per-model step cost. Forward the rollup to the typed event surface
+        // (CostMeter per-model breakdown) AND, when the step was continued across
+        // models, drop a "↪ continued by <successor>" marker into the activity
+        // stream. The handoff is read from the rollup's `continuation` summary
+        // (burned-vs-completed model sets) — NOT from re-injected token volume or
+        // cost — so it fires on the common 429-before-first-delta burn (empty
+        // prefill, zero tokens) and for unpriced successors (zero reinjection $).
+        runner.on('step-cost', (data) => {
+            deps.services.pipeline.emit('pipeline.step-cost', data);
+            const cont = data.continuation;
+            if (cont && cont.successors.length > 0 && cont.predecessors.length > 0) {
+                // Only append the re-injection cost when there actually was one (a
+                // non-empty prefill priced against a known model).
+                const reinjected = data.prefillReinjectionUsd > 0
+                    ? ` (+$${data.prefillReinjectionUsd.toFixed(4)} re-injected)`
+                    : '';
+                const entry = {
+                    timestamp: Date.now(),
+                    stage: data.stepId,
+                    type: 'stdout',
+                    content: `↪ Continued by ${cont.successors.join(', ')} after ${cont.predecessors.join(', ')} exhausted${reinjected}`,
+                    kind: 'provenance',
+                };
+                pipelineActivities.push(entry);
+                deps.pushOutputEntry(entry);
+                deps.services.agents.emit('agent.output', { entries: [entry], runId: pipelineRunId });
+            }
         });
         // Show artifacts in changes tab + scan ship artifacts for PR URLs
         runner.on('artifact-written', (data) => {

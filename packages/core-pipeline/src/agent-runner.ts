@@ -14,6 +14,8 @@
  * existing imports.
  */
 
+import type { TurnRecorder, Prefill } from '@esankhan3/anvil-agent-core';
+
 export interface AgentRunRequest {
   /** Persona name (clarifier, analyst, architect, lead, engineer, …). */
   persona: string;
@@ -25,6 +27,14 @@ export interface AgentRunRequest {
   workingDir: string;
   /** Stage label for telemetry (clarify, repo-requirements, build, …). */
   stage: string;
+  /**
+   * Stage key for burn-fallback MODEL resolution, when it must differ from
+   * `stage`. fix-loop spawns under `stage='validate'` (so its turns roll up
+   * under the enclosing validate step's cost), but its post-burn fallback must
+   * follow the `fix-loop` chain — `routingStage='fix-loop'`. Defaults to
+   * `stage` (clarify/QA/per-repo: routing == recording stage).
+   */
+  routingStage?: string;
   /** Optional model override; resolver picks one when omitted. */
   model?: string;
   /** Optional provider override (claude, openrouter, opencode, …). */
@@ -37,6 +47,40 @@ export interface AgentRunRequest {
   maxOutputTokens?: number;
   /** Optional fan-out hint — repo name when this run is per-repo. */
   repoName?: string;
+  /**
+   * Turn-level durable recorder (v2 ADR §2.5). When a step body builds
+   * one (from its `ctx.effect` runtime + a DurableStore-backed partial
+   * sink) and threads it here, the runner forwards it down to
+   * `ModelAdapterConfig.turnRecorder`, splitting the agent's LLM
+   * invocation into per-turn sub-effects. Omitted → adapters use a
+   * NullTurnRecorder (no persistence; identical observable behavior).
+   */
+  turnRecorder?: TurnRecorder;
+  /**
+   * Prefill from a prior chain entry that burned mid-stream (v2 ADR
+   * §2.3). Threaded from `runWithChainFallback`'s `resolvePrefill` into
+   * the next attempt's request, then down to
+   * `ModelAdapterConfig.prefill` so the adapter continues from the
+   * exact character the prior model stopped at.
+   */
+  prefill?: Prefill;
+  /**
+   * Prefill resolver (v2 ADR §2.4). When a step body wires turn-level
+   * resume, it builds this closure (capturing the DurableStore + the
+   * recorder's scope) and threads it here; the runner forwards it into
+   * `runWithChainFallback`'s `resolvePrefill` so that after a burn the
+   * NEXT attempt continues from the burned model's recorded partial.
+   * Omitted → every attempt runs prefill-less (identical to pre-H3).
+   *
+   * Returns the prefill for the next attempt, or undefined for a clean
+   * (prefill-less) retry — e.g. when no servable partial exists or the
+   * §2.3.3 truncation gate rejects it for the target window.
+   */
+  resolvePrefill?: (info: {
+    burnedModel: string;
+    attemptIndex: number;
+    nextModel?: string;
+  }) => Promise<Prefill | undefined>;
 }
 
 export interface AgentRunResult {

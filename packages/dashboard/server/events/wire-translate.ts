@@ -84,6 +84,10 @@ export function toLegacyWire(ev: DashboardEvent): LegacyMessage | null {
       type: 'waiting-for-input',
       payload: e.payload,
     } as LegacyMessage))
+    .with({ kind: 'pipeline.step-cost' }, (e) => ({
+      type: 'pipeline-step-cost',
+      payload: e.payload,
+    } as LegacyMessage))
 
     // ── Cost ─────────────────────────────────────────────────────────
     .with({ kind: 'cost.breach' }, (e) => ({
