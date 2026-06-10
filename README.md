@@ -20,6 +20,15 @@
   <b>No vendor lock-in. No markup. No hosted plan.</b>
 </p>
 
+<p>
+  <sub>
+  Anvil is an <b>open-source, self-hosted AI coding agent</b> — an end-to-end <b>LLM pipeline</b>
+  (clarify → plan → build → review → PR) that runs on Claude, GPT, Gemini, and OpenRouter, or fully
+  local via Ollama &amp; OpenCode. It speaks the <b>Model Context Protocol (MCP)</b> and uses your own
+  API keys. Written in TypeScript.
+  </sub>
+</p>
+
 <br />
 
 <p>
@@ -31,7 +40,7 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/version-0.2.0-3b82f6.svg" alt="Version 0.2.0" />
+  <img src="https://img.shields.io/badge/version-0.3.0-3b82f6.svg" alt="Version 0.3.0" />
   <img src="https://img.shields.io/badge/license-MIT-3b82f6.svg" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%E2%89%A518-339933.svg" alt="Node 18+" />
   <img src="https://img.shields.io/badge/TypeScript-5.8-3178c6.svg" alt="TypeScript" />
@@ -286,6 +295,10 @@ Long-term project memory with five types — working, episodic,
 semantic, procedural, profile. Auto-learners propose; a sleeptime
 ratifier decides. Code-fact drift detection keeps memories honest
 when the underlying file changes.
+
+**📊 83.4% on LoCoMo** (full 1,540-question set,
+vectorize-io's [Agent Memory Benchmark](packages/memory-core/benchmark)) —
+hybrid BM25 + vector + graph retrieval, runs fully local.
 
 </td>
 <td width="33%" valign="top">
@@ -625,7 +638,7 @@ verifies the chain automatically.
 | [**`@esankhan3/anvil-cli`**](packages/cli) | The user-facing CLI + bundled dashboard. Run `npx @esankhan3/anvil-cli` to start. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-cli.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-cli) [![downloads](https://img.shields.io/npm/dm/@esankhan3/anvil-cli.svg?label=&color=64748b)](https://www.npmjs.com/package/@esankhan3/anvil-cli) |
 | [`@esankhan3/anvil-agent-core`](packages/agent-core) | Shared LLM stack — unified `LanguageModel` interface, provider adapters, agent subprocess machinery, cost calc. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-agent-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-agent-core) |
 | [`@esankhan3/anvil-knowledge-core`](packages/knowledge-core) | AST chunking, tree-sitter parsing, embeddings, LanceDB vector store, hybrid retrieval. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-knowledge-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-knowledge-core) |
-| [`@esankhan3/anvil-memory-core`](packages/memory-core) | Long-term memory — five-type taxonomy, bi-temporal facts, drift detection, sleeptime ratification. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-memory-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-memory-core) |
+| [`@esankhan3/anvil-memory-core`](packages/memory-core) | Long-term memory — five-type taxonomy, bi-temporal facts, drift detection, sleeptime ratification. **[83.4% on LoCoMo](packages/memory-core/benchmark).** | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-memory-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-memory-core) |
 | [`@esankhan3/anvil-convention-core`](packages/convention-core) | Convention extraction, rule engine, promotion ledger. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-convention-core.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-convention-core) |
 | [`@esankhan3/anvil-core-pipeline`](packages/core-pipeline) | Typed `Step<I,O>` graph, `EventBus`, `StepRegistry`, lifecycle hooks. | [![npm](https://img.shields.io/npm/v/@esankhan3/anvil-core-pipeline.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/anvil-core-pipeline) |
 | [`@esankhan3/code-search-mcp`](packages/code-search-mcp) | Standalone code-search product — MCP server + `code-search` CLI + `code-search-daemon` (file-watcher + UDS JSON-RPC). | [![npm](https://img.shields.io/npm/v/@esankhan3/code-search-mcp.svg?logo=npm&label=&color=cb3837)](https://www.npmjs.com/package/@esankhan3/code-search-mcp) |
