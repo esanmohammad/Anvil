@@ -11,8 +11,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import type { AgentRunner } from '../pipeline/stages/types.js';
-import { runWithChainFallback } from '@esankhan3/anvil-core-pipeline';
-import { ProviderRegistry, type ProviderName } from '@esankhan3/anvil-agent-core';
+import { ProviderRegistry, getAgentReliabilityRouter, type ProviderName } from '@esankhan3/anvil-agent-core';
 import { error, success, info, warn } from '../logger.js';
 import { estimatePipelineCost, formatCostEstimate } from '../pipeline/cost-estimator.js';
 import { resolveModelForStage, ModelResolutionError, UnknownStageError } from '@esankhan3/anvil-core-pipeline';
@@ -121,16 +120,15 @@ function createAgentRunner(providerName?: ProviderName, defaultModel?: string): 
       // (stage, persona, provider) tuple. The fallback wrapper still gives
       // us the empty-throw retry surface and primes the model burn-set so
       // future stages skip a model that's been burning.
-      return runWithChainFallback(
+      // Reliability via the shared LlmRouter (chain fallback + per-error-class
+      // backoff + circuit breaker + unified classify). cli's resolver returns
+      // one pinned model, so a transient failure becomes same-model
+      // retry-with-backoff; the burn-set still primes future stages.
+      const { result } = await getAgentReliabilityRouter().runAgent(
         {
-          stageName: config.stage,
+          stage: config.stage,
           maxAttempts: 5,
-          resolveModel: () => {
-            const requested = config.model ?? defaultModel ?? 'claude-sonnet-4-6';
-            // Nothing more to fall back to today — burn-set primed for future
-            // stages of this run.
-            return requested;
-          },
+          resolveModel: () => config.model ?? defaultModel ?? 'claude-sonnet-4-6',
           onBurn: ({ model, status }) => {
             burnedModels.add(model);
             warn(`[cli] ${config.stage}: ${model} burned (status ${status})`);
@@ -138,6 +136,7 @@ function createAgentRunner(providerName?: ProviderName, defaultModel?: string): 
         },
         async (resolvedModel) => runOnce(config, resolvedModel),
       );
+      return result;
     },
   };
 }

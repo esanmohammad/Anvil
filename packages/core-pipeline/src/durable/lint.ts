@@ -29,12 +29,11 @@ export interface LintViolation {
     | 'no-direct-fs-read'
     | 'no-direct-exec'
     | 'no-direct-setTimeout'
-    // H4 stub (NOT enforced in H3): forbid any new single-effect LLM
-    // wrapper — `ctx.effect('...', () => adapter.run(...))` that bypasses
-    // the TurnRecorder. No RuleSpec entry yet because H1–H3 deliberately
-    // allow ported (TurnRecorder) and legacy (single-effect) adapters to
-    // coexist; enforcing now would flag every un-ported adapter. The
-    // regex lands in H4 after the last adapter is ported (ADR §4.4).
+    // Stub (NOT yet enforced): forbid any new single-effect LLM wrapper —
+    // `ctx.effect('...', () => adapter.run(...))` that bypasses the
+    // TurnRecorder. No RuleSpec entry yet. Every adapter now records turns
+    // except gemini-cli (CLI subprocess), so this could be enforced as a
+    // follow-up (ADR §4.4); it stays a stub until then.
     | 'no-single-effect-llm-wrapper';
   /** Suggested replacement. */
   suggestion: string;

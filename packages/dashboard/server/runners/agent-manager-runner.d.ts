@@ -11,7 +11,7 @@
  * factories drive both consumers without modification.
  */
 import type { AgentRunner, AgentRunRequest, AgentRunResult } from '@esankhan3/anvil-core-pipeline';
-import type { AgentManager } from '@esankhan3/anvil-agent-core';
+import type { AgentManager, ErrorClass } from '@esankhan3/anvil-agent-core';
 export interface AgentManagerRunnerOptions {
     agentManager: AgentManager;
     /** Project name forwarded to the spawn config. */
@@ -28,7 +28,7 @@ export interface AgentManagerRunnerOptions {
     resolveModel: (stageName: string, exclude: ReadonlySet<string>) => string;
     /** Mutable burn-set shared across all stages of a single run. */
     burnedModels: Set<string>;
-    /** Max chain-fallback attempts. Forwarded to `runWithChainFallback`. */
+    /** Max chain-fallback attempts. Forwarded to `LlmRouter.runAgent`. */
     maxAttempts: number;
     /** Optional callback fired the moment an agent is spawned. */
     onSpawn?: (agentId: string, req: AgentRunRequest) => void;
@@ -40,6 +40,8 @@ export interface AgentManagerRunnerOptions {
         model: string;
         status: number | string;
         message: string;
+        errorClass: ErrorClass;
+        delayMs: number;
     }) => void;
     /**
      * Wave 5 — optional callback that powers the agent's `recall_memory`

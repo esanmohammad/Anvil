@@ -20,8 +20,25 @@ export type {
 } from './types.js';
 export { ALL_ERROR_CLASSES } from './types.js';
 export { LlmRouter } from './router.js';
-export type { LlmRouterDeps, AdapterResolver } from './router.js';
-export { RouterError, classifyError, parseRetryAfterMs } from './errors.js';
+export type {
+  LlmRouterDeps,
+  AdapterResolver,
+  AgentChainOptions,
+  AgentChainResult,
+} from './router.js';
+export {
+  ProviderRegistryAdapterResolver,
+  providerRegistryAdapterResolver,
+  getAgentReliabilityRouter,
+  _resetAgentReliabilityRouter,
+} from './provider-registry-resolver.js';
+export {
+  RouterError,
+  classifyError,
+  parseRetryAfterMs,
+  isTerminalErrorClass,
+  isFallbackEligibleErrorClass,
+} from './errors.js';
 export { runWithRetry, DEFAULT_RETRY_POLICY } from './retry.js';
 export type { RetryAttempt, RunWithRetryDeps, RunWithRetryResult } from './retry.js';
 export {

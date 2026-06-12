@@ -44,11 +44,10 @@ export interface EffectRuntimeLike {
    * that a turn was already fully recorded (its `assistant-end` exists)
    * so the adapter can skip the upstream call entirely on crash-resume.
    *
-   * Optional: the NullEffectRuntime omits it, so un-ported callers
-   * always run live (peek → undefined → no replay), preserving
-   * byte-identical pre-H3 behavior. The concrete core-pipeline
-   * `EffectRuntime` implements it as a pure read over the pre-loaded
-   * recorded-effect set.
+   * Optional: the NullEffectRuntime omits it, so non-durable callers
+   * (single-shot / no DurableStore) always run live (peek → undefined →
+   * no replay). The concrete core-pipeline `EffectRuntime` implements it
+   * as a pure read over the pre-loaded recorded-effect set.
    */
   peekRecorded?<T = unknown>(name: string): T | undefined;
 }
@@ -58,6 +57,13 @@ export interface EffectInvokeOptions {
   idempotencyKey?: string;
   /** Hint that the payload is small enough to inline; runtime may skip blobs. */
   smallResult?: boolean;
+  /**
+   * Transform applied to the result before it is persisted to the durable
+   * log; the live caller still gets the full result. Used to cap large
+   * tool-result payloads so a turn doesn't block the loop serialising them.
+   * Mirrors `EffectOptions.persistTransform` in core-pipeline.
+   */
+  persistTransform?: (result: unknown) => unknown;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -190,14 +196,13 @@ export interface AssistantStartRequest {
   model: string;
   provider: ProviderName;
   system?: string;
-  /** Raw conversation messages sent to the upstream. Hashed for replay. */
+  /** Raw conversation messages sent to the upstream. Recorded for provenance. */
   messages: unknown;
   prefill?: Prefill;
   /**
    * §Tier 2 — the new user message that opened this phase. Recorded in the
-   * assistant-start payload (NOT hashed — `messages` already covers it) so
-   * `reconstructSessionHistory` can re-present prior turns with their prompts
-   * on a stateful (non-claude) session resume.
+   * assistant-start payload so `reconstructSessionHistory` can re-present
+   * prior turns with their prompts on a stateful (non-claude) session resume.
    */
   userPrompt?: string;
 }
@@ -217,10 +222,11 @@ export interface AssistantTurn {
    * (assistant message + tool-result messages), as opaque objects. On
    * crash-resume the adapter re-appends these verbatim instead of
    * reconstructing them from the neutral `toolUses`/`text` — raw vs
-   * canonical `tool_calls` arguments and vendor `reasoning_details`
-   * echoes would otherwise drift and trip a `DeterminismViolationError`
-   * on the NEXT turn's `assistant-start` input hash. Empty for a
-   * terminal (no-tool) turn that appended nothing before breaking.
+   * canonical `tool_calls` arguments and vendor `reasoning_details` echoes
+   * would otherwise drift, leaving the FIRST live turn past the replay
+   * frontier with a malformed upstream request (e.g. unpaired tool_calls,
+   * or "reasoning_content is missing"). Empty for a terminal (no-tool)
+   * turn that appended nothing before breaking.
    */
   historyDelta: unknown[];
 }

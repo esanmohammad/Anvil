@@ -36,6 +36,7 @@ import type {
   InvokeResult,
   ProviderCapabilities,
   ProviderName,
+  StreamEvent,
 } from '../types.js';
 
 // ── Test-local OTel provider ───────────────────────────────────────────────
@@ -105,7 +106,9 @@ function makeMatrix(
         supportsModel: () => true,
         getModelPricing: () => null,
         checkAvailability: async () => ({ available: true }),
-        invokeStream: async function* () {},
+        invokeStream: async function* (): AsyncGenerator<StreamEvent, InvokeResult> {
+          throw new Error('invokeStream not exercised in this telemetry test');
+        },
         invoke: async (_o: LanguageModelInvokeOptions) => {
           const idx = calls[id];
           calls[id] = idx + 1;

@@ -201,11 +201,13 @@ OpenRouter, OpenCode) get the right `BuiltinToolExecutor` scope.
 Build can edit; review is read-only.
 
 ### Chain-fallback on retryable upstream errors
-`runStageWithFallback` catches `UpstreamError` shapes from
-`@anvil/agent-core`, burns the failed model in
-`runtimeBurnedModels`, and re-resolves the stage's chain via
-`pickAliveModelFromChainSync`. Quota bursts on a single provider
-don't sink the run.
+Every spawn runs through `LlmRouter.runAgent` (agent-core's shared
+`getAgentReliabilityRouter()`). On a retryable failure (classified by the
+unified `classifyError`) it backs off per error class — letting a poisoned
+socket / quota recover — trips a per-provider circuit breaker on repeated
+failure, burns the model into `runtimeBurnedModels`, and re-resolves the
+chain via the injected `pickAliveModelFromChainSync`. Quota bursts and
+transient `fetch failed` no longer sink the run.
 
 ### Pre-flight liveness
 `prefetchProviderLiveness` runs at pipeline start and probes every

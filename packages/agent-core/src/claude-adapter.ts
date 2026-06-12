@@ -158,9 +158,10 @@ export class ClaudeAdapter implements ModelAdapter {
     // Deliberately NO replay-skip: claude pipes rich stream-json (tool_result
     // frames carry PR URLs); re-running it on a same-runId resume preserves
     // that full output, whereas re-emitting only the recorded text would drop
-    // it. The single assistant-start key is the deterministic prompt hash, so
-    // replay matches without a DeterminismViolation. NullTurnRecorder no-ops
-    // without a durable recorder.
+    // it. The assistant-start effect carries no input-hash guard (the prompt
+    // embeds live-queried KB/memory that drifts across a resume), so replay
+    // advances the cursor without a DeterminismViolation. NullTurnRecorder
+    // no-ops without a durable recorder.
     const recorder = config.turnRecorder ?? createNullTurnRecorder({
       runId: config.sessionId,
       stepId: config.stage,

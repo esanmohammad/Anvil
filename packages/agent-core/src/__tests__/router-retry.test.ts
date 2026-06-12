@@ -47,9 +47,7 @@ function makeFakeAdapter(
     supportsModel: () => true,
     getModelPricing: () => null,
     checkAvailability: async () => ({ available: true }),
-    invokeStream: async function* () {
-      /* unused */
-    },
+    invokeStream: (async function* () { /* unused in retry tests */ }) as unknown as LanguageModel['invokeStream'],
     invoke: async (_opts: LanguageModelInvokeOptions): Promise<InvokeResult> => {
       const r = responses[calls];
       calls += 1;
@@ -287,7 +285,7 @@ describe('LlmRouter.invoke (Phase 2 single-adapter)', () => {
       supportsModel: () => true,
       getModelPricing: () => null,
       checkAvailability: async () => ({ available: true }),
-      invokeStream: async function* () {},
+      invokeStream: (async function* () {}) as unknown as LanguageModel['invokeStream'],
       invoke: async (opts) => {
         captured = opts.model;
         return { ...fakeResult(), provider: 'openai' };
@@ -335,7 +333,7 @@ describe('LlmRouter.invoke (Phase 2 single-adapter)', () => {
       supportsModel: () => true,
       getModelPricing: () => null,
       checkAvailability: async () => ({ available: true }),
-      invokeStream: async function* () {},
+      invokeStream: (async function* () {}) as unknown as LanguageModel['invokeStream'],
       invoke: async () => {
         calls += 1;
         if (calls === 1) throw new Error('quota exceeded'); // no status code

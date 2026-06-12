@@ -58,7 +58,7 @@ export interface AgentRunRequest {
   turnRecorder?: TurnRecorder;
   /**
    * Prefill from a prior chain entry that burned mid-stream (v2 ADR
-   * §2.3). Threaded from `runWithChainFallback`'s `resolvePrefill` into
+   * §2.3). Threaded from `LlmRouter.runAgent`'s `resolvePrefill` into
    * the next attempt's request, then down to
    * `ModelAdapterConfig.prefill` so the adapter continues from the
    * exact character the prior model stopped at.
@@ -68,9 +68,9 @@ export interface AgentRunRequest {
    * Prefill resolver (v2 ADR §2.4). When a step body wires turn-level
    * resume, it builds this closure (capturing the DurableStore + the
    * recorder's scope) and threads it here; the runner forwards it into
-   * `runWithChainFallback`'s `resolvePrefill` so that after a burn the
+   * `LlmRouter.runAgent`'s `resolvePrefill` so that after a burn the
    * NEXT attempt continues from the burned model's recorded partial.
-   * Omitted → every attempt runs prefill-less (identical to pre-H3).
+   * Omitted → every attempt runs prefill-less.
    *
    * Returns the prefill for the next attempt, or undefined for a clean
    * (prefill-less) retry — e.g. when no servable partial exists or the

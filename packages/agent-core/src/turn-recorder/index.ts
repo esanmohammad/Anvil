@@ -4,7 +4,7 @@
  * a chain-fallback model swap.
  *
  * Effect-name vocabulary (per the v2 ADR §2.1):
- *   - `turn:<N>:assistant-start`     — request payload, hashed for replay
+ *   - `turn:<N>:assistant-start`     — request payload (recorded, NOT input-hash-guarded: see startTurn)
  *   - `turn:<N>:tool_use:<M>`        — intent (name + parsed args)
  *   - `turn:<N>:tool_result:<M>`     — neutral result; replay short-circuits the executor
  *   - `turn:<N>:assistant-end`       — completed assistant text + provenance
@@ -39,7 +39,43 @@ import type {
   TurnTokenUsage,
 } from './types.js';
 import type { ProviderName } from '../types.js';
-import { contentHashFromArgs } from './hash.js';
+
+const DEFAULT_TOOL_RESULT_CAP_BYTES = 65_536;
+
+/**
+ * Resolve the persisted-tool-result cap. `ANVIL_DURABLE_MAX_TOOL_RESULT_BYTES`
+ * overrides the 64 KiB default; `0` disables the cap (persist the full result).
+ */
+function toolResultPersistCapBytes(): number {
+  const raw = process.env.ANVIL_DURABLE_MAX_TOOL_RESULT_BYTES;
+  if (raw === undefined) return DEFAULT_TOOL_RESULT_CAP_BYTES;
+  const n = Number(raw);
+  if (n === 0) return Infinity; // explicit opt-out — persist full payloads
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_TOOL_RESULT_CAP_BYTES;
+}
+
+/**
+ * Cap the `content` of a NeutralToolResult for durable storage. Only string
+ * content past the cap is truncated (with a marker); the result keeps a valid
+ * NeutralToolResult shape so resume's message reconstruction still works. The
+ * live caller is unaffected — this runs only on the persisted copy via
+ * `EffectOptions.persistTransform`.
+ */
+function capToolResultForPersist(result: unknown): unknown {
+  const cap = toolResultPersistCapBytes();
+  if (cap === Infinity || !result || typeof result !== 'object') return result;
+  const r = result as { content?: unknown; [k: string]: unknown };
+  if (typeof r.content === 'string' && r.content.length > cap) {
+    const omitted = r.content.length - cap;
+    return {
+      ...r,
+      content:
+        r.content.slice(0, cap) +
+        `\n…[${omitted} bytes truncated for durable storage; full output was sent to the model live]`,
+    };
+  }
+  return result;
+}
 
 const DEFAULT_UUID = (): string =>
   (globalThis.crypto?.randomUUID?.() ?? fallbackUuid());
@@ -101,17 +137,24 @@ export class TurnRecorder {
     this.toolIdxByTurn.set(turn, 0);
     this.turnMeta.set(turn, { model: req.model, provider: req.provider });
 
-    const idempotencyKey = contentHashFromArgs({
-      model: req.model,
-      provider: req.provider,
-      system: req.system ?? '',
-      messages: req.messages,
-      prefillTurnUuid: req.prefill?.turnUuid,
-    });
-
     // Record the start. On replay this is a no-op that returns the
     // recorded payload — we don't use the return value here because
     // the meaningful replay signal is whether `assistant-end` exists.
+    //
+    // Deliberately NO `idempotencyKey` (input-hash) guard on this effect.
+    // The turn's input (system prompt + messages) embeds live-queried,
+    // process-local context: the Knowledge Base graph and memory block are
+    // re-queried in a fresh process on resume (the "stable" prompt getters
+    // only memoise WITHIN one run, not across a restart), and a cross-vendor
+    // continuation legitimately swaps the model/prefill. So the input is NOT
+    // byte-stable across resume — and it doesn't need to be: when
+    // `assistant-end` exists the recorded transcript is replayed verbatim
+    // (the upstream call is skipped, so the rebuilt prompt is never sent);
+    // when it doesn't, the turn re-runs live (the whole point of resume).
+    // Hashing the input into a FATAL determinism guard turned that benign
+    // drift into a `DeterminismViolationError` and broke resume entirely.
+    // The effect-SEQUENCE guard (name + idx) still catches genuine step-logic
+    // divergence; `runTool` still pins tool args via its own idempotencyKey.
     await this.deps.runtime.effect(
       this.key(`turn:${turn}:assistant-start`),
       async () => ({
@@ -120,13 +163,11 @@ export class TurnRecorder {
         provider: req.provider,
         prefillTurnUuid: req.prefill?.turnUuid ?? null,
         // §Tier 2: persist the phase's user prompt so a stateful resume can
-        // reconstruct prior turns WITH their prompts. NOT in `idempotencyKey`
-        // (above) — `messages` already covers it for the replay hash; storing
-        // it here is additive and never re-read by replay-skip (which reads
-        // assistant-end), so it cannot perturb determinism.
+        // reconstruct prior turns WITH their prompts. Additive only — never
+        // re-read by replay-skip (which reads assistant-end).
         userPrompt: req.userPrompt ?? null,
       }),
-      { idempotencyKey, smallResult: true },
+      { smallResult: true },
     );
 
     // H3 replay-skip: if this turn's `assistant-end` is already in the
@@ -221,6 +262,16 @@ export class TurnRecorder {
     const result = await this.deps.runtime.effect(
       this.key(`turn:${turn}:tool_result:${idx}`),
       exec,
+      {
+        // Cap the PERSISTED copy of large tool results (file dumps, bash
+        // stdout). A single agentic turn can fire many tool calls; persisting
+        // multi-MB payloads synchronously into SQLite blocks the event loop
+        // and is the dominant "LLM feels slow" cost. The live model still
+        // receives the full result — only the durable copy (replayed on
+        // resume) is truncated. Default cap 64 KiB; set
+        // ANVIL_DURABLE_MAX_TOOL_RESULT_BYTES=0 to disable.
+        persistTransform: (r) => capToolResultForPersist(r),
+      },
     );
 
     return result;

@@ -18,6 +18,8 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import * as YAML from 'yaml';
 import type { ProviderName } from '../types.js';
+import type { ErrorClass, RetryPolicy, CircuitBreakerConfig } from './types.js';
+import { ALL_ERROR_CLASSES } from './types.js';
 
 // — Vocabulary (closed) —
 export type ModelCapability = 'embed' | 'rerank' | 'code' | 'reasoning' | 'vision';
@@ -64,6 +66,16 @@ export interface ModelEntry {
  * walker:
  *   liveness_ttl_ms: 30000   # provider-liveness cache TTL (ms)
  *   max_attempts: 5          # max chain-fallback attempts per stage
+ *   # Optional reliability tuning (consumed by LlmRouter.runAgent). Omit
+ *   # for the well-tuned compiled defaults. This is the single place to
+ *   # tune retry/backoff + circuit breaking — `llm-router.yaml` is no
+ *   # longer read for the agentic path.
+ *   retry:                   # per-error-class backoff overrides
+ *     rate_limit: { attempts: 5, baseMs: 1000, maxMs: 30000 }
+ *     timeout:    { attempts: 3, baseMs: 500 }
+ *   circuit_breaker:         # per-provider breaker thresholds
+ *     failureThreshold: 5
+ *     cooldownMs: 30000
  * ```
  */
 export interface WalkerConfig {
@@ -79,6 +91,17 @@ export interface WalkerConfig {
    * the last error to the user.
    */
   max_attempts: number;
+  /**
+   * Optional per-error-class retry/backoff overrides, shallow-merged onto
+   * `DEFAULT_RETRY_POLICY`. Only the classes/fields you specify change.
+   * Consumed by the shared `LlmRouter.runAgent`.
+   */
+  retry?: Partial<Record<ErrorClass, Partial<RetryPolicy>>>;
+  /**
+   * Optional circuit-breaker threshold overrides, shallow-merged onto
+   * `DEFAULT_CIRCUIT_BREAKER`.
+   */
+  circuit_breaker?: Partial<CircuitBreakerConfig>;
 }
 
 /** Compiled-in defaults — used when models.yaml omits the walker block. */
@@ -201,7 +224,7 @@ function parseWalkerConfig(raw: unknown): WalkerConfig {
     throw new ModelRegistryValidationError(`'walker' must be an object, got ${describe(raw)}`);
   }
   const w = raw as Record<string, unknown>;
-  const allowed = new Set<string>(['liveness_ttl_ms', 'max_attempts']);
+  const allowed = new Set<string>(['liveness_ttl_ms', 'max_attempts', 'retry', 'circuit_breaker']);
   for (const k of Object.keys(w)) {
     if (!allowed.has(k)) {
       throw new ModelRegistryValidationError(
@@ -220,6 +243,65 @@ function parseWalkerConfig(raw: unknown): WalkerConfig {
     }
     out.max_attempts = n;
   }
+  if (w.retry !== undefined) out.retry = parseRetryOverrides(w.retry);
+  if (w.circuit_breaker !== undefined) out.circuit_breaker = parseCircuitBreakerOverrides(w.circuit_breaker);
+  return out;
+}
+
+/** Parse `walker.retry` — a map of ErrorClass → partial RetryPolicy. */
+function parseRetryOverrides(raw: unknown): Partial<Record<ErrorClass, Partial<RetryPolicy>>> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new ModelRegistryValidationError(`walker.retry must be an object, got ${describe(raw)}`);
+  }
+  const validClasses = new Set<string>(ALL_ERROR_CLASSES);
+  const out: Partial<Record<ErrorClass, Partial<RetryPolicy>>> = {};
+  for (const [cls, val] of Object.entries(raw as Record<string, unknown>)) {
+    if (!validClasses.has(cls)) {
+      throw new ModelRegistryValidationError(
+        `walker.retry.${cls}: unknown error class. Supported: [${[...validClasses].join(', ')}]`,
+      );
+    }
+    if (typeof val !== 'object' || val === null || Array.isArray(val)) {
+      throw new ModelRegistryValidationError(`walker.retry.${cls} must be an object, got ${describe(val)}`);
+    }
+    const p = val as Record<string, unknown>;
+    const policy: Partial<RetryPolicy> = {};
+    if (p.attempts !== undefined) policy.attempts = requireNumber(p.attempts, `walker.retry.${cls}.attempts`, { min: 0, integer: true });
+    if (p.baseMs !== undefined) policy.baseMs = requireNumber(p.baseMs, `walker.retry.${cls}.baseMs`, { min: 0 });
+    if (p.maxMs !== undefined) policy.maxMs = requireNumber(p.maxMs, `walker.retry.${cls}.maxMs`, { min: 0 });
+    if (p.jitter !== undefined) {
+      if (typeof p.jitter !== 'boolean') throw new ModelRegistryValidationError(`walker.retry.${cls}.jitter must be boolean`);
+      policy.jitter = p.jitter;
+    }
+    if (p.backoff !== undefined) {
+      if (p.backoff !== 'exponential' && p.backoff !== 'linear' && p.backoff !== 'constant') {
+        throw new ModelRegistryValidationError(`walker.retry.${cls}.backoff must be exponential|linear|constant`);
+      }
+      policy.backoff = p.backoff;
+    }
+    out[cls as ErrorClass] = policy;
+  }
+  return out;
+}
+
+/** Parse `walker.circuit_breaker` — partial CircuitBreakerConfig. */
+function parseCircuitBreakerOverrides(raw: unknown): Partial<CircuitBreakerConfig> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new ModelRegistryValidationError(`walker.circuit_breaker must be an object, got ${describe(raw)}`);
+  }
+  const c = raw as Record<string, unknown>;
+  const allowed = new Set(['failureThreshold', 'cooldownMs', 'halfOpenAttempts']);
+  for (const k of Object.keys(c)) {
+    if (!allowed.has(k)) {
+      throw new ModelRegistryValidationError(
+        `walker.circuit_breaker.${k}: unknown key. Supported: [${[...allowed].join(', ')}]`,
+      );
+    }
+  }
+  const out: Partial<CircuitBreakerConfig> = {};
+  if (c.failureThreshold !== undefined) out.failureThreshold = requireNumber(c.failureThreshold, 'walker.circuit_breaker.failureThreshold', { min: 1, integer: true });
+  if (c.cooldownMs !== undefined) out.cooldownMs = requireNumber(c.cooldownMs, 'walker.circuit_breaker.cooldownMs', { min: 0 });
+  if (c.halfOpenAttempts !== undefined) out.halfOpenAttempts = requireNumber(c.halfOpenAttempts, 'walker.circuit_breaker.halfOpenAttempts', { min: 1, integer: true });
   return out;
 }
 

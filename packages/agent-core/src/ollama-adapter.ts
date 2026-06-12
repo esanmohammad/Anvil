@@ -261,9 +261,9 @@ export class OllamaAdapter implements ModelAdapter {
         // ── H3 replay-skip ────────────────────────────────────────────
         // This turn's assistant-end is already in the durable log. Skip the
         // upstream call; re-append the EXACT recorded native history (so the
-        // next turn's assistant-start hash matches) and re-issue runTool in
-        // order so the replay cursor advances (exec never fires — recorded
-        // tool_results return verbatim).
+        // first live turn past the replay frontier continues from coherent
+        // context) and re-issue runTool in order so the replay cursor advances
+        // (exec never fires — recorded tool_results return verbatim).
         if (replayed) {
           // Burned sentinel: this turn burned mid-stream live. Re-issue its
           // recorded sub-effects (none for ollama — burns happen before any

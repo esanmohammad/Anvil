@@ -148,8 +148,13 @@ export interface LanguageModel {
   /** `[inputPer1M, outputPer1M]` pricing in USD, or `null` if unknown. */
   getModelPricing(modelId: string): [number, number] | null;
   checkAvailability(): Promise<{ available: boolean; version?: string; error?: string }>;
-  /** Streaming surface — yields events as the provider produces them. */
-  invokeStream(opts: LanguageModelInvokeOptions): AsyncIterable<StreamEvent>;
+  /**
+   * Streaming surface — yields events as the provider produces them and
+   * RETURNS the assembled `InvokeResult` (cost/usage/finish) on completion,
+   * so a streaming consumer (the router's chain walk) gets the same outcome
+   * data a single-shot `invoke()` would, without re-running the call.
+   */
+  invokeStream(opts: LanguageModelInvokeOptions): AsyncGenerator<StreamEvent, InvokeResult>;
   /** Single-shot surface — drains the stream and returns the final block. */
   invoke(opts: LanguageModelInvokeOptions): Promise<InvokeResult>;
 }
@@ -226,9 +231,9 @@ export interface ModelAdapterConfig {
    * `assistant-end`) recorded against the caller's `EffectRuntime`.
    * When absent, adapters construct a `NullTurnRecorder` internally —
    * structural calls still happen so the code path is the same, but
-   * nothing is persisted. This is sequencing, NOT a feature flag:
-   * adapter ports happen one phase at a time; un-ported adapters keep
-   * their current path until their phase lands.
+   * nothing is persisted. Recording is implemented for every adapter
+   * except `gemini-cli` (a CLI subprocess with no token-level stream),
+   * which always no-ops the recorder.
    */
   turnRecorder?: import('./turn-recorder/index.js').TurnRecorder;
   /**

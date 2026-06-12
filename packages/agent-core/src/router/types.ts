@@ -22,6 +22,12 @@ export type ErrorClass =
   | 'auth'
   | 'content_policy'
   | 'invalid_request'
+  // Provider can't serve THIS model right now (phantom/unknown model id,
+  // unsupported operation, hard billing block). Non-terminal — the chain
+  // walk should fall back to a DIFFERENT model — but with zero same-model
+  // retries (waiting won't help). This replaces the binary
+  // `bodyLooksRetryable` "model not found" → burn-and-hop heuristic.
+  | 'model_unavailable'
   | 'unknown';
 
 export const ALL_ERROR_CLASSES: readonly ErrorClass[] = [
@@ -31,6 +37,7 @@ export const ALL_ERROR_CLASSES: readonly ErrorClass[] = [
   'auth',
   'content_policy',
   'invalid_request',
+  'model_unavailable',
   'unknown',
 ] as const;
 

@@ -195,6 +195,18 @@ export interface EffectOptions {
   timeoutMs?: number;
   /** When true, store the full result in the event payload (small enough not to need a blob). Default false. */
   smallResult?: boolean;
+  /**
+   * Optional transform applied to the result *before* it is persisted to
+   * the durable log. The live caller still receives the original (full)
+   * result; only the stored copy — and therefore the value replayed on
+   * resume — is transformed. Used to cap very large effect payloads
+   * (e.g. multi-MB tool outputs) so a single agentic turn doesn't block
+   * the event loop serialising file dumps into SQLite. Resume then sees
+   * the capped copy — a deliberate cross-vendor-resume fidelity tradeoff,
+   * not a correctness change for a fresh run. Omit (the default) to
+   * persist the full result verbatim.
+   */
+  persistTransform?: (result: unknown) => unknown;
 }
 
 export interface StepRetryPolicy {

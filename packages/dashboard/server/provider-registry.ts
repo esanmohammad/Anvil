@@ -5,7 +5,10 @@
  * Returns models tagged with capabilities so the UI can offer the right choices.
  */
 
-import { execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 import { readFileSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -50,9 +53,15 @@ export interface DiscoveryResult {
 
 // ── Detection helpers ────────────────────────────────────────────────────
 
-function tryExec(cmd: string): string | null {
+async function tryExec(cmd: string): Promise<string | null> {
+  // Non-blocking (was execSync, which froze the ENTIRE event loop for up to
+  // 5s per CLI version probe while discovery ran on the init critical path —
+  // the canonical "dashboard stuck for so long / empty screen" cause).
+  // execFile (no shell) + hard timeout; resolves to null on any failure.
+  const [bin, ...args] = cmd.split(' ');
   try {
-    return execSync(cmd, { timeout: 5000, stdio: 'pipe' }).toString().trim();
+    const { stdout } = await execFileAsync(bin, args, { timeout: 5000 });
+    return stdout.toString().trim();
   } catch {
     return null;
   }
@@ -64,14 +73,22 @@ function hasEnv(...vars: string[]): boolean {
 
 // ── Provider definitions ─────────────────────────────────────────────────
 
-function detectProviders(): ProviderInfo[] {
+async function detectProviders(): Promise<ProviderInfo[]> {
   const providers: ProviderInfo[] = [];
+
+  // All CLI version probes run in PARALLEL and OFF the event loop (async
+  // execFile). Previously these were serial synchronous execSync calls —
+  // each could block the whole server for up to 5s, so a slow/hanging CLI
+  // froze the dashboard during boot/connect.
+  const [claudeVersion, claudeCurrentModel, geminiVersion] = await Promise.all([
+    tryExec('claude --version'),
+    tryExec('claude model'),  // e.g. "claude-opus-4-7[1m]"
+    tryExec('gemini --version'),
+  ]);
 
   // ── CLI Providers (agentic — can run multi-turn agent loops) ──
 
   // Claude CLI
-  const claudeVersion = tryExec('claude --version');
-  const claudeCurrentModel = tryExec('claude model');  // e.g. "claude-opus-4-7[1m]"
   // Aliases are a stable Claude CLI contract — they always resolve to the
   // current latest version. Pinned model IDs come dynamically from:
   //   1. `claude model` — user's currently-active model (authoritative)
@@ -104,8 +121,7 @@ function detectProviders(): ProviderInfo[] {
     models: claudeModels,
   });
 
-  // Gemini CLI
-  const geminiVersion = tryExec('gemini --version');
+  // Gemini CLI (geminiVersion probed in parallel above)
   providers.push({
     name: 'gemini-cli',
     displayName: 'Gemini CLI',
@@ -253,13 +269,13 @@ async function fetchAnthropicModels(): Promise<ModelInfo[]> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return [];
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
+    // AbortSignal.timeout (not a manual AbortController + setTimeout): undici
+    // honors it reliably even on a stuck socket. A hung probe here would
+    // otherwise block provider discovery and the dashboard's init frame.
     const res = await fetch('https://api.anthropic.com/v1/models?limit=50', {
       headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      signal: controller.signal,
+      signal: AbortSignal.timeout(4000),
     });
-    clearTimeout(timeout);
     if (!res.ok) return [];
     const data = await res.json() as { data?: Array<{ id: string; display_name?: string }> };
     return (data.data ?? []).map(m => ({
@@ -317,11 +333,18 @@ function dedupeModels(models: ModelInfo[]): ModelInfo[] {
 
 async function detectOllamaModels(): Promise<{ available: boolean; models: ModelInfo[] }> {
   try {
-    const host = process.env.OLLAMA_HOST || 'http://localhost:11434';
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    const res = await fetch(`${host}/api/tags`, { signal: controller.signal });
-    clearTimeout(timeout);
+    // IPv4 literal, not `localhost`: on macOS `localhost` resolves to ::1
+    // first, and when the Ollama daemon is down the IPv6→IPv4 fallback can
+    // outlive the timeout. AbortSignal.timeout is also honored far more
+    // reliably by undici than a manual AbortController + setTimeout on a
+    // stuck socket. Without this, a down Ollama makes this fetch hang, which
+    // blocks discoverProviders → discoverAvailableModels → sendInit's
+    // Promise.all, so the dashboard never receives its `init` frame and
+    // falls back to the empty "Welcome" screen.
+    const host = process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
+    // 2s: /api/tags just lists models (no model load), so a live daemon
+    // answers in ms; a down daemon aborts fast instead of stalling discovery.
+    const res = await fetch(`${host}/api/tags`, { signal: AbortSignal.timeout(2000) });
 
     if (!res.ok) return { available: false, models: [] };
 
@@ -352,17 +375,33 @@ async function detectOllamaModels(): Promise<{ available: boolean; models: Model
 
 let cachedResult: DiscoveryResult | null = null;
 let cacheTimestamp = 0;
+let inFlight: Promise<DiscoveryResult> | null = null;
 const CACHE_TTL = 30_000;
 
+/**
+ * Public entry. Serves the cached result within the TTL; otherwise COALESCES
+ * concurrent callers onto a single in-flight discovery. The background boot
+ * warm and the first client's sendInit must not each spawn their own
+ * `claude`/`gemini` subprocess + network probe set — that doubled the load
+ * and pushed the init frame past its deadline.
+ */
 export async function discoverProviders(): Promise<DiscoveryResult> {
+  if (cachedResult && Date.now() - cacheTimestamp < CACHE_TTL) return cachedResult;
+  if (inFlight) return inFlight;
+  inFlight = computeDiscovery().finally(() => { inFlight = null; });
+  return inFlight;
+}
+
+async function computeDiscovery(): Promise<DiscoveryResult> {
   if (cachedResult && Date.now() - cacheTimestamp < CACHE_TTL) {
     return cachedResult;
   }
 
-  const providers = detectProviders();
-
-  // Async: enrich Claude, OpenAI, and Ollama model lists from live sources
-  const [claudeApiModels, ollama] = await Promise.all([
+  // Provider detection (CLI probes) + live model enrichment all run
+  // concurrently and non-blocking — bounded by the slowest single probe,
+  // never the sum.
+  const [providers, claudeApiModels, ollama] = await Promise.all([
+    detectProviders(),
     fetchAnthropicModels(),
     detectOllamaModels(),
   ]);

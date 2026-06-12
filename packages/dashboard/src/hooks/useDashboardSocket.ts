@@ -157,6 +157,19 @@ export function useDashboardSocket(opts: UseDashboardSocketOpts = {}): Dashboard
       setReady('connected');
       retriesRef.current = 0;
       if (opts.retriesRef) opts.retriesRef.current = 0;
+      // Restore the WS-compat ref on every (re)connect. socket.io reuses the
+      // same `sock` instance across reconnects, so `connectSocketIo` (where
+      // `wsRef.current = compat` is first set) runs only once on mount. The
+      // `disconnect` handler below nulls `wsRef.current`; without this
+      // restore, a transient websocket drop (e.g. a ping timeout during a
+      // long clarify LLM turn or a server event-loop stall) would leave
+      // child components able to RECEIVE (onAny still fires) but unable to
+      // SEND — `sendWs` no-ops on a null ref. That was the canonical
+      // "clarify answer does nothing after the first question" hang: the
+      // optimistic answer chip rendered, but the `send-input` frame was
+      // silently dropped and the durable `clarify-answer-*` wait polled
+      // forever.
+      if (opts.wsRef) opts.wsRef.current = compat;
       // Re-request current state on (re)connect — the server's `onAction`
       // adapter routes this to `handleClientMessage` which fires
       // `sendInit` and emits the `init` frame.

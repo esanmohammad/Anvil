@@ -23,7 +23,7 @@ import {
   allowedToolsForStage,
   permissionClassesForStage,
 } from '@esankhan3/anvil-core-pipeline';
-import { pickAliveModelFromChainSync, prefetchLiveness, setLivenessTtlMs } from './provider-liveness.js';
+import { pickAliveModelFromChainSync, prefetchLiveness, isProviderAlive, setLivenessTtlMs } from './provider-liveness.js';
 import type { ProjectLoader } from './project-loader.js';
 import {
   LOCAL_TIER_STAGES,
@@ -164,11 +164,28 @@ export function recordResolvedStageState(
 
 /**
  * Pre-warm the provider-liveness cache + load the walker block from
- * `~/.anvil/models.yaml`. Probes run in parallel; failures are
- * non-fatal. Returns the resolved walker config so the caller can
- * thread it through stage-fallback and retry loops.
+ * `~/.anvil/models.yaml`. Returns the resolved walker config so the caller
+ * can thread it through stage-fallback and retry loops.
+ *
+ * Two-tier probe (matches the "check the selected model, background the
+ * rest" design):
+ *   1. EAGER — probe ONLY the currently-selected model's provider and
+ *      await it. Cloud providers (opencode / claude / gemini / …) are an
+ *      instant env-var check; Ollama is a single 2s-capped network probe.
+ *      This is the "does the model the user picked actually work" check.
+ *   2. BACKGROUND — fire the full provider sweep fire-and-forget. The sync
+ *      chain walker (`pickAliveModelFromChainSync`) treats a cold-cache
+ *      provider as ALIVE, so the sweep never gates a stage; it just makes
+ *      the cache fresher for later fallback decisions.
+ *
+ * There is deliberately NO blocking timeout race here. The previous 5s
+ * `Promise.race` only delayed a background task (the hook that calls this
+ * runs with `await: false`), yet logged a scary "liveness prefetch timed
+ * out after 5s" line that read like a stall. Removing it: the eager probe
+ * is naturally short-bounded by its own per-provider cap, and the sweep is
+ * genuinely detached.
  */
-export async function prefetchProviderLiveness(): Promise<WalkerConfig> {
+export async function prefetchProviderLiveness(selectedModel?: string): Promise<WalkerConfig> {
   let walkerConfig: WalkerConfig = { ...DEFAULT_WALKER_CONFIG };
   let registry: ModelRegistry | null = null;
   try {
@@ -183,17 +200,23 @@ export async function prefetchProviderLiveness(): Promise<WalkerConfig> {
   const providers = registry && registry.models.length > 0
     ? Array.from(new Set(registry.models.map((m) => m.provider)))
     : ['ollama', 'claude', 'openai', 'openrouter', 'gemini', 'gemini-cli', 'opencode', 'adk'] as ProviderName[];
-  // Hard 5s cap: a hung probe used to block `pipeline:started` (and
-  // therefore the entire run) forever. Provider liveness is a cache
-  // warm — a stale cache is fine, an infinite hang is not.
-  await Promise.race([
-    prefetchLiveness(providers).catch((err) => {
-      console.warn(`[pipeline] liveness prefetch failed: ${(err as Error).message}`);
-    }),
-    new Promise<void>((resolve) => setTimeout(() => {
-      console.warn('[pipeline] liveness prefetch timed out after 5s — continuing with cached/stale data');
-      resolve();
-    }, 5000)),
-  ]);
+
+  // Tier 1 — eager probe of the selected model's provider only. Unknown /
+  // alias model ids that don't resolve degrade gracefully: no eager probe,
+  // the background sweep still warms everything.
+  const selectedProvider = selectedModel
+    ? registry?.models.find((m) => m.id === selectedModel)?.provider
+    : undefined;
+  if (selectedProvider) {
+    try {
+      await isProviderAlive(selectedProvider);
+    } catch { /* non-fatal — walker treats unknown as alive */ }
+  }
+
+  // Tier 2 — full sweep, detached. Never awaited, no cap.
+  void prefetchLiveness(providers).catch((err) => {
+    console.warn(`[pipeline] liveness sweep (background) failed: ${(err as Error).message}`);
+  });
+
   return walkerConfig;
 }

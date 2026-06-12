@@ -38,7 +38,8 @@
  * continuation all work via the singleton store regardless. fix-loop sets
  * `coarseWrap:false` (parallel per-repo sessions over one ctx).
  */
-import { runWithChainFallback, serializeAgentRunResult, disallowedToolsForPersona, } from '@esankhan3/anvil-core-pipeline';
+import { serializeAgentRunResult, disallowedToolsForPersona, } from '@esankhan3/anvil-core-pipeline';
+import { getAgentReliabilityRouter } from '@esankhan3/anvil-agent-core';
 import { spawnAndWait, waitForAgent } from '../steps/agent-spawner.js';
 import { providerOfModelId } from '../pipeline-runner-types.js';
 export class AgentManagerSession {
@@ -113,8 +114,8 @@ export class AgentManagerSession {
         // recording/telemetry stage). fix-loop records under 'validate' but must
         // re-resolve burns from the 'fix-loop' chain. Defaults to req.stage.
         const routingStage = req.routingStage ?? req.stage;
-        const runPhase = () => runWithChainFallback({
-            stageName: routingStage,
+        const runPhase = async () => (await getAgentReliabilityRouter().runAgent({
+            stage: routingStage,
             maxAttempts: fb.maxAttempts,
             resolveModel: (exclude) => {
                 // Resume phase: first attempt = the session's current model
@@ -148,18 +149,18 @@ export class AgentManagerSession {
                         `(no native session resume for ${providerOfModelId(model)})`);
                 }
                 else {
-                    // §Tier 2 cross-vendor gap: a prior phase authored by a
-                    // non-recording adapter (claude/ollama/gemini/adk) wrote no
-                    // `turn:N:*` effects, so there's nothing to reconstruct — the
-                    // successor loses that history. NOT silent: surface it. The full
-                    // fix is recording turns for those adapters (ADR Phase H4 — "port
-                    // remaining adapters").
+                    // No prior turns to reconstruct. §H4 turn-recording is complete
+                    // for every adapter EXCEPT gemini-cli (a CLI subprocess with no
+                    // token-level stream to record). So this branch means the prior
+                    // phase was authored by gemini-cli (or ran without a durable
+                    // recorder); there's nothing to re-present and the successor
+                    // starts fresh. Surfaced, not silent.
                     fb.warn?.(`[${req.stage}] resume on ${model}: 0 prior turns reconstructed — a prior phase was ` +
-                        `authored by a non-recording adapter; its conversation history will NOT be re-presented (H4).`);
+                        `authored by a non-recording path (gemini-cli / no durable recorder); history will NOT be re-presented.`);
                 }
             }
             return this.spawnFresh(req, model, prefill, this.recorder, priorMessages);
-        });
+        })).result;
         // Coarse per-phase ctx.effect → crash-resume replays the WHOLE phase
         // result without touching the (possibly-dead) AgentProcess (so claude's
         // model-locked `--resume` can't fail). The per-phase burn continuation

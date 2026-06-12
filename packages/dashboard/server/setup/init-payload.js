@@ -23,12 +23,35 @@
  * on every pipeline / quick-action start.
  */
 export function createInitSender(deps) {
+    // Warm the provider/model discovery cache in the background at boot (now
+    // safe — the probes are non-blocking). By the time the first client
+    // connects, discovery is usually already cached, so sendInit returns the
+    // init frame immediately instead of waiting on a cold probe.
+    void deps.discoverAvailableModels().catch(() => { });
     return async function sendInit(ws) {
         try {
-            // Load projects and discover models in parallel to avoid waterfalls
+            // Load projects and discover models in parallel to avoid waterfalls.
+            // Model discovery is HARD-CAPPED: a slow or hung provider probe must
+            // NEVER block the init frame. projects/runs/state are far more
+            // important than the model dropdown, and without this cap a down
+            // provider (e.g. Ollama) left the whole dashboard stuck on the empty
+            // "Welcome" screen until the client's 12s boot deadline.
+            const fallbackModels = () => ({ providers: [], defaultModel: 'sonnet', defaultProvider: 'claude' });
+            // 2s cap: the boot warm + in-flight dedup means discovery is normally
+            // already cached by the time a client connects, so this rarely fires.
+            // When it does (e.g. a slow `claude model` CLI probe), we send init
+            // immediately with fallback models — projects/runs still render, and
+            // the full model list lands on the next get-state once discovery caches.
+            const modelsBounded = Promise.race([
+                deps.discoverAvailableModels(),
+                new Promise((resolve) => {
+                    const t = setTimeout(() => resolve(fallbackModels()), 2000);
+                    t.unref?.();
+                }),
+            ]).catch(fallbackModels);
             const [projects, availableModels] = await Promise.all([
                 deps.projectLoader.listProjects(),
-                deps.discoverAvailableModels().catch(() => ({ providers: [], defaultModel: 'sonnet', defaultProvider: 'claude' })),
+                modelsBounded,
             ]);
             const projectInfos = projects.map((s) => ({
                 name: s.name,

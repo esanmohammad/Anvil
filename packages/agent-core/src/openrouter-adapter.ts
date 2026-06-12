@@ -319,10 +319,10 @@ export class OpenRouterAdapter implements ModelAdapter {
     // Turn-level durable recorder (v2 ADR §2.5). Defaults to a no-op
     // recorder when the caller hasn't injected a real one — structural
     // calls happen either way, persistence is gated on whether a real
-    // EffectRuntime + partial sink were threaded through the bridge.
-    // This is NOT a feature flag: it's the bridge between un-ported and
-    // ported call sites during the H1→H4 cutover. Once the pipeline
-    // injects a real recorder everywhere, this fallback drops out.
+    // EffectRuntime + partial sink were threaded through the bridge. The
+    // no-op fallback covers single-shot / non-durable call sites (e.g. the
+    // router's thin `invoke`); the live durable pipeline always threads a
+    // real recorder.
     const recorder = config.turnRecorder ?? createNullTurnRecorder({
       runId: config.sessionId,
       stepId: config.stage,
@@ -380,10 +380,12 @@ export class OpenRouterAdapter implements ModelAdapter {
         // ── H3 replay-skip ────────────────────────────────────────────
         // This turn's `assistant-end` is already in the durable log (a
         // prior process ran it). Skip the upstream call entirely; re-append
-        // the EXACT recorded native history so the next turn's
-        // assistant-start hash matches, and re-issue runTool/endTurn in
-        // order so the replay cursor advances over the recorded sub-effects
-        // (exec never fires — recorded tool_results are returned verbatim).
+        // the EXACT recorded native history so the FIRST live turn past the
+        // replay frontier continues from coherent conversation context, and
+        // re-issue runTool/endTurn in order so the replay cursor advances over
+        // the recorded sub-effects (exec never fires — recorded tool_results
+        // are returned verbatim; runTool's tool-arg idempotencyKey still
+        // matches because the args are replayed verbatim).
         if (replayed) {
           activeTurnSseComplete = true; // no live SSE happened this turn
 

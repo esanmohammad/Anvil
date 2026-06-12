@@ -315,8 +315,8 @@ export function attachAgentEventRouter(deps: AgentEventRouterDeps): () => void {
     }
 
     // Plan-agent chain-walker retry. Applied at the event level since
-    // plan agents don't go through `runWithChainFallback` (which lives
-    // on the awaitable `spawnAndWait` path).
+    // plan agents don't go through the router's agentic chain walk
+    // (`LlmRouter.runAgent`, on the awaitable `spawnAndWait` path).
     const planCtx = planAgentContext.get(agentId);
     if (planCtx) {
       planAgentContext.delete(agentId);

@@ -1,5 +1,11 @@
 # Dashboard Pipeline-Runner Deprecation — Final Plan
 
+> **Note (reliability rewrite):** references to `runWithChainFallback` /
+> `runStageWithFallback` are stale — that chain-fallback stack was replaced
+> by `LlmRouter.runAgent` (`@esankhan3/anvil-agent-core`). Where this plan
+> says "the step factories use `runWithChainFallback`," read
+> `getAgentReliabilityRouter().runAgent`.
+
 **Goal:** Eliminate `packages/dashboard/server/pipeline-runner.ts` (3378 LOC) and consolidate all pipeline orchestration into `@esankhan3/anvil-core-pipeline`. Cli + dashboard become two thin consumers of one canonical engine.
 
 **Branch:** `feat/harness-improvment` (4 unpushed commits already on the foundation: Phases A, B, C, partial D)

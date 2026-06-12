@@ -74,7 +74,11 @@ export function createStartPipeline(deps) {
             type: 'build',
             project,
             description: feature,
-            model: options?.model ?? 'sonnet',
+            // `||` not `??`: HomePage sends model:'' when no explicit pick, and
+            // '' ?? 'sonnet' === '' (empty string is not nullish). An empty model
+            // forces per-stage default resolution downstream and shows a blank
+            // model chip on the run row. Coerce empty → 'sonnet'.
+            model: options?.model || 'sonnet',
             status: 'running',
             startedAt: Date.now(),
             activities: pipelineActivities,
@@ -86,7 +90,7 @@ export function createStartPipeline(deps) {
             runId: pipelineRunId,
             project,
             feature,
-            model: options?.model ?? 'sonnet',
+            model: options?.model || 'sonnet',
             modelTier: options?.modelTier,
             baseBranch: options?.baseBranch,
             skipClarify: options?.skipClarify,

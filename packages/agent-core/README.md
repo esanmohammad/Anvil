@@ -106,7 +106,7 @@ All adapters share the same Anvil Stream Format (NDJSON), the same
                                               ↑
                                          ProviderRegistry
                                               ↑
-                                         LlmRouter   (retries, fallbacks, rate limit)
+                                         LlmRouter   (runAgent/invoke: backoff retries, fallbacks, circuit breaker, rate limit)
                                               ↑
                                          Telemetry   (OTel spans + cost)
                                               ↑

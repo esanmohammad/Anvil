@@ -16,8 +16,8 @@ import type {
   AgentRunRequest,
   AgentRunResult,
 } from '@esankhan3/anvil-core-pipeline';
-import { runWithChainFallback } from '@esankhan3/anvil-core-pipeline';
-import type { AgentManager, Prefill } from '@esankhan3/anvil-agent-core';
+import type { AgentManager, Prefill, ErrorClass } from '@esankhan3/anvil-agent-core';
+import { getAgentReliabilityRouter } from '@esankhan3/anvil-agent-core';
 import { spawnAndWait } from '../steps/agent-spawner.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 
@@ -37,14 +37,21 @@ export interface AgentManagerRunnerOptions {
   resolveModel: (stageName: string, exclude: ReadonlySet<string>) => string;
   /** Mutable burn-set shared across all stages of a single run. */
   burnedModels: Set<string>;
-  /** Max chain-fallback attempts. Forwarded to `runWithChainFallback`. */
+  /** Max chain-fallback attempts. Forwarded to `LlmRouter.runAgent`. */
   maxAttempts: number;
   /** Optional callback fired the moment an agent is spawned. */
   onSpawn?: (agentId: string, req: AgentRunRequest) => void;
   /** Optional callback fired when the adapter reports max-tokens truncation. */
   onTruncation?: (agentName: string, outputTokens: number) => void;
   /** Optional callback fired when a model gets burned mid-run. */
-  onBurn?: (info: { stageName: string; model: string; status: number | string; message: string }) => void;
+  onBurn?: (info: {
+    stageName: string;
+    model: string;
+    status: number | string;
+    message: string;
+    errorClass: ErrorClass;
+    delayMs: number;
+  }) => void;
   /**
    * Wave 5 — optional callback that powers the agent's `recall_memory`
    * tool. When set AND the stage's permissions include `recall`, the
@@ -61,27 +68,26 @@ export class AgentManagerRunner implements AgentRunner {
   constructor(private readonly opts: AgentManagerRunnerOptions) {}
 
   async run(req: AgentRunRequest): Promise<AgentRunResult> {
-    return runWithChainFallback<AgentRunResult, Prefill>(
+    // Reliability (chain fallback + per-error-class backoff + circuit breaker
+    // + unified classify) is owned by the shared LlmRouter. The model walk
+    // stays liveness-aware via the injected `resolveModel`; durable
+    // cross-vendor continuation flows through `resolvePrefill` exactly as
+    // before. Replaces the old `runWithChainFallback` (which had no backoff
+    // or breaker — the gap that let one transient `fetch failed` kill a run).
+    const { result } = await getAgentReliabilityRouter().runAgent<AgentRunResult, Prefill>(
       {
-        stageName: req.stage,
+        stage: req.stage,
         maxAttempts: this.opts.maxAttempts,
         resolveModel: (excluded) => this.opts.resolveModel(req.stage, excluded),
         onBurn: (info) => {
           this.opts.burnedModels.add(info.model);
           this.opts.onBurn?.(info);
         },
-        // Turn-level resume (v2 ADR §2.4): the step body wires a resolver
-        // that reads the burned model's recorded partial from the durable
-        // store + applies the §2.3.3 truncation gate. Absent → every
-        // attempt runs prefill-less (pre-H3 behavior).
         resolvePrefill: req.resolvePrefill,
       },
-      // Prefill (v2 ADR §2.3) arrives from the chain walker after a
-      // burn; thread it onto the spawn so the resumed adapter continues
-      // from the prior model's stopping point. Undefined unless a
-      // `resolvePrefill` is wired (deferred to the per-stage cutover).
       async (model, prefill) => this.spawnOnce(req, model, prefill),
     );
+    return result;
   }
 
   private async spawnOnce(
