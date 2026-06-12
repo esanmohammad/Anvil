@@ -711,10 +711,21 @@ function App() {
             if (msgRunId) a.runId = msgRunId;
             return a;
           });
-          // Deduplicate: skip text activities with identical content to the last one
+          // Deduplicate: skip text activities with identical content to the
+          // last one, AND skip the server's `user-message` echo of an answer
+          // we already rendered optimistically in handleSendInput (matched by
+          // trimmed content over a small recent window).
           setActivities((prev) => {
             const lastContent = prev.length > 0 ? prev[prev.length - 1].content ?? prev[prev.length - 1].summary : '';
+            const recentUserMsgs = new Set(
+              prev.slice(-8)
+                .filter((a) => a.kind === 'user-message')
+                .map((a) => (a.content ?? a.summary)?.trim()),
+            );
             const deduped = newActivities.filter((a) => {
+              if (a.kind === 'user-message') {
+                return !recentUserMsgs.has((a.content ?? a.summary)?.trim());
+              }
               if (a.kind !== 'text') return true;
               const thisContent = a.content ?? a.summary;
               return thisContent !== lastContent;
@@ -965,6 +976,34 @@ function App() {
   const handleSendInput = useCallback((agentIdOrText: string, text?: string) => {
     const actualText = text ?? agentIdOrText;
     const agentId = text ? agentIdOrText : undefined;
+
+    // Optimistic echo: render the user's answer instantly instead of waiting
+    // for the server to round-trip it back as a `user-message` activity. The
+    // clarify Q&A loop emits onAnswerReceived → user-message only once the
+    // answer reaches the in-process resolver, so without this the answer
+    // appeared to lag (it showed up bundled with the next question). The
+    // server still echoes it; the 'agent-output' handler dedupes that echo by
+    // (kind, content). Mirrors useClarificationChat.respond + the Build
+    // optimistic placeholder.
+    if (actualText.trim()) {
+      const stageName = activePipeline
+        ? (activePipeline.stages?.[activePipeline.currentStage]?.rawName
+            ?? activePipeline.stages?.[activePipeline.currentStage]?.name)
+        : undefined;
+      setActivities((prev) => [
+        ...prev,
+        {
+          id: ++activityIdCounter,
+          timestamp: Date.now(),
+          kind: 'user-message',
+          summary: actualText,
+          content: actualText,
+          stage: stageName,
+          runId: activePipeline?.runId,
+        },
+      ]);
+    }
+
     sendWs({
       action: 'send-input',
       agentId,
@@ -1161,10 +1200,13 @@ function App() {
           navigate(`/run/${only.id}`);
           return <PendingView label="Loading run..." />;
         }
-        // Still waiting for server to register the run
-        if (actionPending && realRuns.length === 0) {
-          return <PendingView label="Starting agent..." />;
-        }
+        // No PendingView gate at zero real runs: the optimistic
+        // `pending-build-*` row (inserted into activeRunsList on Build click)
+        // is meant to appear INSTANTLY. Hiding it behind a "Starting agent..."
+        // spinner until the first agent-output arrives defeats its whole
+        // purpose and is the "Build takes a long time to show in Active Runs"
+        // symptom. Fall through and render the list (which includes the
+        // placeholder row) immediately.
         return (
           <div className="page-enter" style={{ padding: 'var(--space-lg)', maxWidth: 800, margin: '0 auto', overflowY: 'auto', height: '100%' }}>
             <h2 style={{ fontSize: 22, fontWeight: 600, marginBottom: 20 }}>Active Runs</h2>

@@ -2,7 +2,9 @@
  * Unit tests for TurnRecorder — v2 ADR §2.1 / §2.5.
  *
  * Covers:
- *   a) startTurn records `assistant-start` with a stable idempotency key.
+ *   a) startTurn records `assistant-start` WITHOUT an input-hash guard, so
+ *      a resume whose prompt drifted (live-requeried KB/memory, cross-vendor
+ *      continuation) replays the recorded transcript instead of aborting.
  *   b) Concurrent recorder instances do not cross-pollinate turn counters.
  *   c) runTool records `tool_use:N` AND `tool_result:N`, executes the
  *      exec callback exactly once on live, returns its NeutralToolResult.
@@ -61,7 +63,7 @@ function buildFakeRuntime(seed: Record<string, unknown> = {}): {
 }
 
 describe('TurnRecorder', () => {
-  it('records assistant-start with a stable idempotency key', async () => {
+  it('records assistant-start WITHOUT an input-hash guard (resume tolerates prompt drift)', async () => {
     const { runtime, log } = buildFakeRuntime();
     const sink: AssistantPartial[] = [];
     const recorder = new TurnRecorder({
@@ -82,8 +84,17 @@ describe('TurnRecorder', () => {
     assert.equal(turnUuid, 'uuid-0');
     assert.equal(log.length, 1);
     assert.equal(log[0].name, 'turn:0:assistant-start');
-    assert.equal(typeof log[0].opts?.idempotencyKey, 'string');
-    assert.ok((log[0].opts!.idempotencyKey as string).length >= 32);
+    // The turn's input (system + messages) embeds live-queried KB/memory that
+    // is rebuilt in a fresh process on resume, so it is NOT byte-stable. The
+    // assistant-start effect must NOT carry a fatal input-hash guard — else
+    // benign prompt drift aborts replay with a DeterminismViolationError and
+    // breaks resume. On replay the recorded transcript (assistant-end) is
+    // authoritative; the rebuilt prompt is never re-sent.
+    assert.equal(
+      log[0].opts?.idempotencyKey,
+      undefined,
+      'assistant-start must not be guarded by an input hash',
+    );
   });
 
   it('seeds the turn counter from deps.initialTurn (§2.5.1 resume)', async () => {

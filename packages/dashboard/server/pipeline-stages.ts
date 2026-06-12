@@ -286,11 +286,14 @@ export function makeAgentSession(
           resolveModel: (stageName) => deps.resolveModelForStage(stageName),
           burnedModels: deps.runtimeBurnedModels,
           maxAttempts: deps.walkerConfig().max_attempts,
-          onBurn: ({ model, status }) => {
+          onBurn: ({ model, status, errorClass, delayMs }) => {
             deps.runtimeBurnedModels.add(model);
+            const backoff = delayMs > 0
+              ? ` — backing off ${(delayMs / 1000).toFixed(1)}s before next model`
+              : '';
             deps.emit('project-event', {
               source: 'routing',
-              message: `${model} unavailable (HTTP ${status}); falling back to next chain entry`,
+              message: `${model}: ${errorClass} (status ${status})${backoff}`,
               level: 'warn',
             });
           },
@@ -405,10 +408,10 @@ async function runClarifyStage(
   index: number,
   ctx?: StepContext<string>,
 ): Promise<{ artifact: string; cost: number; tokens: StageTokenStats }> {
-  // H3 burn-aware session: per-phase chain-fallback + a session-spanning turn
-  // recorder + coarse `${stage}:session:pN` ctx.effect crash-resume wraps all
-  // live INSIDE the session now (`ctx` → fallback config). So clarify calls
-  // runClarifyForProject ONCE — no outer runWithChainFallback / coarse wrap.
+  // H3 burn-aware session: per-phase chain-fallback (via `LlmRouter.runAgent`)
+  // + a session-spanning turn recorder + coarse `${stage}:session:pN`
+  // ctx.effect crash-resume all live INSIDE the session now (`ctx` → fallback
+  // config). So clarify calls runClarifyForProject ONCE — no outer wrap.
   // Burn during EXPLORE continues from its partial (cross-model where the
   // next model is prefill-capable); SYNTHESIZE (resume) carries the full prior
   // conversation (§Tier 2): claude uses native --resume; a non-claude model
@@ -1109,9 +1112,9 @@ async function runFixLoop(
   // §H3 fix-loop turn recording (per-repo step-body fallback). Each repo (and
   // the single-repo path) gets its OWN burn-aware session: per-phase
   // chain-fallback + a per-repo-scoped turn recorder (cost/provenance) +
-  // cross-attempt resume — moving the fallback INTO the per-repo loop (was a
-  // step-level outer `runWithChainFallback`, which couldn't carry a per-repo
-  // prefill/recorder). Sessions are cached across attempts (`fixSessions`,
+  // cross-attempt resume — the fallback (`LlmRouter.runAgent`) runs INSIDE the
+  // per-repo loop so each repo carries its own prefill/recorder (a step-level
+  // outer wrap couldn't). Sessions are cached across attempts (`fixSessions`,
   // owned by the validate while-loop) so each recorder's turn counter stays
   // monotonic across `sendInput` resumes. `coarseWrap:false` — the sessions run
   // in parallel over one shared `ctx`, so the per-repo `ownRuntime` recorder is

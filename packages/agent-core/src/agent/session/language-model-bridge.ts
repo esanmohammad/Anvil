@@ -238,12 +238,12 @@ export class LanguageModelBridge extends EventEmitter implements AgentAdapter {
     // Forward the turn recorder + prefill from the chain-walker layer
     // (v2 ADR §2.5 / §2.3). agent-core never imports core-pipeline;
     // these arrive as structural objects on the AdapterRequest and are
-    // handed straight to the adapter. As of H4 every agentic/single-shot
-    // adapter consumes the recorder — openrouter-family (openrouter /
-    // opencode / openai), claude, gemini, ollama, adk. Only gemini-cli
-    // remains un-ported and silently ignores it (its turns aren't
-    // recorded — H4 follow-up). Each consumer falls back to a
-    // NullTurnRecorder when none is forwarded.
+    // handed straight to the adapter. Every agentic/single-shot adapter
+    // consumes the recorder — openrouter-family (openrouter / opencode /
+    // openai), claude, gemini, ollama, adk. Only gemini-cli does not record
+    // (a CLI subprocess with no token-level stream — by design, not pending
+    // work). Each consumer falls back to a NullTurnRecorder when none is
+    // forwarded.
     if (this.request.turnRecorder) {
       config.turnRecorder = this.request.turnRecorder;
     }

@@ -368,7 +368,9 @@ export class PipelineRunner extends EventEmitter {
   }
 
   protected async prefetchProviderLiveness(): Promise<void> {
-    this.walkerConfig = await prefetchProviderLivenessBridge();
+    // Pass the run's selected model so the bridge eagerly verifies only that
+    // provider and backgrounds the rest of the sweep.
+    this.walkerConfig = await prefetchProviderLivenessBridge(this.config.model);
   }
 
   private getPromptContext(): PromptBuilderContext {
@@ -595,9 +597,14 @@ export class PipelineRunner extends EventEmitter {
         console.warn('[pipeline] convention warm failed:', err);
       });
       // Warm the hybrid-search memory block ONCE per run, in parallel with
-      // the rest of run-prep. The sync `getStableMemoryBlock()` reads from
-      // this cache; if warm fails, it transparently falls back to BM25.
-      await this.promptCache.warmMemoryBlock().catch((err: unknown) => {
+      // the rest of run-prep — FIRE-AND-FORGET, never awaited. The sync
+      // `getStableMemoryBlock()` transparently falls back to raw BM25 until
+      // this resolves, so blocking on it buys nothing. Awaiting it stalled
+      // run start on the Transformers.js embedder's first-inference model
+      // load whenever the configured Ollama embedder was unreachable — the
+      // canonical "stuck at Initialising pipeline…" hang on the first run
+      // after a dashboard restart.
+      void this.promptCache.warmMemoryBlock().catch((err: unknown) => {
         console.warn('[pipeline] memory warm failed:', err);
       });
       // Wave 4 + Wave 1 — record the per-stage set of memories that

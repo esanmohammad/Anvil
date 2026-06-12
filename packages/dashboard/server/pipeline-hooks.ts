@@ -72,7 +72,16 @@ export function attachPipelineHooks(deps: PipelineHooksDeps): PipelineHooksHandl
   });
   const livenessHandle = attachLivenessPrefetchHook(deps.bus, {
     probe: () => deps.prefetchProviderLiveness(),
-    await: true,
+    // Fire-and-forget: do NOT block `pipeline:started` (and therefore stage 0)
+    // on the probe. A configured-but-down provider (e.g. Ollama bound to v4
+    // only) otherwise burns its full 2s AbortSignal timeout on the critical
+    // path before the first agent even spawns — the canonical "liveness is
+    // slow / Build takes forever to do anything" symptom. The sync chain
+    // walker tolerates a cold cache (pickAliveModelFromChainSync returns the
+    // primary when empty) and the reactive UpstreamError burn recovers any
+    // model that is actually dead, so warming the cache off the hot path is
+    // strictly better here.
+    await: false,
   });
 
   return {

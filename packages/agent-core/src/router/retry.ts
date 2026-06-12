@@ -12,6 +12,8 @@
  *   - auth:          0 attempts, constant     (terminal — surface immediately)
  *   - content_policy: 0 attempts, constant    (terminal)
  *   - invalid_request: 0 attempts, constant   (terminal)
+ *   - model_unavailable: 0 attempts, constant (non-terminal — fall back to a
+ *     different model immediately; same-model retry can't help)
  *   - unknown:       1 attempt,  constant,    base 1000ms
  *
  * `Retry-After` headers — when present on the thrown error — override
@@ -28,6 +30,7 @@ export const DEFAULT_RETRY_POLICY: Record<ErrorClass, RetryPolicy> = {
   auth: { attempts: 0, backoff: 'constant', baseMs: 0 },
   content_policy: { attempts: 0, backoff: 'constant', baseMs: 0 },
   invalid_request: { attempts: 0, backoff: 'constant', baseMs: 0 },
+  model_unavailable: { attempts: 0, backoff: 'constant', baseMs: 0 },
   unknown: { attempts: 1, backoff: 'constant', baseMs: 1000 },
 };
 
@@ -144,7 +147,7 @@ export async function runWithRetry<T>(
   }
 }
 
-function computeDelay(
+export function computeDelay(
   policy: RetryPolicy,
   attemptIndex: number,
   random: () => number,

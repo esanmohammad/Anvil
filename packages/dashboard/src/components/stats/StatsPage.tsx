@@ -880,7 +880,7 @@ export function StatsPage({ runs, features, projects, prs: _prs, ws }: StatsPage
         </h2>
         <EmptyState />
         <div style={{ marginTop: 'var(--space-xl)' }}>
-          <ReviewsSection />
+          <ReviewsSection ws={ws} />
         </div>
       </div>
     );
@@ -994,7 +994,7 @@ export function StatsPage({ runs, features, projects, prs: _prs, ws }: StatsPage
 
       {/* ── PR Reviews ── */}
       <div style={{ marginBottom: 'var(--space-xl)' }}>
-        <ReviewsSection />
+        <ReviewsSection ws={ws} />
       </div>
     </div>
   );
@@ -1182,7 +1182,7 @@ function VerdictMixBar({
   );
 }
 
-function ReviewsSection() {
+function ReviewsSection({ ws }: { ws?: WebSocket | null }) {
   const { currentProject } = useSystem();
   const project = currentProject?.name ?? null;
 
@@ -1190,33 +1190,24 @@ function ReviewsSection() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Open a short-lived WebSocket to fetch the review list. Kept local so we
-  // don't have to touch main.tsx's shared connection wiring.
+  // Fetch the review list over the shared dashboard socket. (This used to
+  // open a raw WebSocket to `/ws`, but that endpoint was removed in the
+  // socket.io migration — so the list silently never loaded.)
   useEffect(() => {
     if (!project) {
       setReviews([]);
       return;
     }
-
-    let cancelled = false;
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
-    let ws: WebSocket | null = null;
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch (err) {
-      setError('Could not connect to review service');
+    if (!ws) {
+      setError('Not connected to the dashboard');
       setLoading(false);
       return;
     }
 
-    const handleOpen = () => {
-      ws?.send(JSON.stringify({ action: 'list-reviews', project, limit: 200 }));
-    };
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
     const handleMessage = (event: MessageEvent) => {
       if (cancelled) return;
       try {
@@ -1225,28 +1216,21 @@ function ReviewsSection() {
           const payload = msg.payload?.reviews;
           setReviews(Array.isArray(payload) ? payload : []);
           setLoading(false);
-          ws?.close();
         }
       } catch { /* ignore non-JSON */ }
     };
-    const handleError = () => {
-      if (cancelled) return;
-      setError('Could not reach review service');
-      setLoading(false);
-    };
 
-    ws.addEventListener('open', handleOpen);
+    // Reuse the shared socket — never open or close it here. socket.io
+    // buffers outgoing emits until connected, so sending immediately is safe
+    // even if the socket is still mid-connect.
     ws.addEventListener('message', handleMessage);
-    ws.addEventListener('error', handleError);
+    ws.send(JSON.stringify({ action: 'list-reviews', project, limit: 200 }));
 
     return () => {
       cancelled = true;
-      ws?.removeEventListener('open', handleOpen);
-      ws?.removeEventListener('message', handleMessage);
-      ws?.removeEventListener('error', handleError);
-      if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
+      ws.removeEventListener('message', handleMessage);
     };
-  }, [project]);
+  }, [project, ws]);
 
   const handleRowClick = useCallback((reviewId: string) => {
     navigateToReview(reviewId);

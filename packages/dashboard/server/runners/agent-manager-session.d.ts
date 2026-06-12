@@ -39,7 +39,7 @@
  * `coarseWrap:false` (parallel per-repo sessions over one ctx).
  */
 import type { AgentSession, AgentSessionResult, AgentRunRequest, StepContext } from '@esankhan3/anvil-core-pipeline';
-import type { AgentManager, TurnRecorder, Prefill, PrefillTurn } from '@esankhan3/anvil-agent-core';
+import type { AgentManager, TurnRecorder, Prefill, PrefillTurn, ErrorClass } from '@esankhan3/anvil-agent-core';
 /** Resolver shape produced by `buildSessionTurnWiring`. */
 type SessionResolvePrefill = (info: {
     burnedModel: string;
@@ -65,6 +65,8 @@ export interface SessionFallbackConfig {
         model: string;
         status: number | string;
         message: string;
+        errorClass: ErrorClass;
+        delayMs: number;
     }) => void;
     /**
      * Build the session-spanning recorder + prefill resolver ONCE (on the

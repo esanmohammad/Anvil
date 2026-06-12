@@ -55,12 +55,14 @@ export async function spawnAndWait(opts) {
  * adapter's thrown error before we ever see it (see
  * `language-model-bridge.ts:259`), losing the structured shape. We
  * parse the canonical UpstreamError format `<provider> <status>: <body>`
- * and rehydrate a duck-typed UpstreamError so `runWithChainFallback`'s
- * retryable check (`name === 'UpstreamError' && retryable === true`)
- * walks the chain instead of failing the stage on first attempt.
+ * and rehydrate a duck-typed UpstreamError so the router's agentic chain
+ * walk (`LlmRouter.runAgent`) sees a structured status and burns/falls
+ * back instead of failing the stage on first attempt.
  *
- * Without this, the claude-cli silent-empty bug surfaces as a single
- * non-retryable plain-Error and chain-fallback never kicks in.
+ * Note: `LlmRouter`'s `classifyError` also matches the error *message*
+ * (e.g. "fetch failed"), so a transient failure is caught even when this
+ * rehydration can't recover a structured status; the rehydration just
+ * gives a cleaner status for classification + logs.
  */
 function rehydrateAgentError(raw) {
     const msg = raw ?? 'Agent failed';

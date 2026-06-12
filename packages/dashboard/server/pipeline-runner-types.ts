@@ -355,10 +355,14 @@ export function findInterruptedPipelines(anvilHome: string): PipelineCheckpoint[
         for (const slug of readdirSync(projectDir)) {
           const cp = readCheckpoint(join(projectDir, slug));
           if (!cp) continue;
+          // ONLY genuinely-interrupted runs (mid-flight when the dashboard
+          // stopped) belong in Active Runs — marked failed so the user can
+          // Replay the one that died. Terminal failed/cancelled runs are
+          // HISTORY: surfacing every one of them here floods Active Runs and
+          // buries running / just-started runs. They stay replayable from the
+          // History page → Run Detail.
           if (cp.status === 'running' || cp.status === 'waiting') {
             incomplete.push({ ...cp, status: 'failed' as PipelineRunState['status'] });
-          } else if (cp.status === 'failed' || cp.status === 'cancelled') {
-            incomplete.push(cp);
           }
         }
       } catch { /* skip unreadable dirs */ }

@@ -29,6 +29,7 @@ export { buildAdapterRequest } from './adapter.js';
 
 // Default factory + bridge (the concrete production adapter resolution path).
 export { LanguageModelBridge } from './language-model-bridge.js';
+export { legacyAdapterToLanguageModel } from './legacy-adapter-language-model.js';
 export {
   defaultAdapterFactory,
   defaultAdapterFactoryFn,

@@ -11,8 +11,9 @@
  *
  * Empty-artifact defense (Step 3 from earlier sessions) is baked in —
  * any repo that returns an artifact below `minArtifactLength` chars
- * throws a retryable upstream error, letting `runWithChainFallback`
- * walk the model chain instead of writing a 0-byte file.
+ * throws a retryable upstream error, letting the router's agentic chain
+ * walk (`LlmRouter.runAgent`) try the next model instead of writing a
+ * 0-byte file.
  */
 
 import type { AgentRunner } from '../agent-runner.js';

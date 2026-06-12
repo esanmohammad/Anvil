@@ -60,7 +60,7 @@ function makeMatrix(
         supportsModel: () => true,
         getModelPricing: () => null,
         checkAvailability: async () => ({ available: true }),
-        invokeStream: async function* () {},
+        invokeStream: (async function* () {}) as unknown as LanguageModel['invokeStream'],
         invoke: async (_opts: LanguageModelInvokeOptions): Promise<InvokeResult> => {
           const idx = calls[modelId];
           calls[modelId] = idx + 1;

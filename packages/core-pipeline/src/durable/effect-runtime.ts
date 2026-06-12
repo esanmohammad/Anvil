@@ -307,9 +307,21 @@ export class EffectRuntime {
       throw err;
     }
 
+    // The live caller always receives the FULL result. Only the persisted
+    // copy may be transformed (e.g. capped) via opts.persistTransform — that
+    // transformed copy is what resume replays. With no transform this is
+    // byte-for-byte identical to persisting `result` verbatim.
+    let toPersist: unknown = result;
+    if (opts.persistTransform) {
+      try {
+        toPersist = opts.persistTransform(result);
+      } catch {
+        toPersist = result; // a transform bug must never drop the event
+      }
+    }
     let serialised: unknown;
     try {
-      serialised = JSON.parse(JSON.stringify(result ?? null));
+      serialised = JSON.parse(JSON.stringify(toPersist ?? null));
     } catch (err) {
       throw new EffectResultNotSerialisableError(name, err);
     }

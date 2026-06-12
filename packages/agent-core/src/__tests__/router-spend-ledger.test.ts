@@ -60,7 +60,7 @@ function fakeAdapter(behavior: () => Promise<InvokeResult>): LanguageModel {
     supportsModel: () => true,
     getModelPricing: () => null,
     checkAvailability: async () => ({ available: true }),
-    invokeStream: async function* () {},
+    invokeStream: (async function* () {}) as unknown as LanguageModel['invokeStream'],
     invoke: behavior as (opts: LanguageModelInvokeOptions) => Promise<InvokeResult>,
   };
 }

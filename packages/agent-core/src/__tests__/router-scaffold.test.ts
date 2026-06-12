@@ -31,6 +31,7 @@ const defaultRetryPolicy: Record<ErrorClass, RetryPolicy> = {
   auth: { attempts: 0, backoff: 'constant', baseMs: 0 },
   content_policy: { attempts: 0, backoff: 'constant', baseMs: 0 },
   invalid_request: { attempts: 0, backoff: 'constant', baseMs: 0 },
+  model_unavailable: { attempts: 0, backoff: 'constant', baseMs: 0 },
   unknown: { attempts: 1, backoff: 'constant', baseMs: 1000 },
 };
 
@@ -40,7 +41,7 @@ describe('router/index barrel', () => {
     assert.equal(typeof RouterError, 'function');
     assert.equal(typeof classifyError, 'function');
     assert.equal(typeof parseRetryAfterMs, 'function');
-    assert.equal(ALL_ERROR_CLASSES.length, 7);
+    assert.equal(ALL_ERROR_CLASSES.length, 8);
   });
 });
 

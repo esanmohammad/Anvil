@@ -242,6 +242,14 @@ binding redundancy declared in `optionalDependencies`.
 
 ## Conventions
 
+### Comment hygiene — delete stale comments when you touch code
+
+Every comment must be true of the code **as it currently stands**. When a change makes a comment false, irrelevant, or obsolete, update or delete it **in the same edit** — this is not optional.
+- Delete references to removed symbols / functions / files (e.g. a comment naming a deleted helper).
+- Delete "this used to…", "for now / temporary", "Phase X pending", or "TODO (already done)" narration once it no longer matches reality.
+- A comment describing a removed mechanism or a since-completed migration is **worse than no comment** — it actively misleads (humans and agents alike).
+- History belongs in commit messages / ADRs, not in code comments. If a comment narrates the past instead of describing the present code, move it or delete it.
+
 ### Adding a new tool
 
 1. Add a `register<X>Tools()` exporter that returns an MCP tool

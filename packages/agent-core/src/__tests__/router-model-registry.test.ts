@@ -495,6 +495,44 @@ describe('parseModelRegistry — walker block', () => {
     );
   });
 
+  it('parses walker.retry per-error-class overrides (partial)', () => {
+    const reg = parseModelRegistry({
+      models: [],
+      walker: { retry: { rate_limit: { attempts: 7, baseMs: 2000 }, timeout: { attempts: 2 } } },
+    });
+    assert.deepEqual(reg.walker.retry?.rate_limit, { attempts: 7, baseMs: 2000 });
+    assert.deepEqual(reg.walker.retry?.timeout, { attempts: 2 });
+  });
+
+  it('rejects walker.retry with an unknown error class', () => {
+    assert.throws(
+      () => parseModelRegistry({ models: [], walker: { retry: { not_a_class: { attempts: 1 } } } }),
+      /unknown error class/,
+    );
+  });
+
+  it('rejects walker.retry with a bad backoff value', () => {
+    assert.throws(
+      () => parseModelRegistry({ models: [], walker: { retry: { timeout: { backoff: 'wibble' } } } }),
+      /backoff must be/,
+    );
+  });
+
+  it('parses walker.circuit_breaker overrides', () => {
+    const reg = parseModelRegistry({
+      models: [],
+      walker: { circuit_breaker: { failureThreshold: 8, cooldownMs: 60000 } },
+    });
+    assert.deepEqual(reg.walker.circuit_breaker, { failureThreshold: 8, cooldownMs: 60000 });
+  });
+
+  it('rejects unknown walker.circuit_breaker keys', () => {
+    assert.throws(
+      () => parseModelRegistry({ models: [], walker: { circuit_breaker: { threshold: 5 } } }),
+      /unknown key/,
+    );
+  });
+
   it('empty registry (no file) returns walker with defaults', () => {
     const reg = parseModelRegistry(undefined);
     assert.deepEqual(reg.walker, DEFAULT_WALKER_CONFIG);

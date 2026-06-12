@@ -216,7 +216,8 @@ extracted modules live under `server/{setup,handlers,pipeline,http,runs,shared,s
   `AgentRunner` / `AgentSession` interfaces (from `core-pipeline`)
   over the dashboard's heavyweight `AgentManager`:
     - `agent-manager-runner.ts` — `AgentManagerRunner` is the one-shot
-      runner. Wraps `spawnAndWait` + `runWithChainFallback`. Used by
+      runner. Wraps `spawnAndWait` + `LlmRouter.runAgent` (the shared
+      agentic reliability router). Used by
       `runOneStage`'s single-stage / per-repo / per-task delegations.
     - `agent-manager-session.ts` — `AgentManagerSession` is the
       multi-turn session. Wraps `agentManager.spawn` for `start()` and
@@ -346,7 +347,8 @@ extracted modules live under `server/{setup,handlers,pipeline,http,runs,shared,s
   `AgentRunner` / `AgentSession` interfaces (from `core-pipeline`)
   over the dashboard's heavyweight `AgentManager`:
     - `agent-manager-runner.ts` — `AgentManagerRunner` is the one-shot
-      runner. Wraps `spawnAndWait` + `runWithChainFallback`. Used by
+      runner. Wraps `spawnAndWait` + `LlmRouter.runAgent` (the shared
+      agentic reliability router). Used by
       `runOneStage`'s single-stage / per-repo / per-task delegations.
     - `agent-manager-session.ts` — `AgentManagerSession` is the
       multi-turn session. Wraps `agentManager.spawn` for `start()` and
@@ -422,6 +424,14 @@ config change" symptom).
 
 ## Conventions
 
+### Comment hygiene — delete stale comments when you touch code
+
+Every comment must be true of the code **as it currently stands**. When a change makes a comment false, irrelevant, or obsolete, update or delete it **in the same edit** — this is not optional.
+- Delete references to removed symbols / functions / files (e.g. a comment naming a deleted helper).
+- Delete "this used to…", "for now / temporary", "Phase X pending", or "TODO (already done)" narration once it no longer matches reality.
+- A comment describing a removed mechanism or a since-completed migration is **worse than no comment** — it actively misleads (humans and agents alike).
+- History belongs in commit messages / ADRs, not in code comments. If a comment narrates the past instead of describing the present code, move it or delete it.
+
 ### Typed event emission — never call `broadcast()` directly
 
 The WS extraction (Phases 0–6) replaced ~90+ inline `broadcast({ type, payload })`
@@ -495,17 +505,22 @@ ran but produced no diff" symptom.
 
 ### Chain-fallback on retryable upstream errors
 
-`runStageWithFallback<T>(stageName, attemptFn)` (max attempts read from
-`walker.max_attempts` in `~/.anvil/models.yaml`, default 5) wraps each
-spawn site. When the inner attempt throws an `UpstreamError`-shape
-(duck-typed: `name === 'UpstreamError' && retryable === true`), the
-runner adds the failed model to `runtimeBurnedModels` and re-resolves
-the stage's chain via `pickAliveModelFromChainSync(..., excludeModels=runtimeBurnedModels)`.
-The 429/quota burst on Alibaba upstream for `qwen3.5-plus` (an
-OpenCode→upstream provider quota issue, not the user's) is the
-canonical case this guards.
+Every spawn site runs through `LlmRouter.runAgent` (via the shared
+`getAgentReliabilityRouter()`), which the dashboard's `AgentManagerRunner`
+/ `AgentManagerSession` call instead of the old `runWithChainFallback`. Max
+attempts come from `walker.max_attempts` in `~/.anvil/models.yaml` (default
+5). On a fall-back-eligible failure (classified by the unified
+`classifyError` — rate_limit / server_5xx / timeout / model_unavailable),
+`runAgent` records the burn into `runtimeBurnedModels`, **backs off** per
+the error class (the layer that lets a poisoned socket recycle), trips the
+per-provider **circuit breaker** if it keeps failing, and re-resolves the
+chain via the injected `pickAliveModelFromChainSync(..., excludeModels=runtimeBurnedModels)`.
+Terminal (auth / content_policy / invalid_request) and `unknown` errors
+surface immediately. The 429/quota burst on Alibaba upstream for
+`qwen3.5-plus` is the canonical case this guards. Tune via `walker.retry`
+/ `walker.circuit_breaker`.
 
-The chain walker is reactive (post-failure burn) **plus** proactive
+The model walk is reactive (post-failure burn + breaker) **plus** proactive
 (pre-call liveness probe). `prefetchProviderLiveness` runs once at
 pipeline start and probes every distinct provider in
 `~/.anvil/models.yaml`'s `models:` array (auto-derived — no hardcoded

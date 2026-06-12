@@ -46,11 +46,11 @@ import type {
   StepContext,
 } from '@esankhan3/anvil-core-pipeline';
 import {
-  runWithChainFallback,
   serializeAgentRunResult,
   disallowedToolsForPersona,
 } from '@esankhan3/anvil-core-pipeline';
-import type { AgentManager, TurnRecorder, Prefill, PrefillTurn } from '@esankhan3/anvil-agent-core';
+import type { AgentManager, TurnRecorder, Prefill, PrefillTurn, ErrorClass } from '@esankhan3/anvil-agent-core';
+import { getAgentReliabilityRouter } from '@esankhan3/anvil-agent-core';
 import { spawnAndWait, waitForAgent } from '../steps/agent-spawner.js';
 import { providerOfModelId } from '../pipeline-runner-types.js';
 
@@ -77,7 +77,13 @@ export interface SessionFallbackConfig {
   /** Shared run-wide burned-model set (mutated on burn). */
   burnedModels: Set<string>;
   maxAttempts: number;
-  onBurn?: (info: { model: string; status: number | string; message: string }) => void;
+  onBurn?: (info: {
+    model: string;
+    status: number | string;
+    message: string;
+    errorClass: ErrorClass;
+    delayMs: number;
+  }) => void;
   /**
    * Build the session-spanning recorder + prefill resolver ONCE (on the
    * first `start`). The recorder outlives the call — it's threaded into
@@ -199,9 +205,9 @@ export class AgentManagerSession implements AgentSession {
     // recording/telemetry stage). fix-loop records under 'validate' but must
     // re-resolve burns from the 'fix-loop' chain. Defaults to req.stage.
     const routingStage = req.routingStage ?? req.stage;
-    const runPhase = (): Promise<AgentSessionResult> => runWithChainFallback<AgentSessionResult, Prefill>(
+    const runPhase = async (): Promise<AgentSessionResult> => (await getAgentReliabilityRouter().runAgent<AgentSessionResult, Prefill>(
       {
-        stageName: routingStage,
+        stage: routingStage,
         maxAttempts: fb.maxAttempts,
         resolveModel: (exclude) => {
           // Resume phase: first attempt = the session's current model
@@ -235,21 +241,21 @@ export class AgentManagerSession implements AgentSession {
               `(no native session resume for ${providerOfModelId(model)})`,
             );
           } else {
-            // §Tier 2 cross-vendor gap: a prior phase authored by a
-            // non-recording adapter (claude/ollama/gemini/adk) wrote no
-            // `turn:N:*` effects, so there's nothing to reconstruct — the
-            // successor loses that history. NOT silent: surface it. The full
-            // fix is recording turns for those adapters (ADR Phase H4 — "port
-            // remaining adapters").
+            // No prior turns to reconstruct. §H4 turn-recording is complete
+            // for every adapter EXCEPT gemini-cli (a CLI subprocess with no
+            // token-level stream to record). So this branch means the prior
+            // phase was authored by gemini-cli (or ran without a durable
+            // recorder); there's nothing to re-present and the successor
+            // starts fresh. Surfaced, not silent.
             fb.warn?.(
               `[${req.stage}] resume on ${model}: 0 prior turns reconstructed — a prior phase was ` +
-              `authored by a non-recording adapter; its conversation history will NOT be re-presented (H4).`,
+              `authored by a non-recording path (gemini-cli / no durable recorder); history will NOT be re-presented.`,
             );
           }
         }
         return this.spawnFresh(req, model, prefill, this.recorder, priorMessages);
       },
-    );
+    )).result;
 
     // Coarse per-phase ctx.effect → crash-resume replays the WHOLE phase
     // result without touching the (possibly-dead) AgentProcess (so claude's

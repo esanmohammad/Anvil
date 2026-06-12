@@ -438,9 +438,11 @@ export { VERSION } from './version.js';
 export type { AgentRunner, AgentRunRequest, AgentRunResult } from './agent-runner.js';
 export type { AgentSession, AgentSessionResult } from './agent-session.js';
 
-// — Chain-fallback for retryable upstream failures
-export type { ChainFallbackOptions, BurnInfo } from './routing/with-fallback.js';
-export { runWithChainFallback, isRetryableUpstreamError } from './routing/with-fallback.js';
+// Chain-fallback (`runWithChainFallback` / `isRetryableUpstreamError`) was
+// removed in the reliability rewrite — agentic chain walking + per-error-class
+// backoff + circuit breaking now live in `LlmRouter.runAgent`
+// (`@esankhan3/anvil-agent-core`). Error classification is the unified
+// `classifyError` there.
 
 // — Stage logic owned by core-pipeline
 export type { StageContext, StageOutput, StageTokens, FeatureScope } from './stages/types.js';

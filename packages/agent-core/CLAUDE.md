@@ -7,9 +7,11 @@ belong in ADRs, not here.
 
 ## What this package owns
 
-- Two type surfaces: `LanguageModel` (forward-looking) and `ModelAdapter`
-  (legacy; what the eight adapters actually implement today). Source:
-  `src/types.ts`.
+- Two type surfaces: `ModelAdapter` (what the eight adapters implement —
+  the streaming `run()` shape) and `LanguageModel` (the router's
+  `invoke`/`invokeStream` surface). Adapters are bridged to `LanguageModel`
+  by `legacyAdapterToLanguageModel` (`agent/session/`), so the router drives
+  all eight uniformly. Source: `src/types.ts`.
 - Eight `ModelAdapter` implementations: `claude`, `openai`, `gemini`,
   `openrouter`, `ollama`, `gemini-cli`, `adk`, `opencode`. One file each at
   the package root. Plus a meta-adapter `FallbackAdapter` (deprecated;
@@ -69,9 +71,15 @@ belong in ADRs, not here.
     `ProviderRegistry` and wraps it in a `LanguageModelBridge`.
   - `runWithAgent` — single-shot helper for cli commands that don't need
     the full registry.
-- `LlmRouter` (`src/router/`) — tag-based routing, retries, fallbacks,
-  per-provider rate limiting, SQLite spend ledger, circuit breaker. Yaml
-  config at `~/.anvil/llm-router.yaml`; compiled-in defaults work.
+- `LlmRouter` (`src/router/`) — the single reliability authority for every
+  LLM call. Three surfaces, one kernel (per-error-class backoff retry +
+  per-provider circuit breaker + unified `classifyError` + spend ledger):
+  `invoke` (single-shot) / `invokeStream` (streaming) / `runAgent` (agentic
+  chain walk — what the pipeline + cli spawns ride on). The process-wide
+  agentic router is `getAgentReliabilityRouter()`; adapters are presented to
+  it as `LanguageModel` via `legacyAdapterToLanguageModel`. Tuned from
+  `~/.anvil/models.yaml`'s `walker:` block (`retry`, `circuit_breaker`); the
+  legacy `llm-router.yaml` is no longer read for the agentic path.
 - Checkpoint cache (`src/checkpoint/`) — SHA-keyed per-call output cache
   (project / runFamily / stage / hash). Higher-order `runWithCheckpoint`
   wraps any agent call.
@@ -142,9 +150,9 @@ belong in ADRs, not here.
   etc.). Both cli and dashboard share one cache.
 - Empty-output retryable throws — the three agentic adapters (`claude`,
   `openrouter` / `opencode`, `ollama`) throw `503 retryable
-  UpstreamError` when the run completes with empty final text. The
-  dashboard's `runWithChainFallback` (in `core-pipeline`) catches this
-  and walks the chain to the next model. Without this, claude-cli's
+  UpstreamError` when the run completes with empty final text.
+  `LlmRouter.runAgent`'s `classifyError` treats it as retryable and walks
+  the chain to the next model. Without this, claude-cli's
   silent-empty bug (exit 0, no `result` frame) silently produced 0-byte
   artifacts downstream; now the chain walker recovers automatically.
 - Concurrency-safe Claude adapter — `claude-adapter.ts` keeps a
@@ -194,6 +202,14 @@ Build copies `src/data/model-prices.json` into `dist/data/` because the
 cost loader resolves the JSON via `fileURLToPath(import.meta.url)`.
 
 ## Conventions
+
+### Comment hygiene — delete stale comments when you touch code
+
+Every comment must be true of the code **as it currently stands**. When a change makes a comment false, irrelevant, or obsolete, update or delete it **in the same edit** — this is not optional.
+- Delete references to removed symbols / functions / files (e.g. a comment naming a deleted helper).
+- Delete "this used to…", "for now / temporary", "Phase X pending", or "TODO (already done)" narration once it no longer matches reality.
+- A comment describing a removed mechanism or a since-completed migration is **worse than no comment** — it actively misleads (humans and agents alike).
+- History belongs in commit messages / ADRs, not in code comments. If a comment narrates the past instead of describing the present code, move it or delete it.
 
 ### Adapter authoring
 
@@ -332,11 +348,12 @@ when a new flagship rev ships.
   ~150-LOC adapter file but isn't done yet.
 - No abstraction framework — no Vercel AI SDK, LiteLLM proxy, Mastra,
   LangChain.
-- No native `LanguageModel.invoke()` impl on any adapter yet — every
-  adapter implements `ModelAdapter.run()` only. The bridge from
-  `ModelAdapter` → `LanguageModel` is follow-up work for `LlmRouter`
-  callers, who must inject their own `LanguageModel`. The eval path
-  (`collectTrajectory`) does NOT need this bridge — it routes through
+- No native `LanguageModel.invoke()` impl ON the adapters — they implement
+  `ModelAdapter.run()` (streaming) only. The `LanguageModel` surface the
+  router consumes is provided by the `legacyAdapterToLanguageModel` shim
+  (`agent/session/legacy-adapter-language-model.ts`), which turns `run()`'s
+  NDJSON push stream into `invoke`/`invokeStream`. The eval path
+  (`collectTrajectory`) does NOT use the router — it routes through
   `AgentProcess` + `defaultAdapterFactory` like every other spawn.
 - No tier-promotion — `OllamaAdapter`, `OpenRouterAdapter`, and
   `OpenCodeAdapter` are all `tier:'agentic'` because they drive a real

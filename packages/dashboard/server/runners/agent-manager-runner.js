@@ -10,7 +10,7 @@
  * lightweight runner that fulfills the same shape, so the same Step
  * factories drive both consumers without modification.
  */
-import { runWithChainFallback } from '@esankhan3/anvil-core-pipeline';
+import { getAgentReliabilityRouter } from '@esankhan3/anvil-agent-core';
 import { spawnAndWait } from '../steps/agent-spawner.js';
 import { disallowedToolsForPersona } from '@esankhan3/anvil-core-pipeline';
 export class AgentManagerRunner {
@@ -19,25 +19,23 @@ export class AgentManagerRunner {
         this.opts = opts;
     }
     async run(req) {
-        return runWithChainFallback({
-            stageName: req.stage,
+        // Reliability (chain fallback + per-error-class backoff + circuit breaker
+        // + unified classify) is owned by the shared LlmRouter. The model walk
+        // stays liveness-aware via the injected `resolveModel`; durable
+        // cross-vendor continuation flows through `resolvePrefill` exactly as
+        // before. Replaces the old `runWithChainFallback` (which had no backoff
+        // or breaker — the gap that let one transient `fetch failed` kill a run).
+        const { result } = await getAgentReliabilityRouter().runAgent({
+            stage: req.stage,
             maxAttempts: this.opts.maxAttempts,
             resolveModel: (excluded) => this.opts.resolveModel(req.stage, excluded),
             onBurn: (info) => {
                 this.opts.burnedModels.add(info.model);
                 this.opts.onBurn?.(info);
             },
-            // Turn-level resume (v2 ADR §2.4): the step body wires a resolver
-            // that reads the burned model's recorded partial from the durable
-            // store + applies the §2.3.3 truncation gate. Absent → every
-            // attempt runs prefill-less (pre-H3 behavior).
             resolvePrefill: req.resolvePrefill,
-        }, 
-        // Prefill (v2 ADR §2.3) arrives from the chain walker after a
-        // burn; thread it onto the spawn so the resumed adapter continues
-        // from the prior model's stopping point. Undefined unless a
-        // `resolvePrefill` is wired (deferred to the per-stage cutover).
-        async (model, prefill) => this.spawnOnce(req, model, prefill));
+        }, async (model, prefill) => this.spawnOnce(req, model, prefill));
+        return result;
     }
     async spawnOnce(req, model, prefill) {
         const cwd = req.workingDir || this.opts.workspaceDir;

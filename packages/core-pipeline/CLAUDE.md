@@ -149,13 +149,14 @@ you want supported, otherwise the resolver throws `UnknownStageError`.
     - `types.ts` + `registry.ts` — `StageContext`, `StageOutput`,
       `StageTokens`, the canonical `STAGES` array (9 stages with
       name/label/persona/perRepo).
-- **Chain-fallback** (`src/routing/with-fallback.ts`) —
-  `runWithChainFallback(opts, attempt)` retries on
-  retryable `UpstreamError` (HTTP 429/5xx, or `name === 'UpstreamError'
-  && retryable === true`). Burns the failing model in a per-call set;
-  caller-supplied `resolveModel(burned)` picks the next chain entry.
-  Both cli's lightweight runner and dashboard's `AgentManagerRunner`
-  wrap their attempts with this.
+- **Chain-fallback** — owned by agent-core, not this package. The old
+  `routing/with-fallback.ts` (`runWithChainFallback`) was removed in the
+  reliability rewrite; the agentic chain walk (burn + per-error-class
+  backoff + circuit breaker + durable prefill resume) is now
+  `LlmRouter.runAgent` (`@esankhan3/anvil-agent-core`), which both cli and
+  dashboard call via `getAgentReliabilityRouter()`. Error classification is
+  the unified `classifyError`. `AgentRunRequest.resolvePrefill` (this
+  package) still carries the cross-vendor continuation into it.
 
 Public barrel: `src/index.ts`.
 
@@ -171,6 +172,14 @@ resume, shared-state, retry, sub-steps, hooks, stage-permissions,
 routing.
 
 ## Conventions
+
+### Comment hygiene — delete stale comments when you touch code
+
+Every comment must be true of the code **as it currently stands**. When a change makes a comment false, irrelevant, or obsolete, update or delete it **in the same edit** — this is not optional.
+- Delete references to removed symbols / functions / files (e.g. a comment naming a deleted helper).
+- Delete "this used to…", "for now / temporary", "Phase X pending", or "TODO (already done)" narration once it no longer matches reality.
+- A comment describing a removed mechanism or a since-completed migration is **worse than no comment** — it actively misleads (humans and agents alike).
+- History belongs in commit messages / ADRs, not in code comments. If a comment narrates the past instead of describing the present code, move it or delete it.
 
 ### Step authoring
 
