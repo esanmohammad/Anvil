@@ -1,8 +1,9 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execSync } from 'node:child_process';
 
 import { handleGraphTool } from '../tools/graph.js';
 import { handleSearchTool } from '../tools/search.js';
@@ -159,5 +160,67 @@ describe('get_code_snippet', () => {
   it('reports when nothing matches', async () => {
     const r = await handleSearchTool('get_code_snippet', { id: 'app::a.ts::nope' }, ctx());
     assert.match(text(r), /No snippet found/);
+  });
+});
+
+describe('search_graph', () => {
+  it('filters by type and minDegree, ranked by connectivity', async () => {
+    const r = await handleGraphTool('search_graph', { type: 'function', minDegree: 2 }, ctx());
+    const t = text(r);
+    assert.match(t, /validateToken/);     // degree 2 (1 in + 1 out)
+    assert.doesNotMatch(t, /handleRequest/); // degree 1 < 2
+  });
+
+  it('matches names by regex/substring', async () => {
+    const r = await handleGraphTool('search_graph', { name: 'caller' }, ctx());
+    const t = text(r);
+    assert.match(t, /caller1/);
+    assert.match(t, /caller2/);
+  });
+
+  it('reports when no entity matches', async () => {
+    const r = await handleGraphTool('search_graph', { type: 'class' }, ctx());
+    assert.match(text(r), /No entities match/);
+  });
+});
+
+describe('detect_changes', () => {
+  it('requires a local repo path', async () => {
+    const r = await handleGraphTool('detect_changes', { repo: 'app' }, ctx()); // directoryPath null
+    assert.match(text(r), /needs a local repo path/);
+  });
+
+  it('maps a git working-tree change to affected entities + dependents', async () => {
+    const ws = mkdtempSync(join(tmpdir(), 'cs-ws-'));
+    const repoDir = join(ws, 'app');
+    mkdirSync(repoDir, { recursive: true });
+    let baseSha = '';
+    try {
+      const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: repoDir, stdio: ['pipe', 'pipe', 'pipe'] });
+      git('init -q');
+      git('config user.email t@t.dev');
+      git('config user.name test');
+      git('config commit.gpgsign false');
+      writeFileSync(join(repoDir, 'a.ts'), 'export function handleRequest() {}\n');
+      writeFileSync(join(repoDir, 'b.ts'), 'export function dbQuery() {}\n');
+      git('add -A');
+      git('commit -q -m init');
+      baseSha = execSync('git rev-parse HEAD', { cwd: repoDir }).toString().trim();
+      // uncommitted change to b.ts (where dbQuery lives in the fixture graph)
+      appendFileSync(join(repoDir, 'b.ts'), '// touched\n');
+    } catch {
+      rmSync(ws, { recursive: true, force: true });
+      return; // git unavailable — skip
+    }
+
+    const c = ctx();
+    c.directoryPath = ws;
+    const r = await handleGraphTool('detect_changes', { repo: 'app', baseSha }, c);
+    const t = text(r);
+    rmSync(ws, { recursive: true, force: true });
+
+    assert.match(t, /b\.ts/);                    // changed file
+    assert.match(t, /dbQuery/);                  // affected entity in b.ts
+    assert.match(t, /validateToken.*dbQuery/s);  // dependent edge into the change
   });
 });

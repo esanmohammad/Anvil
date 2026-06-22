@@ -17,6 +17,8 @@ import {
   getKnowledgeBasePath,
   loadAllProfiles,
   loadProfile,
+  getAllChanges,
+  getChangedFilesList,
 } from '@esankhan3/anvil-knowledge-core';
 
 // ---------------------------------------------------------------------------
@@ -30,6 +32,7 @@ interface SysGraph { nodes: SysNode[]; edges: SysEdge[] }
 const GRAPH_TOOL_NAMES = [
   'get_repo_graph', 'get_cross_repo_edges', 'find_callers', 'find_dependencies',
   'impact_analysis', 'trace_path', 'find_dead_code', 'get_architecture',
+  'search_graph', 'detect_changes',
 ];
 
 function loadSystemGraph(kbPath: string): SysGraph | null {
@@ -227,6 +230,34 @@ export function registerGraphTools() {
       inputSchema: {
         type: 'object' as const,
         properties: { repo: { type: 'string', description: 'Drill into one repo profile (optional)' } },
+      },
+    },
+    {
+      name: 'search_graph',
+      description: 'Structural search over the knowledge graph: filter entities by name (regex/substring), type, file, and repo; rank by connectivity (degree). Answers "which functions matter most in this module" — a structural question search/grep can\'t.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          name: { type: 'string', description: 'Name regex or substring to match (optional)' },
+          type: { type: 'string', description: 'Entity type filter: function | class | interface | method | type | … (optional)' },
+          file: { type: 'string', description: 'File-path substring filter (optional)' },
+          repo: { type: 'string', description: 'Limit to this repo (optional)' },
+          minDegree: { type: 'number', description: 'Only entities with at least this many connections (default 0)' },
+          limit: { type: 'number', description: 'Max results (default 50)' },
+        },
+      },
+    },
+    {
+      name: 'detect_changes',
+      description: 'Map a git diff to affected symbols and their dependents. Compares the working tree against a base commit (or the last-indexed SHA) and reports which entities changed and what depends on them — a blast-radius / code-review tool. Requires a local repo (local/serve mode).',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          repo: { type: 'string', description: 'Repository name' },
+          baseSha: { type: 'string', description: 'Git base commit to diff against (default: last-indexed SHA)' },
+          limit: { type: 'number', description: 'Max dependent edges to list (default 50)' },
+        },
+        required: ['repo'],
       },
     },
   ];
@@ -463,6 +494,118 @@ export async function handleGraphTool(
         return { content: [{ type: 'text', text }] };
       }
       return { content: [{ type: 'text', text: 'No architecture data yet. Index the project, then run profiling / project-graph generation (requires an LLM) for an architecture overview.' }] };
+    }
+
+    if (name === 'search_graph') {
+      const sys = loadSystemGraph(kbPath);
+      if (!sys) return { content: [{ type: 'text', text: 'No system graph found. Build KB first.' }] };
+      const repo = args.repo as string | undefined;
+      const type = args.type as string | undefined;
+      const file = args.file as string | undefined;
+      const minDegree = (args.minDegree as number) ?? 0;
+      const limit = (args.limit as number) || 50;
+      const nameArg = args.name as string | undefined;
+
+      let nameTest: (s: string) => boolean = () => true;
+      if (nameArg) {
+        try {
+          const re = new RegExp(nameArg, 'i');
+          nameTest = (s) => re.test(s);
+        } catch {
+          const lc = nameArg.toLowerCase();
+          nameTest = (s) => s.toLowerCase().includes(lc);
+        }
+      }
+
+      // Degree = non-`contains` edges touching the node.
+      const degree = new Map<string, number>();
+      for (const e of sys.edges) {
+        if (edgeType(e) === 'contains') continue;
+        degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
+        degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+      }
+
+      const matches = sys.nodes
+        .filter((n) => {
+          if (repo && !n.key.startsWith(repo + '::')) return false;
+          if (type && n.attributes?.type !== type) return false;
+          const f = n.attributes?.file ?? n.key.split('::')[1] ?? '';
+          if (file && !f.includes(file)) return false;
+          if (nameArg && !(nameTest(n.attributes?.label ?? '') || nameTest(n.key))) return false;
+          return (degree.get(n.key) ?? 0) >= minDegree;
+        })
+        .map((n) => ({ key: n.key, label: nodeLabel(n), type: n.attributes?.type ?? '?', file: n.attributes?.file ?? n.key.split('::')[1] ?? '', deg: degree.get(n.key) ?? 0 }))
+        .sort((a, b) => b.deg - a.deg);
+
+      if (matches.length === 0) {
+        return { content: [{ type: 'text', text: 'No entities match the given filters.' }] };
+      }
+      const rows = matches.slice(0, limit).map((m) =>
+        `- \`${m.label}\` (${m.type}, ${m.file}) — degree ${m.deg}  \`${m.key}\``).join('\n');
+      return { content: [{ type: 'text', text: `# search_graph — ${matches.length} match${matches.length === 1 ? '' : 'es'}\n\n${rows}${matches.length > limit ? `\n\n... and ${matches.length - limit} more` : ''}` }] };
+    }
+
+    if (name === 'detect_changes') {
+      const repo = args.repo as string;
+      const limit = (args.limit as number) || 50;
+      if (!ctx.directoryPath) {
+        return { content: [{ type: 'text', text: 'detect_changes needs a local repo path — available in local/serve mode only (not remote-proxy mode).' }] };
+      }
+      const candidate = join(ctx.directoryPath, repo);
+      const repoPath = existsSync(join(candidate, '.git')) ? candidate : ctx.directoryPath;
+      if (!existsSync(repoPath)) {
+        return { content: [{ type: 'text', text: `Repo path not found: ${repoPath}` }] };
+      }
+
+      let baseSha = args.baseSha as string | undefined;
+      if (!baseSha) {
+        const metaPath = join(kbPath, repo, 'index_meta.json');
+        if (existsSync(metaPath)) {
+          try { baseSha = JSON.parse(readFileSync(metaPath, 'utf-8')).lastIndexedSha; } catch { /* ignore */ }
+        }
+      }
+      if (!baseSha) {
+        return { content: [{ type: 'text', text: 'No base commit available. Pass baseSha, or index the repo first so a last-indexed SHA exists.' }] };
+      }
+
+      const diff = getAllChanges(repoPath, baseSha);
+      if (diff.fallbackToFull) {
+        return { content: [{ type: 'text', text: `git diff against ${baseSha.slice(0, 7)} failed or is too large to map incrementally. Check the base SHA.` }] };
+      }
+      const changedFiles = getChangedFilesList(diff);
+      if (changedFiles.length === 0 && diff.deleted.length === 0) {
+        return { content: [{ type: 'text', text: `No source changes since ${baseSha.slice(0, 7)}.` }] };
+      }
+
+      const sys = loadSystemGraph(kbPath);
+      const changedKeys = new Set<string>();
+      if (sys) {
+        for (const f of changedFiles) {
+          for (const n of sys.nodes) {
+            if (n.key.startsWith(`${repo}::${f}::`) || n.key === `${repo}::${f}`) changedKeys.add(n.key);
+          }
+        }
+      }
+      const dependents = sys
+        ? sys.edges.filter((e) => changedKeys.has(e.target) && !changedKeys.has(e.source) && edgeType(e) !== 'contains')
+        : [];
+      const dependentRepos = new Set(dependents.map((e) => e.source.split('::')[0]));
+
+      const lines = [
+        `# Changes since ${baseSha.slice(0, 7)} — ${repo}`,
+        '',
+        `## Changed files: ${changedFiles.length} (+${diff.added.length} / ~${diff.modified.length}), deleted ${diff.deleted.length}`,
+        ...changedFiles.slice(0, 30).map((f) => `- ${f}`),
+        '',
+        `## Affected entities: ${changedKeys.size}`,
+        ...[...changedKeys].slice(0, 30).map((k) => `- \`${k}\``),
+        '',
+        `## Dependents: ${dependents.length} edges from ${dependentRepos.size} repo(s)`,
+        ...dependents.slice(0, limit).map((e) => `- \`${e.source}\` → \`${e.target}\` (${edgeType(e) ?? 'edge'})`),
+        '',
+        `## Affected repos: ${[...dependentRepos].join(', ') || 'none'}`,
+      ];
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
     return null;
