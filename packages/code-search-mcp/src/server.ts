@@ -53,7 +53,7 @@ export interface ServerContext {
 /** Create a wired MCP Server instance (shared logic for stdio and HTTP sessions) */
 function createMcpServerInstance(ctx: ServerContext) {
   const server = new Server(
-    { name: 'code-search-mcp', version: '0.1.0' },
+    { name: 'code-search-mcp', version: '0.4.0' },
     { capabilities: { tools: {}, resources: {} } },
   );
 
