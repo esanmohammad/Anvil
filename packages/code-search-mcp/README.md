@@ -118,15 +118,21 @@ retrieval pipeline that powers the Anvil dashboard.
 | `search_code` | Hybrid retrieval — vector + BM25 + graph + rerank |
 | `search_semantic` | Vector-only (paraphrases, intent) |
 | `search_exact` | BM25-only (identifiers, error codes) |
+| `get_code_snippet` | Fetch the source for one entity by qualified name (cheaper than reading the file) |
 
 ### Graph
 | Tool | What it does |
 |---|---|
 | `get_repo_graph` | Single-repo AST graph |
 | `get_cross_repo_edges` | Inter-repo edges (Kafka, HTTP, gRPC, shared types, …) |
-| `find_callers` | Who calls this function |
+| `find_callers` | Who calls this function (exact by default; `fuzzy:true` for substring) |
 | `find_dependencies` | What this function calls |
 | `impact_analysis` | What breaks if this changes |
+| `trace_path` | Multi-hop call chain — shortest path between two functions, or the reachable call tree |
+| `search_graph` | Structural query — filter entities by name/type/file, ranked by connectivity |
+| `find_dead_code` | Entities with no callers (heuristic) |
+| `detect_changes` | Map a git diff to affected entities + their dependents |
+| `get_architecture` | Project overview — repo roles, key flows, connections |
 
 ### Profiles
 | Tool | What it does |
