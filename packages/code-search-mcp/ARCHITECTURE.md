@@ -262,7 +262,7 @@ server.ts dispatcher try the next handler.
 | `search_semantic` | `'vector'` (single-source) |
 | `search_exact` | `'bm25'` (single-source) |
 
-All three:
+The three search tools:
 
 1. Guard on `ctx.indexReady`.
 2. `retriever = await getRetriever(ctx.projectName)` (knowledge-core).
@@ -270,20 +270,35 @@ All three:
    repoFilter: repos, mode })`.
 4. Format chunks as markdown with score, source, language fence.
 
+`get_code_snippet` is the exception — it reads `chunks.json` directly
+(no retriever, no embedder), so it works in BM25-only / lite mode. Parses
+`id="repo::file::entity"` (or `repo`/`file`/`entity` fields), matches
+chunks, and returns the source for that entity.
+
 ### 7.2 Graph (`tools/graph.ts`)
 
-Reads JSON files directly from `<KB>/<project>/`:
+Reads JSON files directly from `<KB>/<project>/`. A shared
+`resolveEntityNodes(nodes, name, repo?, fuzzy?)` resolves a symbol name to
+node keys — exact by default (`label === name` or key endsWith `::name`),
+substring only when `fuzzy:true`.
 
 | Tool | Reads | What it computes |
 |---|---|---|
 | `get_repo_graph` | `<repo>/graph.json` | summary + first 50 entities |
 | `get_cross_repo_edges` | `system_graph_v2.json` | filter to `src.repo !== tgt.repo`, optional `repo` filter on either end |
-| `find_callers` | `system_graph_v2.json` | match nodes by label/key substring → incoming edges → unique sources (top 30) |
+| `find_callers` | `system_graph_v2.json` | `resolveEntityNodes` → incoming non-`contains` edges → unique sources (top 30) |
 | `find_dependencies` | `system_graph_v2.json` | same but outgoing → unique targets |
-| `impact_analysis` | `system_graph_v2.json` | nodes whose key contains `<repo>::<file>::` (and optional `<entity>`); incoming edges from outside the file → dependents + affected repo set |
+| `impact_analysis` | `system_graph_v2.json` | nodes whose key contains `<repo>::<file>::` (precise `::<entity>` suffix); incoming edges from outside the file → dependents + affected repo set |
+| `trace_path` | `system_graph_v2.json` | confidence-weighted BFS (skips `contains`, `confidence≥0.7`); shortest path to `to`, else the reachable tree (≤`maxDepth`, cap 50) |
+| `search_graph` | `system_graph_v2.json` | filter nodes by name (regex/substring) / type / file / repo; rank by non-`contains` degree; top `limit` |
+| `find_dead_code` | `<repo>/graph.json` | entity nodes (function/method/class/…) with zero non-`contains` in-degree |
+| `detect_changes` | git + `system_graph_v2.json` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)` → changed files → entities in those files → outside dependents |
+| `get_architecture` | `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` / profiles | renders project graph; degrades to profiles, then to a "no data" hint |
 
 Node id convention: `<repo>::<filePath>::<entity>` (matches AST graph
-builder's namespacing).
+builder's namespacing). `get_architecture` reads `PROJECT_GRAPH.json` /
+`PROJECT_SUMMARY.md` via `getKnowledgeBasePath` (honors
+`CODE_SEARCH_DATA_DIR`), not knowledge-core's `ANVIL_HOME`-based loaders.
 
 ### 7.3 Profile (`tools/profile.ts`)
 

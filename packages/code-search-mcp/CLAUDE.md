@@ -39,16 +39,24 @@ running indexer).
   `/health` + `/ready` + `/version` + `/status` + `/metrics` +
   `/admin/api/status` + `POST /index` endpoints.
 
-### Tools (4 categories, 11 tools total)
+### Tools (4 categories, 17 tools total)
 
 All implemented in `src/tools/`:
 
 - **Search** (`search.ts`) — `search_code` (hybrid),
-  `search_semantic` (vector-only), `search_exact` (BM25). All call
-  `getRetriever(project).retrieve(query, opts)` from knowledge-core.
+  `search_semantic` (vector-only), `search_exact` (BM25) all call
+  `getRetriever(project).retrieve(query, opts)`. `get_code_snippet`
+  fetches one entity's source from `chunks.json` directly (embedder-
+  independent — works in BM25-only mode).
 - **Graph** (`graph.ts`) — `get_repo_graph`, `get_cross_repo_edges`,
-  `find_callers`, `find_dependencies`, `impact_analysis`. Read directly
-  from `<KB>/system_graph_v2.json` and `<KB>/<repo>/graph.json`.
+  `find_callers`, `find_dependencies`, `impact_analysis`, `trace_path`
+  (multi-hop call-chain BFS), `search_graph` (structural query by
+  name/type/file, ranked by degree), `find_dead_code` (zero-caller
+  entities), `detect_changes` (git diff → affected entities + dependents),
+  `get_architecture` (project overview). Read directly from
+  `<KB>/system_graph_v2.json` and `<KB>/<repo>/graph.json`. Symbol
+  resolution is exact by default via `resolveEntityNodes` (`fuzzy:true`
+  for substring).
 - **Profiles** (`profile.ts`) — `list_repos`, `get_repo_profile`. Read
   from `<KB>/<repo>/profile.json` via `loadProfile` /
   `loadAllProfiles`.
