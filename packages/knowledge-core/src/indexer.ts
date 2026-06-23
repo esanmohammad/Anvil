@@ -20,6 +20,7 @@ import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core
 import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
 import { computeStructuralHashes, deduplicateByStructure } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
+import { writeChunksFile, readChunksFile } from './chunks-io.js';
 
 // ---------------------------------------------------------------------------
 // SHA-based staleness detection
@@ -303,14 +304,25 @@ export class KnowledgeIndexer {
     report({ phase: 'graphing', message: 'Detecting communities...', percent: 90, etaSeconds: -1 });
     graphBuilder.detectCommunities();
 
-    // 10. Save project graph
+    // 10. Save project graph. Compact (no pretty-print): the indentation
+    // doubled the string and pushed large orgs past V8's ~512MB string limit.
+    // If even the compact graph is too big to serialize, degrade gracefully so
+    // indexing still completes — search + embeddings are unaffected; only the
+    // cross-repo graph tools lose this project-wide file.
     const graphOutputPath = join(basePath, 'system_graph_v2.json');
-    writeFileSync(graphOutputPath, JSON.stringify(graphBuilder.exportJson(), null, 2));
-    log(`Saved project graph to ${graphOutputPath}`);
+    try {
+      writeFileSync(graphOutputPath, JSON.stringify(graphBuilder.exportJson()));
+      log(`Saved project graph to ${graphOutputPath}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[knowledge-core] Could not serialize system graph (${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges): ${msg}. Skipping system_graph_v2.json — cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
+    }
 
-    // 11. Save chunks to disk (for later embedding)
+    // 11. Save chunks to disk as NDJSON (for later embedding). NDJSON streams
+    // line-by-line on write and read, so org-scale chunk sets never hit V8's
+    // single-string ceiling. See chunks-io.ts.
     const chunksPath = join(basePath, 'chunks.json');
-    writeFileSync(chunksPath, JSON.stringify(uniqueChunks));
+    writeChunksFile(chunksPath, uniqueChunks);
     log(`Saved ${uniqueChunks.length} chunks to ${chunksPath}`);
 
     // 11b. Save stale files list (for incremental embedding cleanup).
@@ -385,7 +397,7 @@ export class KnowledgeIndexer {
     if (!existsSync(chunksPath)) {
       throw new Error(`No chunks found — run Build KB first. Expected: ${chunksPath}`);
     }
-    const chunks: CodeChunk[] = JSON.parse(readFileSync(chunksPath, 'utf-8'));
+    const chunks: CodeChunk[] = await readChunksFile(chunksPath);
     log(`Loaded ${chunks.length} chunks from ${chunksPath}`);
 
     // Open vector store

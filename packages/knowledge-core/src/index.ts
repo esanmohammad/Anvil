@@ -13,6 +13,7 @@
 export * from './types.js';
 export * from './config.js';
 export * from './chunker.js';
+export * from './chunks-io.js';
 export * from './cross-repo-detector.js';
 export * from './file-walker.js';
 export * from './git-diff.js';
