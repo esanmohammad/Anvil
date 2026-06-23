@@ -161,6 +161,14 @@ describe('get_code_snippet', () => {
     const r = await handleSearchTool('get_code_snippet', { id: 'app::a.ts::nope' }, ctx());
     assert.match(text(r), /No snippet found/);
   });
+
+  it('reads the NDJSON chunks format (org-scale)', async () => {
+    // knowledge-core >=0.3.1 writes chunks.json as NDJSON, not a JSON array.
+    const ndjson = CHUNKS.map((c) => JSON.stringify(c)).join('\n') + '\n';
+    writeFileSync(join(tmp, PROJECT, 'chunks.json'), ndjson);
+    const r = await handleSearchTool('get_code_snippet', { id: 'app::a.ts::handleRequest' }, ctx());
+    assert.match(text(r), /function handleRequest/);
+  });
 });
 
 describe('search_graph', () => {
