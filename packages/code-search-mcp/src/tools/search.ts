@@ -2,10 +2,10 @@
  * Search tools — hybrid, semantic, and keyword search.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
-import { getRetriever, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
+import { getRetriever, getKnowledgeBasePath, findChunksInFile } from '@esankhan3/anvil-knowledge-core';
 
 export function registerSearchTools() {
   return [
@@ -69,7 +69,7 @@ export async function handleSearchTool(
 ): Promise<{ content: Array<{ type: string; text: string }> } | null> {
   // get_code_snippet reads chunks.json directly — embedder-independent, so it
   // does its own existence check rather than gating on ctx.indexReady.
-  if (name === 'get_code_snippet') return handleGetCodeSnippet(args, ctx);
+  if (name === 'get_code_snippet') return await handleGetCodeSnippet(args, ctx);
 
   if (!['search_code', 'search_semantic', 'search_exact'].includes(name)) return null;
 
@@ -113,11 +113,11 @@ export async function handleSearchTool(
   }
 }
 
-/** Fetch source for one entity from chunks.json by qualified name. */
-function handleGetCodeSnippet(
+/** Fetch source for one entity from chunks.json (NDJSON or legacy array) by qualified name. */
+async function handleGetCodeSnippet(
   args: Record<string, unknown>,
   ctx: ServerContext,
-): { content: Array<{ type: string; text: string }> } {
+): Promise<{ content: Array<{ type: string; text: string }> }> {
   let repo = args.repo as string | undefined;
   let file = args.file as string | undefined;
   let entity = args.entity as string | undefined;
@@ -137,26 +137,29 @@ function handleGetCodeSnippet(
     return { content: [{ type: 'text', text: 'No index found — chunks.json missing. Index the project first.' }] };
   }
 
-  let chunks: any[];
   try {
-    chunks = JSON.parse(readFileSync(chunksPath, 'utf-8'));
+    // Stream with early-exit. chunks.json is NDJSON at org scale;
+    // findChunksInFile also reads the legacy single-array format.
+    let matches = await findChunksInFile(
+      chunksPath,
+      (c) => c.repoName === repo && c.filePath === file && (!entity || c.entityName === entity),
+      5,
+    );
+    // Fallback: entity may live in a differently-named file — match by entity within repo.
+    if (matches.length === 0 && entity) {
+      matches = await findChunksInFile(chunksPath, (c) => c.repoName === repo && c.entityName === entity, 5);
+    }
+    if (matches.length === 0) {
+      return { content: [{ type: 'text', text: `No snippet found for ${repo}::${file}${entity ? `::${entity}` : ''}` }] };
+    }
+
+    matches.sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0));
+    const text = matches.map((c) =>
+      `### ${c.repoName}/${c.filePath}:${c.startLine}-${c.endLine}${c.entityName ? ` — ${c.entityName}` : ''}\n\`\`\`${c.language ?? ''}\n${c.content}\n\`\`\``,
+    ).join('\n\n');
+    return { content: [{ type: 'text', text }] };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { content: [{ type: 'text', text: `Failed to read chunks: ${msg}` }] };
   }
-
-  let matches = chunks.filter((c) => c.repoName === repo && c.filePath === file && (!entity || c.entityName === entity));
-  // Fallback: entity may live in a differently-named file — match by entity within repo.
-  if (matches.length === 0 && entity) {
-    matches = chunks.filter((c) => c.repoName === repo && c.entityName === entity);
-  }
-  if (matches.length === 0) {
-    return { content: [{ type: 'text', text: `No snippet found for ${repo}::${file}${entity ? `::${entity}` : ''}` }] };
-  }
-
-  matches = matches.sort((a, b) => (a.startLine ?? 0) - (b.startLine ?? 0)).slice(0, 5);
-  const text = matches.map((c) =>
-    `### ${c.repoName}/${c.filePath}:${c.startLine}-${c.endLine}${c.entityName ? ` — ${c.entityName}` : ''}\n\`\`\`${c.language ?? ''}\n${c.content}\n\`\`\``,
-  ).join('\n\n');
-  return { content: [{ type: 'text', text }] };
 }
