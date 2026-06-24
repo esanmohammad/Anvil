@@ -33,7 +33,10 @@ export class VectorStore {
   }
 
   /** Create or rebuild the full-text search index on contextualizedContent */
-  private async ensureFtsIndex(): Promise<void> {
+  /** (Re)build the full-text index. Public so a streamed batch insert can
+   *  defer it to a single call after the final batch instead of paying the
+   *  rebuild on every addChunks. */
+  async ensureFtsIndex(): Promise<void> {
     if (!this.table) return;
     try {
       const lancedb = await import('@lancedb/lancedb');
@@ -254,8 +257,10 @@ export class VectorStore {
     }
   }
 
-  /** Add chunks without deleting existing project data (for incremental updates) */
-  async addChunks(chunks: Array<CodeChunk & { embedding: number[] }>): Promise<void> {
+  /** Add chunks without deleting existing project data (for incremental updates).
+   *  Pass { skipIndex: true } to defer the FTS rebuild; the caller must then
+   *  call ensureFtsIndex() once after the final batch. */
+  async addChunks(chunks: Array<CodeChunk & { embedding: number[] }>, opts?: { skipIndex?: boolean }): Promise<void> {
     if (chunks.length === 0) return;
     const rows = chunks.map((c) => ({
       id: c.id,
@@ -280,8 +285,11 @@ export class VectorStore {
     } else {
       await this.table.add(rows);
     }
-    // Rebuild FTS index after data changes
-    await this.ensureFtsIndex();
+    // Rebuild FTS index after data changes — unless the caller is streaming
+    // batches and will call ensureFtsIndex() once at the end.
+    if (!opts?.skipIndex) {
+      await this.ensureFtsIndex();
+    }
   }
 }
 
