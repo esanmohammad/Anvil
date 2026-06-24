@@ -459,16 +459,21 @@ export class KnowledgeIndexer {
 
     log(`Embedding ${newChunks.length} new chunks with ${embedder.name} (${chunks.length - newChunks.length} cached, batch size: ${batchSize})...`);
 
-    const texts = newChunks.map((c) => c.contextualizedContent);
-    const embeddings: number[][] = [];
-    const totalBatches = Math.ceil(texts.length / batchSize);
+    // Stream: embed each batch, write it to LanceDB immediately, then let it be
+    // GC'd. Accumulating every embedding in memory (1024+ dims × millions of
+    // chunks) would exhaust RAM and swap-thrash the host. The FTS index is built
+    // once after the loop (addChunks with skipIndex avoids per-batch rebuilds).
+    const totalBatches = Math.ceil(newChunks.length / batchSize);
     let batchesDone = 0;
+    let stored = 0;
     const embedStartTime = Date.now();
 
-    for (let i = 0; i < texts.length; i += batchSize) {
-      const batch = texts.slice(i, i + batchSize);
-      const batchEmbeddings = await embedder.embed(batch);
-      embeddings.push(...batchEmbeddings);
+    for (let i = 0; i < newChunks.length; i += batchSize) {
+      const batchChunks = newChunks.slice(i, i + batchSize);
+      const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
+      const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
+      await vectorStore.addChunks(batchRows, { skipIndex: true });
+      stored += batchRows.length;
       batchesDone++;
 
       const elapsed = Date.now() - embedStartTime;
@@ -476,31 +481,28 @@ export class KnowledgeIndexer {
       const remainingBatches = totalBatches - batchesDone;
       const etaSeconds = Math.ceil((msPerBatch * remainingBatches) / 1000);
       const percent = Math.round(5 + (batchesDone / totalBatches) * 85);
-      const processed = Math.min(i + batchSize, texts.length);
 
       report({
         phase: 'embedding',
-        message: `Embedding: ${processed}/${texts.length} new (~${etaSeconds}s remaining)`,
+        message: `Embedding: ${stored}/${newChunks.length} new (~${etaSeconds}s remaining)`,
         percent, etaSeconds,
-        chunksTotal: texts.length, chunksProcessed: processed,
+        chunksTotal: newChunks.length, chunksProcessed: stored,
       });
 
       if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
-        log(`  Embedded ${processed}/${texts.length} (ETA: ${formatEta(etaSeconds)})`);
+        log(`  Embedded ${stored}/${newChunks.length} (ETA: ${formatEta(etaSeconds)})`);
       }
-      if (i + batchSize < texts.length && batchDelay > 0) {
+      if (i + batchSize < newChunks.length && batchDelay > 0) {
         await new Promise((resolve) => setTimeout(resolve, batchDelay));
       }
     }
 
-    const embeddedChunks = newChunks.map((chunk, i) => ({ ...chunk, embedding: embeddings[i] }));
-
-    // Add only new chunks to LanceDB (existing ones are preserved)
-    report({ phase: 'storing', message: 'Saving new chunks to vector database...', percent: 92, etaSeconds: -1 });
-    if (embeddedChunks.length > 0) {
-      await vectorStore.addChunks(embeddedChunks);
+    // Build the full-text index once, after all batches are inserted.
+    report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });
+    if (newChunks.length > 0) {
+      await vectorStore.ensureFtsIndex();
     }
-    log(`Stored ${embeddedChunks.length} new chunks in LanceDB (${deletedFiles.length} removed)`);
+    log(`Stored ${newChunks.length} new chunks in LanceDB (${deletedFiles.length} removed)`);
 
     // Update metadata
     const repoNames = [...new Set(chunks.map((c) => c.repoName))];
