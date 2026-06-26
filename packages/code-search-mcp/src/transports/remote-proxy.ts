@@ -49,7 +49,7 @@ class RemoteConnection {
   }
 
   /** Send a JSON-RPC request to the remote MCP server */
-  async request(method: string, params: Record<string, unknown> = {}, id: number = 1): Promise<any> {
+  async request(method: string, params: Record<string, unknown> = {}, id: number = 1, _retried = false): Promise<any> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/event-stream',
@@ -75,6 +75,14 @@ class RemoteConnection {
     });
 
     if (!response.ok) {
+      // The server reaped our session (idle TTL) → it returns 404 (or 400 on
+      // older servers). Transparently re-initialize a fresh session and retry
+      // once, so a long-lived connection recovers instead of hard-failing.
+      if ((response.status === 404 || response.status === 400) && this.sessionId && method !== 'initialize' && !_retried) {
+        this.sessionId = null;
+        await this.initialize();
+        return this.request(method, params, id, true);
+      }
       const errBody = await response.text().catch(() => '');
       throw new Error(`Remote server error (${response.status}): ${errBody.slice(0, 300)}`);
     }

@@ -41,6 +41,19 @@ function cacheEmbedding(query: string, embedding: number[]): void {
   queryEmbeddingCache.set(query, { embedding, timestamp: Date.now() });
 }
 
+/**
+ * Normalize a repos filter from whatever shape an MCP client sent into a clean
+ * `string[]`. Clients pass `repos` inconsistently — a JSON array, a single
+ * string, or a comma-joined string — and the query router may return a
+ * non-array. Without this, a non-array reached `.map()` and threw
+ * "filterRepos.map is not a function", and a scalar silently failed to scope.
+ */
+function toRepoArray(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter((s) => s.length > 0);
+  if (typeof v === 'string') return v.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  return [];
+}
+
 export class HybridRetriever {
   // Expose for testing/debugging
   readonly vectorStore: VectorStore;
@@ -86,20 +99,24 @@ export class HybridRetriever {
     const classification = classifyQuery(query);
     const adaptiveWeights = classification.weights;
 
-    // Repo filter — use query router (WS-8) if no explicit filter
-    let filterRepos = opts?.repoFilter ?? opts?.repos;
-    if (!filterRepos && this.queryRouter) {
+    // Repo filter — use query router (WS-8) if no explicit filter.
+    // Normalize to a clean string[]: MCP clients pass `repos` inconsistently
+    // (array, a single string, or a comma-joined string), and the router may
+    // hand back a non-array. Coercing here fixes the `filterRepos.map is not a
+    // function` crash and makes repo-scoping behave the same for every tool.
+    let filterRepos = toRepoArray(opts?.repoFilter ?? opts?.repos);
+    if (filterRepos.length === 0 && this.queryRouter) {
       try {
         const routeResult = await this.queryRouter.route(query);
         if (routeResult.strategy === 'filtered') {
-          filterRepos = routeResult.repos;
+          filterRepos = toRepoArray(routeResult.repos);
         }
       } catch {
         // Routing failed — search all repos
       }
     }
-    const filter = filterRepos
-      ? `repoName IN (${filterRepos.map((r) => `'${r}'`).join(',')})`
+    const filter = filterRepos.length > 0
+      ? `repoName IN (${filterRepos.map((r) => `'${r.replace(/'/g, "''")}'`).join(',')})`
       : undefined;
 
     // ---------------------------------------------------------------
@@ -120,7 +137,7 @@ export class HybridRetriever {
         ? this.vectorStore.vectorSearch(queryEmbedding, { limit: 50, filter })
         : Promise.resolve([] as ScoredChunk[]),
       useBm25
-        ? this.vectorStore.fullTextSearch(query, 50)
+        ? this.vectorStore.fullTextSearch(query, 50, filter)
         : Promise.resolve([] as ScoredChunk[]),
     ]);
 

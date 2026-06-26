@@ -100,6 +100,16 @@ export class ProjectGraphBuilder {
   /** Run Louvain community detection on the merged graph */
   detectCommunities(): Map<string, number> {
     if (this.graph.order === 0) return new Map();
+    // Louvain requires a full undirected COPY of the graph, and its internal
+    // pass + result object also scale with node count. At org scale (900k+
+    // nodes / 2.4M+ edges) that transient ~2× doubling of an already multi-GB
+    // graphology graph is the next OOM after the chunk phase — and the
+    // resulting `systemCommunity` attribute is not consumed anywhere
+    // (write-only metadata). So above a threshold, skip it rather than crash.
+    // Adaptive + overridable; below the threshold behavior is unchanged.
+    const envMax = parseInt(process.env.CODE_SEARCH_MAX_COMMUNITY_NODES ?? '', 10);
+    const maxNodes = Number.isFinite(envMax) && envMax > 0 ? envMax : 200_000;
+    if (this.graph.order > maxNodes) return new Map();
     // Louvain needs undirected — create a copy
     const G = getGraphClass();
     const undirected = new G({ type: 'undirected' });

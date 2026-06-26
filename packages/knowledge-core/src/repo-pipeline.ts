@@ -16,7 +16,7 @@ import { chunkRepo, chunkChangedFiles } from './chunker.js';
 import { buildAstGraph, incrementalGraphUpdate, generateGraphReport } from './ast-graph-builder.js';
 import { detectWorkspace } from './workspace-detector.js';
 import { getAllChanges, getChangedFilesList, getDeletedFilesList } from './git-diff.js';
-import { writeChunksFile } from './chunks-io.js';
+import { createChunkWriter } from './chunks-io.js';
 import { initTreeSitter } from './tree-sitter-parser.js';
 // Type-only (erased at runtime — keeps the worker lean): from the package barrel.
 import type { FileIndexEntry, WorkspaceMap, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
@@ -100,11 +100,19 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
   let changedFiles: string[] = [];
   let deletedFiles: string[] = [];
   if (doChunk) {
-    const result = useIncremental
-      ? await chunkChangedFiles(repoPath, repoName, project, chunking, diff!)
-      : await chunkRepo(repoPath, repoName, project, chunking, meta?.files ?? undefined);
     shardPath = join(repoKbDir, 'chunks.shard.ndjson');
-    writeChunksFile(shardPath, result.chunks);
+    // Stream chunks straight to the shard as the chunker produces them — never
+    // hold a repo's full chunk set in memory. This bounds per-lane memory in the
+    // worker pool (a big repo's chunks would otherwise be multi-GB × concurrency).
+    const writer = createChunkWriter(shardPath);
+    let result: Awaited<ReturnType<typeof chunkRepo>>;
+    try {
+      result = useIncremental
+        ? await chunkChangedFiles(repoPath, repoName, project, chunking, diff!, writer.write)
+        : await chunkRepo(repoPath, repoName, project, chunking, meta?.files ?? undefined, writer.write);
+    } finally {
+      writer.close();
+    }
     fileIndex = result.fileIndex;
     chunkCount = Object.values(result.fileIndex).reduce((s, f) => s + (f as FileIndexEntry).chunkCount, 0);
     changedFiles = result.changedFiles ?? [];
