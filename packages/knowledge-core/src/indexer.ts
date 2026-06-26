@@ -15,7 +15,7 @@ import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
 import { computeStructuralHash } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { createChunkWriter, iterateChunksFile } from './chunks-io.js';
-import { writeSystemGraphSqlite } from './graph-store.js';
+import { writeSystemGraphSqlite, openSystemGraphStore, createSystemGraphSqliteWriter } from './graph-store.js';
 import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
 import { processRepoPipeline, getRepoSha, readRepoIndexMeta } from './repo-pipeline.js';
 import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
@@ -181,8 +181,14 @@ export class KnowledgeIndexer {
     const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry> }>();
     const workspaceMaps = new Map<string, WorkspaceMap>();
     const shardPaths: string[] = [];
-    const graphBuilder = new ProjectGraphBuilder();
-    await graphBuilder.init();
+    // System graph: stream per-repo nodes/edges straight to SQLite as repos
+    // finish — never assemble the full graphology graph (~5GB at org scale, the
+    // last unbounded structure). Fall back to the in-memory builder only when no
+    // sqlite driver is available (small/local indexes; also gives the JSON
+    // fallback + community detection that the streamed path drops as unused).
+    const graphWriter = await createSystemGraphSqliteWriter(basePath);
+    const graphBuilder = graphWriter ? null : new ProjectGraphBuilder();
+    if (graphBuilder) await graphBuilder.init();
 
     const toIndex = new Set(reposToIndex.map((r) => r.name));
     const jobs: RepoJob[] = repos.map((r) => ({
@@ -209,8 +215,10 @@ export class KnowledgeIndexer {
       toMessage: (job) => job,
       onResult: (res) => {
         if (res.graph) {
-          try { graphBuilder.addRepoGraph(res.repoName, res.graph); }
-          catch (e) { log(`Warning: addRepoGraph failed for ${res.repoName}: ${e}`); }
+          try {
+            if (graphWriter) graphWriter.addRepoGraph(res.repoName, res.graph);
+            else graphBuilder!.addRepoGraph(res.repoName, res.graph);
+          } catch (e) { log(`Warning: addRepoGraph failed for ${res.repoName}: ${e}`); }
         }
         if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
         repoStats.push({ name: res.repoName, chunkCount: res.chunkCount, language: res.language });
@@ -246,7 +254,8 @@ export class KnowledgeIndexer {
     const hasWorkspaces = workspaceMaps.size > 0;
     if (repos.length > 1 || hasWorkspaces) {
       const crossEdges = await detectCrossRepoEdges(repos, workspaceMaps);
-      graphBuilder.addCrossRepoEdges(crossEdges);
+      if (graphWriter) graphWriter.addCrossRepoEdges(crossEdges);
+      else graphBuilder!.addCrossRepoEdges(crossEdges);
       crossRepoEdgeCount = crossEdges.length;
       log(`Detected ${crossEdges.length} cross-repo edges`);
     }
@@ -265,7 +274,8 @@ export class KnowledgeIndexer {
             },
           });
           if (meshEdges.length > 0) {
-            graphBuilder.addCrossRepoEdges(meshEdges);
+            if (graphWriter) graphWriter.addCrossRepoEdges(meshEdges);
+            else graphBuilder!.addCrossRepoEdges(meshEdges);
             crossRepoEdgeCount += meshEdges.length;
             log(`Service mesh: ${meshEdges.length} edges inferred`);
           }
@@ -280,28 +290,35 @@ export class KnowledgeIndexer {
       report({ phase: 'service-mesh', message: 'Skipped (LLM disabled)', percent: 85, etaSeconds: -1 });
     }
 
-    // 9. Community detection
-    report({ phase: 'graphing', message: 'Detecting communities...', percent: 90, etaSeconds: -1 });
-    graphBuilder.detectCommunities();
-
-    // 10. Save the project graph. Stream it into SQLite (system_graph.sqlite):
-    // queryable in slices and free of V8's ~512MB string ceiling, which the
-    // old single-JSON-blob write hit at org scale (900k+ nodes / 2.4M+ edges).
-    // Fall back to the legacy JSON blob only when no sqlite driver is available
-    // (small graphs); at org scale that path degrades gracefully — search +
-    // embeddings are unaffected, only the cross-repo graph tools lose the file.
-    try {
-      const wroteSqlite = await writeSystemGraphSqlite(basePath, graphBuilder);
-      if (wroteSqlite) {
-        log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')}`);
-      } else {
-        const graphOutputPath = join(basePath, 'system_graph_v2.json');
-        writeFileSync(graphOutputPath, JSON.stringify(graphBuilder.exportJson()));
-        log(`Saved project graph to ${graphOutputPath} (no sqlite driver; JSON fallback)`);
+    // 9. Persist the system graph.
+    report({ phase: 'graphing', message: 'Saving system graph...', percent: 90, etaSeconds: -1 });
+    if (graphWriter) {
+      // Streamed path: nodes/edges already written per-repo; backfill degrees +
+      // close. Community detection is skipped — `systemCommunity` has no readers.
+      try {
+        const { nodeCount, edgeCount } = graphWriter.finalize();
+        log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')} (streamed: ${nodeCount} nodes, ${edgeCount} edges)`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[knowledge-core] Could not persist system graph (streamed): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[knowledge-core] Could not persist system graph (${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
+    } else {
+      // In-memory fallback (no sqlite driver): detect communities, then write
+      // the whole graph to sqlite if a driver appears, else the legacy JSON blob.
+      graphBuilder!.detectCommunities();
+      try {
+        const wroteSqlite = await writeSystemGraphSqlite(basePath, graphBuilder!);
+        if (wroteSqlite) {
+          log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')}`);
+        } else {
+          const graphOutputPath = join(basePath, 'system_graph_v2.json');
+          writeFileSync(graphOutputPath, JSON.stringify(graphBuilder!.exportJson()));
+          log(`Saved project graph to ${graphOutputPath} (no sqlite driver; JSON fallback)`);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[knowledge-core] Could not persist system graph (${graphBuilder!.nodeCount} nodes, ${graphBuilder!.edgeCount} edges): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
+      }
     }
 
     // 11. (chunks.json was written + the chunk arrays freed right after dedup,
@@ -831,18 +848,13 @@ export async function getRetriever(
   const vectorStore = new VectorStore(dbPath);
   await vectorStore.init();
 
-  // Load project graph (if available)
-  let graph: ProjectGraphBuilder | null = null;
-  const graphPath = join(basePath, 'system_graph_v2.json');
-  if (existsSync(graphPath)) {
-    try {
-      const graphData = JSON.parse(readFileSync(graphPath, 'utf-8'));
-      graph = new ProjectGraphBuilder();
-      await graph.importJson(graphData);
-    } catch {
-      // Proceed without graph — vector + BM25 still work
-    }
-  }
+  // Open the system-graph store for graph-augmented retrieval. It prefers
+  // system_graph.sqlite (org scale, bounded slice queries) and falls back to
+  // the legacy JSON for small/old indexes; null if neither exists → retrieval
+  // runs vector + BM25 only. This replaces loading the whole graph into an
+  // in-memory graphology graph per query — which at org scale either didn't
+  // exist (only the sqlite is written) or was multi-GB to parse.
+  const graphStore = await openSystemGraphStore(basePath);
 
   // Create embedding provider for query-time embedding
   const embedder = createEmbeddingProvider(config.embedding);
@@ -891,7 +903,7 @@ export async function getRetriever(
     // Query routing unavailable — search all repos
   }
 
-  return new HybridRetriever(vectorStore, embedder, graph, {
+  return new HybridRetriever(vectorStore, embedder, graphStore, {
     maxChunks: config.retrieval.maxChunks,
     maxTokens: config.retrieval.maxTokens,
     hybridWeights: config.retrieval.hybridWeights,

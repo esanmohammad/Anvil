@@ -10,7 +10,7 @@
 
 import type { ScoredChunk, RetrievalResult, EmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 import type { VectorStore } from '@esankhan3/anvil-knowledge-core';
-import type { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
+import type { GraphStore } from '@esankhan3/anvil-knowledge-core';
 import type { Reranker } from '@esankhan3/anvil-knowledge-core';
 import type { QueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { classifyQuery } from '@esankhan3/anvil-knowledge-core';
@@ -58,12 +58,16 @@ export class HybridRetriever {
   // Expose for testing/debugging
   readonly vectorStore: VectorStore;
   readonly embedder: EmbeddingProvider;
-  readonly graph: ProjectGraphBuilder | null;
+  // System graph is read through the SQLite-backed GraphStore (bounded slice
+  // queries) — NOT an in-memory graphology graph. At org scale the graphology
+  // graph either didn't exist (only system_graph.sqlite is written) or was
+  // multi-GB to load per query; the store keeps graph expansion O(slice).
+  readonly graphStore: GraphStore | null;
 
   constructor(
     vectorStore: VectorStore,
     embedder: EmbeddingProvider,
-    graph: ProjectGraphBuilder | null,
+    graphStore: GraphStore | null,
     private config: {
       maxChunks: number;
       maxTokens: number;
@@ -74,7 +78,13 @@ export class HybridRetriever {
   ) {
     this.vectorStore = vectorStore;
     this.embedder = embedder;
-    this.graph = graph;
+    this.graphStore = graphStore;
+  }
+
+  /** Release the GraphStore's SQLite connection. Callers that create a retriever
+   *  per request (the in-process backend) should call this when done. */
+  close(): void {
+    try { this.graphStore?.close(); } catch { /* already closed */ }
   }
 
   async retrieve(
@@ -170,7 +180,7 @@ export class HybridRetriever {
     // Phase 3 — AST tripartite expansion from fused seeds
     // ---------------------------------------------------------------
     let astChunks: ScoredChunk[] = [];
-    if (useGraph && this.graph) {
+    if (useGraph && this.graphStore) {
       // 3a. Diversified seed selection from FUSED results (not vector-only)
       const seedNodeIds = this.resolveFusedSeeds(fused, 5);
 
@@ -223,8 +233,12 @@ export class HybridRetriever {
     // Budget-constrained selection
     const selected = packWithinBudget(finalChunks, maxTokens, maxChunks);
 
-    // Graph context (architecture summary for LLM prompt)
-    const graphContext = useGraph && this.graph ? (this.graph.exportForPrompt(2000) ?? '') : '';
+    // Graph context (architecture summary for LLM prompt) is intentionally
+    // empty under the GraphStore: it was only consumed by the RAG-eval harness,
+    // and at org scale the in-memory graph it was generated from didn't exist
+    // (so it was already ''). Retrieval quality comes from the graph EXPANSION
+    // above, not this summary string.
+    const graphContext = '';
 
     return {
       chunks: selected,
@@ -235,11 +249,12 @@ export class HybridRetriever {
   }
 
   // ---------------------------------------------------------------
-  // Seed resolution: map chunk entities to graph node IDs
+  // Seed resolution: map chunk entities to graph node IDs (bounded SQLite
+  // lookups — no full-graph scan, which was the org-scale timeout).
   // ---------------------------------------------------------------
   private resolveFusedSeeds(fused: ScoredChunk[], maxSeeds: number): string[] {
-    if (!this.graph) return [];
-    const g = this.graph.getGraph();
+    const store = this.graphStore;
+    if (!store) return [];
     const seenFiles = new Set<string>();
     const nodeIds: string[] = [];
 
@@ -252,59 +267,47 @@ export class HybridRetriever {
 
       const baseName = entityName.replace(/\$\d+$/, '');
 
-      // Try exact: repoName::filePath::entityName
-      const exactId = `${repoName}::${filePath}::${baseName}`;
-      if (g.hasNode(exactId)) { nodeIds.push(exactId); continue; }
+      // Exact: the entity node in this repo+file (try normalized + original name).
+      const exact = store.nodesInFiles(repoName, [filePath], baseName);
+      if (exact.length > 0) { nodeIds.push(exact[0]); continue; }
+      if (entityName !== baseName) {
+        const exactOrig = store.nodesInFiles(repoName, [filePath], entityName);
+        if (exactOrig.length > 0) { nodeIds.push(exactOrig[0]); continue; }
+      }
 
-      const exactIdOrig = `${repoName}::${filePath}::${entityName}`;
-      if (g.hasNode(exactIdOrig)) { nodeIds.push(exactIdOrig); continue; }
-
-      // Fallback: search by label in same repo
-      let found = false;
-      g.forEachNode((nodeId: string, attrs: any) => {
-        if (!found && attrs.repo === repoName && attrs.label === baseName) {
-          nodeIds.push(nodeId);
-          found = true;
-        }
-      });
+      // Fallback: resolve by label within the same repo (indexed query).
+      const byLabel = store.resolveNodes(baseName, repoName);
+      if (byLabel.length > 0) { nodeIds.push(byLabel[0].key); }
     }
 
     return nodeIds;
   }
 
   // ---------------------------------------------------------------
-  // Tripartite expansion: dependencies + dependents + definitions
+  // Tripartite expansion: dependencies + dependents (definitions follow via
+  // chunk lookup). neighborsOf already drops `contains` edges + low-confidence
+  // edges, matching the prior in-graph filter.
   // ---------------------------------------------------------------
   private tripartiteExpand(seedNodeIds: string[]): string[] {
-    if (!this.graph) return [];
-    const g = this.graph.getGraph();
+    const store = this.graphStore;
+    if (!store) return [];
     const expanded = new Set<string>();
     const seedSet = new Set(seedNodeIds);
 
     for (const seed of seedNodeIds) {
-      if (!g.hasNode(seed)) continue;
-
-      // Dependencies (outgoing: imports, calls, uses, type-ref)
-      g.forEachOutEdge(seed, (_edge: string, attrs: any, _src: string, tgt: string) => {
-        const conf = attrs.confidence ?? 0.8;
-        if (conf >= 0.7 && attrs.type !== 'contains' && !seedSet.has(tgt)) {
-          expanded.add(tgt);
-        }
-      });
-
-      // Dependents (incoming: who calls/imports/uses this entity)
-      g.forEachInEdge(seed, (_edge: string, attrs: any, src: string) => {
-        const conf = attrs.confidence ?? 0.8;
-        if (conf >= 0.7 && attrs.type !== 'contains' && !seedSet.has(src)) {
-          expanded.add(src);
-        }
-      });
+      // 'both' = outgoing (dependencies) + incoming (dependents).
+      for (const n of store.neighborsOf(seed, 'both')) {
+        if (!seedSet.has(n)) expanded.add(n);
+      }
     }
+    if (expanded.size === 0) return [];
 
-    // Filter out module/package nodes — we want entity chunks
-    return [...expanded].filter((nodeId) => {
-      const type = g.getNodeAttributes(nodeId)?.type;
-      return type !== 'module' && type !== 'package';
+    // Filter out module/package nodes — we want entity chunks.
+    const keys = [...expanded];
+    const types = store.nodeTypes(keys);
+    return keys.filter((k) => {
+      const t = types.get(k);
+      return t !== 'module' && t !== 'package';
     });
   }
 }

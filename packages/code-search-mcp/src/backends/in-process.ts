@@ -40,8 +40,9 @@ export class InProcessBackend implements SearchBackend {
   async search(query: string, opts: SearchOpts): Promise<SearchResultPayload> {
     const started = Date.now();
     let outcome: 'ok' | 'error' = 'ok';
+    let retriever: Awaited<ReturnType<typeof getRetriever>> | undefined;
     try {
-      const retriever = await getRetriever(this.project, this.knowledge);
+      retriever = await getRetriever(this.project, this.knowledge);
       const modeMap = {
         hybrid: 'vector+bm25+graph',
         vector: 'vector',
@@ -71,6 +72,9 @@ export class InProcessBackend implements SearchBackend {
       metrics.errors.inc({ kind: 'search' });
       throw err;
     } finally {
+      // Release the GraphStore's SQLite connection — the retriever is created
+      // per request, so without this each search would leak an fd until GC.
+      retriever?.close?.();
       const elapsed = (Date.now() - started) / 1000;
       metrics.queriesTotal.inc({ mode: opts.mode, outcome });
       metrics.queryDuration.observe(elapsed, { mode: opts.mode });

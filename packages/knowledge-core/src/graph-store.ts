@@ -34,6 +34,7 @@ export interface GraphStore {
   dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] };
   neighborsOf(key: string, direction: GraphDirection): string[];
   labelsOf(keys: string[]): Map<string, string>;
+  nodeTypes(keys: string[]): Map<string, string>;
   searchNodes(
     f: { name?: string; type?: string; file?: string; repo?: string; minDegree?: number },
     limit: number,
@@ -159,6 +160,111 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
 }
 
 // ---------------------------------------------------------------------------
+// Streaming writer — write the system graph to SQLite per-repo as repos finish,
+// WITHOUT ever assembling the full in-memory graphology graph (~5GB at org
+// scale, the last unbounded structure in buildKB). Holds only a node-key Set +
+// a degree Map (~hundreds of MB). Produces a byte-equivalent system_graph.sqlite
+// to ProjectGraphBuilder → writeSystemGraphSqlite (verified by parity test).
+// Returns null if no sqlite driver (caller keeps the in-memory fallback).
+// ---------------------------------------------------------------------------
+
+interface RepoGraphInput {
+  nodes: Array<{ id: string; label?: string; type?: string; file?: string; community?: unknown }>;
+  links: Array<{ source: string; target: string; type?: string; confidence?: number }>;
+}
+interface CrossEdgeInput {
+  sourceRepo: string; sourceNode: string; targetRepo: string; targetNode: string;
+  edgeType: string; evidence?: string; confidence?: number;
+}
+export interface SystemGraphSqliteWriter {
+  /** Namespace + insert one repo's nodes/edges (mirrors ProjectGraphBuilder.addRepoGraph). */
+  addRepoGraph(repoName: string, graph: RepoGraphInput): void;
+  /** Insert cross-repo edges + synthetic endpoints (mirrors addCrossRepoEdges). */
+  addCrossRepoEdges(edges: CrossEdgeInput[]): void;
+  /** Backfill node degrees, write meta, close. */
+  finalize(): { nodeCount: number; edgeCount: number };
+}
+
+export async function createSystemGraphSqliteWriter(basePath: string): Promise<SystemGraphSqliteWriter | null> {
+  const open = await loadDriver();
+  if (!open) return null;
+  const dbPath = systemGraphSqlitePath(basePath);
+  for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try { rmSync(f, { force: true }); } catch { /* ok */ }
+  }
+  const db = open(dbPath);
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;');
+  db.exec(SCHEMA);
+  const insNode = db.prepare('INSERT OR REPLACE INTO nodes(key,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?)');
+  const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo) VALUES(?,?,?,?,?,?)');
+  const updDegree = db.prepare('UPDATE nodes SET degree=? WHERE key=?');
+
+  const nodeKeys = new Set<string>();
+  const degree = new Map<string, number>();
+  let edgeCount = 0;
+  const bump = (type: string | null, src: string, tgt: string) => {
+    if (type !== 'contains') {
+      degree.set(src, (degree.get(src) ?? 0) + 1);
+      degree.set(tgt, (degree.get(tgt) ?? 0) + 1);
+    }
+  };
+
+  return {
+    addRepoGraph(repoName, graph) {
+      db.exec('BEGIN');
+      try {
+        for (const node of graph.nodes ?? []) {
+          const key = `${repoName}::${node.id}`;
+          if (nodeKeys.has(key)) continue; // dedup — mirrors the hasNode guard
+          nodeKeys.add(key);
+          const attrs = node.community !== undefined ? JSON.stringify({ community: node.community }) : null;
+          insNode.run(key, repoName, node.file ?? fileOf(key), node.label ?? labelFromKey(key), node.type ?? '', 0, attrs);
+        }
+        for (const edge of graph.links ?? []) {
+          const src = `${repoName}::${edge.source}`;
+          const tgt = `${repoName}::${edge.target}`;
+          if (!nodeKeys.has(src) || !nodeKeys.has(tgt)) continue; // both endpoints must exist
+          const type = edge.type ?? 'depends';
+          const conf = typeof edge.confidence === 'number' ? edge.confidence : 0.8;
+          insEdge.run(src, tgt, type, conf, repoName, repoName);
+          edgeCount++;
+          bump(type, src, tgt);
+        }
+        db.exec('COMMIT');
+      } catch (e) { db.exec('ROLLBACK'); throw e; }
+    },
+
+    addCrossRepoEdges(edges) {
+      db.exec('BEGIN');
+      try {
+        for (const e of edges ?? []) {
+          const src = `${e.sourceRepo}::${e.sourceNode}`;
+          const tgt = `${e.targetRepo}::${e.targetNode}`;
+          if (!nodeKeys.has(src)) { nodeKeys.add(src); insNode.run(src, e.sourceRepo, fileOf(src), e.sourceNode, 'external', 0, null); }
+          if (!nodeKeys.has(tgt)) { nodeKeys.add(tgt); insNode.run(tgt, e.targetRepo, fileOf(tgt), e.targetNode, 'external', 0, null); }
+          const conf = typeof e.confidence === 'number' ? e.confidence : null;
+          insEdge.run(src, tgt, e.edgeType, conf, e.sourceRepo, e.targetRepo);
+          edgeCount++;
+          bump(e.edgeType, src, tgt);
+        }
+        db.exec('COMMIT');
+      } catch (e) { db.exec('ROLLBACK'); throw e; }
+    },
+
+    finalize() {
+      db.exec('BEGIN');
+      try {
+        for (const [key, deg] of degree) updDegree.run(deg, key);
+        db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)').run('nodeCount', String(nodeKeys.size));
+        db.exec('COMMIT');
+      } catch (e) { db.exec('ROLLBACK'); db.close(); throw e; }
+      db.close();
+      return { nodeCount: nodeKeys.size, edgeCount };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // SQLite-backed reader
 // ---------------------------------------------------------------------------
 
@@ -272,6 +378,17 @@ class SqliteGraphStore implements GraphStore {
     return m;
   }
 
+  nodeTypes(keys: string[]): Map<string, string> {
+    const m = new Map<string, string>();
+    for (const batch of chunked(keys)) {
+      const ph = batch.map(() => '?').join(',');
+      for (const r of this.db.prepare(`SELECT key, type FROM nodes WHERE key IN (${ph})`).all(...batch)) {
+        m.set(r.key as string, (r.type as string) || '');
+      }
+    }
+    return m;
+  }
+
   searchNodes(
     f: { name?: string; type?: string; file?: string; repo?: string; minDegree?: number },
     limit: number,
@@ -369,6 +486,12 @@ class JsonGraphStore implements GraphStore {
     const m = new Map<string, string>();
     for (const n of this.nodes) if (want.has(n.key)) m.set(n.key, this.label(n));
     for (const k of keys) if (!m.has(k)) m.set(k, labelFromKey(k));
+    return m;
+  }
+  nodeTypes(keys: string[]): Map<string, string> {
+    const want = new Set(keys);
+    const m = new Map<string, string>();
+    for (const n of this.nodes) if (want.has(n.key)) m.set(n.key, n.attributes?.type ?? '');
     return m;
   }
   private degree(): Map<string, number> {
