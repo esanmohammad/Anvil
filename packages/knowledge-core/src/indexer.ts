@@ -1,62 +1,68 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
-import { chunkRepo, chunkChangedFiles } from '@esankhan3/anvil-knowledge-core';
 import type { FileIndexEntry } from '@esankhan3/anvil-knowledge-core';
-import { buildAstGraph, generateGraphReport, incrementalGraphUpdate } from '@esankhan3/anvil-knowledge-core';
-import { getAllChanges, getChangedFilesList, getDeletedFilesList } from '@esankhan3/anvil-knowledge-core';
-import type { GitDiff } from '@esankhan3/anvil-knowledge-core';
 import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 import { VectorStore } from '@esankhan3/anvil-knowledge-core';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { detectCrossRepoEdges } from '@esankhan3/anvil-knowledge-core';
-import { detectWorkspace } from '@esankhan3/anvil-knowledge-core';
 import { HybridRetriever } from './retriever.js';
 import { loadKnowledgeConfig, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
 import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap } from '@esankhan3/anvil-knowledge-core';
 import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
 import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
-import { computeStructuralHashes, deduplicateByStructure } from '@esankhan3/anvil-knowledge-core';
+import { computeStructuralHash } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
-import { writeChunksFile, readChunksFile } from './chunks-io.js';
+import { readChunksFile, createChunkWriter, iterateChunksFile } from './chunks-io.js';
 import { writeSystemGraphSqlite } from './graph-store.js';
+import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
+import { processRepoPipeline, getRepoSha, readRepoIndexMeta } from './repo-pipeline.js';
+import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
 
 // ---------------------------------------------------------------------------
 // SHA-based staleness detection
 // ---------------------------------------------------------------------------
 
-interface RepoIndexMeta {
-  lastIndexedSha: string;
-  lastIndexedAt: string;
-  chunkCount: number;
-  embeddingProvider: string;
-  files?: Record<string, FileIndexEntry>;
-}
-
-function getRepoSha(repoPath: string): string | null {
-  try {
-    return execSync('git rev-parse HEAD', { cwd: repoPath, stdio: 'pipe', encoding: 'utf-8', timeout: 5000 }).trim();
-  } catch {
-    return null;
-  }
-}
-
-function readRepoIndexMeta(basePath: string, repoName: string): RepoIndexMeta | null {
-  const metaPath = join(basePath, repoName, 'index_meta.json');
-  if (!existsSync(metaPath)) return null;
-  try {
-    return JSON.parse(readFileSync(metaPath, 'utf-8'));
-  } catch {
-    return null;
-  }
-}
-
+// RepoIndexMeta, getRepoSha, readRepoIndexMeta moved to repo-pipeline.ts (shared
+// with the worker). writeRepoIndexMeta stays here — only buildKB writes meta.
 function writeRepoIndexMeta(basePath: string, repoName: string, meta: RepoIndexMeta): void {
   const dir = join(basePath, repoName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'index_meta.json'), JSON.stringify(meta, null, 2), 'utf-8');
+}
+
+/**
+ * Structural dedup, streaming: read each per-repo shard line-by-line, keep the
+ * first chunk per structural hash, write survivors to chunks.json. Bounded
+ * memory — a Set of hashes + one chunk at a time, never the whole corpus (this
+ * replaces the in-RAM deduplicateByStructure(allChunks) that OOM'd at org scale).
+ * Keeps first-seen per hash (repo order) rather than smallest-id, but the
+ * survivors are structurally identical, so dedup is functionally equivalent.
+ */
+async function dedupShardsToChunks(
+  shardPaths: string[],
+  chunksPath: string,
+): Promise<{ kept: number; dropped: number; tokens: number }> {
+  const seen = new Set<string>();
+  const writer = createChunkWriter(chunksPath);
+  let kept = 0, dropped = 0, tokens = 0;
+  try {
+    for (const sp of shardPaths) {
+      if (!existsSync(sp)) continue;
+      for await (const c of iterateChunksFile(sp)) {
+        const h = computeStructuralHash(c.content, c.language).hash;
+        if (seen.has(h)) { dropped++; continue; }
+        seen.add(h);
+        writer.write(c);
+        kept++;
+        tokens += c.tokens;
+      }
+    }
+  } finally {
+    writer.close();
+  }
+  return { kept, dropped, tokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -166,115 +172,73 @@ export class KnowledgeIndexer {
     // 3. Chunk repos — use git diff for incremental detection
     report({ phase: 'chunking', message: `Chunking ${reposToIndex.length} repos...`, percent: 10, etaSeconds: -1, reposTotal: repos.length, reposProcessed: skippedRepos.length, skippedRepos });
     log(`Chunking ${reposToIndex.length} repos (${skippedRepos.length} skipped — unchanged)...`);
-    const allChunks: CodeChunk[] = [];
+    // Process each repo (chunk + AST graph + workspace) through a persistent
+    // worker pool across cores — the CPU-bound bottleneck. Each repo streams its
+    // chunks to a per-repo shard on disk and returns only its (small) graph +
+    // metadata, so the main thread never accumulates the whole corpus (bounded
+    // memory). Concurrency is adaptive; a worker failure falls back to in-thread.
     const repoStats: Array<{ name: string; chunkCount: number; language: string }> = [];
     const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry> }>();
-    const repoDiffs = new Map<string, GitDiff>();
+    const workspaceMaps = new Map<string, WorkspaceMap>();
+    const shardPaths: string[] = [];
+    const graphBuilder = new ProjectGraphBuilder();
+    await graphBuilder.init();
 
-    for (const repo of reposToIndex) {
-      const meta = opts?.force ? null : readRepoIndexMeta(basePath, repo.name);
+    const toIndex = new Set(reposToIndex.map((r) => r.name));
+    const jobs: RepoJob[] = repos.map((r) => ({
+      repoName: r.name,
+      repoPath: r.path,
+      language: r.language,
+      basePath,
+      project,
+      chunking: config.chunking,
+      doChunk: toIndex.has(r.name),
+      force: !!opts?.force,
+    }));
+    const concurrency = resolveIndexConcurrency(jobs.length);
+    const workerUrl = concurrency > 1 ? new URL('./index-worker.js', import.meta.url) : null;
+    log(`Processing ${jobs.length} repos (chunk + AST) — concurrency ${concurrency}${workerUrl ? ' (workers)' : ' (in-thread)'}, ${skippedRepos.length} skipped`);
+    report({ phase: 'chunking', message: `Chunking + graphing ${jobs.length} repos (×${concurrency})...`, percent: 15, etaSeconds: -1, reposTotal: repos.length, reposProcessed: 0, skippedRepos });
 
-      // Use git diff for incremental change detection (O(1) via git's Merkle DAG)
-      const diff = opts?.force ? null : (meta?.lastIndexedSha ? getAllChanges(repo.path, meta.lastIndexedSha) : null);
-      const useIncremental = diff && !diff.fallbackToFull && (diff.added.length + diff.modified.length + diff.deleted.length) > 0;
-
-      let result;
-      if (useIncremental) {
-        const changedCount = diff.added.length + diff.modified.length;
-        const deletedCount = diff.deleted.length;
-        log(`  ${repo.name}: git diff → ${changedCount} changed, ${deletedCount} deleted (incremental)`);
-        result = await chunkChangedFiles(repo.path, repo.name, project, config.chunking, diff);
-        repoDiffs.set(repo.name, diff);
-      } else {
-        // Full re-chunk (first index or force)
-        result = await chunkRepo(repo.path, repo.name, project, config.chunking, meta?.files ?? undefined);
-      }
-
-      allChunks.push(...result.chunks);
-      repoChunkResults.set(repo.name, result);
-      const totalChunkCount = Object.values(result.fileIndex).reduce((sum: number, f: any) => sum + f.chunkCount, 0);
-      repoStats.push({ name: repo.name, chunkCount: totalChunkCount, language: repo.language });
-    }
+    let processed = 0;
+    await runReposPooled<RepoJob, RepoResult>(jobs, {
+      concurrency,
+      workerUrl,
+      log,
+      inThread: (job) => processRepoPipeline(job),
+      toMessage: (job) => job,
+      onResult: (res) => {
+        if (res.graph) {
+          try { graphBuilder.addRepoGraph(res.repoName, res.graph); }
+          catch (e) { log(`Warning: addRepoGraph failed for ${res.repoName}: ${e}`); }
+        }
+        if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
+        repoStats.push({ name: res.repoName, chunkCount: res.chunkCount, language: res.language });
+        if (res.chunked) {
+          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {} });
+          if (res.shardPath) shardPaths.push(res.shardPath);
+        }
+        processed++;
+        if (processed % 10 === 0 || processed === jobs.length) {
+          report({ phase: 'graphing', message: `Processed ${processed}/${jobs.length} repos`, percent: Math.round(15 + (processed / jobs.length) * 50), etaSeconds: -1 });
+        }
+      },
+    });
     for (const name of skippedRepos) {
       const meta = readRepoIndexMeta(basePath, name);
       repoStats.push({ name, chunkCount: meta?.chunkCount ?? 0, language: '' });
     }
-    log(`Chunked ${allChunks.length} chunks from ${reposToIndex.length} repos`);
 
-    // 4. Structural dedup (WS-6)
-    report({ phase: 'dedup', message: 'Deduplicating chunks by structure...', percent: 25, etaSeconds: -1 });
-    const dedupResult = deduplicateByStructure(allChunks);
-    const uniqueChunks = dedupResult.unique;
-    if (dedupResult.savings.chunks > 0) {
-      log(`Structural dedup: ${dedupResult.savings.chunks} duplicates removed`);
-    }
-
-    // Persist chunks NOW — BEFORE building the graph — and free the in-memory
-    // chunk arrays. Otherwise ~810k chunk objects (content + contextualized
-    // source, multi-GB) stay resident alongside the ~900k-node graphology graph
-    // (also multi-GB); their SUM OOMs even a 16GB heap. Writing + freeing here
-    // makes the chunk and graph phases sequential — peak ≈ max(chunks, graph),
-    // not their sum.
+    // Structural dedup — streaming over the per-repo shards into chunks.json
+    // (bounded memory; replaces the in-RAM dedup that OOM'd at org scale).
+    report({ phase: 'dedup', message: 'Deduplicating chunks (streaming)...', percent: 68, etaSeconds: -1 });
     const chunksPath = join(basePath, 'chunks.json');
-    writeChunksFile(chunksPath, uniqueChunks);
-    log(`Saved ${uniqueChunks.length} chunks to ${chunksPath}`);
-    const dedupedChunkCount = uniqueChunks.length;
-    const dedupedTokenSum = uniqueChunks.reduce((sum, c) => sum + c.tokens, 0);
-    allChunks.length = 0;
-    uniqueChunks.length = 0;
-    dedupResult.duplicates.length = 0;
-
-    // 5. Detect workspace structures
-    const workspaceMaps = new Map<string, WorkspaceMap>();
-    for (const repo of repos) {
-      try {
-        const wsMap = detectWorkspace(repo.path);
-        if (wsMap.packages.length > 0) {
-          workspaceMaps.set(repo.name, wsMap);
-          log(`Detected workspace in ${repo.name}: ${wsMap.packages.length} packages`);
-        }
-      } catch (err) {
-        log(`Warning: Workspace detection failed for ${repo.name}: ${err}`);
-      }
-    }
-
-    // 6. Build AST graphs — incremental when possible via git diff
-    report({ phase: 'graphing', message: 'Building AST graphs...', percent: 40, etaSeconds: -1 });
-    const graphBuilder = new ProjectGraphBuilder();
-    await graphBuilder.init();
-
-    for (const repo of repos) {
-      try {
-        const repoKbDir = join(basePath, repo.name);
-        mkdirSync(repoKbDir, { recursive: true });
-        const existingGraphPath = join(repoKbDir, 'graph.json');
-        const diff = repoDiffs.get(repo.name);
-
-        let graph;
-        if (diff && !diff.fallbackToFull && existsSync(existingGraphPath)) {
-          // Incremental graph update — only re-parse changed files
-          const existingGraph = JSON.parse(readFileSync(existingGraphPath, 'utf-8'));
-          graph = await incrementalGraphUpdate(
-            existingGraph,
-            getChangedFilesList(diff),
-            getDeletedFilesList(diff),
-            repo.path,
-            { workspaceMap: workspaceMaps.get(repo.name) },
-          );
-          log(`Updated AST graph for ${repo.name} incrementally (${diff.added.length + diff.modified.length} files changed)`);
-        } else {
-          // Full rebuild
-          graph = await buildAstGraph(repo.path, { workspaceMap: workspaceMaps.get(repo.name) });
-          log(`Built AST graph for ${repo.name} (${graph.nodes.length} nodes, ${graph.links.length} edges)`);
-        }
-
-        graphBuilder.addRepoGraph(repo.name, graph);
-        writeFileSync(join(repoKbDir, 'graph.json'), JSON.stringify(graph));
-        writeFileSync(join(repoKbDir, 'GRAPH_REPORT.md'), generateGraphReport(repo.name, graph));
-      } catch (err) {
-        log(`Warning: AST graph build failed for ${repo.name}: ${err}`);
-      }
-    }
+    const dedup = await dedupShardsToChunks(shardPaths, chunksPath);
+    const dedupedChunkCount = dedup.kept;
+    const dedupedTokenSum = dedup.tokens;
+    if (dedup.dropped > 0) log(`Structural dedup: ${dedup.dropped} duplicates removed`);
+    log(`Saved ${dedupedChunkCount} chunks to ${chunksPath}`);
+    for (const sp of shardPaths) { try { rmSync(sp, { force: true }); } catch { /* ok */ } }
 
     // 7. Detect cross-repo edges (14 strategies)
     report({ phase: 'graphing', message: 'Detecting cross-repo edges...', percent: 70, etaSeconds: -1 });
