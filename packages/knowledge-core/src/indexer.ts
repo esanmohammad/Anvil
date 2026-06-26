@@ -451,51 +451,78 @@ export class KnowledgeIndexer {
       }
     }
 
-    // Embed only new/changed chunks
+    // Embed only new/changed chunks.
     const embedder = createEmbeddingProvider(config.embedding);
     const isOllama = embedder.name === 'ollama';
-    const batchSize = isOllama ? 10 : 50;
-    const batchDelay = isOllama ? 50 : 100;
+    // Operational tuning. Cloud providers (OpenAI, etc.) parallelize across many
+    // in-flight requests, so embedding throughput scales ~linearly with
+    // concurrency until the provider's TPM rate limit kicks in (then embedFetch's
+    // 429 backoff paces it). Ollama is a local single-runtime — concurrency
+    // doesn't help and oversubscribes the GPU/CPU — so keep it serial. Override
+    // per deployment (e.g. raise concurrency on a higher OpenAI tier):
+    //   CODE_SEARCH_EMBEDDING_CONCURRENCY (default 8), _BATCH_SIZE (default 128).
+    const envInt = (key: string, dflt: number): number => {
+      const n = parseInt(process.env[key] ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : dflt;
+    };
+    const batchSize = envInt('CODE_SEARCH_EMBEDDING_BATCH_SIZE', isOllama ? 10 : 128);
+    const concurrency = isOllama ? 1 : envInt('CODE_SEARCH_EMBEDDING_CONCURRENCY', 8);
 
-    log(`Embedding ${newChunks.length} new chunks with ${embedder.name} (${chunks.length - newChunks.length} cached, batch size: ${batchSize})...`);
+    log(`Embedding ${newChunks.length} new chunks with ${embedder.name} (${chunks.length - newChunks.length} cached, batch ${batchSize} × concurrency ${concurrency})...`);
 
-    // Stream: embed each batch, write it to LanceDB immediately, then let it be
-    // GC'd. Accumulating every embedding in memory (1024+ dims × millions of
-    // chunks) would exhaust RAM and swap-thrash the host. The FTS index is built
-    // once after the loop (addChunks with skipIndex avoids per-batch rebuilds).
-    const totalBatches = Math.ceil(newChunks.length / batchSize);
+    // Pre-split into batches, then run up to `concurrency` of them in flight.
+    // Each batch is written to LanceDB the instant its embeddings return (writes
+    // serialized via writeChain — LanceDB's add must not run concurrently on one
+    // table). Streaming the writes keeps memory bounded (we never hold every
+    // embedding at once) AND makes the run resumable: a crash loses only the few
+    // in-flight batches, since newChunks was diffed against the ids already in
+    // the store (above) and a re-run continues from there. The FTS index is built
+    // once after the loop (skipIndex defers the per-batch rebuild).
+    const batches: CodeChunk[][] = [];
+    for (let i = 0; i < newChunks.length; i += batchSize) batches.push(newChunks.slice(i, i + batchSize));
+
+    const totalBatches = batches.length;
     let batchesDone = 0;
     let stored = 0;
+    let cursor = 0;
     const embedStartTime = Date.now();
+    let writeChain: Promise<void> = Promise.resolve();
 
-    for (let i = 0; i < newChunks.length; i += batchSize) {
-      const batchChunks = newChunks.slice(i, i + batchSize);
-      const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
-      const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
-      await vectorStore.addChunks(batchRows, { skipIndex: true });
-      stored += batchRows.length;
-      batchesDone++;
+    const runWorker = async (): Promise<void> => {
+      for (;;) {
+        const idx = cursor++;
+        if (idx >= totalBatches) return;
+        const batchChunks = batches[idx];
+        const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
+        const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
+        // Serialize the LanceDB write by chaining onto the previous one, and
+        // await only the promise we just appended.
+        const myWrite = (writeChain = writeChain.then(() =>
+          vectorStore.addChunks(batchRows, { skipIndex: true }),
+        ));
+        await myWrite;
+        stored += batchRows.length;
+        batchesDone++;
 
-      const elapsed = Date.now() - embedStartTime;
-      const msPerBatch = elapsed / batchesDone;
-      const remainingBatches = totalBatches - batchesDone;
-      const etaSeconds = Math.ceil((msPerBatch * remainingBatches) / 1000);
-      const percent = Math.round(5 + (batchesDone / totalBatches) * 85);
+        const elapsed = Date.now() - embedStartTime;
+        const msPerBatch = elapsed / batchesDone;
+        const etaSeconds = Math.ceil((msPerBatch * (totalBatches - batchesDone)) / 1000);
+        const percent = Math.round(5 + (batchesDone / totalBatches) * 85);
 
-      report({
-        phase: 'embedding',
-        message: `Embedding: ${stored}/${newChunks.length} new (~${etaSeconds}s remaining)`,
-        percent, etaSeconds,
-        chunksTotal: newChunks.length, chunksProcessed: stored,
-      });
+        report({
+          phase: 'embedding',
+          message: `Embedding: ${stored}/${newChunks.length} new (~${etaSeconds}s remaining)`,
+          percent, etaSeconds,
+          chunksTotal: newChunks.length, chunksProcessed: stored,
+        });
 
-      if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
-        log(`  Embedded ${stored}/${newChunks.length} (ETA: ${formatEta(etaSeconds)})`);
+        if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
+          log(`  Embedded ${stored}/${newChunks.length} (ETA: ${formatEta(etaSeconds)})`);
+        }
       }
-      if (i + batchSize < newChunks.length && batchDelay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, batchDelay));
-      }
-    }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, totalBatches) }, () => runWorker()));
 
     // Build the full-text index once, after all batches are inserted.
     report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });
