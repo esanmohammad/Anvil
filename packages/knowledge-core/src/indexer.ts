@@ -400,10 +400,12 @@ export class KnowledgeIndexer {
     const chunks: CodeChunk[] = await readChunksFile(chunksPath);
     log(`Loaded ${chunks.length} chunks from ${chunksPath}`);
 
-    // Open vector store
+    // Open vector store. healCorrupt: this is the write/rebuild path, so if a
+    // prior run left the table corrupt (killed mid-write → 0-byte fragment),
+    // drop it and rebuild from chunks.json rather than failing every reindex.
     const dbPath = join(basePath, 'lancedb');
     const vectorStore = new VectorStore(dbPath);
-    await vectorStore.init();
+    await vectorStore.init({ healCorrupt: true });
 
     // Determine which chunks actually need embedding by checking existing IDs
     const existingIds = new Set<string>();

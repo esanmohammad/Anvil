@@ -1,4 +1,16 @@
+import { rmSync } from 'node:fs';
 import type { CodeChunk, ScoredChunk } from '@esankhan3/anvil-knowledge-core';
+
+/** A LanceDB store left 0-byte/truncated by a prior killed-mid-write (OOM /
+ *  SIGKILL / ENOSPC). Surfaces as a lance IO / "Invalid range" / generic
+ *  memory error on open or first read. Distinct from "table not found"
+ *  (a normal first run), which must NOT trigger a destructive rebuild. */
+function isCorruptVectorStore(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /Invalid range|Generic memory error|LanceError\(IO\)|corrupt|unexpected end of file|failed to (read|open)/i.test(
+    msg,
+  );
+}
 
 export class VectorStore {
   private db: any; // lancedb.Connection
@@ -10,8 +22,13 @@ export class VectorStore {
     this.dbPath = dbPath;
   }
 
-  /** Initialize connection, create or open table */
-  async init(): Promise<void> {
+  /** Initialize connection, create or open table.
+   *
+   *  `healCorrupt` (write path only): force a real read on open so a table
+   *  corrupted by a prior killed-mid-write surfaces here, and if it does, drop
+   *  the table and start fresh — the caller rebuilds it from chunks.json. NEVER
+   *  pass this on a read/search path: a reader must not delete the index. */
+  async init(opts?: { healCorrupt?: boolean }): Promise<void> {
     let lancedb: typeof import('@lancedb/lancedb');
     try {
       lancedb = await import('@lancedb/lancedb');
@@ -23,13 +40,26 @@ export class VectorStore {
     this.db = await lancedb.connect(this.dbPath);
     try {
       this.table = await this.db.openTable('chunks');
+      // A 0-byte fragment from a killed-mid-write often opens fine but throws on
+      // the first read, not at openTable — so force a read when healing.
+      if (opts?.healCorrupt) await this.table.query().limit(1).toArray();
       // Ensure FTS index exists for existing tables
       await this.ensureFtsIndex();
-      this.initialized = true;
-    } catch {
-      // Table doesn't exist yet — will be created on first upsert
-      this.initialized = true;
+    } catch (err) {
+      if (opts?.healCorrupt && isCorruptVectorStore(err)) {
+        // Store is unreadable but fully rebuildable from chunks.json: drop it
+        // and reconnect to an empty dir so the embed loop recreates the table.
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[knowledge-core] vector store at ${this.dbPath} is corrupt (${msg.slice(0, 160)}); dropping and rebuilding from chunks.json.`,
+        );
+        this.table = undefined;
+        try { rmSync(this.dbPath, { recursive: true, force: true }); } catch { /* best effort */ }
+        this.db = await lancedb.connect(this.dbPath);
+      }
+      // else: table doesn't exist yet (first run) — created on first upsert.
     }
+    this.initialized = true;
   }
 
   /** Create or rebuild the full-text search index on contextualizedContent */
