@@ -1,62 +1,68 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
-import { chunkRepo, chunkChangedFiles } from '@esankhan3/anvil-knowledge-core';
 import type { FileIndexEntry } from '@esankhan3/anvil-knowledge-core';
-import { buildAstGraph, generateGraphReport, incrementalGraphUpdate } from '@esankhan3/anvil-knowledge-core';
-import { getAllChanges, getChangedFilesList, getDeletedFilesList } from '@esankhan3/anvil-knowledge-core';
-import type { GitDiff } from '@esankhan3/anvil-knowledge-core';
 import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 import { VectorStore } from '@esankhan3/anvil-knowledge-core';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { detectCrossRepoEdges } from '@esankhan3/anvil-knowledge-core';
-import { detectWorkspace } from '@esankhan3/anvil-knowledge-core';
 import { HybridRetriever } from './retriever.js';
 import { loadKnowledgeConfig, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
 import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap } from '@esankhan3/anvil-knowledge-core';
 import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
 import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
-import { computeStructuralHashes, deduplicateByStructure } from '@esankhan3/anvil-knowledge-core';
+import { computeStructuralHash } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
-import { writeChunksFile, readChunksFile } from './chunks-io.js';
+import { createChunkWriter, iterateChunksFile } from './chunks-io.js';
 import { writeSystemGraphSqlite } from './graph-store.js';
+import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
+import { processRepoPipeline, getRepoSha, readRepoIndexMeta } from './repo-pipeline.js';
+import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
 
 // ---------------------------------------------------------------------------
 // SHA-based staleness detection
 // ---------------------------------------------------------------------------
 
-interface RepoIndexMeta {
-  lastIndexedSha: string;
-  lastIndexedAt: string;
-  chunkCount: number;
-  embeddingProvider: string;
-  files?: Record<string, FileIndexEntry>;
-}
-
-function getRepoSha(repoPath: string): string | null {
-  try {
-    return execSync('git rev-parse HEAD', { cwd: repoPath, stdio: 'pipe', encoding: 'utf-8', timeout: 5000 }).trim();
-  } catch {
-    return null;
-  }
-}
-
-function readRepoIndexMeta(basePath: string, repoName: string): RepoIndexMeta | null {
-  const metaPath = join(basePath, repoName, 'index_meta.json');
-  if (!existsSync(metaPath)) return null;
-  try {
-    return JSON.parse(readFileSync(metaPath, 'utf-8'));
-  } catch {
-    return null;
-  }
-}
-
+// RepoIndexMeta, getRepoSha, readRepoIndexMeta moved to repo-pipeline.ts (shared
+// with the worker). writeRepoIndexMeta stays here — only buildKB writes meta.
 function writeRepoIndexMeta(basePath: string, repoName: string, meta: RepoIndexMeta): void {
   const dir = join(basePath, repoName);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'index_meta.json'), JSON.stringify(meta, null, 2), 'utf-8');
+}
+
+/**
+ * Structural dedup, streaming: read each per-repo shard line-by-line, keep the
+ * first chunk per structural hash, write survivors to chunks.json. Bounded
+ * memory — a Set of hashes + one chunk at a time, never the whole corpus (this
+ * replaces the in-RAM deduplicateByStructure(allChunks) that OOM'd at org scale).
+ * Keeps first-seen per hash (repo order) rather than smallest-id, but the
+ * survivors are structurally identical, so dedup is functionally equivalent.
+ */
+async function dedupShardsToChunks(
+  shardPaths: string[],
+  chunksPath: string,
+): Promise<{ kept: number; dropped: number; tokens: number }> {
+  const seen = new Set<string>();
+  const writer = createChunkWriter(chunksPath);
+  let kept = 0, dropped = 0, tokens = 0;
+  try {
+    for (const sp of shardPaths) {
+      if (!existsSync(sp)) continue;
+      for await (const c of iterateChunksFile(sp)) {
+        const h = computeStructuralHash(c.content, c.language).hash;
+        if (seen.has(h)) { dropped++; continue; }
+        seen.add(h);
+        writer.write(c);
+        kept++;
+        tokens += c.tokens;
+      }
+    }
+  } finally {
+    writer.close();
+  }
+  return { kept, dropped, tokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -166,115 +172,73 @@ export class KnowledgeIndexer {
     // 3. Chunk repos — use git diff for incremental detection
     report({ phase: 'chunking', message: `Chunking ${reposToIndex.length} repos...`, percent: 10, etaSeconds: -1, reposTotal: repos.length, reposProcessed: skippedRepos.length, skippedRepos });
     log(`Chunking ${reposToIndex.length} repos (${skippedRepos.length} skipped — unchanged)...`);
-    const allChunks: CodeChunk[] = [];
+    // Process each repo (chunk + AST graph + workspace) through a persistent
+    // worker pool across cores — the CPU-bound bottleneck. Each repo streams its
+    // chunks to a per-repo shard on disk and returns only its (small) graph +
+    // metadata, so the main thread never accumulates the whole corpus (bounded
+    // memory). Concurrency is adaptive; a worker failure falls back to in-thread.
     const repoStats: Array<{ name: string; chunkCount: number; language: string }> = [];
     const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry> }>();
-    const repoDiffs = new Map<string, GitDiff>();
+    const workspaceMaps = new Map<string, WorkspaceMap>();
+    const shardPaths: string[] = [];
+    const graphBuilder = new ProjectGraphBuilder();
+    await graphBuilder.init();
 
-    for (const repo of reposToIndex) {
-      const meta = opts?.force ? null : readRepoIndexMeta(basePath, repo.name);
+    const toIndex = new Set(reposToIndex.map((r) => r.name));
+    const jobs: RepoJob[] = repos.map((r) => ({
+      repoName: r.name,
+      repoPath: r.path,
+      language: r.language,
+      basePath,
+      project,
+      chunking: config.chunking,
+      doChunk: toIndex.has(r.name),
+      force: !!opts?.force,
+    }));
+    const concurrency = resolveIndexConcurrency(jobs.length);
+    const workerUrl = concurrency > 1 ? new URL('./index-worker.js', import.meta.url) : null;
+    log(`Processing ${jobs.length} repos (chunk + AST) — concurrency ${concurrency}${workerUrl ? ' (workers)' : ' (in-thread)'}, ${skippedRepos.length} skipped`);
+    report({ phase: 'chunking', message: `Chunking + graphing ${jobs.length} repos (×${concurrency})...`, percent: 15, etaSeconds: -1, reposTotal: repos.length, reposProcessed: 0, skippedRepos });
 
-      // Use git diff for incremental change detection (O(1) via git's Merkle DAG)
-      const diff = opts?.force ? null : (meta?.lastIndexedSha ? getAllChanges(repo.path, meta.lastIndexedSha) : null);
-      const useIncremental = diff && !diff.fallbackToFull && (diff.added.length + diff.modified.length + diff.deleted.length) > 0;
-
-      let result;
-      if (useIncremental) {
-        const changedCount = diff.added.length + diff.modified.length;
-        const deletedCount = diff.deleted.length;
-        log(`  ${repo.name}: git diff → ${changedCount} changed, ${deletedCount} deleted (incremental)`);
-        result = await chunkChangedFiles(repo.path, repo.name, project, config.chunking, diff);
-        repoDiffs.set(repo.name, diff);
-      } else {
-        // Full re-chunk (first index or force)
-        result = await chunkRepo(repo.path, repo.name, project, config.chunking, meta?.files ?? undefined);
-      }
-
-      allChunks.push(...result.chunks);
-      repoChunkResults.set(repo.name, result);
-      const totalChunkCount = Object.values(result.fileIndex).reduce((sum: number, f: any) => sum + f.chunkCount, 0);
-      repoStats.push({ name: repo.name, chunkCount: totalChunkCount, language: repo.language });
-    }
+    let processed = 0;
+    await runReposPooled<RepoJob, RepoResult>(jobs, {
+      concurrency,
+      workerUrl,
+      log,
+      inThread: (job) => processRepoPipeline(job),
+      toMessage: (job) => job,
+      onResult: (res) => {
+        if (res.graph) {
+          try { graphBuilder.addRepoGraph(res.repoName, res.graph); }
+          catch (e) { log(`Warning: addRepoGraph failed for ${res.repoName}: ${e}`); }
+        }
+        if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
+        repoStats.push({ name: res.repoName, chunkCount: res.chunkCount, language: res.language });
+        if (res.chunked) {
+          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {} });
+          if (res.shardPath) shardPaths.push(res.shardPath);
+        }
+        processed++;
+        if (processed % 10 === 0 || processed === jobs.length) {
+          report({ phase: 'graphing', message: `Processed ${processed}/${jobs.length} repos`, percent: Math.round(15 + (processed / jobs.length) * 50), etaSeconds: -1 });
+        }
+      },
+    });
     for (const name of skippedRepos) {
       const meta = readRepoIndexMeta(basePath, name);
       repoStats.push({ name, chunkCount: meta?.chunkCount ?? 0, language: '' });
     }
-    log(`Chunked ${allChunks.length} chunks from ${reposToIndex.length} repos`);
 
-    // 4. Structural dedup (WS-6)
-    report({ phase: 'dedup', message: 'Deduplicating chunks by structure...', percent: 25, etaSeconds: -1 });
-    const dedupResult = deduplicateByStructure(allChunks);
-    const uniqueChunks = dedupResult.unique;
-    if (dedupResult.savings.chunks > 0) {
-      log(`Structural dedup: ${dedupResult.savings.chunks} duplicates removed`);
-    }
-
-    // Persist chunks NOW — BEFORE building the graph — and free the in-memory
-    // chunk arrays. Otherwise ~810k chunk objects (content + contextualized
-    // source, multi-GB) stay resident alongside the ~900k-node graphology graph
-    // (also multi-GB); their SUM OOMs even a 16GB heap. Writing + freeing here
-    // makes the chunk and graph phases sequential — peak ≈ max(chunks, graph),
-    // not their sum.
+    // Structural dedup — streaming over the per-repo shards into chunks.json
+    // (bounded memory; replaces the in-RAM dedup that OOM'd at org scale).
+    report({ phase: 'dedup', message: 'Deduplicating chunks (streaming)...', percent: 68, etaSeconds: -1 });
     const chunksPath = join(basePath, 'chunks.json');
-    writeChunksFile(chunksPath, uniqueChunks);
-    log(`Saved ${uniqueChunks.length} chunks to ${chunksPath}`);
-    const dedupedChunkCount = uniqueChunks.length;
-    const dedupedTokenSum = uniqueChunks.reduce((sum, c) => sum + c.tokens, 0);
-    allChunks.length = 0;
-    uniqueChunks.length = 0;
-    dedupResult.duplicates.length = 0;
-
-    // 5. Detect workspace structures
-    const workspaceMaps = new Map<string, WorkspaceMap>();
-    for (const repo of repos) {
-      try {
-        const wsMap = detectWorkspace(repo.path);
-        if (wsMap.packages.length > 0) {
-          workspaceMaps.set(repo.name, wsMap);
-          log(`Detected workspace in ${repo.name}: ${wsMap.packages.length} packages`);
-        }
-      } catch (err) {
-        log(`Warning: Workspace detection failed for ${repo.name}: ${err}`);
-      }
-    }
-
-    // 6. Build AST graphs — incremental when possible via git diff
-    report({ phase: 'graphing', message: 'Building AST graphs...', percent: 40, etaSeconds: -1 });
-    const graphBuilder = new ProjectGraphBuilder();
-    await graphBuilder.init();
-
-    for (const repo of repos) {
-      try {
-        const repoKbDir = join(basePath, repo.name);
-        mkdirSync(repoKbDir, { recursive: true });
-        const existingGraphPath = join(repoKbDir, 'graph.json');
-        const diff = repoDiffs.get(repo.name);
-
-        let graph;
-        if (diff && !diff.fallbackToFull && existsSync(existingGraphPath)) {
-          // Incremental graph update — only re-parse changed files
-          const existingGraph = JSON.parse(readFileSync(existingGraphPath, 'utf-8'));
-          graph = await incrementalGraphUpdate(
-            existingGraph,
-            getChangedFilesList(diff),
-            getDeletedFilesList(diff),
-            repo.path,
-            { workspaceMap: workspaceMaps.get(repo.name) },
-          );
-          log(`Updated AST graph for ${repo.name} incrementally (${diff.added.length + diff.modified.length} files changed)`);
-        } else {
-          // Full rebuild
-          graph = await buildAstGraph(repo.path, { workspaceMap: workspaceMaps.get(repo.name) });
-          log(`Built AST graph for ${repo.name} (${graph.nodes.length} nodes, ${graph.links.length} edges)`);
-        }
-
-        graphBuilder.addRepoGraph(repo.name, graph);
-        writeFileSync(join(repoKbDir, 'graph.json'), JSON.stringify(graph));
-        writeFileSync(join(repoKbDir, 'GRAPH_REPORT.md'), generateGraphReport(repo.name, graph));
-      } catch (err) {
-        log(`Warning: AST graph build failed for ${repo.name}: ${err}`);
-      }
-    }
+    const dedup = await dedupShardsToChunks(shardPaths, chunksPath);
+    const dedupedChunkCount = dedup.kept;
+    const dedupedTokenSum = dedup.tokens;
+    if (dedup.dropped > 0) log(`Structural dedup: ${dedup.dropped} duplicates removed`);
+    log(`Saved ${dedupedChunkCount} chunks to ${chunksPath}`);
+    for (const sp of shardPaths) { try { rmSync(sp, { force: true }); } catch { /* ok */ } }
 
     // 7. Detect cross-repo edges (14 strategies)
     report({ phase: 'graphing', message: 'Detecting cross-repo edges...', percent: 70, etaSeconds: -1 });
@@ -410,13 +374,10 @@ export class KnowledgeIndexer {
     const startTime = Date.now();
     const basePath = getKnowledgeBasePath(project);
 
-    // Load chunks from disk (only new/changed chunks from buildKB)
     const chunksPath = join(basePath, 'chunks.json');
     if (!existsSync(chunksPath)) {
       throw new Error(`No chunks found — run Build KB first. Expected: ${chunksPath}`);
     }
-    const chunks: CodeChunk[] = await readChunksFile(chunksPath);
-    log(`Loaded ${chunks.length} chunks from ${chunksPath}`);
 
     // Open vector store. healCorrupt: this is the write/rebuild path, so if a
     // prior run left the table corrupt (killed mid-write → 0-byte fragment),
@@ -425,21 +386,40 @@ export class KnowledgeIndexer {
     const vectorStore = new VectorStore(dbPath);
     await vectorStore.init({ healCorrupt: true });
 
-    // Determine which chunks actually need embedding by checking existing IDs
+    // Which chunks are already embedded (id-set diff). Bounded: holds only the
+    // id strings, never the chunk bodies.
     const existingIds = new Set<string>();
     try {
       const stats = await vectorStore.getStats();
       if (stats && stats.rowCount > 0) {
-        // Load existing chunk IDs from the store
         const existingChunks = await vectorStore.getChunkIds(project);
         for (const id of existingChunks) existingIds.add(id);
       }
     } catch { /* first run — no existing data */ }
 
-    const newChunks = chunks.filter((c) => !existingIds.has(c.id));
     const deletedFiles = this.getDeletedFiles(basePath);
 
-    if (newChunks.length === 0 && deletedFiles.length === 0) {
+    // Pass 1 — stream chunks.json to tally totals + how many need embedding,
+    // WITHOUT ever holding all chunks in memory. At org scale (~810k chunks,
+    // each carrying full source + contextualized text) the old
+    // `readChunksFile()` array was multi-GB and OOM'd the embed step (the
+    // crash surfaced during "Removing stale chunks", but the array — loaded
+    // here, before deletion — was the resident hog). Streaming bounds memory
+    // to the id-set + one in-flight batch (see pass 2 below).
+    let totalChunks = 0;
+    let totalTokens = 0;
+    let newChunkCount = 0;
+    const repoChunkCounts = new Map<string, number>();
+    for await (const c of iterateChunksFile(chunksPath)) {
+      totalChunks++;
+      totalTokens += c.tokens;
+      repoChunkCounts.set(c.repoName, (repoChunkCounts.get(c.repoName) ?? 0) + 1);
+      if (!existingIds.has(c.id)) newChunkCount++;
+    }
+    log(`Loaded ${totalChunks} chunks from ${chunksPath}`);
+    const repoNames = [...repoChunkCounts.keys()];
+
+    if (newChunkCount === 0 && deletedFiles.length === 0) {
       // All vectors already present, so DON'T re-embed. But still (re)build the
       // full-text (BM25) index over the existing rows: a prior run that wrote
       // vectors then aborted before the post-loop FTS build (e.g. killed/aborted
@@ -448,12 +428,11 @@ export class KnowledgeIndexer {
       log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
       await vectorStore.ensureFtsIndex();
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
-      const repoNames = [...new Set(chunks.map((c) => c.repoName))];
       return {
         project,
-        repos: repoNames.map((n) => ({ name: n, chunkCount: chunks.filter((c) => c.repoName === n).length, language: '' })),
-        totalChunks: chunks.length,
-        totalTokens: chunks.reduce((sum, c) => sum + c.tokens, 0),
+        repos: repoNames.map((n) => ({ name: n, chunkCount: repoChunkCounts.get(n) ?? 0, language: '' })),
+        totalChunks,
+        totalTokens,
         embeddingProvider: 'cached',
         embeddingDimensions: 0,
         crossRepoEdges: 0,
@@ -494,85 +473,97 @@ export class KnowledgeIndexer {
     const batchSize = envInt('CODE_SEARCH_EMBEDDING_BATCH_SIZE', isOllama ? 10 : 128);
     const concurrency = isOllama ? 1 : envInt('CODE_SEARCH_EMBEDDING_CONCURRENCY', 8);
 
-    log(`Embedding ${newChunks.length} new chunks with ${embedder.name} (${chunks.length - newChunks.length} cached, batch ${batchSize} × concurrency ${concurrency})...`);
+    log(`Embedding ${newChunkCount} new chunks with ${embedder.name} (${totalChunks - newChunkCount} cached, batch ${batchSize} × concurrency ${concurrency})...`);
 
-    // Pre-split into batches, then run up to `concurrency` of them in flight.
-    // Each batch is written to LanceDB the instant its embeddings return (writes
-    // serialized via writeChain — LanceDB's add must not run concurrently on one
-    // table). Streaming the writes keeps memory bounded (we never hold every
-    // embedding at once) AND makes the run resumable: a crash loses only the few
-    // in-flight batches, since newChunks was diffed against the ids already in
-    // the store (above) and a re-run continues from there. The FTS index is built
-    // once after the loop (skipIndex defers the per-batch rebuild).
-    const batches: CodeChunk[][] = [];
-    for (let i = 0; i < newChunks.length; i += batchSize) batches.push(newChunks.slice(i, i + batchSize));
-
-    const totalBatches = batches.length;
+    // Stream chunks.json a second time and embed only the new ones, in batches.
+    // Up to `concurrency` batches are in flight at once; each is written to
+    // LanceDB the instant its embeddings return (writes serialized via
+    // writeChain — LanceDB's add must not run concurrently on one table).
+    // Crucially we NEVER materialize the full chunk set nor a pre-sliced
+    // `batches[][]`: the producer reads one chunk at a time, fills a batch,
+    // dispatches it, then blocks until an in-flight slot frees. Memory stays
+    // bounded to the id-set + ~concurrency batches regardless of corpus size.
+    // The run stays resumable: new chunks are diffed against ids already in the
+    // store, so a crash loses only the few in-flight batches and a re-run
+    // continues from there. FTS is built once after the loop (skipIndex defers
+    // the per-batch rebuild).
+    const totalBatches = Math.max(1, Math.ceil(newChunkCount / batchSize));
     let batchesDone = 0;
     let stored = 0;
-    let cursor = 0;
     const embedStartTime = Date.now();
     let writeChain: Promise<void> = Promise.resolve();
 
-    // When any worker fails, signal the others to stop and surface the error
-    // after all have settled — otherwise the failed worker rejects Promise.all
-    // while its siblings keep embedding + mutating progress in the background
-    // ("zombie" workers), so the run reads as failed yet the count keeps rising.
+    // When any batch fails, signal the producer + siblings to stop and surface
+    // the error after all in-flight batches settle — otherwise a failed batch
+    // rejects while its siblings keep embedding + mutating progress in the
+    // background ("zombie" workers), so the run reads as failed yet the count
+    // keeps rising.
     let aborted: unknown = null;
-    const runWorker = async (): Promise<void> => {
-      for (;;) {
+    const inFlight = new Set<Promise<void>>();
+
+    const dispatch = (batchChunks: CodeChunk[]): void => {
+      const task = (async () => {
         if (aborted) return;
-        const idx = cursor++;
-        if (idx >= totalBatches) return;
-        const batchChunks = batches[idx];
-        let batchRows: Array<CodeChunk & { embedding: number[] }>;
         try {
           const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
-          batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
+          const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
           // Serialize the LanceDB write by chaining onto the previous one, and
           // await only the promise we just appended.
           const myWrite = (writeChain = writeChain.then(() =>
             vectorStore.addChunks(batchRows, { skipIndex: true }),
           ));
           await myWrite;
+          if (aborted) return;
+          stored += batchRows.length;
+          batchesDone++;
+
+          const elapsed = Date.now() - embedStartTime;
+          const msPerBatch = elapsed / batchesDone;
+          const etaSeconds = Math.ceil((msPerBatch * (totalBatches - batchesDone)) / 1000);
+          const percent = Math.round(5 + (batchesDone / totalBatches) * 85);
+
+          report({
+            phase: 'embedding',
+            message: `Embedding: ${stored}/${newChunkCount} new (~${etaSeconds}s remaining)`,
+            percent, etaSeconds,
+            chunksTotal: newChunkCount, chunksProcessed: stored,
+          });
+
+          if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
+            log(`  Embedded ${stored}/${newChunkCount} (ETA: ${formatEta(etaSeconds)})`);
+          }
         } catch (err) {
-          aborted = err; // stop siblings; rethrown after Promise.all settles
-          return;
+          aborted = err; // stop producer + siblings; rethrown after all settle
         }
-        if (aborted) return;
-        stored += batchRows.length;
-        batchesDone++;
-
-        const elapsed = Date.now() - embedStartTime;
-        const msPerBatch = elapsed / batchesDone;
-        const etaSeconds = Math.ceil((msPerBatch * (totalBatches - batchesDone)) / 1000);
-        const percent = Math.round(5 + (batchesDone / totalBatches) * 85);
-
-        report({
-          phase: 'embedding',
-          message: `Embedding: ${stored}/${newChunks.length} new (~${etaSeconds}s remaining)`,
-          percent, etaSeconds,
-          chunksTotal: newChunks.length, chunksProcessed: stored,
-        });
-
-        if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
-          log(`  Embedded ${stored}/${newChunks.length} (ETA: ${formatEta(etaSeconds)})`);
-        }
-      }
+      })();
+      inFlight.add(task);
+      void task.finally(() => inFlight.delete(task));
     };
 
-    await Promise.all(Array.from({ length: Math.min(concurrency, totalBatches) }, () => runWorker()));
+    let batch: CodeChunk[] = [];
+    for await (const c of iterateChunksFile(chunksPath)) {
+      if (aborted) break;
+      if (existingIds.has(c.id)) continue;
+      batch.push(c);
+      if (batch.length >= batchSize) {
+        dispatch(batch);
+        batch = [];
+        // Back-pressure: never let more than `concurrency` batches be resident.
+        while (inFlight.size >= concurrency && !aborted) await Promise.race(inFlight);
+      }
+    }
+    if (batch.length > 0 && !aborted) dispatch(batch);
+    await Promise.all(inFlight);
     if (aborted) throw aborted; // no zombies left running; fail the run cleanly
 
     // Build the full-text index once, after all batches are inserted.
     report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });
-    if (newChunks.length > 0) {
+    if (newChunkCount > 0) {
       await vectorStore.ensureFtsIndex();
     }
-    log(`Stored ${newChunks.length} new chunks in LanceDB (${deletedFiles.length} removed)`);
+    log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
 
-    // Update metadata
-    const repoNames = [...new Set(chunks.map((c) => c.repoName))];
+    // Update metadata (repoNames was computed during pass 1).
     for (const repoName of repoNames) {
       const metaPath = join(basePath, repoName, 'index_meta.json');
       if (existsSync(metaPath)) {
@@ -586,13 +577,13 @@ export class KnowledgeIndexer {
     }
 
     const durationMs = Date.now() - startTime;
-    report({ phase: 'done', message: `Embedded ${newChunks.length} new chunks (${deletedFiles.length} removed) in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0 });
+    report({ phase: 'done', message: `Embedded ${newChunkCount} new chunks (${deletedFiles.length} removed) in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0 });
 
     return {
       project,
-      repos: repoNames.map((n) => ({ name: n, chunkCount: chunks.filter((c) => c.repoName === n).length, language: '' })),
-      totalChunks: chunks.length,
-      totalTokens: chunks.reduce((sum, c) => sum + c.tokens, 0),
+      repos: repoNames.map((n) => ({ name: n, chunkCount: repoChunkCounts.get(n) ?? 0, language: '' })),
+      totalChunks,
+      totalTokens,
       embeddingProvider: embedder.name,
       embeddingDimensions: embedder.dimensions,
       crossRepoEdges: 0,

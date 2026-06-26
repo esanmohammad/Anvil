@@ -36,6 +36,26 @@ export function writeChunksFile(path: string, chunks: CodeChunk[]): void {
   }
 }
 
+/**
+ * Streaming NDJSON writer — append chunks one at a time without ever holding
+ * the whole set in memory (the inverse of writeChunksFile). Used to stream
+ * deduped chunks from per-repo shards into chunks.json at org scale.
+ */
+export function createChunkWriter(path: string): { write(c: CodeChunk): void; close(): void } {
+  const fd = openSync(path, 'w');
+  let buf = '';
+  return {
+    write(c: CodeChunk): void {
+      buf += JSON.stringify(c) + '\n';
+      if (buf.length >= FLUSH_BYTES) { writeSync(fd, buf); buf = ''; }
+    },
+    close(): void {
+      if (buf.length > 0) writeSync(fd, buf);
+      closeSync(fd);
+    },
+  };
+}
+
 /** First non-whitespace character of a file (cheap format sniff). */
 function peekFirstNonWs(path: string): string {
   const fd = openSync(path, 'r');
