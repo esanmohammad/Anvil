@@ -21,6 +21,7 @@ import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
 import { computeStructuralHashes, deduplicateByStructure } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { writeChunksFile, readChunksFile } from './chunks-io.js';
+import { writeSystemGraphSqlite } from './graph-store.js';
 
 // ---------------------------------------------------------------------------
 // SHA-based staleness detection
@@ -304,18 +305,24 @@ export class KnowledgeIndexer {
     report({ phase: 'graphing', message: 'Detecting communities...', percent: 90, etaSeconds: -1 });
     graphBuilder.detectCommunities();
 
-    // 10. Save project graph. Compact (no pretty-print): the indentation
-    // doubled the string and pushed large orgs past V8's ~512MB string limit.
-    // If even the compact graph is too big to serialize, degrade gracefully so
-    // indexing still completes — search + embeddings are unaffected; only the
-    // cross-repo graph tools lose this project-wide file.
-    const graphOutputPath = join(basePath, 'system_graph_v2.json');
+    // 10. Save the project graph. Stream it into SQLite (system_graph.sqlite):
+    // queryable in slices and free of V8's ~512MB string ceiling, which the
+    // old single-JSON-blob write hit at org scale (900k+ nodes / 2.4M+ edges).
+    // Fall back to the legacy JSON blob only when no sqlite driver is available
+    // (small graphs); at org scale that path degrades gracefully — search +
+    // embeddings are unaffected, only the cross-repo graph tools lose the file.
     try {
-      writeFileSync(graphOutputPath, JSON.stringify(graphBuilder.exportJson()));
-      log(`Saved project graph to ${graphOutputPath}`);
+      const wroteSqlite = await writeSystemGraphSqlite(basePath, graphBuilder);
+      if (wroteSqlite) {
+        log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')}`);
+      } else {
+        const graphOutputPath = join(basePath, 'system_graph_v2.json');
+        writeFileSync(graphOutputPath, JSON.stringify(graphBuilder.exportJson()));
+        log(`Saved project graph to ${graphOutputPath} (no sqlite driver; JSON fallback)`);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[knowledge-core] Could not serialize system graph (${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges): ${msg}. Skipping system_graph_v2.json — cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
+      console.error(`[knowledge-core] Could not persist system graph (${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
     }
 
     // 11. Save chunks to disk as NDJSON (for later embedding). NDJSON streams
