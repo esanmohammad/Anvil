@@ -27,6 +27,81 @@ function deprecatedEnv(key: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Resilient fetch for cloud embedding providers.
+//
+// A bare fetch() with no timeout/retry turns any transient network blip into a
+// fatal error that aborts a multi-hour indexing run: undici "fetch failed" /
+// ECONNRESET from a recycled keep-alive socket, a stalled request with no
+// timeout, a 429, or a 5xx. embedFetch wraps fetch with a per-request timeout
+// plus exponential backoff + jitter (honoring Retry-After on 429), retrying
+// network errors and 429/5xx. Tunable via env:
+//   CODE_SEARCH_EMBEDDING_TIMEOUT_MS  (default 60000)
+//   CODE_SEARCH_EMBEDDING_MAX_RETRIES (default 5)
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+function embedBackoffMs(attempt: number): number {
+  const base = Math.min(30_000, 500 * 2 ** attempt); // 0.5s, 1s, 2s, ... cap 30s
+  return base + Math.random() * base * 0.25; // +0-25% jitter
+}
+
+function isRetryableNetworkError(err: unknown): boolean {
+  // Do NOT gate on `instanceof Error`: AbortSignal.timeout rejects with a
+  // DOMException, which is not an Error subclass on Node < ~22, so a timeout
+  // would silently fail to retry on the deployment runtime. Inspect any object.
+  if (typeof err !== 'object' || err === null) return false;
+  const e = err as { name?: string; message?: string; code?: string; cause?: { code?: string } };
+  if (e.name === 'TimeoutError' || e.name === 'AbortError') return true; // AbortSignal.timeout / abort
+  const haystack = `${e.message ?? ''} ${e.code ?? ''} ${e.cause?.code ?? ''}`;
+  return /fetch failed|terminated|socket hang up|other side closed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|UND_ERR/i.test(
+    haystack,
+  );
+}
+
+async function embedFetch(opts: {
+  url: string;
+  apiKey?: string;
+  body: unknown;
+  provider: string;
+}): Promise<Response> {
+  const timeoutMs = parseInt(process.env.CODE_SEARCH_EMBEDDING_TIMEOUT_MS ?? '', 10) || 60_000;
+  const maxRetries = parseInt(process.env.CODE_SEARCH_EMBEDDING_MAX_RETRIES ?? '', 10) || 5;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (opts.apiKey) headers.Authorization = `Bearer ${opts.apiKey}`;
+  const payload = JSON.stringify(opts.body);
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await fetch(opts.url, {
+        method: 'POST',
+        headers,
+        body: payload,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (response.ok) return response;
+      // Retry 429 (rate limit) and 5xx (transient server) — but not 4xx (our bug).
+      if ((response.status === 429 || response.status >= 500) && attempt < maxRetries) {
+        const retryAfter = Number(response.headers.get('retry-after'));
+        const wait =
+          Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : embedBackoffMs(attempt);
+        await response.text().catch(() => {}); // drain body so the socket is released
+        await sleep(wait);
+        continue;
+      }
+      const body = await response.text().catch(() => '');
+      throw new Error(`${opts.provider} embedding request failed (${response.status}): ${body.slice(0, 500)}`);
+    } catch (err) {
+      if (isRetryableNetworkError(err) && attempt < maxRetries) {
+        await sleep(embedBackoffMs(attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 1. Codestral (Mistral) Embedder
 // ---------------------------------------------------------------------------
 
@@ -148,23 +223,12 @@ export class OpenAIEmbedder implements EmbeddingProvider {
       throw new Error('OPENAI_API_KEY (or config.embedding.apiKey) is not set');
     }
 
-    const response = await fetch('https://api.openai.com/v1/embeddings', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input: texts,
-        dimensions: this.dimensions,
-      }),
+    const response = await embedFetch({
+      url: 'https://api.openai.com/v1/embeddings',
+      apiKey,
+      provider: 'OpenAI',
+      body: { model: this.model, input: texts, dimensions: this.dimensions },
     });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`OpenAI embedding request failed (${response.status}): ${body}`);
-    }
 
     const json = (await response.json()) as { data: Array<{ embedding: number[] }> };
     return json.data.map((d) => d.embedding);
@@ -455,24 +519,17 @@ export class OpenAICompatibleEmbedder implements EmbeddingProvider {
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (this.apiKey) headers['Authorization'] = `Bearer ${this.apiKey}`;
-
-    const response = await fetch(`${this.baseUrl.replace(/\/$/, '')}/v1/embeddings`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
+    const response = await embedFetch({
+      url: `${this.baseUrl.replace(/\/$/, '')}/v1/embeddings`,
+      apiKey: this.apiKey,
+      provider: 'Embedding',
+      body: {
         model: this.model,
         input: texts,
         dimensions: this.dimensions,
         encoding_format: 'float',
-      }),
+      },
     });
-
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Embedding request failed (${response.status}): ${body}`);
-    }
 
     const json = (await response.json()) as { data: Array<{ embedding: number[] }> };
     return json.data.map((d) => d.embedding);
