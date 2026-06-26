@@ -319,7 +319,9 @@ async function autoIndex(ctx: ServerContext): Promise<void> {
   try {
     const kbPath = getKnowledgeBasePath(ctx.projectName);
     const hasLanceDB = existsSync(join(kbPath, 'lancedb'));
-    const hasGraph = existsSync(join(kbPath, 'system_graph_v2.json'));
+    // System graph is now SQLite (system_graph.sqlite); accept the legacy JSON
+    // too so pre-migration indexes still read as ready.
+    const hasGraph = existsSync(join(kbPath, 'system_graph.sqlite')) || existsSync(join(kbPath, 'system_graph_v2.json'));
 
     if (hasLanceDB && hasGraph) {
       ctx.indexReady = true;
