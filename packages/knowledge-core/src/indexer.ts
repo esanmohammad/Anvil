@@ -209,6 +209,21 @@ export class KnowledgeIndexer {
       log(`Structural dedup: ${dedupResult.savings.chunks} duplicates removed`);
     }
 
+    // Persist chunks NOW — BEFORE building the graph — and free the in-memory
+    // chunk arrays. Otherwise ~810k chunk objects (content + contextualized
+    // source, multi-GB) stay resident alongside the ~900k-node graphology graph
+    // (also multi-GB); their SUM OOMs even a 16GB heap. Writing + freeing here
+    // makes the chunk and graph phases sequential — peak ≈ max(chunks, graph),
+    // not their sum.
+    const chunksPath = join(basePath, 'chunks.json');
+    writeChunksFile(chunksPath, uniqueChunks);
+    log(`Saved ${uniqueChunks.length} chunks to ${chunksPath}`);
+    const dedupedChunkCount = uniqueChunks.length;
+    const dedupedTokenSum = uniqueChunks.reduce((sum, c) => sum + c.tokens, 0);
+    allChunks.length = 0;
+    uniqueChunks.length = 0;
+    dedupResult.duplicates.length = 0;
+
     // 5. Detect workspace structures
     const workspaceMaps = new Map<string, WorkspaceMap>();
     for (const repo of repos) {
@@ -325,12 +340,8 @@ export class KnowledgeIndexer {
       console.error(`[knowledge-core] Could not persist system graph (${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
     }
 
-    // 11. Save chunks to disk as NDJSON (for later embedding). NDJSON streams
-    // line-by-line on write and read, so org-scale chunk sets never hit V8's
-    // single-string ceiling. See chunks-io.ts.
-    const chunksPath = join(basePath, 'chunks.json');
-    writeChunksFile(chunksPath, uniqueChunks);
-    log(`Saved ${uniqueChunks.length} chunks to ${chunksPath}`);
+    // 11. (chunks.json was written + the chunk arrays freed right after dedup,
+    // above — so ~810k chunk objects don't sit in memory through the graph build.)
 
     // 11b. Save stale files list (for incremental embedding cleanup).
     // Includes both deleted AND modified files: chunk.id is position-keyed
@@ -369,13 +380,13 @@ export class KnowledgeIndexer {
     }
 
     const durationMs = Date.now() - startTime;
-    report({ phase: 'done', message: `KB built: ${uniqueChunks.length} chunks, ${crossRepoEdgeCount} edges in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0, skippedRepos });
+    report({ phase: 'done', message: `KB built: ${dedupedChunkCount} chunks, ${crossRepoEdgeCount} edges in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0, skippedRepos });
 
     return {
       project,
       repos: repoStats,
-      totalChunks: uniqueChunks.length,
-      totalTokens: uniqueChunks.reduce((sum, c) => sum + c.tokens, 0),
+      totalChunks: dedupedChunkCount,
+      totalTokens: dedupedTokenSum,
       crossRepoEdges: crossRepoEdgeCount,
       durationMs,
       chunksPath,
