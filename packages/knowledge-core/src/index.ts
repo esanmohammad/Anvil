@@ -28,6 +28,7 @@ export * from './structural-hasher.js';
 export * from './workspace-detector.js';
 export * from './embedder.js';
 export * from './vector-store.js';
+export * from './graph-store.js';
 export * from './reranker.js';
 export * from './claude-runner.js';
 export * from './repo-profiler.js';

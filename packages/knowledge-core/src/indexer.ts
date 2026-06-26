@@ -21,6 +21,7 @@ import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
 import { computeStructuralHashes, deduplicateByStructure } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { writeChunksFile, readChunksFile } from './chunks-io.js';
+import { writeSystemGraphSqlite } from './graph-store.js';
 
 // ---------------------------------------------------------------------------
 // SHA-based staleness detection
@@ -304,18 +305,24 @@ export class KnowledgeIndexer {
     report({ phase: 'graphing', message: 'Detecting communities...', percent: 90, etaSeconds: -1 });
     graphBuilder.detectCommunities();
 
-    // 10. Save project graph. Compact (no pretty-print): the indentation
-    // doubled the string and pushed large orgs past V8's ~512MB string limit.
-    // If even the compact graph is too big to serialize, degrade gracefully so
-    // indexing still completes — search + embeddings are unaffected; only the
-    // cross-repo graph tools lose this project-wide file.
-    const graphOutputPath = join(basePath, 'system_graph_v2.json');
+    // 10. Save the project graph. Stream it into SQLite (system_graph.sqlite):
+    // queryable in slices and free of V8's ~512MB string ceiling, which the
+    // old single-JSON-blob write hit at org scale (900k+ nodes / 2.4M+ edges).
+    // Fall back to the legacy JSON blob only when no sqlite driver is available
+    // (small graphs); at org scale that path degrades gracefully — search +
+    // embeddings are unaffected, only the cross-repo graph tools lose the file.
     try {
-      writeFileSync(graphOutputPath, JSON.stringify(graphBuilder.exportJson()));
-      log(`Saved project graph to ${graphOutputPath}`);
+      const wroteSqlite = await writeSystemGraphSqlite(basePath, graphBuilder);
+      if (wroteSqlite) {
+        log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')}`);
+      } else {
+        const graphOutputPath = join(basePath, 'system_graph_v2.json');
+        writeFileSync(graphOutputPath, JSON.stringify(graphBuilder.exportJson()));
+        log(`Saved project graph to ${graphOutputPath} (no sqlite driver; JSON fallback)`);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[knowledge-core] Could not serialize system graph (${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges): ${msg}. Skipping system_graph_v2.json — cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
+      console.error(`[knowledge-core] Could not persist system graph (${graphBuilder.nodeCount} nodes, ${graphBuilder.edgeCount} edges): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
     }
 
     // 11. Save chunks to disk as NDJSON (for later embedding). NDJSON streams
@@ -422,7 +429,13 @@ export class KnowledgeIndexer {
     const deletedFiles = this.getDeletedFiles(basePath);
 
     if (newChunks.length === 0 && deletedFiles.length === 0) {
-      log('All chunks already embedded — nothing to do.');
+      // All vectors already present, so DON'T re-embed. But still (re)build the
+      // full-text (BM25) index over the existing rows: a prior run that wrote
+      // vectors then aborted before the post-loop FTS build (e.g. killed/aborted
+      // mid-run) leaves BM25 permanently degraded, and this "nothing new" path is
+      // the only one a re-run reaches. Cheap relative to embedding; idempotent.
+      log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
+      await vectorStore.ensureFtsIndex();
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
       const repoNames = [...new Set(chunks.map((c) => c.repoName))];
       return {
@@ -490,19 +503,32 @@ export class KnowledgeIndexer {
     const embedStartTime = Date.now();
     let writeChain: Promise<void> = Promise.resolve();
 
+    // When any worker fails, signal the others to stop and surface the error
+    // after all have settled — otherwise the failed worker rejects Promise.all
+    // while its siblings keep embedding + mutating progress in the background
+    // ("zombie" workers), so the run reads as failed yet the count keeps rising.
+    let aborted: unknown = null;
     const runWorker = async (): Promise<void> => {
       for (;;) {
+        if (aborted) return;
         const idx = cursor++;
         if (idx >= totalBatches) return;
         const batchChunks = batches[idx];
-        const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
-        const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
-        // Serialize the LanceDB write by chaining onto the previous one, and
-        // await only the promise we just appended.
-        const myWrite = (writeChain = writeChain.then(() =>
-          vectorStore.addChunks(batchRows, { skipIndex: true }),
-        ));
-        await myWrite;
+        let batchRows: Array<CodeChunk & { embedding: number[] }>;
+        try {
+          const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
+          batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
+          // Serialize the LanceDB write by chaining onto the previous one, and
+          // await only the promise we just appended.
+          const myWrite = (writeChain = writeChain.then(() =>
+            vectorStore.addChunks(batchRows, { skipIndex: true }),
+          ));
+          await myWrite;
+        } catch (err) {
+          aborted = err; // stop siblings; rethrown after Promise.all settles
+          return;
+        }
+        if (aborted) return;
         stored += batchRows.length;
         batchesDone++;
 
@@ -525,6 +551,7 @@ export class KnowledgeIndexer {
     };
 
     await Promise.all(Array.from({ length: Math.min(concurrency, totalBatches) }, () => runWorker()));
+    if (aborted) throw aborted; // no zombies left running; fail the run cleanly
 
     // Build the full-text index once, after all batches are inserted.
     report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });

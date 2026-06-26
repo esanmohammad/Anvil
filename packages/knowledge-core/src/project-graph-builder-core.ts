@@ -36,6 +36,19 @@ export class ProjectGraphBuilder {
   /** Expose the underlying graph for query functions */
   getGraph(): any { return this.graph; }
 
+  /** Stream nodes for persistence — avoids materializing the full export
+   *  object (which JSON.stringify can't serialize at org scale). */
+  forEachNode(cb: (key: string, attrs: Record<string, unknown>) => void): void {
+    this.graph.forEachNode((key: string, attrs: Record<string, unknown>) => cb(key, attrs ?? {}));
+  }
+
+  /** Stream edges as (source, target, attrs) for persistence. */
+  forEachEdge(cb: (source: string, target: string, attrs: Record<string, unknown>) => void): void {
+    this.graph.forEachEdge((_e: string, attrs: Record<string, unknown>, source: string, target: string) =>
+      cb(source, target, attrs ?? {}),
+    );
+  }
+
   /** Load a per-repo graph.json from Graphify and merge into the project graph.
    * Namespace all nodes as "repoName::originalId" to avoid collisions. */
   addRepoGraph(repoName: string, graphJson: GraphifyOutput): void {
