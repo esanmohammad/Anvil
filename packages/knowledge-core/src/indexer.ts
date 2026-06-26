@@ -14,7 +14,7 @@ import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core
 import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
 import { computeStructuralHash } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
-import { readChunksFile, createChunkWriter, iterateChunksFile } from './chunks-io.js';
+import { createChunkWriter, iterateChunksFile } from './chunks-io.js';
 import { writeSystemGraphSqlite } from './graph-store.js';
 import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
 import { processRepoPipeline, getRepoSha, readRepoIndexMeta } from './repo-pipeline.js';
@@ -374,13 +374,10 @@ export class KnowledgeIndexer {
     const startTime = Date.now();
     const basePath = getKnowledgeBasePath(project);
 
-    // Load chunks from disk (only new/changed chunks from buildKB)
     const chunksPath = join(basePath, 'chunks.json');
     if (!existsSync(chunksPath)) {
       throw new Error(`No chunks found — run Build KB first. Expected: ${chunksPath}`);
     }
-    const chunks: CodeChunk[] = await readChunksFile(chunksPath);
-    log(`Loaded ${chunks.length} chunks from ${chunksPath}`);
 
     // Open vector store. healCorrupt: this is the write/rebuild path, so if a
     // prior run left the table corrupt (killed mid-write → 0-byte fragment),
@@ -389,21 +386,40 @@ export class KnowledgeIndexer {
     const vectorStore = new VectorStore(dbPath);
     await vectorStore.init({ healCorrupt: true });
 
-    // Determine which chunks actually need embedding by checking existing IDs
+    // Which chunks are already embedded (id-set diff). Bounded: holds only the
+    // id strings, never the chunk bodies.
     const existingIds = new Set<string>();
     try {
       const stats = await vectorStore.getStats();
       if (stats && stats.rowCount > 0) {
-        // Load existing chunk IDs from the store
         const existingChunks = await vectorStore.getChunkIds(project);
         for (const id of existingChunks) existingIds.add(id);
       }
     } catch { /* first run — no existing data */ }
 
-    const newChunks = chunks.filter((c) => !existingIds.has(c.id));
     const deletedFiles = this.getDeletedFiles(basePath);
 
-    if (newChunks.length === 0 && deletedFiles.length === 0) {
+    // Pass 1 — stream chunks.json to tally totals + how many need embedding,
+    // WITHOUT ever holding all chunks in memory. At org scale (~810k chunks,
+    // each carrying full source + contextualized text) the old
+    // `readChunksFile()` array was multi-GB and OOM'd the embed step (the
+    // crash surfaced during "Removing stale chunks", but the array — loaded
+    // here, before deletion — was the resident hog). Streaming bounds memory
+    // to the id-set + one in-flight batch (see pass 2 below).
+    let totalChunks = 0;
+    let totalTokens = 0;
+    let newChunkCount = 0;
+    const repoChunkCounts = new Map<string, number>();
+    for await (const c of iterateChunksFile(chunksPath)) {
+      totalChunks++;
+      totalTokens += c.tokens;
+      repoChunkCounts.set(c.repoName, (repoChunkCounts.get(c.repoName) ?? 0) + 1);
+      if (!existingIds.has(c.id)) newChunkCount++;
+    }
+    log(`Loaded ${totalChunks} chunks from ${chunksPath}`);
+    const repoNames = [...repoChunkCounts.keys()];
+
+    if (newChunkCount === 0 && deletedFiles.length === 0) {
       // All vectors already present, so DON'T re-embed. But still (re)build the
       // full-text (BM25) index over the existing rows: a prior run that wrote
       // vectors then aborted before the post-loop FTS build (e.g. killed/aborted
@@ -412,12 +428,11 @@ export class KnowledgeIndexer {
       log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
       await vectorStore.ensureFtsIndex();
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
-      const repoNames = [...new Set(chunks.map((c) => c.repoName))];
       return {
         project,
-        repos: repoNames.map((n) => ({ name: n, chunkCount: chunks.filter((c) => c.repoName === n).length, language: '' })),
-        totalChunks: chunks.length,
-        totalTokens: chunks.reduce((sum, c) => sum + c.tokens, 0),
+        repos: repoNames.map((n) => ({ name: n, chunkCount: repoChunkCounts.get(n) ?? 0, language: '' })),
+        totalChunks,
+        totalTokens,
         embeddingProvider: 'cached',
         embeddingDimensions: 0,
         crossRepoEdges: 0,
@@ -458,85 +473,97 @@ export class KnowledgeIndexer {
     const batchSize = envInt('CODE_SEARCH_EMBEDDING_BATCH_SIZE', isOllama ? 10 : 128);
     const concurrency = isOllama ? 1 : envInt('CODE_SEARCH_EMBEDDING_CONCURRENCY', 8);
 
-    log(`Embedding ${newChunks.length} new chunks with ${embedder.name} (${chunks.length - newChunks.length} cached, batch ${batchSize} × concurrency ${concurrency})...`);
+    log(`Embedding ${newChunkCount} new chunks with ${embedder.name} (${totalChunks - newChunkCount} cached, batch ${batchSize} × concurrency ${concurrency})...`);
 
-    // Pre-split into batches, then run up to `concurrency` of them in flight.
-    // Each batch is written to LanceDB the instant its embeddings return (writes
-    // serialized via writeChain — LanceDB's add must not run concurrently on one
-    // table). Streaming the writes keeps memory bounded (we never hold every
-    // embedding at once) AND makes the run resumable: a crash loses only the few
-    // in-flight batches, since newChunks was diffed against the ids already in
-    // the store (above) and a re-run continues from there. The FTS index is built
-    // once after the loop (skipIndex defers the per-batch rebuild).
-    const batches: CodeChunk[][] = [];
-    for (let i = 0; i < newChunks.length; i += batchSize) batches.push(newChunks.slice(i, i + batchSize));
-
-    const totalBatches = batches.length;
+    // Stream chunks.json a second time and embed only the new ones, in batches.
+    // Up to `concurrency` batches are in flight at once; each is written to
+    // LanceDB the instant its embeddings return (writes serialized via
+    // writeChain — LanceDB's add must not run concurrently on one table).
+    // Crucially we NEVER materialize the full chunk set nor a pre-sliced
+    // `batches[][]`: the producer reads one chunk at a time, fills a batch,
+    // dispatches it, then blocks until an in-flight slot frees. Memory stays
+    // bounded to the id-set + ~concurrency batches regardless of corpus size.
+    // The run stays resumable: new chunks are diffed against ids already in the
+    // store, so a crash loses only the few in-flight batches and a re-run
+    // continues from there. FTS is built once after the loop (skipIndex defers
+    // the per-batch rebuild).
+    const totalBatches = Math.max(1, Math.ceil(newChunkCount / batchSize));
     let batchesDone = 0;
     let stored = 0;
-    let cursor = 0;
     const embedStartTime = Date.now();
     let writeChain: Promise<void> = Promise.resolve();
 
-    // When any worker fails, signal the others to stop and surface the error
-    // after all have settled — otherwise the failed worker rejects Promise.all
-    // while its siblings keep embedding + mutating progress in the background
-    // ("zombie" workers), so the run reads as failed yet the count keeps rising.
+    // When any batch fails, signal the producer + siblings to stop and surface
+    // the error after all in-flight batches settle — otherwise a failed batch
+    // rejects while its siblings keep embedding + mutating progress in the
+    // background ("zombie" workers), so the run reads as failed yet the count
+    // keeps rising.
     let aborted: unknown = null;
-    const runWorker = async (): Promise<void> => {
-      for (;;) {
+    const inFlight = new Set<Promise<void>>();
+
+    const dispatch = (batchChunks: CodeChunk[]): void => {
+      const task = (async () => {
         if (aborted) return;
-        const idx = cursor++;
-        if (idx >= totalBatches) return;
-        const batchChunks = batches[idx];
-        let batchRows: Array<CodeChunk & { embedding: number[] }>;
         try {
           const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
-          batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
+          const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
           // Serialize the LanceDB write by chaining onto the previous one, and
           // await only the promise we just appended.
           const myWrite = (writeChain = writeChain.then(() =>
             vectorStore.addChunks(batchRows, { skipIndex: true }),
           ));
           await myWrite;
+          if (aborted) return;
+          stored += batchRows.length;
+          batchesDone++;
+
+          const elapsed = Date.now() - embedStartTime;
+          const msPerBatch = elapsed / batchesDone;
+          const etaSeconds = Math.ceil((msPerBatch * (totalBatches - batchesDone)) / 1000);
+          const percent = Math.round(5 + (batchesDone / totalBatches) * 85);
+
+          report({
+            phase: 'embedding',
+            message: `Embedding: ${stored}/${newChunkCount} new (~${etaSeconds}s remaining)`,
+            percent, etaSeconds,
+            chunksTotal: newChunkCount, chunksProcessed: stored,
+          });
+
+          if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
+            log(`  Embedded ${stored}/${newChunkCount} (ETA: ${formatEta(etaSeconds)})`);
+          }
         } catch (err) {
-          aborted = err; // stop siblings; rethrown after Promise.all settles
-          return;
+          aborted = err; // stop producer + siblings; rethrown after all settle
         }
-        if (aborted) return;
-        stored += batchRows.length;
-        batchesDone++;
-
-        const elapsed = Date.now() - embedStartTime;
-        const msPerBatch = elapsed / batchesDone;
-        const etaSeconds = Math.ceil((msPerBatch * (totalBatches - batchesDone)) / 1000);
-        const percent = Math.round(5 + (batchesDone / totalBatches) * 85);
-
-        report({
-          phase: 'embedding',
-          message: `Embedding: ${stored}/${newChunks.length} new (~${etaSeconds}s remaining)`,
-          percent, etaSeconds,
-          chunksTotal: newChunks.length, chunksProcessed: stored,
-        });
-
-        if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
-          log(`  Embedded ${stored}/${newChunks.length} (ETA: ${formatEta(etaSeconds)})`);
-        }
-      }
+      })();
+      inFlight.add(task);
+      void task.finally(() => inFlight.delete(task));
     };
 
-    await Promise.all(Array.from({ length: Math.min(concurrency, totalBatches) }, () => runWorker()));
+    let batch: CodeChunk[] = [];
+    for await (const c of iterateChunksFile(chunksPath)) {
+      if (aborted) break;
+      if (existingIds.has(c.id)) continue;
+      batch.push(c);
+      if (batch.length >= batchSize) {
+        dispatch(batch);
+        batch = [];
+        // Back-pressure: never let more than `concurrency` batches be resident.
+        while (inFlight.size >= concurrency && !aborted) await Promise.race(inFlight);
+      }
+    }
+    if (batch.length > 0 && !aborted) dispatch(batch);
+    await Promise.all(inFlight);
     if (aborted) throw aborted; // no zombies left running; fail the run cleanly
 
     // Build the full-text index once, after all batches are inserted.
     report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });
-    if (newChunks.length > 0) {
+    if (newChunkCount > 0) {
       await vectorStore.ensureFtsIndex();
     }
-    log(`Stored ${newChunks.length} new chunks in LanceDB (${deletedFiles.length} removed)`);
+    log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
 
-    // Update metadata
-    const repoNames = [...new Set(chunks.map((c) => c.repoName))];
+    // Update metadata (repoNames was computed during pass 1).
     for (const repoName of repoNames) {
       const metaPath = join(basePath, repoName, 'index_meta.json');
       if (existsSync(metaPath)) {
@@ -550,13 +577,13 @@ export class KnowledgeIndexer {
     }
 
     const durationMs = Date.now() - startTime;
-    report({ phase: 'done', message: `Embedded ${newChunks.length} new chunks (${deletedFiles.length} removed) in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0 });
+    report({ phase: 'done', message: `Embedded ${newChunkCount} new chunks (${deletedFiles.length} removed) in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0 });
 
     return {
       project,
-      repos: repoNames.map((n) => ({ name: n, chunkCount: chunks.filter((c) => c.repoName === n).length, language: '' })),
-      totalChunks: chunks.length,
-      totalTokens: chunks.reduce((sum, c) => sum + c.tokens, 0),
+      repos: repoNames.map((n) => ({ name: n, chunkCount: repoChunkCounts.get(n) ?? 0, language: '' })),
+      totalChunks,
+      totalTokens,
       embeddingProvider: embedder.name,
       embeddingDimensions: embedder.dimensions,
       crossRepoEdges: 0,
