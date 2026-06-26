@@ -67,11 +67,18 @@ async function embedFetch(opts: {
 }): Promise<Response> {
   const timeoutMs = parseInt(process.env.CODE_SEARCH_EMBEDDING_TIMEOUT_MS ?? '', 10) || 60_000;
   const maxRetries = parseInt(process.env.CODE_SEARCH_EMBEDDING_MAX_RETRIES ?? '', 10) || 5;
+  // 429 is backpressure, not a failure: at a saturated TPM tier (e.g. OpenAI's
+  // 10M) it is routine, so retry it FAR more generously than hard errors,
+  // honoring Retry-After. With a small shared budget a few 429s exhaust it, a
+  // worker throws, and an otherwise-healthy run gets wrongly marked failed.
+  const max429 = parseInt(process.env.CODE_SEARCH_EMBEDDING_MAX_429_RETRIES ?? '', 10) || 30;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (opts.apiKey) headers.Authorization = `Bearer ${opts.apiKey}`;
   const payload = JSON.stringify(opts.body);
 
-  for (let attempt = 0; ; attempt++) {
+  let netAttempt = 0; // network errors / 5xx
+  let rlAttempt = 0;  // 429 rate-limit (separate, larger budget)
+  for (;;) {
     try {
       const response = await fetch(opts.url, {
         method: 'POST',
@@ -80,20 +87,26 @@ async function embedFetch(opts: {
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (response.ok) return response;
-      // Retry 429 (rate limit) and 5xx (transient server) — but not 4xx (our bug).
-      if ((response.status === 429 || response.status >= 500) && attempt < maxRetries) {
+      if (response.status === 429 && rlAttempt < max429) {
         const retryAfter = Number(response.headers.get('retry-after'));
-        const wait =
-          Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : embedBackoffMs(attempt);
+        const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : embedBackoffMs(rlAttempt);
         await response.text().catch(() => {}); // drain body so the socket is released
         await sleep(wait);
+        rlAttempt++;
+        continue;
+      }
+      if (response.status >= 500 && netAttempt < maxRetries) {
+        await response.text().catch(() => {});
+        await sleep(embedBackoffMs(netAttempt));
+        netAttempt++;
         continue;
       }
       const body = await response.text().catch(() => '');
       throw new Error(`${opts.provider} embedding request failed (${response.status}): ${body.slice(0, 500)}`);
     } catch (err) {
-      if (isRetryableNetworkError(err) && attempt < maxRetries) {
-        await sleep(embedBackoffMs(attempt));
+      if (isRetryableNetworkError(err) && netAttempt < maxRetries) {
+        await sleep(embedBackoffMs(netAttempt));
+        netAttempt++;
         continue;
       }
       throw err;

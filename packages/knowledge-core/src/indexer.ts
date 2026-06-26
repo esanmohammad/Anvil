@@ -429,7 +429,13 @@ export class KnowledgeIndexer {
     const deletedFiles = this.getDeletedFiles(basePath);
 
     if (newChunks.length === 0 && deletedFiles.length === 0) {
-      log('All chunks already embedded — nothing to do.');
+      // All vectors already present, so DON'T re-embed. But still (re)build the
+      // full-text (BM25) index over the existing rows: a prior run that wrote
+      // vectors then aborted before the post-loop FTS build (e.g. killed/aborted
+      // mid-run) leaves BM25 permanently degraded, and this "nothing new" path is
+      // the only one a re-run reaches. Cheap relative to embedding; idempotent.
+      log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
+      await vectorStore.ensureFtsIndex();
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
       const repoNames = [...new Set(chunks.map((c) => c.repoName))];
       return {
@@ -497,19 +503,32 @@ export class KnowledgeIndexer {
     const embedStartTime = Date.now();
     let writeChain: Promise<void> = Promise.resolve();
 
+    // When any worker fails, signal the others to stop and surface the error
+    // after all have settled — otherwise the failed worker rejects Promise.all
+    // while its siblings keep embedding + mutating progress in the background
+    // ("zombie" workers), so the run reads as failed yet the count keeps rising.
+    let aborted: unknown = null;
     const runWorker = async (): Promise<void> => {
       for (;;) {
+        if (aborted) return;
         const idx = cursor++;
         if (idx >= totalBatches) return;
         const batchChunks = batches[idx];
-        const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
-        const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
-        // Serialize the LanceDB write by chaining onto the previous one, and
-        // await only the promise we just appended.
-        const myWrite = (writeChain = writeChain.then(() =>
-          vectorStore.addChunks(batchRows, { skipIndex: true }),
-        ));
-        await myWrite;
+        let batchRows: Array<CodeChunk & { embedding: number[] }>;
+        try {
+          const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
+          batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
+          // Serialize the LanceDB write by chaining onto the previous one, and
+          // await only the promise we just appended.
+          const myWrite = (writeChain = writeChain.then(() =>
+            vectorStore.addChunks(batchRows, { skipIndex: true }),
+          ));
+          await myWrite;
+        } catch (err) {
+          aborted = err; // stop siblings; rethrown after Promise.all settles
+          return;
+        }
+        if (aborted) return;
         stored += batchRows.length;
         batchesDone++;
 
@@ -532,6 +551,7 @@ export class KnowledgeIndexer {
     };
 
     await Promise.all(Array.from({ length: Math.min(concurrency, totalBatches) }, () => runWorker()));
+    if (aborted) throw aborted; // no zombies left running; fail the run cleanly
 
     // Build the full-text index once, after all batches are inserted.
     report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });
