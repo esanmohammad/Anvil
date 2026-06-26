@@ -35,8 +35,32 @@ export function resolveIndexConcurrency(repoCount: number): number {
   }
   if (!Number.isFinite(cores) || cores < 1) cores = 1;
 
+  // Memory-aware cap (container/cgroup-aware): each lane builds a repo's AST
+  // graph and ships it to the main thread, which is simultaneously growing the
+  // merged system graph — so cap lanes by a per-lane memory budget against the
+  // available memory, reserving headroom for that merged graph. This keeps the
+  // default adaptive to BOTH cores and RAM (not hardcoded) and NEVER throws —
+  // it degrades to 1 if any reading is odd. `process.constrainedMemory()`
+  // returns the cgroup limit inside a container (0 if unconstrained), so a
+  // 16 GB pod is throttled correctly even on a many-core host.
+  let memCap = cores;
+  try {
+    const constrained = typeof process.constrainedMemory === 'function' ? process.constrainedMemory() : 0;
+    const budget = constrained && constrained > 0 ? constrained : os.totalmem();
+    if (Number.isFinite(budget) && budget > 0) {
+      const RESERVE_BYTES = 4 * 1024 ** 3; // headroom for the main-thread merged graph + overhead
+      const PER_LANE_BYTES = 1024 ** 3;    // per-repo AST graph + transient buffers (chunks now stream to disk)
+      memCap = Math.floor((budget - RESERVE_BYTES) / PER_LANE_BYTES);
+    }
+  } catch {
+    /* keep memCap = cores */
+  }
+  if (!Number.isFinite(memCap) || memCap < 1) memCap = 1;
+
   const env = parseInt(process.env.CODE_SEARCH_INDEX_CONCURRENCY ?? '', 10);
-  const desired = Number.isFinite(env) && env > 0 ? env : cores; // default = available cores
+  // An explicit env override bypasses the memory cap (operator opt-in to push
+  // higher); otherwise the default is min(available cores, memory budget).
+  const desired = Number.isFinite(env) && env > 0 ? env : Math.min(cores, memCap);
   const repos = Number.isFinite(repoCount) && repoCount > 0 ? repoCount : 1;
   return Math.max(1, Math.min(desired, repos));
 }

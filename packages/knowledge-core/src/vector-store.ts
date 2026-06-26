@@ -139,13 +139,14 @@ export class VectorStore {
   }
 
   /** Full-text BM25 search (LanceDB built-in FTS) */
-  async fullTextSearch(queryText: string, limit: number = 20): Promise<ScoredChunk[]> {
+  async fullTextSearch(queryText: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
     if (!this.table) return [];
     try {
-      const results = await this.table
-        .search(queryText, 'fts', 'contextualizedContent')
-        .limit(limit)
-        .toArray();
+      let q = this.table.search(queryText, 'fts', 'contextualizedContent').limit(limit);
+      // Apply the same repo filter as vectorSearch — without it, BM25 results
+      // leak across repos even when the caller scoped to specific repos.
+      if (filter) q = q.where(filter);
+      const results = await q.toArray();
       return results.map((r: any) => ({
         chunk: rowToChunk(r),
         score: r._relevance_score ?? 0.5,

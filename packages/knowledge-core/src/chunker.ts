@@ -439,10 +439,15 @@ export async function chunkRepo(
   project: string,
   config: { maxTokens: number },
   cachedFiles?: Record<string, FileIndexEntry>,
+  onChunk?: (chunk: CodeChunk) => void,
 ): Promise<ChunkResult> {
   const files: string[] = [];
   walkDir(repoPath, files);
 
+  // When a sink is provided, stream each chunk to it and NEVER accumulate the
+  // full array: at org scale a single big repo (e.g. 8k+ files) produces a
+  // multi-GB chunk set, and under the worker-pool concurrency that footprint,
+  // multiplied per lane, OOMs the prep phase. With a sink, `chunks` stays [].
   const allChunks: CodeChunk[] = [];
   const changedFiles: string[] = [];
   const fileIndex: Record<string, FileIndexEntry> = {};
@@ -470,7 +475,7 @@ export async function chunkRepo(
     // File is new or changed — chunk it
     changedFiles.push(relPath);
     const chunks = chunkFile(file, repoPath, repoName, project, config.maxTokens);
-    allChunks.push(...chunks);
+    if (onChunk) { for (const c of chunks) onChunk(c); } else { allChunks.push(...chunks); }
     fileIndex[relPath] = { contentHash, chunkCount: chunks.length };
   }
 
@@ -501,6 +506,7 @@ export async function chunkChangedFiles(
   project: string,
   config: { maxTokens: number },
   diff: { added: string[]; modified: string[]; deleted: string[] },
+  onChunk?: (chunk: CodeChunk) => void,
 ): Promise<ChunkResult> {
   const allChunks: CodeChunk[] = [];
   const changedFiles: string[] = [];
@@ -521,7 +527,7 @@ export async function chunkChangedFiles(
     changedFiles.push(relPath);
     const contentHash = createHash('sha256').update(contents).digest('hex');
     const chunks = chunkFile(fullPath, repoPath, repoName, project, config.maxTokens);
-    allChunks.push(...chunks);
+    if (onChunk) { for (const c of chunks) onChunk(c); } else { allChunks.push(...chunks); }
     fileIndex[relPath] = { contentHash, chunkCount: chunks.length };
   }
 

@@ -42,8 +42,13 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<vo
 
   // Map of sessionId → session (with TTL + max limit)
   const sessions = new Map<string, Session & { lastActivity: number }>();
-  const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-  const MAX_SESSIONS = 100;
+  // Idle session lifetime. 30 min was too aggressive for an all-day interactive
+  // MCP client — an idle gap > 30 min got the session reaped, and the next call
+  // then failed. Default 120 min, env-overridable; any POST/GET refreshes it.
+  const ttlMin = parseInt(process.env.CODE_SEARCH_SESSION_TTL_MINUTES ?? '', 10);
+  const SESSION_TTL_MS = (Number.isFinite(ttlMin) && ttlMin > 0 ? ttlMin : 120) * 60 * 1000;
+  const maxEnv = parseInt(process.env.CODE_SEARCH_MAX_SESSIONS ?? '', 10);
+  const MAX_SESSIONS = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 100;
 
   // Clean up stale sessions every 5 minutes
   setInterval(() => {
@@ -184,8 +189,10 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<vo
         }
 
         if (sessionId && !sessions.has(sessionId)) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid session ID. Session may have expired.' }));
+          // 404 (not 400) so a spec-compliant client re-initializes a new
+          // session instead of treating it as a fatal error.
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Session expired or unknown — reinitialize.' }));
           return;
         }
 
@@ -233,14 +240,18 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<vo
       }
 
       if (req.method === 'GET') {
-        // SSE stream for existing session
+        // SSE stream for an existing session. Refresh activity here too — this
+        // long-lived server→client stream is exactly the case the POST-only
+        // refresh missed, so an actively-streaming session was being reaped.
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
         if (sessionId && sessions.has(sessionId)) {
+          sessions.get(sessionId)!.lastActivity = Date.now();
           await sessions.get(sessionId)!.transport.handleRequest(req, res);
           return;
         }
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Session ID required for GET requests' }));
+        // Provided-but-unknown session → 404 (reinitialize); missing → 400.
+        res.writeHead(sessionId ? 404 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: sessionId ? 'Session expired or unknown — reinitialize.' : 'Session ID required for GET requests' }));
         return;
       }
 
