@@ -5,7 +5,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
-import { getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
+import { getKnowledgeBasePath, openSystemGraphStore } from '@esankhan3/anvil-knowledge-core';
 import { loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
 import { loadProfile } from '@esankhan3/anvil-knowledge-core';
 
@@ -47,17 +47,31 @@ export async function handleResource(
     }
 
     if (uri === 'code-search://system-graph') {
-      const graphPath = join(kbPath, 'system_graph_v2.json');
-      if (!existsSync(graphPath)) {
-        return { contents: [{ uri, mimeType: 'application/json', text: '{"nodes":[],"edges":[]}' }] };
+      // The merged graph is now a slice-queryable SQLite store (system_graph.sqlite).
+      // Dumping every node+edge would reintroduce the org-scale V8 string-length
+      // OOM the sqlite migration removed, so serve a bounded overview — the
+      // highest-degree nodes + cross-repo edges + totals. Full traversal is via
+      // the graph tools (search_graph, find_callers, impact_analysis, …).
+      const store = await openSystemGraphStore(kbPath);
+      if (!store) {
+        return { contents: [{ uri, mimeType: 'application/json', text: '{"nodes":[],"crossRepoEdges":[],"totals":{"nodes":0,"crossRepoEdges":0}}' }] };
       }
-      return {
-        contents: [{
-          uri,
-          mimeType: 'application/json',
-          text: readFileSync(graphPath, 'utf-8'),
-        }],
-      };
+      try {
+        const NODE_LIMIT = 200;
+        const EDGE_LIMIT = 200;
+        const { rows: nodes, total: nodeTotal } = store.searchNodes({ minDegree: 0 }, NODE_LIMIT);
+        const { edges: crossRepoEdges, total: edgeTotal } = store.crossRepoEdges(undefined, EDGE_LIMIT);
+        const payload = {
+          nodes,
+          crossRepoEdges,
+          totals: { nodes: nodeTotal, crossRepoEdges: edgeTotal },
+          truncated: nodeTotal > nodes.length || edgeTotal > crossRepoEdges.length,
+          note: 'Bounded overview (top nodes by degree + cross-repo edges). Use the graph tools for full traversal.',
+        };
+        return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(payload, null, 2) }] };
+      } finally {
+        store.close();
+      }
     }
 
     // Dynamic resource: code-search://repo/{name}/profile

@@ -68,7 +68,11 @@ All implemented in `src/tools/`:
 `src/resources/resources.ts` exposes:
 
 - `code-search://repos` — JSON of all profiles.
-- `code-search://system-graph` — `system_graph_v2.json`.
+- `code-search://system-graph` — bounded overview of the merged graph
+  (top nodes by degree + cross-repo edges + totals), served from
+  `system_graph.sqlite` via `openSystemGraphStore`. Not a full dump —
+  that would reintroduce the org-scale OOM; use the graph tools for
+  traversal.
 - `code-search://repo/{name}/profile` — single repo profile (dynamic).
 - `code-search://repo/{name}/graph` — single repo graph (dynamic).
 
