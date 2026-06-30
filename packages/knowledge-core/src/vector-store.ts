@@ -12,6 +12,11 @@ function isCorruptVectorStore(err: unknown): boolean {
   );
 }
 
+/** IVF partitions probed per vector query (recall/latency dial; env-tunable so
+ *  it can be adjusted on the VM without a redeploy). No effect until the IVF
+ *  index exists (ensureVectorIndex). */
+const VECTOR_NPROBES = Math.max(1, parseInt(process.env.CODE_SEARCH_VECTOR_NPROBES ?? '', 10) || 40);
+
 export class VectorStore {
   private db: any; // lancedb.Connection
   private table: any; // lancedb.Table
@@ -79,6 +84,88 @@ export class VectorStore {
     }
   }
 
+  /** Build scalar indexes on every column that `.filter()` / `.where()` touches,
+   *  so graph-expansion + filtered search do indexed lookups instead of full
+   *  table scans — the dominant per-query cost at org scale (a 383k-row scan of
+   *  text-heavy rows, repeated per graph-expansion batch). `bitmap` for
+   *  low-cardinality equality columns (repoName, project), `btree` for
+   *  high-cardinality ones (filePath, entityName, id).
+   *
+   *  Write path only; idempotent (build-if-absent — a full rebuild recreates the
+   *  table and rebuilds these; incremental adds are folded by {@link optimizeIndexes}).
+   *  Non-fatal: a missing index just means that query falls back to a scan, so a
+   *  build failure (e.g. on an empty table) degrades performance, never correctness. */
+  async ensureScalarIndexes(): Promise<void> {
+    if (!this.table) return;
+    const wanted: Array<{ col: string; kind: 'bitmap' | 'btree' }> = [
+      { col: 'repoName', kind: 'bitmap' },
+      { col: 'project', kind: 'bitmap' },
+      { col: 'filePath', kind: 'btree' },
+      { col: 'entityName', kind: 'btree' },
+      { col: 'id', kind: 'btree' },
+    ];
+    try {
+      const existing: Array<{ columns?: string[] }> = await this.table.listIndices();
+      const indexed = new Set(existing.flatMap((i) => i.columns ?? []));
+      const lancedb = await import('@lancedb/lancedb');
+      for (const { col, kind } of wanted) {
+        if (indexed.has(col)) continue; // already built; appends folded by optimizeIndexes()
+        try {
+          await this.table.createIndex(col, {
+            config: kind === 'bitmap' ? lancedb.Index.bitmap() : lancedb.Index.btree(),
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[knowledge-core] scalar index on ${col} skipped: ${msg.slice(0, 160)}`);
+        }
+      }
+    } catch {
+      // listIndices unavailable — non-fatal; queries fall back to scans.
+    }
+  }
+
+  /** Fold newly-appended rows into the existing FTS/scalar/vector indexes (and
+   *  compact fragments). Run on the write path AFTER an incremental embed so the
+   *  unindexed tail doesn't grow across reindexes and drag scans back in. Work is
+   *  proportional to the NEW data, not the whole table. Non-fatal. */
+  async optimizeIndexes(): Promise<void> {
+    if (!this.table) return;
+    try {
+      await this.table.optimize();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[knowledge-core] index optimize skipped: ${msg.slice(0, 160)}`);
+    }
+  }
+
+  /** Build an IVF_FLAT index on the `vector` column so vector search reads only
+   *  the probed partitions instead of brute-force scanning every row — the fix
+   *  for the multi-second flat-scan latency at org scale. IVF_FLAT (not PQ) keeps
+   *  exact distances within each partition, so there's no quantization recall
+   *  loss, and the full vectors fit comfortably in the VM's RAM. Query-time
+   *  `nprobes` (VECTOR_NPROBES) trades recall vs partitions scanned.
+   *
+   *  Write path only; idempotent (build-if-absent — a full rebuild recreates it,
+   *  incremental adds are folded by optimizeIndexes()). Below `minRows` a flat
+   *  scan is already fast and IVF training is noise, so skip. Non-fatal: on
+   *  failure vector search falls back to the exact flat scan. */
+  async ensureVectorIndex(opts?: { minRows?: number }): Promise<void> {
+    if (!this.table) return;
+    const minRows = opts?.minRows ?? 10_000;
+    try {
+      const count = await this.table.countRows();
+      if (count < minRows) return;
+      const existing: Array<{ columns?: string[] }> = await this.table.listIndices();
+      if (existing.some((i) => Array.isArray(i.columns) && i.columns.includes('vector'))) return;
+      const lancedb = await import('@lancedb/lancedb');
+      await this.table.createIndex('vector', { config: lancedb.Index.ivfFlat() });
+      console.error(`[knowledge-core] built IVF_FLAT vector index on ${count} rows.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[knowledge-core] vector index build skipped (flat scan still works): ${msg.slice(0, 160)}`);
+    }
+  }
+
   /** Insert or replace chunks with embeddings */
   async upsertChunks(chunks: Array<CodeChunk & { embedding: number[] }>): Promise<void> {
     // Map chunks to flat row objects for LanceDB
@@ -128,7 +215,9 @@ export class VectorStore {
     },
   ): Promise<ScoredChunk[]> {
     if (!this.table) return [];
-    let query = this.table.search(queryEmbedding).limit(opts?.limit ?? 20);
+    // nprobes = IVF partitions scanned per query (no-op on a flat/un-indexed
+    // table). Higher = better recall, more work; tunable without a redeploy.
+    let query = this.table.search(queryEmbedding).limit(opts?.limit ?? 20).nprobes(VECTOR_NPROBES);
     if (opts?.filter) query = query.where(opts.filter);
     const results = await query.toArray();
     return results.map((r: any) => ({
@@ -161,9 +250,12 @@ export class VectorStore {
   /** Get specific chunks by their IDs */
   async getByIds(ids: string[]): Promise<CodeChunk[]> {
     if (!this.table || ids.length === 0) return [];
-    const filter = ids.map((id) => `id = '${id}'`).join(' OR ');
+    const filter = ids.map((id) => `id = '${id.replace(/'/g, "''")}'`).join(' OR ');
     try {
-      const results = await this.table.filter(filter).toArray();
+      // `.query().where()` — NOT the legacy `.filter()`, which is a no-op on this
+      // binding (silently returns nothing). With the scalar index on `id` this is
+      // an indexed lookup, not a scan.
+      const results = await this.table.query().where(filter).toArray();
       return results.map((r: any) => rowToChunk(r));
     } catch {
       return [];
@@ -184,21 +276,26 @@ export class VectorStore {
         : `(${base})`;
     });
     try {
-      // Query in batches to avoid overly long filters
-      const allResults: ScoredChunk[] = [];
+      // Split into batches (avoid overly long filter strings) and run them
+      // CONCURRENTLY — each is an independent indexed lookup (see
+      // ensureScalarIndexes), so overlapping them collapses the graph-expansion
+      // phase from sum-of-batches to slowest-batch latency.
       const batchSize = 20;
+      const batches: string[] = [];
       for (let i = 0; i < conditions.length; i += batchSize) {
-        const batch = conditions.slice(i, i + batchSize).join(' OR ');
-        const results = await this.table.filter(batch).limit(batchSize * 2).toArray();
-        for (const r of results) {
-          allResults.push({
-            chunk: rowToChunk(r),
-            score: 0.75,
-            source: 'graph' as const,
-          });
-        }
+        batches.push(conditions.slice(i, i + batchSize).join(' OR '));
       }
-      return allResults;
+      const perBatch = await Promise.all(
+        // `.query().where()` — the legacy `.filter()` is a no-op on this binding
+        // (this is why graph expansion silently returned nothing). The scalar
+        // indexes on repoName/filePath/entityName make each an indexed lookup.
+        batches.map((batch) => this.table.query().where(batch).limit(batchSize * 2).toArray()),
+      );
+      return perBatch.flat().map((r: any) => ({
+        chunk: rowToChunk(r),
+        score: 0.75,
+        source: 'graph' as const,
+      }));
     } catch {
       return [];
     }
@@ -212,8 +309,10 @@ export class VectorStore {
     if (!this.table) return [];
     const esc = (s: string) => s.replace(/'/g, "''");
     try {
+      // `.query().where()` — see getByIds; `.filter()` is a no-op on this binding.
       const results = await this.table
-        .filter(`repoName = '${esc(repoName)}' AND filePath = '${esc(filePath)}'`)
+        .query()
+        .where(`repoName = '${esc(repoName)}' AND filePath = '${esc(filePath)}'`)
         .toArray();
       return results.map((r: any) => ({
         id: r.id,

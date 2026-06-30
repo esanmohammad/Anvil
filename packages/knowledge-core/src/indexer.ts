@@ -444,6 +444,11 @@ export class KnowledgeIndexer {
       // the only one a re-run reaches. Cheap relative to embedding; idempotent.
       log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
       await vectorStore.ensureFtsIndex();
+      // Heal missing scalar + vector indexes too (a prior run could have aborted
+      // before building them) so filtered search / graph expansion / vector search
+      // stay index-backed rather than full-scanning.
+      await vectorStore.ensureScalarIndexes();
+      await vectorStore.ensureVectorIndex();
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
       return {
         project,
@@ -573,11 +578,18 @@ export class KnowledgeIndexer {
     await Promise.all(inFlight);
     if (aborted) throw aborted; // no zombies left running; fail the run cleanly
 
-    // Build the full-text index once, after all batches are inserted.
-    report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });
+    // Build the full-text + scalar indexes once, after all batches are inserted.
+    report({ phase: 'storing', message: 'Building search indexes...', percent: 92, etaSeconds: -1 });
     if (newChunkCount > 0) {
       await vectorStore.ensureFtsIndex();
     }
+    // Scalar indexes (repoName/project/filePath/entityName/id) turn graph-expansion
+    // + filtered search from full-table scans into indexed lookups; the IVF_FLAT
+    // vector index turns brute-force KNN into probed-partition reads — together the
+    // query-latency win at org scale. Build-if-absent, then fold the new rows in.
+    await vectorStore.ensureScalarIndexes();
+    await vectorStore.ensureVectorIndex();
+    await vectorStore.optimizeIndexes();
     log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
 
     // Update metadata (repoNames was computed during pass 1).
