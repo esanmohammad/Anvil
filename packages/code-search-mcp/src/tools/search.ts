@@ -93,6 +93,11 @@ export async function handleSearchTool(
 
     const result = await retriever.retrieve(query, {
       maxChunks: maxResults,
+      // A search tool returns a fixed COUNT of results; the config token budget
+      // is for LLM-context packing and would truncate below maxResults (the
+      // benchmark saw ~6.6 of 10 returned). Give maxChunks room to bind while
+      // still bounding a pathological all-huge-chunks payload.
+      maxTokens: maxResults * 4000,
       repoFilter: repos,
       mode: modeMap[name] as any,
     });

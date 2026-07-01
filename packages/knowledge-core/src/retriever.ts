@@ -41,6 +41,22 @@ function cacheEmbedding(query: string, embedding: number[]): void {
   queryEmbeddingCache.set(query, { embedding, timestamp: Date.now() });
 }
 
+// Auto repo-routing (WS-8) is OFF by default. At org scale (>10 repos) the
+// router hard-filters to ≤60% of repos by *repo-profile* similarity — so a
+// distinctive symbol whose defining repo doesn't resemble the query is
+// excluded from BOTH vector and BM25 search before retrieval even runs. That
+// pre-filter was the dominant exact-symbol recall loss. Callers still scope
+// explicitly via `repos`/`repoFilter`; opt the auto-router back in per-deploy.
+const AUTO_ROUTE_REPOS =
+  process.env.CODE_SEARCH_AUTO_ROUTE === '1' || process.env.CODE_SEARCH_AUTO_ROUTE === 'true';
+
+// RRF rank constant. The TREC default (60) deliberately flattens rank gaps —
+// wrong for code search, where the exact definition (found only by BM25, at
+// rank 1) must not be outscored by a semantically-adjacent file that merely
+// appears in BOTH lists at mid-rank. Smaller k sharpens rank sensitivity.
+// Env-tunable without a redeploy.
+const RRF_K = Number(process.env.CODE_SEARCH_RRF_K) || 10;
+
 /**
  * Normalize a repos filter from whatever shape an MCP client sent into a clean
  * `string[]`. Clients pass `repos` inconsistently — a JSON array, a single
@@ -115,7 +131,7 @@ export class HybridRetriever {
     // hand back a non-array. Coercing here fixes the `filterRepos.map is not a
     // function` crash and makes repo-scoping behave the same for every tool.
     let filterRepos = toRepoArray(opts?.repoFilter ?? opts?.repos);
-    if (filterRepos.length === 0 && this.queryRouter) {
+    if (AUTO_ROUTE_REPOS && filterRepos.length === 0 && this.queryRouter) {
       try {
         const routeResult = await this.queryRouter.route(query);
         if (routeResult.strategy === 'filtered') {
@@ -132,24 +148,24 @@ export class HybridRetriever {
     // ---------------------------------------------------------------
     // Phase 1 — Parallel retrieval (fetch 50 from each)
     // ---------------------------------------------------------------
-    let queryEmbedding: number[] | null = null;
-    if (useVector) {
-      // Check embedding cache first (WS-7 optimization)
-      queryEmbedding = getCachedEmbedding(query);
-      if (!queryEmbedding) {
-        queryEmbedding = await this.embedder.embedSingle(query);
-        cacheEmbedding(query, queryEmbedding);
-      }
-    }
-
-    const [vectorResults, bm25Results] = await Promise.all([
-      useVector && queryEmbedding
-        ? this.vectorStore.vectorSearch(queryEmbedding, { limit: 50, filter })
-        : Promise.resolve([] as ScoredChunk[]),
-      useBm25
-        ? this.vectorStore.fullTextSearch(query, 50, filter)
-        : Promise.resolve([] as ScoredChunk[]),
-    ]);
+    // BM25 needs no embedding, so run it CONCURRENTLY with the embed round-trip
+    // (the ~0.5s OpenAI embed dominates single-query latency) rather than after
+    // it — the embed latency is hidden behind the FTS query. Vector path embeds
+    // (cache-first) then searches, all inside its own promise.
+    const vectorPromise: Promise<ScoredChunk[]> = useVector
+      ? (async () => {
+          let emb = getCachedEmbedding(query);
+          if (!emb) {
+            emb = await this.embedder.embedSingle(query);
+            cacheEmbedding(query, emb);
+          }
+          return this.vectorStore.vectorSearch(emb, { limit: 50, filter });
+        })()
+      : Promise.resolve([] as ScoredChunk[]);
+    const bm25Promise: Promise<ScoredChunk[]> = useBm25
+      ? this.vectorStore.fullTextSearch(query, 50, filter)
+      : Promise.resolve([] as ScoredChunk[]);
+    const [vectorResults, bm25Results] = await Promise.all([vectorPromise, bm25Promise]);
 
     // Single-source shortcuts — no fusion needed
     if (mode === 'vector') {
@@ -172,9 +188,15 @@ export class HybridRetriever {
     if (vectorResults.length > 0) { retrievalSets.push(vectorResults); weights.push(wV); }
     if (bm25Results.length > 0) { retrievalSets.push(bm25Results); weights.push(wB); }
 
-    const fused = retrievalSets.length > 1
-      ? reciprocalRankFusion(retrievalSets, weights)
+    const fusedRaw = retrievalSets.length > 1
+      ? reciprocalRankFusion(retrievalSets, weights, RRF_K)
       : (retrievalSets[0] ?? []);
+
+    // Exact-symbol boost — pin candidates whose entity name equals a bare
+    // identifier query to the top. RRF buries the exact definition (found only
+    // by BM25) under adjacent files that appear in both lists; with no reranker
+    // downstream, this fused order IS the final order.
+    const fused = boostExactSymbol(fusedRaw, query, classification.type);
 
     // ---------------------------------------------------------------
     // Phase 3 — AST tripartite expansion from fused seeds
@@ -319,7 +341,7 @@ export class HybridRetriever {
 function reciprocalRankFusion(
   resultSets: ScoredChunk[][],
   weights: number[],
-  k: number = 60,
+  k: number = RRF_K,
 ): ScoredChunk[] {
   const scoreMap = new Map<string, { chunk: ScoredChunk['chunk']; score: number }>();
 
@@ -346,6 +368,30 @@ function reciprocalRankFusion(
       score,
       source: 'fused' as const,
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Exact-symbol boost
+// ---------------------------------------------------------------------------
+
+/**
+ * For a bare single-token identifier query, move candidates whose entityName
+ * exactly matches the query to the front (preserving their relative order).
+ * Repairs RRF's under-ranking of exact definitions for symbol lookups. No-op
+ * for multi-word / natural-language queries and when nothing matches.
+ */
+function boostExactSymbol(fused: ScoredChunk[], query: string, type: string): ScoredChunk[] {
+  const q = query.trim();
+  if (q.length === 0 || /\s/.test(q) || type === 'natural-language') return fused;
+  const target = q.toLowerCase();
+  const norm = (s?: string) => (s ?? '').replace(/\$\d+$/, '').toLowerCase();
+  const exact: ScoredChunk[] = [];
+  const rest: ScoredChunk[] = [];
+  for (const sc of fused) {
+    if (norm(sc.chunk.entityName) === target) exact.push(sc);
+    else rest.push(sc);
+  }
+  return exact.length > 0 ? [...exact, ...rest] : fused;
 }
 
 // ---------------------------------------------------------------------------
