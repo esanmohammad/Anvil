@@ -848,11 +848,57 @@ function formatEta(seconds: number): string {
  * before any vector search runs — silent vector-space drift is the
  * canonical "results are garbage and there's no error" symptom.
  */
+/**
+ * Retriever cache. Building a retriever opens LanceDB + SQLite, reads every
+ * repo's index_meta, and loads the query router — seconds of work that used to
+ * run on EVERY query (getRetriever was called per search). We build it once per
+ * (project, embedding-space) and reuse it; the embedding space is in the key so
+ * a config change to the embedder rebuilds rather than serving a mismatched
+ * store. Promises are cached so concurrent first-hits share one build.
+ *
+ * Invalidated by {@link invalidateRetriever} when a reindex writes new data (the
+ * writer serve process); read-only replicas that don't reindex in-process get
+ * freshness separately (Step 2 — checkoutLatest).
+ */
+const retrieverCache = new Map<string, Promise<HybridRetriever>>();
+
+function retrieverCacheKey(project: string, config: KnowledgeConfig): string {
+  const e = config.embedding;
+  return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}`;
+}
+
 export async function getRetriever(
   project: string,
   configOverride?: KnowledgeConfig,
 ): Promise<HybridRetriever> {
   const config = configOverride ?? loadKnowledgeConfig(project);
+  const key = retrieverCacheKey(project, config);
+  const cached = retrieverCache.get(key);
+  if (cached) return cached;
+  const building = buildRetriever(project, config);
+  retrieverCache.set(key, building);
+  // Evict a failed build so a transient error doesn't poison the cache forever.
+  building.catch(() => { if (retrieverCache.get(key) === building) retrieverCache.delete(key); });
+  return building;
+}
+
+/**
+ * Drop cached retrievers (closing their SQLite handles) so the next query
+ * rebuilds against fresh index data. Call after a reindex completes. No arg =
+ * clear all projects.
+ */
+export async function invalidateRetriever(project?: string): Promise<void> {
+  const entries = [...retrieverCache.entries()].filter(([k]) => !project || k.startsWith(`${project}::`));
+  for (const [k, pr] of entries) {
+    retrieverCache.delete(k);
+    try { (await pr).close(); } catch { /* already closed / build failed */ }
+  }
+}
+
+async function buildRetriever(
+  project: string,
+  config: KnowledgeConfig,
+): Promise<HybridRetriever> {
   const basePath = getKnowledgeBasePath(project);
 
   // Load vector store

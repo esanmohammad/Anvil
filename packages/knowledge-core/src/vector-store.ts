@@ -48,8 +48,10 @@ export class VectorStore {
       // A 0-byte fragment from a killed-mid-write often opens fine but throws on
       // the first read, not at openTable — so force a read when healing.
       if (opts?.healCorrupt) await this.table.query().limit(1).toArray();
-      // Ensure FTS index exists for existing tables
-      await this.ensureFtsIndex();
+      // NOTE: the FTS index is built on the WRITE path only (embedChunks calls
+      // ensureFtsIndex explicitly). A reader must NOT rebuild it — doing so here
+      // rebuilt the full-text index over the whole table on every open, i.e. on
+      // every query (getRetriever → init), which was the dominant serving cost.
     } catch (err) {
       if (opts?.healCorrupt && isCorruptVectorStore(err)) {
         // Store is unreadable but fully rebuildable from chunks.json: drop it

@@ -20,7 +20,7 @@ import { registerProfileTools, handleProfileTool } from './tools/profile.js';
 import { registerIndexTools, handleIndexTool } from './tools/index-tools';
 import { registerResources, handleResource } from './resources/resources';
 import { getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
-import { indexFromPath } from '@esankhan3/anvil-knowledge-core';
+import { indexFromPath, invalidateRetriever } from '@esankhan3/anvil-knowledge-core';
 import { loadServerConfig, type ServerConfig } from './core/env-config.js';
 import { toKnowledgeConfig } from './core/config.js';
 import { startHttpTransport } from './transports/http-transport.js';
@@ -294,6 +294,10 @@ async function trackedIndex(
         ctx.indexing.message = p.message;
       },
     });
+
+    // Fresh data on disk → drop the cached retriever so the next query rebuilds
+    // against the new index (otherwise the cache would serve pre-reindex results).
+    try { await invalidateRetriever(project); } catch { /* non-fatal */ }
 
     ctx.indexReady = true;
     ctx.indexing.status = 'idle';
