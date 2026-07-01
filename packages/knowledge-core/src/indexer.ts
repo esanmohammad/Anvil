@@ -860,11 +860,32 @@ function formatEta(seconds: number): string {
  * writer serve process); read-only replicas that don't reindex in-process get
  * freshness separately (Step 2 — checkoutLatest).
  */
-const retrieverCache = new Map<string, Promise<HybridRetriever>>();
+interface RetrieverCacheEntry {
+  retriever: Promise<HybridRetriever>;
+  fingerprint: string; // on-disk index fingerprint at build time
+  checkedAt: number;   // last freshness check (ms epoch)
+}
+const retrieverCache = new Map<string, RetrieverCacheEntry>();
+
+/**
+ * How often a cached retriever re-checks whether the on-disk index changed.
+ * The in-process writer invalidates its own cache on reindex (immediate); a
+ * READ-ONLY replica (separate process sharing the same volume) can't be
+ * invalidated that way, so it relies on this TTL check to notice the writer's
+ * reindex and rebuild. 0 disables. env: CODE_SEARCH_RETRIEVER_TTL_MS.
+ */
+const RETRIEVER_FRESHNESS_MS = Math.max(0, parseInt(process.env.CODE_SEARCH_RETRIEVER_TTL_MS ?? '', 10) || 30_000);
 
 function retrieverCacheKey(project: string, config: KnowledgeConfig): string {
   const e = config.embedding;
   return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}`;
+}
+
+/** Cheap change-signal for a project's index: mtimes of the LanceDB dir + the
+ *  system-graph sqlite. Both change when the writer commits a reindex. */
+function indexFingerprint(basePath: string): string {
+  const mt = (p: string): number => { try { return statSync(p).mtimeMs; } catch { return 0; } };
+  return `${mt(join(basePath, 'lancedb'))}:${mt(join(basePath, 'system_graph.sqlite'))}`;
 }
 
 export async function getRetriever(
@@ -873,25 +894,40 @@ export async function getRetriever(
 ): Promise<HybridRetriever> {
   const config = configOverride ?? loadKnowledgeConfig(project);
   const key = retrieverCacheKey(project, config);
-  const cached = retrieverCache.get(key);
-  if (cached) return cached;
+  const basePath = getKnowledgeBasePath(project);
+  const entry = retrieverCache.get(key);
+  if (entry) {
+    const now = Date.now();
+    if (RETRIEVER_FRESHNESS_MS === 0 || now - entry.checkedAt < RETRIEVER_FRESHNESS_MS) {
+      return entry.retriever; // within TTL — serve cached, no disk touch
+    }
+    // TTL elapsed: one cheap stat; rebuild ONLY if the index actually advanced
+    // (i.e. a sole-writer replica reindexed). Steady state = a stat every TTL.
+    if (indexFingerprint(basePath) === entry.fingerprint) {
+      entry.checkedAt = now;
+      return entry.retriever;
+    }
+    retrieverCache.delete(key);
+    entry.retriever.then((r) => r.close()).catch(() => { /* ignore */ });
+  }
+  const fingerprint = indexFingerprint(basePath);
   const building = buildRetriever(project, config);
-  retrieverCache.set(key, building);
+  retrieverCache.set(key, { retriever: building, fingerprint, checkedAt: Date.now() });
   // Evict a failed build so a transient error doesn't poison the cache forever.
-  building.catch(() => { if (retrieverCache.get(key) === building) retrieverCache.delete(key); });
+  building.catch(() => { const e = retrieverCache.get(key); if (e && e.retriever === building) retrieverCache.delete(key); });
   return building;
 }
 
 /**
  * Drop cached retrievers (closing their SQLite handles) so the next query
- * rebuilds against fresh index data. Call after a reindex completes. No arg =
- * clear all projects.
+ * rebuilds against fresh index data. Called after an in-process reindex. No arg
+ * = clear all projects. (Read replicas refresh via the freshness TTL instead.)
  */
 export async function invalidateRetriever(project?: string): Promise<void> {
   const entries = [...retrieverCache.entries()].filter(([k]) => !project || k.startsWith(`${project}::`));
-  for (const [k, pr] of entries) {
+  for (const [k, e] of entries) {
     retrieverCache.delete(k);
-    try { (await pr).close(); } catch { /* already closed / build failed */ }
+    try { (await e.retriever).close(); } catch { /* already closed / build failed */ }
   }
 }
 
@@ -954,8 +990,7 @@ async function buildRetriever(
   try {
     queryRouter = await createQueryRouter(project, embedder);
     if (queryRouter) {
-      // eslint-disable-next-line no-console
-      console.log(`[knowledge] Query router ready (${queryRouter.repoCount} repo profiles)`);
+      console.error(`[knowledge] Query router ready (${queryRouter.repoCount} repo profiles)`);
     }
   } catch {
     // Query routing unavailable — search all repos
