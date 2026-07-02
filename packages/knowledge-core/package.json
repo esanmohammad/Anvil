@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/anvil-knowledge-core",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "description": "Shared knowledge stack (chunking, AST, embedders, vector store, hybrid retrieval) for cli + code-search-mcp.",
   "type": "module",
   "license": "MIT",
