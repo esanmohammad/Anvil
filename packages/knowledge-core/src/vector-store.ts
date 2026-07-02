@@ -238,9 +238,12 @@ export class VectorStore {
       // leak across repos even when the caller scoped to specific repos.
       if (filter) q = q.where(filter);
       const results = await q.toArray();
+      // FTS rows carry `_score` on this binding (0.27.x); `_relevance_score`
+      // is the legacy field name — reading only that flattened every BM25
+      // score to the 0.5 fallback.
       return results.map((r: any) => ({
         chunk: rowToChunk(r),
-        score: r._relevance_score ?? 0.5,
+        score: r._score ?? r._relevance_score ?? 0.5,
         source: 'bm25' as const,
       }));
     } catch {

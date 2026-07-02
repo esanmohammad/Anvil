@@ -13,11 +13,11 @@ import assert from 'node:assert/strict';
 import { HybridRetriever } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk, ScoredChunk, EmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 
-function chunk(id: string, entityName: string): CodeChunk {
+function chunk(id: string, entityName: string, filePath?: string, repoName?: string): CodeChunk {
   return {
     id,
-    filePath: `${id}.ts`,
-    repoName: 'r',
+    filePath: filePath ?? `${id}.ts`,
+    repoName: repoName ?? 'r',
     project: 'p',
     startLine: 1,
     endLine: 5,
@@ -92,5 +92,76 @@ describe('hybrid fusion — exact-symbol boost', () => {
     const res = await r.retrieve('CompanySearchResponse', { mode: 'vector+bm25' });
     assert.equal(res.chunks[0].chunk.id, 'exact', 'exact tier must inject + surface the definition');
     assert.ok(res.chunks.some((c) => c.chunk.id === 'adjacent'), 'fused candidates are kept');
+  });
+
+  it('applies the exact tier in bm25 mode (search_exact tool path)', async () => {
+    const r = new HybridRetriever(storeMissingDef, embedder, null, config, null, null);
+    const res = await r.retrieve('CompanySearchResponse', { mode: 'bm25' });
+    assert.equal(res.chunks[0].chunk.id, 'exact', 'exact match must lead search_exact results');
+  });
+});
+
+describe('hybrid fusion — result-surface shaping', () => {
+  it('caps chunks per file so one hot file cannot fill the top-K', async () => {
+    const hot = ['h1', 'h2', 'h3', 'h4'].map((id, i) => chunk(id, `Hot${i}`, 'hot.ts'));
+    const other = chunk('other', 'Other');
+    const store = {
+      vectorSearch: async (): Promise<ScoredChunk[]> =>
+        hot.map((c) => ({ chunk: c, score: 0.9, source: 'vector' as const })),
+      fullTextSearch: async (): Promise<ScoredChunk[]> => [
+        { chunk: other, score: 0.8, source: 'bm25' },
+      ],
+      searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+    } as any;
+    const r = new HybridRetriever(store, embedder, null, config, null, null);
+    const res = await r.retrieve('how does it work', { mode: 'vector+bm25' });
+    const hotCount = res.chunks.filter((c) => c.chunk.filePath === 'hot.ts').length;
+    assert.ok(hotCount <= 2, `expected ≤2 chunks from hot.ts, got ${hotCount}`);
+    assert.ok(res.chunks.some((c) => c.chunk.id === 'other'), 'other files still surface');
+  });
+
+  it('drops byte-identical vendored copies, keeping the best-ranked one', async () => {
+    const copyA = chunk('copyA', 'Dup', 'lib/Dup.php', 'repo-a');
+    const copyB = chunk('copyB', 'Dup', 'lib/Dup.php', 'repo-b'); // identical content
+    const store = {
+      vectorSearch: async (): Promise<ScoredChunk[]> => [
+        { chunk: copyA, score: 0.9, source: 'vector' },
+        { chunk: copyB, score: 0.8, source: 'vector' },
+      ],
+      fullTextSearch: async (): Promise<ScoredChunk[]> => [],
+      searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+    } as any;
+    const r = new HybridRetriever(store, embedder, null, config, null, null);
+    const res = await r.retrieve('how does dup work', { mode: 'vector+bm25' });
+    const dups = res.chunks.filter((c) => c.chunk.content === 'code for Dup');
+    assert.equal(dups.length, 1, 'only one identical copy survives');
+    assert.equal(dups[0].chunk.id, 'copyA', 'the higher-ranked copy wins');
+  });
+});
+
+describe('hybrid fusion — graph expansion gating (no reranker)', () => {
+  function trackingGraphStore(calls: { seeds: number }) {
+    return {
+      nodesInFiles: () => { calls.seeds++; return []; },
+      resolveNodes: () => { calls.seeds++; return []; },
+      neighborsOf: () => [],
+      nodeTypes: () => new Map(),
+      close: () => {},
+    } as any;
+  }
+
+  it('skips expansion when the fused pool already fills maxChunks', async () => {
+    const calls = { seeds: 0 };
+    const r = new HybridRetriever(store, embedder, trackingGraphStore(calls), config, null, null);
+    const res = await r.retrieve('CompanySearchResponse', { mode: 'vector+bm25+graph', maxChunks: 1 });
+    assert.equal(calls.seeds, 0, 'graph store must not be touched when it cannot surface');
+    assert.equal(res.chunks.length, 1);
+  });
+
+  it('still expands when the pool cannot fill maxChunks', async () => {
+    const calls = { seeds: 0 };
+    const r = new HybridRetriever(store, embedder, trackingGraphStore(calls), config, null, null);
+    await r.retrieve('CompanySearchResponse', { mode: 'vector+bm25+graph', maxChunks: 10 });
+    assert.ok(calls.seeds > 0, 'graph expansion must run when results are scarce');
   });
 });

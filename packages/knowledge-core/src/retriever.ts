@@ -57,6 +57,11 @@ const AUTO_ROUTE_REPOS =
 // Env-tunable without a redeploy.
 const RRF_K = Number(process.env.CODE_SEARCH_RRF_K) || 10;
 
+// Cap on chunks per (repo, file) in the result surface. One hot file can fill
+// several top-K slots with adjacent chunks — wasted slots at K=5/10, since
+// relevance is judged per file. Env-tunable without a redeploy.
+const MAX_CHUNKS_PER_FILE = Math.max(1, Number(process.env.CODE_SEARCH_MAX_PER_FILE) || 2);
+
 /**
  * Normalize a repos filter from whatever shape an MCP client sent into a clean
  * `string[]`. Clients pass `repos` inconsistently — a JSON array, a single
@@ -175,7 +180,7 @@ export class HybridRetriever {
     const isBareIdentifier =
       trimmed.length > 0 && !/\s/.test(trimmed) && classification.type !== 'natural-language';
     const exactPromise: Promise<ScoredChunk[]> =
-      isBareIdentifier && mode !== 'vector' && mode !== 'bm25'
+      isBareIdentifier && mode !== 'vector'
         ? this.vectorStore.searchByEntityName([trimmed], 20, filter)
         : Promise.resolve([] as ScoredChunk[]);
     const [vectorResults, bm25Results, exactResults] = await Promise.all([
@@ -186,11 +191,14 @@ export class HybridRetriever {
 
     // Single-source shortcuts — no fusion needed
     if (mode === 'vector') {
-      const selected = packWithinBudget(vectorResults, maxTokens, maxChunks);
+      const selected = packWithinBudget(diversifyByFile(vectorResults), maxTokens, maxChunks);
       return { chunks: selected, graphContext: '', totalTokens: sumTokens(selected), query };
     }
     if (mode === 'bm25') {
-      const selected = packWithinBudget(bm25Results, maxTokens, maxChunks);
+      // Exact-tier candidates lead — this mode backs the search_exact tool,
+      // and an entityName equality hit is the most exact evidence available.
+      const merged = dedupeExactContent(deduplicateChunks([...exactResults, ...bm25Results]));
+      const selected = packWithinBudget(diversifyByFile(merged), maxTokens, maxChunks);
       return { chunks: selected, graphContext: '', totalTokens: sumTokens(selected), query };
     }
 
@@ -219,11 +227,21 @@ export class HybridRetriever {
     // downstream, this fused order IS the final order.
     const fused = boostExactSymbol(fusedRaw, query, classification.type);
 
+    // Result-surface shaping on the fused ORDER (best-ranked copy survives):
+    // drop exact-content duplicates (vendored copies of the same file across
+    // repos), then cap chunks-per-file so top-K slots go to distinct files.
+    const fusedPool = diversifyByFile(dedupeExactContent(fused)).slice(0, 15);
+
     // ---------------------------------------------------------------
     // Phase 3 — AST tripartite expansion from fused seeds
     // ---------------------------------------------------------------
+    // With no reranker downstream, expansion candidates are appended AFTER the
+    // fused pool and can only surface when the pool can't fill maxChunks by
+    // itself. Skip the expansion (synchronous SQLite on the event loop)
+    // entirely otherwise — it was pure per-query latency.
     let astChunks: ScoredChunk[] = [];
-    if (useGraph && this.graphStore) {
+    const graphCanSurface = this.reranker !== null || fusedPool.length < maxChunks;
+    if (useGraph && this.graphStore && graphCanSurface) {
       // 3a. Diversified seed selection from FUSED results (not vector-only)
       const seedNodeIds = this.resolveFusedSeeds(fused, 5);
 
@@ -251,8 +269,11 @@ export class HybridRetriever {
     // ---------------------------------------------------------------
     // Phase 4 — Cross-encoder reranking
     // ---------------------------------------------------------------
-    // Combine top-15 RRF + AST expanded chunks, deduplicate
-    const candidatePool = deduplicateChunks([...fused.slice(0, 15), ...astChunks]);
+    // Combine the shaped fused pool + AST expanded chunks; re-apply the
+    // per-file cap since expansion can re-add files already at the cap.
+    const candidatePool = diversifyByFile(
+      dedupeExactContent(deduplicateChunks([...fusedPool, ...astChunks])),
+    );
 
     let finalChunks: ScoredChunk[];
 
@@ -425,6 +446,37 @@ function deduplicateChunks(chunks: ScoredChunk[]): ScoredChunk[] {
   for (const sc of chunks) {
     if (seen.has(sc.chunk.id)) continue;
     seen.add(sc.chunk.id);
+    result.push(sc);
+  }
+  return result;
+}
+
+/** Drop chunks whose content is byte-identical to an earlier one — vendored
+ *  copies of the same file across repos rank as distinct results and waste
+ *  top-K slots. Exact equality only: near-duplicates (diverged copies) are
+ *  genuinely different files and are kept. */
+function dedupeExactContent(chunks: ScoredChunk[]): ScoredChunk[] {
+  if (chunks.length <= 1) return chunks;
+  const seen = new Set<string>();
+  const result: ScoredChunk[] = [];
+  for (const sc of chunks) {
+    if (seen.has(sc.chunk.content)) continue;
+    seen.add(sc.chunk.content);
+    result.push(sc);
+  }
+  return result;
+}
+
+/** Cap chunks per (repo, file), preserving order — one hot file must not fill
+ *  the top-K with adjacent chunks. */
+function diversifyByFile(chunks: ScoredChunk[], cap: number = MAX_CHUNKS_PER_FILE): ScoredChunk[] {
+  const counts = new Map<string, number>();
+  const result: ScoredChunk[] = [];
+  for (const sc of chunks) {
+    const key = `${sc.chunk.repoName}::${sc.chunk.filePath}`;
+    const n = counts.get(key) ?? 0;
+    if (n >= cap) continue;
+    counts.set(key, n + 1);
     result.push(sc);
   }
   return result;
