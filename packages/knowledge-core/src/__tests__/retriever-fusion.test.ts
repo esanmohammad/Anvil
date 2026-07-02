@@ -46,6 +46,22 @@ const store = {
     { chunk: adjacent, score: 0.8, source: 'bm25' },
     { chunk: exactDef, score: 0.7, source: 'bm25' },
   ],
+  searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+} as any;
+
+// Stub store where BOTH probabilistic retrievers miss the definition entirely —
+// only the indexed entityName lookup can recover it.
+const storeMissingDef = {
+  vectorSearch: async (): Promise<ScoredChunk[]> => [
+    { chunk: adjacent, score: 0.9, source: 'vector' },
+  ],
+  fullTextSearch: async (): Promise<ScoredChunk[]> => [
+    { chunk: adjacent, score: 0.8, source: 'bm25' },
+  ],
+  searchByEntityName: async (names: string[]): Promise<ScoredChunk[]> =>
+    names.includes('CompanySearchResponse')
+      ? [{ chunk: exactDef, score: 1, source: 'exact' }]
+      : [],
 } as any;
 
 const embedder = {
@@ -69,5 +85,12 @@ describe('hybrid fusion — exact-symbol boost', () => {
     // Adjacent appears in both lists → wins RRF; nothing is force-pinned.
     const res = await r.retrieve('how does company search work', { mode: 'vector+bm25' });
     assert.equal(res.chunks[0].chunk.id, 'adjacent');
+  });
+
+  it('recovers a definition missed by BOTH vector and BM25 via the exact tier', async () => {
+    const r = new HybridRetriever(storeMissingDef, embedder, null, config, null, null);
+    const res = await r.retrieve('CompanySearchResponse', { mode: 'vector+bm25' });
+    assert.equal(res.chunks[0].chunk.id, 'exact', 'exact tier must inject + surface the definition');
+    assert.ok(res.chunks.some((c) => c.chunk.id === 'adjacent'), 'fused candidates are kept');
   });
 });

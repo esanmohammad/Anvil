@@ -5,7 +5,7 @@
  * with a health endpoint. Each session gets its own Server + Transport pair.
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server as NodeHttpServer, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { ServerConfig } from '../core/env-config.js';
@@ -27,13 +27,18 @@ export interface HttpTransportOptions {
   getStatus?: () => Record<string, unknown>;
   /** Handler for POST /index — allows triggering indexing via REST */
   onIndex?: (body: { path: string; project?: string; force?: boolean }) => Promise<Record<string, unknown>>;
+  /** Stateless MCP mode: a fresh Server+Transport pair per POST, no session
+   *  map. Required for cluster workers — a proxy that opens a new upstream
+   *  connection per request lands each request on a different worker, so
+   *  in-memory sessions cannot stick. GET (SSE) and DELETE return 405. */
+  stateless?: boolean;
 }
 
 interface Session {
   transport: StreamableHTTPServerTransport;
 }
 
-export async function startHttpTransport(opts: HttpTransportOptions): Promise<void> {
+export async function startHttpTransport(opts: HttpTransportOptions): Promise<NodeHttpServer> {
   const { config, createMcpServer, onReady, getHealth } = opts;
   const authenticate = createAuthMiddleware(config);
 
@@ -178,6 +183,37 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<vo
         if (!identity) return;
       }
 
+      if (req.method === 'POST' && opts.stateless) {
+        // Stateless: fresh Server+Transport per request; every worker can
+        // serve every request. JSON responses (no SSE) keep it proxy-friendly.
+        try {
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined,
+            enableJsonResponse: true,
+          });
+          const { server: mcpServer } = await createMcpServer();
+          res.on('close', () => {
+            void transport.close();
+          });
+          await mcpServer.connect(transport);
+          await transport.handleRequest(req, res);
+        } catch {
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Request handling failed' }));
+          }
+        }
+        return;
+      }
+
+      if ((req.method === 'GET' || req.method === 'DELETE') && opts.stateless) {
+        // No sessions to stream from or delete in stateless mode. 405 is the
+        // spec-compliant "server does not offer SSE / session teardown" answer.
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Stateless mode: sessions are not supported' }));
+        return;
+      }
+
       if (req.method === 'POST') {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
@@ -277,11 +313,11 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<vo
     res.end(JSON.stringify({ error: 'Not found' }));
   });
 
-  return new Promise<void>((resolve) => {
+  return new Promise<NodeHttpServer>((resolve) => {
     httpServer.listen(config.port, config.host, () => {
       const url = `http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port}`;
       onReady?.(url);
-      resolve();
+      resolve(httpServer);
     });
   });
 }

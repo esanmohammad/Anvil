@@ -165,7 +165,24 @@ export class HybridRetriever {
     const bm25Promise: Promise<ScoredChunk[]> = useBm25
       ? this.vectorStore.fullTextSearch(query, 50, filter)
       : Promise.resolve([] as ScoredChunk[]);
-    const [vectorResults, bm25Results] = await Promise.all([vectorPromise, bm25Promise]);
+    // Literal exact-symbol tier — for a bare identifier query, fetch chunks
+    // whose entityName equals the query via the BTREE-indexed lookup. Vector
+    // and BM25 can BOTH miss an exact definition (its embedding sits far from
+    // the bare token's; BM25 buries rare-token files under chattier ones), and
+    // the downstream boost can only reorder candidates that were retrieved.
+    // Single-source modes return early below and skip fusion, so skip it there.
+    const trimmed = query.trim();
+    const isBareIdentifier =
+      trimmed.length > 0 && !/\s/.test(trimmed) && classification.type !== 'natural-language';
+    const exactPromise: Promise<ScoredChunk[]> =
+      isBareIdentifier && mode !== 'vector' && mode !== 'bm25'
+        ? this.vectorStore.searchByEntityName([trimmed], 20, filter)
+        : Promise.resolve([] as ScoredChunk[]);
+    const [vectorResults, bm25Results, exactResults] = await Promise.all([
+      vectorPromise,
+      bm25Promise,
+      exactPromise,
+    ]);
 
     // Single-source shortcuts — no fusion needed
     if (mode === 'vector') {
@@ -187,6 +204,10 @@ export class HybridRetriever {
     const weights: number[] = [];
     if (vectorResults.length > 0) { retrievalSets.push(vectorResults); weights.push(wV); }
     if (bm25Results.length > 0) { retrievalSets.push(bm25Results); weights.push(wB); }
+    // Exact tier outweighs both probabilistic sets — entityName equality is
+    // stronger evidence than any rank position (and boostExactSymbol pins
+    // matching candidates to the front regardless).
+    if (exactResults.length > 0) { retrievalSets.push(exactResults); weights.push(1); }
 
     const fusedRaw = retrievalSets.length > 1
       ? reciprocalRankFusion(retrievalSets, weights, RRF_K)

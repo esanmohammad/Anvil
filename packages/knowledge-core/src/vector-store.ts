@@ -249,6 +249,27 @@ export class VectorStore {
     }
   }
 
+  /** Exact-symbol lookup: chunks whose entityName equals one of `names`.
+   *  BTREE-indexed equality (see ensureScalarIndexes) — a definition becomes a
+   *  retrieval candidate even when vector and BM25 both rank it outside their
+   *  top-50 (the literal-recall gap vs trigram engines). */
+  async searchByEntityName(names: string[], limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
+    if (!this.table || names.length === 0) return [];
+    const esc = (s: string) => s.replace(/'/g, "''");
+    const nameCond = `entityName IN (${names.map((n) => `'${esc(n)}'`).join(',')})`;
+    const where = filter ? `(${nameCond}) AND (${filter})` : nameCond;
+    try {
+      const results = await this.table.query().where(where).limit(limit).toArray();
+      return results.map((r: any) => ({
+        chunk: rowToChunk(r),
+        score: 1,
+        source: 'exact' as const,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   /** Get specific chunks by their IDs */
   async getByIds(ids: string[]): Promise<CodeChunk[]> {
     if (!this.table || ids.length === 0) return [];
