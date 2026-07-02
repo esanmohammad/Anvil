@@ -33,13 +33,16 @@ function fixExtensions(dir) {
     if (statSync(p).isDirectory()) { fixExtensions(p); continue; }
     if (!e.endsWith('.js')) continue;
     let content = readFileSync(p, 'utf-8');
-    let fixed = content.replace(/from "(\.\.?\/[^"]+)"/g, (m, path) => {
-      if (path.endsWith('.js') || path.startsWith('@') || path.startsWith('node:')) return m;
-      return `from "${path}.js"`;
-    });
-    fixed = fixed.replace(/import\("(\.\.?\/[^"]+)"\)/g, (m, path) => {
+    // esbuild's transform preserves the source quote style, so match BOTH
+    // quote characters — the double-quote-only regex silently skipped files
+    // whenever esbuild emitted single quotes, shipping unresolvable imports.
+    let fixed = content.replace(/from (["'])(\.\.?\/[^"']+)\1/g, (m, quote, path) => {
       if (path.endsWith('.js')) return m;
-      return `import("${path}.js")`;
+      return `from ${quote}${path}.js${quote}`;
+    });
+    fixed = fixed.replace(/import\((["'])(\.\.?\/[^"']+)\1\)/g, (m, quote, path) => {
+      if (path.endsWith('.js')) return m;
+      return `import(${quote}${path}.js${quote})`;
     });
     if (fixed !== content) writeFileSync(p, fixed);
   }
