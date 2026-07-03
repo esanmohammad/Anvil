@@ -187,7 +187,7 @@ export class KnowledgeIndexer {
     // metadata, so the main thread never accumulates the whole corpus (bounded
     // memory). Concurrency is adaptive; a worker failure falls back to in-thread.
     const repoStats: Array<{ name: string; chunkCount: number; language: string }> = [];
-    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry> }>();
+    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry>; sha: string | null }>();
     const workspaceMaps = new Map<string, WorkspaceMap>();
     const shardPaths: string[] = [];
     // System graph: stream per-repo nodes/edges straight to SQLite as repos
@@ -234,7 +234,7 @@ export class KnowledgeIndexer {
         if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
         repoStats.push({ name: res.repoName, chunkCount: res.chunkCount, language: res.language });
         if (res.chunked) {
-          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {} });
+          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {}, sha: res.sha });
           if (res.shardPath) shardPaths.push(res.shardPath);
         }
         processed++;
@@ -358,8 +358,11 @@ export class KnowledgeIndexer {
 
     // 12. Save per-repo metadata
     for (const repo of reposToIndex) {
-      const sha = getRepoSha(repo.path);
       const result = repoChunkResults.get(repo.name);
+      // Writer mode discards the clone before we get here — the sha was
+      // captured inside the pipeline (pre-discard); fall back to the local
+      // checkout only when the pipeline didn't run for this repo.
+      const sha = result?.sha ?? getRepoSha(repo.path);
       const totalChunkCount = result ? Object.values(result.fileIndex).reduce((sum: number, f: any) => sum + f.chunkCount, 0) : 0;
       if (sha) {
         await writeRepoIndexMeta(storage.blobs, repo.name, {
