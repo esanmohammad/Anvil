@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { runLLM } from './claude-runner.js';
 import type { RepoProfile } from '@esankhan3/anvil-knowledge-core';
 import { getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
+import { FsBlobStore } from './storage/fs-blob-store.js';
 
 // ---------------------------------------------------------------------------
 // Types (internal)
@@ -424,7 +425,7 @@ export async function profileProject(
       continue;
     }
 
-    const cached = loadCachedProfile(kbPath, item.repo.name);
+    const cached = await loadCachedProfile(kbPath, item.repo.name);
     if (cached && cached.fingerprintHash === item.fingerprint.fingerprintHash) {
       progress(`  [CACHED] ${item.repo.name} (fingerprint unchanged)`);
       profiles.push(cached);
@@ -457,7 +458,7 @@ export async function profileProject(
         profiles.push(profile);
 
         // Persist to disk
-        saveProfileToDisk(kbPath, repo.name, profile);
+        await saveProfileToDisk(kbPath, repo.name, profile);
         progress(`  [DONE] ${repo.name} -> ${profile.role} (${profile.domain})`);
       } else {
         const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
@@ -481,37 +482,28 @@ export async function profileProject(
 // Cache / persistence
 // ---------------------------------------------------------------------------
 
-/** Load a cached profile from the KB directory */
-function loadCachedProfile(kbPath: string, repoName: string): RepoProfile | null {
-  const profilePath = join(kbPath, repoName, PROFILE_FILENAME);
+/** Load a cached profile from the KB directory (via BlobStorePort) */
+async function loadCachedProfile(kbPath: string, repoName: string): Promise<RepoProfile | null> {
   try {
-    if (!existsSync(profilePath)) return null;
-    const raw = readFileSync(profilePath, 'utf-8');
-    return JSON.parse(raw) as RepoProfile;
+    return await new FsBlobStore(kbPath).getJson<RepoProfile>(`${repoName}/${PROFILE_FILENAME}`);
   } catch {
     return null;
   }
 }
 
-/** Save a profile to disk under {kbPath}/{repoName}/profile.json */
-function saveProfileToDisk(kbPath: string, repoName: string, profile: RepoProfile): void {
-  const repoDir = join(kbPath, repoName);
-  mkdirSync(repoDir, { recursive: true });
-  const profilePath = join(repoDir, PROFILE_FILENAME);
-  writeFileSync(profilePath, JSON.stringify(profile, null, 2), 'utf-8');
+/** Save a profile under {kbPath}/{repoName}/profile.json (via BlobStorePort;
+ *  putJson pretty-prints — byte-identical to the prior JSON.stringify(…, null, 2)). */
+async function saveProfileToDisk(kbPath: string, repoName: string, profile: RepoProfile): Promise<void> {
+  await new FsBlobStore(kbPath).putJson(`${repoName}/${PROFILE_FILENAME}`, profile);
 }
 
 /**
  * Load a cached profile for a single repo.
  * Returns null if no cached profile exists.
  */
-export function loadProfile(project: string, repoName: string): RepoProfile | null {
-  const kbPath = getKnowledgeBasePath(project);
-  const profilePath = join(kbPath, repoName, PROFILE_FILENAME);
+export async function loadProfile(project: string, repoName: string): Promise<RepoProfile | null> {
   try {
-    if (!existsSync(profilePath)) return null;
-    const raw = readFileSync(profilePath, 'utf-8');
-    return JSON.parse(raw) as RepoProfile;
+    return await new FsBlobStore(getKnowledgeBasePath(project)).getJson<RepoProfile>(`${repoName}/${PROFILE_FILENAME}`);
   } catch {
     return null;
   }
@@ -521,22 +513,23 @@ export function loadProfile(project: string, repoName: string): RepoProfile | nu
  * Load all cached profiles for a project.
  * Scans the project's knowledge base directory for profile.json files.
  */
-export function loadAllProfiles(project: string): RepoProfile[] {
+export async function loadAllProfiles(project: string): Promise<RepoProfile[]> {
   const kbPath = getKnowledgeBasePath(project);
+  const blobs = new FsBlobStore(kbPath);
   const profiles: RepoProfile[] = [];
 
+  // Enumerate top-level repo dirs with a shallow fs scan (cheap; a recursive
+  // blob list would descend into lancedb/. S3 enumeration is a P1 concern);
+  // read each profile through the blob port.
   try {
     if (!existsSync(kbPath)) return profiles;
     const entries = readdirSync(kbPath, { withFileTypes: true });
 
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      const profilePath = join(kbPath, entry.name, PROFILE_FILENAME);
       try {
-        if (!existsSync(profilePath)) continue;
-        const raw = readFileSync(profilePath, 'utf-8');
-        const profile = JSON.parse(raw) as RepoProfile;
-        profiles.push(profile);
+        const profile = await blobs.getJson<RepoProfile>(`${entry.name}/${PROFILE_FILENAME}`);
+        if (profile) profiles.push(profile);
       } catch {
         // Skip malformed profile files
       }

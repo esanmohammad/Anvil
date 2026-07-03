@@ -9,8 +9,7 @@
  */
 
 import type { ScoredChunk, RetrievalResult, EmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
-import type { VectorStore } from '@esankhan3/anvil-knowledge-core';
-import type { GraphStore } from '@esankhan3/anvil-knowledge-core';
+import type { VectorStorePort, GraphStorePort } from '@esankhan3/anvil-knowledge-core';
 import type { Reranker } from '@esankhan3/anvil-knowledge-core';
 import type { QueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { classifyQuery } from '@esankhan3/anvil-knowledge-core';
@@ -56,18 +55,18 @@ function toRepoArray(v: unknown): string[] {
 
 export class HybridRetriever {
   // Expose for testing/debugging
-  readonly vectorStore: VectorStore;
+  readonly vectorStore: VectorStorePort;
   readonly embedder: EmbeddingProvider;
   // System graph is read through the SQLite-backed GraphStore (bounded slice
   // queries) — NOT an in-memory graphology graph. At org scale the graphology
   // graph either didn't exist (only system_graph.sqlite is written) or was
   // multi-GB to load per query; the store keeps graph expansion O(slice).
-  readonly graphStore: GraphStore | null;
+  readonly graphStore: GraphStorePort | null;
 
   constructor(
-    vectorStore: VectorStore,
+    vectorStore: VectorStorePort,
     embedder: EmbeddingProvider,
-    graphStore: GraphStore | null,
+    graphStore: GraphStorePort | null,
     private config: {
       maxChunks: number;
       maxTokens: number;

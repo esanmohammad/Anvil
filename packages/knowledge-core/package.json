@@ -36,7 +36,8 @@
     "web-tree-sitter": "0.26.8"
   },
   "optionalDependencies": {
-    "better-sqlite3": "^11.10.0"
+    "better-sqlite3": "^11.10.0",
+    "mongodb": "^6.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.2"

@@ -29,11 +29,13 @@ export * from './workspace-detector.js';
 export * from './embedder.js';
 export * from './vector-store.js';
 export * from './graph-store.js';
+export * from './storage/index.js';
 export * from './reranker.js';
 export * from './claude-runner.js';
 export * from './repo-profiler.js';
 export * from './service-mesh-inferrer.js';
 export * from './rag-evaluator.js';
+export * from './vector-recall.js';
 export * from './ast-graph-builder.js';
 // project-graph-builder.ts re-exports the class from project-graph-builder-core.ts,
 // so a single barrel entry covers both modules without duplicate-name conflicts.

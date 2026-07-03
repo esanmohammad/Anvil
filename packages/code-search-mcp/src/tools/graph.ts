@@ -10,11 +10,12 @@
  * `<KB>/<repo>/graph.json`. Node key convention: `repo::filePath::entity`.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
 import {
   getKnowledgeBasePath,
+  getBlobStore,
   loadAllProfiles,
   loadProfile,
   getAllChanges,
@@ -231,12 +232,12 @@ export async function handleGraphTool(
 
   try {
     const kbPath = getKnowledgeBasePath(ctx.projectName);
+    const blobs = getBlobStore(ctx.projectName);
 
     if (name === 'get_repo_graph') {
       const repo = args.repo as string;
-      const graphPath = join(kbPath, repo, 'graph.json');
-      if (!existsSync(graphPath)) return text(`No graph found for repo "${repo}"`);
-      const graph = JSON.parse(readFileSync(graphPath, 'utf-8'));
+      const graph = await blobs.getJson<{ nodes?: any[]; links?: any[] }>(`${repo}/graph.json`);
+      if (!graph) return text(`No graph found for repo "${repo}"`);
       const summary = `# ${repo} AST Graph\n\n- **Nodes:** ${graph.nodes?.length ?? 0}\n- **Edges:** ${graph.links?.length ?? 0}\n\n## Entities\n${(graph.nodes ?? []).slice(0, 50).map((n: any) => `- \`${n.id}\` (${n.type})`).join('\n')}\n\n${graph.nodes?.length > 50 ? `... and ${graph.nodes.length - 50} more` : ''}`;
       return text(summary);
     }
@@ -342,9 +343,8 @@ export async function handleGraphTool(
     if (name === 'find_dead_code') {
       const repo = args.repo as string;
       const limit = (args.limit as number) || 50;
-      const graphPath = join(kbPath, repo, 'graph.json');
-      if (!existsSync(graphPath)) return text(`No graph found for repo "${repo}"`);
-      const graph = JSON.parse(readFileSync(graphPath, 'utf-8'));
+      const graph = await blobs.getJson<{ nodes?: any[]; links?: any[] }>(`${repo}/graph.json`);
+      if (!graph) return text(`No graph found for repo "${repo}"`);
       const ENTITY_TYPES = new Set(['function', 'method', 'class', 'struct', 'enum', 'trait']);
       const inDegree = new Map<string, number>();
       for (const l of (graph.links ?? []) as any[]) {
@@ -363,7 +363,7 @@ export async function handleGraphTool(
       const repo = args.repo as string | undefined;
 
       if (repo) {
-        const profile = loadProfile(ctx.projectName, repo);
+        const profile = await loadProfile(ctx.projectName, repo);
         if (!profile) return text(`No profile for "${repo}". Run profiling (requires LLM) to generate one.`);
         const ep = (xs: any[]) => xs?.length ? xs.map((e) => `  - ${e.type}: ${e.identifier} — ${e.description}`).join('\n') : '  - (none)';
         const body = [
@@ -376,8 +376,7 @@ export async function handleGraphTool(
         return text(body);
       }
 
-      const pgPath = join(kbPath, 'PROJECT_GRAPH.json');
-      const pg = existsSync(pgPath) ? JSON.parse(readFileSync(pgPath, 'utf-8')) : null;
+      const pg = await blobs.getJson<any>('PROJECT_GRAPH.json');
       if (pg) {
         const lines: string[] = ['# Project Architecture', '', pg.architectureSummary ?? ''];
         if (pg.repoRoles && Object.keys(pg.repoRoles).length) {
@@ -400,10 +399,10 @@ export async function handleGraphTool(
         return text(lines.join('\n'));
       }
 
-      const summaryPath = join(kbPath, 'PROJECT_SUMMARY.md');
-      if (existsSync(summaryPath)) return text(readFileSync(summaryPath, 'utf-8'));
+      const summaryText = await blobs.getText('PROJECT_SUMMARY.md');
+      if (summaryText !== null) return text(summaryText);
 
-      const profiles = loadAllProfiles(ctx.projectName);
+      const profiles = await loadAllProfiles(ctx.projectName);
       if (profiles.length) {
         return text(`# Project Repos\n\n${profiles.map((p) => `- **${p.name}** — ${p.role} (${p.domain}): ${p.description}`).join('\n')}\n\n_Run project-graph generation (requires LLM) for a full architecture view._`);
       }
@@ -439,10 +438,10 @@ export async function handleGraphTool(
 
       let baseSha = args.baseSha as string | undefined;
       if (!baseSha) {
-        const metaPath = join(kbPath, repo, 'index_meta.json');
-        if (existsSync(metaPath)) {
-          try { baseSha = JSON.parse(readFileSync(metaPath, 'utf-8')).lastIndexedSha; } catch { /* ignore */ }
-        }
+        try {
+          const meta = await blobs.getJson<{ lastIndexedSha?: string }>(`${repo}/index_meta.json`);
+          baseSha = meta?.lastIndexedSha;
+        } catch { /* ignore */ }
       }
       if (!baseSha) return text('No base commit available. Pass baseSha, or index the repo first so a last-indexed SHA exists.');
 

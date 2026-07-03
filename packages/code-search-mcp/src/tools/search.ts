@@ -2,10 +2,8 @@
  * Search tools — hybrid, semantic, and keyword search.
  */
 
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
-import { getRetriever, getKnowledgeBasePath, findChunksInFile } from '@esankhan3/anvil-knowledge-core';
+import { getRetriever, getBlobStore, findChunksInProject } from '@esankhan3/anvil-knowledge-core';
 
 export function registerSearchTools() {
   return [
@@ -132,22 +130,21 @@ async function handleGetCodeSnippet(
     return { content: [{ type: 'text', text: 'Provide id="repo::file::entity" or repo + file (entity optional).' }] };
   }
 
-  const chunksPath = join(getKnowledgeBasePath(ctx.projectName), 'chunks.json');
-  if (!existsSync(chunksPath)) {
+  if (!(await getBlobStore(ctx.projectName).exists('chunks.json'))) {
     return { content: [{ type: 'text', text: 'No index found — chunks.json missing. Index the project first.' }] };
   }
 
   try {
-    // Stream with early-exit. chunks.json is NDJSON at org scale;
-    // findChunksInFile also reads the legacy single-array format.
-    let matches = await findChunksInFile(
-      chunksPath,
+    // Stream with early-exit through the blob port. chunks.json is NDJSON at
+    // org scale; the fs adapter also reads the legacy single-array format.
+    let matches = await findChunksInProject(
+      ctx.projectName,
       (c) => c.repoName === repo && c.filePath === file && (!entity || c.entityName === entity),
       5,
     );
     // Fallback: entity may live in a differently-named file — match by entity within repo.
     if (matches.length === 0 && entity) {
-      matches = await findChunksInFile(chunksPath, (c) => c.repoName === repo && c.entityName === entity, 5);
+      matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && c.entityName === entity, 5);
     }
     if (matches.length === 0) {
       return { content: [{ type: 'text', text: `No snippet found for ${repo}::${file}${entity ? `::${entity}` : ''}` }] };

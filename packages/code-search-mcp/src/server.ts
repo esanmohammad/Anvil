@@ -11,15 +11,13 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 
 import { registerSearchTools, handleSearchTool } from './tools/search.js';
 import { registerGraphTools, handleGraphTool } from './tools/graph.js';
 import { registerProfileTools, handleProfileTool } from './tools/profile.js';
 import { registerIndexTools, handleIndexTool } from './tools/index-tools';
 import { registerResources, handleResource } from './resources/resources';
-import { getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
+import { getBlobStore } from '@esankhan3/anvil-knowledge-core';
 import { indexFromPath } from '@esankhan3/anvil-knowledge-core';
 import { loadServerConfig, type ServerConfig } from './core/env-config.js';
 import { toKnowledgeConfig } from './core/config.js';
@@ -317,11 +315,11 @@ async function trackedIndex(
 
 async function autoIndex(ctx: ServerContext): Promise<void> {
   try {
-    const kbPath = getKnowledgeBasePath(ctx.projectName);
-    const hasLanceDB = existsSync(join(kbPath, 'lancedb'));
+    const blobs = getBlobStore(ctx.projectName);
+    const hasLanceDB = await blobs.exists('lancedb');
     // System graph is now SQLite (system_graph.sqlite); accept the legacy JSON
     // too so pre-migration indexes still read as ready.
-    const hasGraph = existsSync(join(kbPath, 'system_graph.sqlite')) || existsSync(join(kbPath, 'system_graph_v2.json'));
+    const hasGraph = (await blobs.exists('system_graph.sqlite')) || (await blobs.exists('system_graph_v2.json'));
 
     if (hasLanceDB && hasGraph) {
       ctx.indexReady = true;

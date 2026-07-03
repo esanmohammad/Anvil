@@ -9,7 +9,7 @@
  * graph + metadata cross the worker boundary (never the chunks themselves).
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
 import { chunkRepo, chunkChangedFiles } from './chunker.js';
@@ -17,6 +17,7 @@ import { buildAstGraph, incrementalGraphUpdate, generateGraphReport } from './as
 import { detectWorkspace } from './workspace-detector.js';
 import { getAllChanges, getChangedFilesList, getDeletedFilesList } from './git-diff.js';
 import { createChunkWriter } from './chunks-io.js';
+import { FsBlobStore } from './storage/fs-blob-store.js';
 import { initTreeSitter } from './tree-sitter-parser.js';
 // Type-only (erased at runtime — keeps the worker lean): from the package barrel.
 import type { FileIndexEntry, WorkspaceMap, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
@@ -37,11 +38,9 @@ export function getRepoSha(repoPath: string): string | null {
   }
 }
 
-export function readRepoIndexMeta(basePath: string, repoName: string): RepoIndexMeta | null {
-  const metaPath = join(basePath, repoName, 'index_meta.json');
-  if (!existsSync(metaPath)) return null;
+export async function readRepoIndexMeta(basePath: string, repoName: string): Promise<RepoIndexMeta | null> {
   try {
-    return JSON.parse(readFileSync(metaPath, 'utf-8'));
+    return await new FsBlobStore(basePath).getJson<RepoIndexMeta>(`${repoName}/index_meta.json`);
   } catch {
     return null;
   }
@@ -81,7 +80,7 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
   const repoKbDir = join(basePath, repoName);
   mkdirSync(repoKbDir, { recursive: true });
 
-  const meta = force ? null : readRepoIndexMeta(basePath, repoName);
+  const meta = force ? null : await readRepoIndexMeta(basePath, repoName);
   const diff = force ? null : (meta?.lastIndexedSha ? getAllChanges(repoPath, meta.lastIndexedSha) : null);
   const useIncremental =
     !!diff && !diff.fallbackToFull && diff.added.length + diff.modified.length + diff.deleted.length > 0;
@@ -121,9 +120,10 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
 
   let graph: GraphifyOutput | null = null;
   try {
-    const existingGraphPath = join(repoKbDir, 'graph.json');
-    if (useIncremental && existsSync(existingGraphPath)) {
-      const existingGraph = JSON.parse(readFileSync(existingGraphPath, 'utf-8'));
+    const blobs = new FsBlobStore(basePath);
+    const graphKey = `${repoName}/graph.json`;
+    const existingGraph = useIncremental ? await blobs.getJson<GraphifyOutput>(graphKey) : null;
+    if (existingGraph) {
       graph = await incrementalGraphUpdate(
         existingGraph,
         getChangedFilesList(diff!),
@@ -134,8 +134,9 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
     } else {
       graph = await buildAstGraph(repoPath, { workspaceMap: workspaceMap ?? undefined });
     }
-    writeFileSync(existingGraphPath, JSON.stringify(graph));
-    writeFileSync(join(repoKbDir, 'GRAPH_REPORT.md'), generateGraphReport(repoName, graph));
+    // graph.json stays compact (JSON.stringify, no indent) for byte-parity.
+    await blobs.putText(graphKey, JSON.stringify(graph));
+    await blobs.putText(`${repoName}/GRAPH_REPORT.md`, generateGraphReport(repoName, graph));
   } catch {
     graph = null; // AST failure is non-fatal (matches prior buildKB behavior)
   }

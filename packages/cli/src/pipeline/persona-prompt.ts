@@ -180,7 +180,7 @@ export async function buildPersonaProjectPrompt(
         ? conventionText.split('\n').map((l) => l.replace(/^- /, ''))
         : [];
 
-      knowledgeGraph = assembleLayeredContext(
+      knowledgeGraph = await assembleLayeredContext(
         {
           project,
           feature,

@@ -1,7 +1,8 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import type { EmbeddingProvider, RepoProfile } from '@esankhan3/anvil-knowledge-core';
 import { getKnowledgeBasePath } from './config.js';
+import { loadAllProfiles } from './repo-profiler.js';
+import { FsBlobStore } from './storage/fs-blob-store.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -212,13 +213,9 @@ export class QueryRouter {
    * Load cached embeddings from disk (skip re-embedding).
    * Returns true if cache was loaded successfully.
    */
-  loadCached(cachePath: string): boolean {
-    const filePath = join(cachePath, 'profile_embeddings.json');
-    if (!existsSync(filePath)) return false;
-
+  async loadCached(cachePath: string): Promise<boolean> {
     try {
-      const raw = readFileSync(filePath, 'utf-8');
-      const data = JSON.parse(raw) as ProfileEmbedding[];
+      const data = await new FsBlobStore(cachePath).getJson<ProfileEmbedding[]>('profile_embeddings.json');
       if (!Array.isArray(data) || data.length === 0) return false;
 
       // Validate structure of first entry
@@ -242,13 +239,9 @@ export class QueryRouter {
   /**
    * Save embeddings to disk for future use.
    */
-  saveCached(cachePath: string): void {
-    const filePath = join(cachePath, 'profile_embeddings.json');
-    const dir = dirname(filePath);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
-    }
-    writeFileSync(filePath, JSON.stringify(this.profileEmbeddings, null, 2), 'utf-8');
+  async saveCached(cachePath: string): Promise<void> {
+    // putJson pretty-prints (byte-identical to the prior write) + creates parents.
+    await new FsBlobStore(cachePath).putJson('profile_embeddings.json', this.profileEmbeddings);
   }
 
   /**
@@ -299,41 +292,17 @@ export async function createQueryRouter(
   project: string,
   embedder: EmbeddingProvider,
 ): Promise<QueryRouter | null> {
-  const kbPath = getKnowledgeBasePath(project);
-  if (!existsSync(kbPath)) return null;
-
-  // Collect all repo profiles from {kbPath}/{repo}/profile.json
-  const profiles: RepoProfile[] = [];
-  let entries: string[];
-  try {
-    entries = readdirSync(kbPath, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => d.name);
-  } catch {
-    return null;
-  }
-
-  for (const repoDir of entries) {
-    const profilePath = join(kbPath, repoDir, 'profile.json');
-    if (!existsSync(profilePath)) continue;
-
-    try {
-      const raw = readFileSync(profilePath, 'utf-8');
-      const profile = JSON.parse(raw) as RepoProfile;
-      if (profile.name && profile.role) {
-        profiles.push(profile);
-      }
-    } catch {
-      // Skip malformed profile files
-    }
-  }
+  // Collect repo profiles through the shared (port-backed) loader; keep only
+  // those carrying the fields routing needs.
+  const profiles = (await loadAllProfiles(project)).filter((p) => p.name && p.role);
 
   if (profiles.length === 0) return null;
 
+  const kbPath = getKnowledgeBasePath(project);
   const router = new QueryRouter(embedder);
 
   // Try loading cached embeddings first
-  if (router.loadCached(kbPath)) {
+  if (await router.loadCached(kbPath)) {
     // Verify cache is still consistent: same repos, same count
     const cachedRepos = new Set(router.getAllRepos());
     const currentRepos = new Set(profiles.map((p) => p.name));
@@ -349,7 +318,7 @@ export async function createQueryRouter(
 
   // Embed all profiles and cache for next time
   await router.init(profiles);
-  router.saveCached(kbPath);
+  await router.saveCached(kbPath);
 
   return router;
 }

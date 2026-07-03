@@ -1,21 +1,22 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
 import type { FileIndexEntry } from '@esankhan3/anvil-knowledge-core';
 import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
-import { VectorStore } from '@esankhan3/anvil-knowledge-core';
+import { resolveStorage } from './storage/resolve.js';
+import type { BlobStorePort } from './storage/ports.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { detectCrossRepoEdges } from '@esankhan3/anvil-knowledge-core';
 import { HybridRetriever } from './retriever.js';
-import { loadKnowledgeConfig, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
+import { loadKnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap } from '@esankhan3/anvil-knowledge-core';
 import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
 import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
 import { computeStructuralHash } from '@esankhan3/anvil-knowledge-core';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
-import { createChunkWriter, iterateChunksFile } from './chunks-io.js';
-import { writeSystemGraphSqlite, openSystemGraphStore, createSystemGraphSqliteWriter } from './graph-store.js';
+import { iterateChunksFile } from './chunks-io.js';
+import { writeSystemGraphSqlite, createSystemGraphSqliteWriter } from './graph-store.js';
 import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
 import { processRepoPipeline, getRepoSha, readRepoIndexMeta } from './repo-pipeline.js';
 import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
@@ -26,10 +27,11 @@ import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
 
 // RepoIndexMeta, getRepoSha, readRepoIndexMeta moved to repo-pipeline.ts (shared
 // with the worker). writeRepoIndexMeta stays here — only buildKB writes meta.
-function writeRepoIndexMeta(basePath: string, repoName: string, meta: RepoIndexMeta): void {
-  const dir = join(basePath, repoName);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'index_meta.json'), JSON.stringify(meta, null, 2), 'utf-8');
+// Routed through BlobStorePort (P0c); putJson pretty-prints, byte-identical to
+// the prior JSON.stringify(meta, null, 2). (readRepoIndexMeta — the shared
+// exported reader — is still raw fs; it reads the same bytes. P0c-2 ports it.)
+async function writeRepoIndexMeta(blobs: BlobStorePort, repoName: string, meta: RepoIndexMeta): Promise<void> {
+  await blobs.putJson(`${repoName}/index_meta.json`, meta);
 }
 
 /**
@@ -42,26 +44,29 @@ function writeRepoIndexMeta(basePath: string, repoName: string, meta: RepoIndexM
  */
 async function dedupShardsToChunks(
   shardPaths: string[],
-  chunksPath: string,
+  blobs: BlobStorePort,
+  chunksKey: string,
 ): Promise<{ kept: number; dropped: number; tokens: number }> {
+  // Shards are transient local scratch — read raw. Survivors stream straight
+  // into the durable chunks blob via putNdjson (byte-identical NDJSON to the
+  // prior createChunkWriter); counts are tallied inside the generator and read
+  // back after putNdjson drains it.
   const seen = new Set<string>();
-  const writer = createChunkWriter(chunksPath);
   let kept = 0, dropped = 0, tokens = 0;
-  try {
+  async function* survivors(): AsyncGenerator<CodeChunk> {
     for (const sp of shardPaths) {
       if (!existsSync(sp)) continue;
       for await (const c of iterateChunksFile(sp)) {
         const h = computeStructuralHash(c.content, c.language).hash;
         if (seen.has(h)) { dropped++; continue; }
         seen.add(h);
-        writer.write(c);
         kept++;
         tokens += c.tokens;
+        yield c;
       }
     }
-  } finally {
-    writer.close();
   }
+  await blobs.putNdjson(chunksKey, survivors());
   return { kept, dropped, tokens };
 }
 
@@ -117,7 +122,8 @@ export class KnowledgeIndexer {
     const log = opts?.onProgress ?? (() => {});
     const report = opts?.onDetailedProgress ?? (() => {});
     const startTime = Date.now();
-    const basePath = getKnowledgeBasePath(project);
+    const storage = resolveStorage(project, config);
+    const basePath = storage.basePath;
     mkdirSync(basePath, { recursive: true });
 
     // 1. Determine which repos need re-indexing (SHA check)
@@ -130,7 +136,7 @@ export class KnowledgeIndexer {
         continue;
       }
       const currentSha = getRepoSha(repo.path);
-      const meta = readRepoIndexMeta(basePath, repo.name);
+      const meta = await readRepoIndexMeta(basePath, repo.name);
       if (meta && currentSha && meta.lastIndexedSha === currentSha) {
         skippedRepos.push(repo.name);
         log(`Skipping ${repo.name} — unchanged (${currentSha.slice(0, 7)})`);
@@ -233,7 +239,7 @@ export class KnowledgeIndexer {
       },
     });
     for (const name of skippedRepos) {
-      const meta = readRepoIndexMeta(basePath, name);
+      const meta = await readRepoIndexMeta(basePath, name);
       repoStats.push({ name, chunkCount: meta?.chunkCount ?? 0, language: '' });
     }
 
@@ -241,7 +247,7 @@ export class KnowledgeIndexer {
     // (bounded memory; replaces the in-RAM dedup that OOM'd at org scale).
     report({ phase: 'dedup', message: 'Deduplicating chunks (streaming)...', percent: 68, etaSeconds: -1 });
     const chunksPath = join(basePath, 'chunks.json');
-    const dedup = await dedupShardsToChunks(shardPaths, chunksPath);
+    const dedup = await dedupShardsToChunks(shardPaths, storage.blobs, 'chunks.json');
     const dedupedChunkCount = dedup.kept;
     const dedupedTokenSum = dedup.tokens;
     if (dedup.dropped > 0) log(`Structural dedup: ${dedup.dropped} duplicates removed`);
@@ -264,7 +270,7 @@ export class KnowledgeIndexer {
     if (isLlmAvailable()) {
       report({ phase: 'service-mesh', message: 'Inferring service mesh from profiles...', percent: 80, etaSeconds: -1 });
       try {
-        const profiles = loadAllProfiles(project);
+        const profiles = await loadAllProfiles(project);
         if (profiles.length > 0) {
           log(`Inferring service mesh from ${profiles.length} profiles...`);
           const meshEdges = await inferServiceMesh(profiles, {
@@ -311,9 +317,9 @@ export class KnowledgeIndexer {
         if (wroteSqlite) {
           log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')}`);
         } else {
-          const graphOutputPath = join(basePath, 'system_graph_v2.json');
-          writeFileSync(graphOutputPath, JSON.stringify(graphBuilder!.exportJson()));
-          log(`Saved project graph to ${graphOutputPath} (no sqlite driver; JSON fallback)`);
+          // No sqlite driver → legacy compact JSON blob (byte-parity via putText).
+          await storage.blobs.putText('system_graph_v2.json', JSON.stringify(graphBuilder!.exportJson()));
+          log(`Saved project graph to ${join(basePath, 'system_graph_v2.json')} (no sqlite driver; JSON fallback)`);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -341,8 +347,7 @@ export class KnowledgeIndexer {
         allStaleFiles.push({ repoName: repo.name, filePath: f });
       }
     }
-    const deletedPath = join(basePath, 'deleted_files.json');
-    writeFileSync(deletedPath, JSON.stringify(allStaleFiles));
+    await storage.blobs.putText('deleted_files.json', JSON.stringify(allStaleFiles));
 
     // 12. Save per-repo metadata
     for (const repo of reposToIndex) {
@@ -350,7 +355,7 @@ export class KnowledgeIndexer {
       const result = repoChunkResults.get(repo.name);
       const totalChunkCount = result ? Object.values(result.fileIndex).reduce((sum: number, f: any) => sum + f.chunkCount, 0) : 0;
       if (sha) {
-        writeRepoIndexMeta(basePath, repo.name, {
+        await writeRepoIndexMeta(storage.blobs, repo.name, {
           lastIndexedSha: sha,
           lastIndexedAt: new Date().toISOString(),
           chunkCount: totalChunkCount,
@@ -389,18 +394,18 @@ export class KnowledgeIndexer {
     const log = opts?.onProgress ?? (() => {});
     const report = opts?.onDetailedProgress ?? (() => {});
     const startTime = Date.now();
-    const basePath = getKnowledgeBasePath(project);
+    const storage = resolveStorage(project, config);
+    const basePath = storage.basePath;
 
-    const chunksPath = join(basePath, 'chunks.json');
-    if (!existsSync(chunksPath)) {
+    const chunksPath = join(basePath, 'chunks.json'); // for display in logs/errors
+    if (!(await storage.blobs.exists('chunks.json'))) {
       throw new Error(`No chunks found — run Build KB first. Expected: ${chunksPath}`);
     }
 
     // Open vector store. healCorrupt: this is the write/rebuild path, so if a
     // prior run left the table corrupt (killed mid-write → 0-byte fragment),
     // drop it and rebuild from chunks.json rather than failing every reindex.
-    const dbPath = join(basePath, 'lancedb');
-    const vectorStore = new VectorStore(dbPath);
+    const vectorStore = storage.vectors;
     await vectorStore.init({ healCorrupt: true });
 
     // Which chunks are already embedded (id-set diff). Bounded: holds only the
@@ -414,7 +419,7 @@ export class KnowledgeIndexer {
       }
     } catch { /* first run — no existing data */ }
 
-    const deletedFiles = this.getDeletedFiles(basePath);
+    const deletedFiles = await this.getDeletedFiles(storage.blobs);
 
     // Pass 1 — stream chunks.json to tally totals + how many need embedding,
     // WITHOUT ever holding all chunks in memory. At org scale (~810k chunks,
@@ -427,7 +432,7 @@ export class KnowledgeIndexer {
     let totalTokens = 0;
     let newChunkCount = 0;
     const repoChunkCounts = new Map<string, number>();
-    for await (const c of iterateChunksFile(chunksPath)) {
+    for await (const c of storage.blobs.iterateNdjson<CodeChunk>('chunks.json')) {
       totalChunks++;
       totalTokens += c.tokens;
       repoChunkCounts.set(c.repoName, (repoChunkCounts.get(c.repoName) ?? 0) + 1);
@@ -444,6 +449,9 @@ export class KnowledgeIndexer {
       // the only one a re-run reaches. Cheap relative to embedding; idempotent.
       log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
       await vectorStore.ensureFtsIndex();
+      // Heal a missing IVF_PQ index too (a prior run could have aborted before
+      // building it); no-op unless storage.vector.lancedb.index is configured.
+      await vectorStore.ensureVectorIndex();
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
       return {
         project,
@@ -558,7 +566,7 @@ export class KnowledgeIndexer {
     };
 
     let batch: CodeChunk[] = [];
-    for await (const c of iterateChunksFile(chunksPath)) {
+    for await (const c of storage.blobs.iterateNdjson<CodeChunk>('chunks.json')) {
       if (aborted) break;
       if (existingIds.has(c.id)) continue;
       batch.push(c);
@@ -578,19 +586,23 @@ export class KnowledgeIndexer {
     if (newChunkCount > 0) {
       await vectorStore.ensureFtsIndex();
     }
+    // Build/retrain the IVF_PQ vector index (no-op unless configured + table ≥
+    // minRows). After a full rebuild the table was recreated, so this trains
+    // fresh centroids; incremental adds are absorbed by the existing index.
+    await vectorStore.ensureVectorIndex();
     log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
 
     // Update metadata (repoNames was computed during pass 1).
     for (const repoName of repoNames) {
-      const metaPath = join(basePath, repoName, 'index_meta.json');
-      if (existsSync(metaPath)) {
-        try {
-          const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      const metaKey = `${repoName}/index_meta.json`;
+      try {
+        const meta = await storage.blobs.getJson<RepoIndexMeta>(metaKey);
+        if (meta) {
           meta.embeddingProvider = embedder.name;
           meta.lastIndexedAt = new Date().toISOString();
-          writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
-        } catch { /* ok */ }
-      }
+          await storage.blobs.putJson(metaKey, meta);
+        }
+      } catch { /* ok */ }
     }
 
     const durationMs = Date.now() - startTime;
@@ -610,11 +622,9 @@ export class KnowledgeIndexer {
   }
 
   /** Read the deleted files list saved by buildKB */
-  private getDeletedFiles(basePath: string): Array<{ repoName: string; filePath: string }> {
-    const deletedPath = join(basePath, 'deleted_files.json');
-    if (!existsSync(deletedPath)) return [];
+  private async getDeletedFiles(blobs: BlobStorePort): Promise<Array<{ repoName: string; filePath: string }>> {
     try {
-      return JSON.parse(readFileSync(deletedPath, 'utf-8'));
+      return (await blobs.getJson<Array<{ repoName: string; filePath: string }>>('deleted_files.json')) ?? [];
     } catch {
       return [];
     }
@@ -643,9 +653,9 @@ export class KnowledgeIndexer {
 
   /** Load index statistics for a project */
   async getStats(project: string): Promise<IndexStats> {
-    const basePath = getKnowledgeBasePath(project);
-    const dbPath = join(basePath, 'lancedb');
-    const store = new VectorStore(dbPath);
+    const storage = resolveStorage(project);
+    const basePath = storage.basePath;
+    const store = storage.vectors;
     await store.init();
     const stats = await store.getStats();
 
@@ -657,7 +667,7 @@ export class KnowledgeIndexer {
     try {
       const { readdirSync } = await import('node:fs');
       for (const entry of readdirSync(basePath)) {
-        const meta = readRepoIndexMeta(basePath, entry);
+        const meta = await readRepoIndexMeta(basePath, entry);
         if (meta) {
           repos.push({ name: entry, chunkCount: meta.chunkCount, language: '' });
           if (meta.embeddingProvider !== 'unknown') provider = meta.embeddingProvider;
@@ -841,11 +851,11 @@ export async function getRetriever(
   configOverride?: KnowledgeConfig,
 ): Promise<HybridRetriever> {
   const config = configOverride ?? loadKnowledgeConfig(project);
-  const basePath = getKnowledgeBasePath(project);
+  const storage = resolveStorage(project, config);
+  const basePath = storage.basePath;
 
   // Load vector store
-  const dbPath = join(basePath, 'lancedb');
-  const vectorStore = new VectorStore(dbPath);
+  const vectorStore = storage.vectors;
   await vectorStore.init();
 
   // Open the system-graph store for graph-augmented retrieval. It prefers
@@ -854,7 +864,7 @@ export async function getRetriever(
   // runs vector + BM25 only. This replaces loading the whole graph into an
   // in-memory graphology graph per query — which at org scale either didn't
   // exist (only the sqlite is written) or was multi-GB to parse.
-  const graphStore = await openSystemGraphStore(basePath);
+  const graphStore = await storage.graph();
 
   // Create embedding provider for query-time embedding
   const embedder = createEmbeddingProvider(config.embedding);
@@ -865,7 +875,7 @@ export async function getRetriever(
   try {
     if (existsSync(basePath)) {
       for (const entry of readdirSync(basePath)) {
-        const meta = readRepoIndexMeta(basePath, entry);
+        const meta = await readRepoIndexMeta(basePath, entry);
         if (!meta || !meta.embeddingProvider || meta.embeddingProvider === 'pending') continue;
         if (meta.embeddingProvider !== embedder.name) {
           throw new Error(

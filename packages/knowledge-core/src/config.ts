@@ -61,6 +61,51 @@ export interface RerankerProviderConfig {
   timeoutMs?: number;
 }
 
+/**
+ * Optional pluggable-storage block (storage-abstraction ADR §6). Absent ⇒
+ * today's behavior exactly: local filesystem blobs + LanceDB vectors + SQLite
+ * graph. P0 implements only those defaults; `s3`/`mongo` backends land in
+ * P1/P2 and `resolveStorage` rejects them with a clear error until then.
+ */
+export interface KnowledgeStorageConfig {
+  blob?: {
+    backend?: 'fs' | 's3' | 'mongo'; // default 'fs'
+    basePath?: string; // fs: overrides getKnowledgeBasePath(project)
+    s3?: { bucket: string; prefix?: string; endpoint?: string; region?: string };
+    mongo?: { uri: string; db: string; gridfsBucket?: string };
+  };
+  vector?: {
+    backend?: 'lancedb' | 'mongo'; // default 'lancedb'
+    lancedb?: {
+      /** 'file://…'/local dir (default), or 's3://<bucket>/<prefix>' for MinIO/S3. */
+      uri?: string;
+      /** S3/MinIO connection (only when uri is s3://). Access key/secret come from
+       *  env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY via Vault), not config. */
+      s3?: {
+        endpoint?: string;            // e.g. lb-object-storage-internal.brevo.tech
+        region?: string;              // required by LanceDB even for MinIO (any label)
+        virtualHostedStyle?: boolean; // MUST be false for MinIO (path-style)
+        allowHttp?: boolean;          // true if endpoint is plain http
+      };
+      /** IVF_PQ build params (P1c); omit ⇒ flat/exact scan. */
+      index?: {
+        type: 'ivf_pq';
+        numPartitions?: number;
+        numSubVectors?: number;
+        minRows?: number;
+        nprobes?: number;
+        refineFactor?: number;
+      };
+    };
+    mongo?: { uri: string; db: string; collection: string; ftsViaText?: boolean };
+  };
+  graph?: {
+    backend?: 'sqlite' | 'mongo'; // default 'sqlite'
+    mongo?: { uri: string; db: string; nodesCollection?: string; edgesCollection?: string };
+  };
+  cache?: { dir: string; maxBytes?: number; mode?: 'read-through' | 'ram' | 'none' };
+}
+
 export interface KnowledgeConfig {
   embedding: EmbeddingProviderConfig;
   chunking: {
@@ -78,6 +123,8 @@ export interface KnowledgeConfig {
     reranker: RerankerProviderConfig | RerankerProviderId;
   };
   autoIndex: boolean;
+  /** Pluggable storage (ADR §6). Optional — omit for today's local defaults. */
+  storage?: KnowledgeStorageConfig;
 }
 
 export const DEFAULT_CONFIG: KnowledgeConfig = {
@@ -111,6 +158,9 @@ export function cloneKnowledgeConfig(c: KnowledgeConfig): KnowledgeConfig {
           : { ...c.retrieval.reranker },
     },
     autoIndex: c.autoIndex,
+    // Deep-clone the optional storage block so env-overlay edits can't mutate
+    // the caller's struct. Plain JSON config → JSON round-trip is sufficient.
+    ...(c.storage ? { storage: JSON.parse(JSON.stringify(c.storage)) as KnowledgeStorageConfig } : {}),
   };
 }
 
