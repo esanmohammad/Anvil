@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, rmSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
 import type { FileIndexEntry } from '@esankhan3/anvil-knowledge-core';
 import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 import { resolveStorage } from './storage/resolve.js';
-import type { BlobStorePort } from './storage/ports.js';
+import type { BlobStorePort, StorageBundle } from './storage/ports.js';
+import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { detectCrossRepoEdges } from '@esankhan3/anvil-knowledge-core';
 import { HybridRetriever } from './retriever.js';
@@ -28,8 +29,7 @@ import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
 // RepoIndexMeta, getRepoSha, readRepoIndexMeta moved to repo-pipeline.ts (shared
 // with the worker). writeRepoIndexMeta stays here — only buildKB writes meta.
 // Routed through BlobStorePort (P0c); putJson pretty-prints, byte-identical to
-// the prior JSON.stringify(meta, null, 2). (readRepoIndexMeta — the shared
-// exported reader — is still raw fs; it reads the same bytes. P0c-2 ports it.)
+// the prior JSON.stringify(meta, null, 2).
 async function writeRepoIndexMeta(blobs: BlobStorePort, repoName: string, meta: RepoIndexMeta): Promise<void> {
   await blobs.putJson(`${repoName}/index_meta.json`, meta);
 }
@@ -136,7 +136,7 @@ export class KnowledgeIndexer {
         continue;
       }
       const currentSha = getRepoSha(repo.path);
-      const meta = await readRepoIndexMeta(basePath, repo.name);
+      const meta = await readRepoIndexMeta(basePath, repo.name, storage.blobs);
       if (meta && currentSha && meta.lastIndexedSha === currentSha) {
         skippedRepos.push(repo.name);
         log(`Skipping ${repo.name} — unchanged (${currentSha.slice(0, 7)})`);
@@ -159,6 +159,7 @@ export class KnowledgeIndexer {
       try {
         const profiles = await profileProject(project, repos, {
           force: opts?.force,
+          config,
           onProgress: (m) => {
             log(m);
             report({ phase: 'profiling', message: m, percent: 5, etaSeconds: -1 });
@@ -206,6 +207,7 @@ export class KnowledgeIndexer {
       chunking: config.chunking,
       doChunk: toIndex.has(r.name),
       force: !!opts?.force,
+      storage: config.storage,
     }));
     const concurrency = resolveIndexConcurrency(jobs.length);
     const workerUrl = concurrency > 1 ? new URL('./index-worker.js', import.meta.url) : null;
@@ -239,7 +241,7 @@ export class KnowledgeIndexer {
       },
     });
     for (const name of skippedRepos) {
-      const meta = await readRepoIndexMeta(basePath, name);
+      const meta = await readRepoIndexMeta(basePath, name, storage.blobs);
       repoStats.push({ name, chunkCount: meta?.chunkCount ?? 0, language: '' });
     }
 
@@ -270,7 +272,7 @@ export class KnowledgeIndexer {
     if (isLlmAvailable()) {
       report({ phase: 'service-mesh', message: 'Inferring service mesh from profiles...', percent: 80, etaSeconds: -1 });
       try {
-        const profiles = await loadAllProfiles(project);
+        const profiles = await loadAllProfiles(project, config);
         if (profiles.length > 0) {
           log(`Inferring service mesh from ${profiles.length} profiles...`);
           const meshEdges = await inferServiceMesh(profiles, {
@@ -304,6 +306,7 @@ export class KnowledgeIndexer {
       try {
         const { nodeCount, edgeCount } = graphWriter.finalize();
         log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')} (streamed: ${nodeCount} nodes, ${edgeCount} edges)`);
+        await uploadSystemGraphIfRemote(storage, basePath, log);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[knowledge-core] Could not persist system graph (streamed): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
@@ -316,6 +319,7 @@ export class KnowledgeIndexer {
         const wroteSqlite = await writeSystemGraphSqlite(basePath, graphBuilder!);
         if (wroteSqlite) {
           log(`Saved project graph to ${join(basePath, 'system_graph.sqlite')}`);
+          await uploadSystemGraphIfRemote(storage, basePath, log);
         } else {
           // No sqlite driver → legacy compact JSON blob (byte-parity via putText).
           await storage.blobs.putText('system_graph_v2.json', JSON.stringify(graphBuilder!.exportJson()));
@@ -662,8 +666,8 @@ export class KnowledgeIndexer {
   }
 
   /** Load index statistics for a project */
-  async getStats(project: string): Promise<IndexStats> {
-    const storage = resolveStorage(project);
+  async getStats(project: string, config?: KnowledgeConfig): Promise<IndexStats> {
+    const storage = resolveStorage(project, config);
     const basePath = storage.basePath;
     const store = storage.vectors;
     await store.init();
@@ -675,9 +679,8 @@ export class KnowledgeIndexer {
     const repos: Array<{ name: string; chunkCount: number; language: string }> = [];
 
     try {
-      const { readdirSync } = await import('node:fs');
-      for (const entry of readdirSync(basePath)) {
-        const meta = await readRepoIndexMeta(basePath, entry);
+      for (const entry of await listRepoNames(storage)) {
+        const meta = await readRepoIndexMeta(basePath, entry, storage.blobs);
         if (meta) {
           repos.push({ name: entry, chunkCount: meta.chunkCount, language: '' });
           if (meta.embeddingProvider !== 'unknown') provider = meta.embeddingProvider;
@@ -896,6 +899,51 @@ function indexFingerprint(basePath: string): string {
   return `${mt(join(basePath, 'lancedb'))}:${mt(join(basePath, 'system_graph.sqlite'))}`;
 }
 
+/** Non-fs backends only: the sqlite system graph is produced on local scratch
+ *  by the writer and shipped as a blob artifact; readers pull it back through
+ *  the graph thunk (resolveStorage). Non-fatal — on failure readers keep the
+ *  previously-uploaded graph. (Whole-file buffer: acceptable for the graph's
+ *  size class; a streaming put needs a fromFile port extension.) */
+async function uploadSystemGraphIfRemote(
+  storage: StorageBundle,
+  basePath: string,
+  log: (m: string) => void,
+): Promise<void> {
+  if (storage.blobs instanceof FsBlobStore) return;
+  const localPath = join(basePath, 'system_graph.sqlite');
+  if (!existsSync(localPath)) return;
+  try {
+    await storage.blobs.putBytes('system_graph.sqlite', readFileSync(localPath));
+    log('Uploaded system_graph.sqlite to the blob backend');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[knowledge-core] system graph upload failed (readers keep the previous graph): ${msg.slice(0, 160)}`);
+  }
+}
+
+/** Repo names that carry KB artifacts. fs fast-path: shallow top-level dir
+ *  scan (readRepoIndexMeta returns null for non-repo entries — same as the
+ *  prior readdirSync walk). Non-fs backends derive names from a blob list
+ *  (a metadata query), keyed on index_meta.json. */
+async function listRepoNames(storage: StorageBundle): Promise<string[]> {
+  if (storage.blobs instanceof FsBlobStore) {
+    try {
+      if (!existsSync(storage.basePath)) return [];
+      return readdirSync(storage.basePath);
+    } catch {
+      return [];
+    }
+  }
+  const names = new Set<string>();
+  try {
+    for (const key of await storage.blobs.list('')) {
+      const m = /^([^/]+)\/index_meta\.json$/.exec(key);
+      if (m) names.add(m[1]);
+    }
+  } catch { /* unreadable */ }
+  return [...names];
+}
+
 export async function getRetriever(
   project: string,
   configOverride?: KnowledgeConfig,
@@ -969,18 +1017,16 @@ async function buildRetriever(
   // different provider/dimension than what the current config resolves to.
   // Garbage results from silent space mismatch are worse than a hard error.
   try {
-    if (existsSync(basePath)) {
-      for (const entry of readdirSync(basePath)) {
-        const meta = await readRepoIndexMeta(basePath, entry);
-        if (!meta || !meta.embeddingProvider || meta.embeddingProvider === 'pending') continue;
-        if (meta.embeddingProvider !== embedder.name) {
-          throw new Error(
-            `[knowledge-core] Vector-space mismatch for repo "${entry}": ` +
-            `index built with "${meta.embeddingProvider}" but retrieval is using "${embedder.name}". ` +
-            `Reindex with consistent embedding provider, or revert the config change. ` +
-            `(set CODE_SEARCH_EMBEDDING_PROVIDER or config.embedding.provider to match the index.)`,
-          );
-        }
+    for (const entry of await listRepoNames(storage)) {
+      const meta = await readRepoIndexMeta(basePath, entry, storage.blobs);
+      if (!meta || !meta.embeddingProvider || meta.embeddingProvider === 'pending') continue;
+      if (meta.embeddingProvider !== embedder.name) {
+        throw new Error(
+          `[knowledge-core] Vector-space mismatch for repo "${entry}": ` +
+          `index built with "${meta.embeddingProvider}" but retrieval is using "${embedder.name}". ` +
+          `Reindex with consistent embedding provider, or revert the config change. ` +
+          `(set CODE_SEARCH_EMBEDDING_PROVIDER or config.embedding.provider to match the index.)`,
+        );
       }
     }
   } catch (err) {
@@ -1000,7 +1046,7 @@ async function buildRetriever(
   // Create query router (WS-8) — routes queries to relevant repos
   let queryRouter = null;
   try {
-    queryRouter = await createQueryRouter(project, embedder);
+    queryRouter = await createQueryRouter(project, embedder, config);
     if (queryRouter) {
       console.error(`[knowledge] Query router ready (${queryRouter.repoCount} repo profiles)`);
     }

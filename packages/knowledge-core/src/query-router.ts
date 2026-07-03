@@ -1,8 +1,8 @@
-import { join } from 'node:path';
 import type { EmbeddingProvider, RepoProfile } from '@esankhan3/anvil-knowledge-core';
-import { getKnowledgeBasePath } from './config.js';
+import type { KnowledgeConfig } from './config.js';
 import { loadAllProfiles } from './repo-profiler.js';
-import { FsBlobStore } from './storage/fs-blob-store.js';
+import { resolveStorage } from './storage/resolve.js';
+import type { BlobStorePort } from './storage/ports.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -210,12 +210,12 @@ export class QueryRouter {
   }
 
   /**
-   * Load cached embeddings from disk (skip re-embedding).
+   * Load cached embeddings through the blob port (skip re-embedding).
    * Returns true if cache was loaded successfully.
    */
-  async loadCached(cachePath: string): Promise<boolean> {
+  async loadCached(blobs: BlobStorePort): Promise<boolean> {
     try {
-      const data = await new FsBlobStore(cachePath).getJson<ProfileEmbedding[]>('profile_embeddings.json');
+      const data = await blobs.getJson<ProfileEmbedding[]>('profile_embeddings.json');
       if (!Array.isArray(data) || data.length === 0) return false;
 
       // Validate structure of first entry
@@ -237,11 +237,11 @@ export class QueryRouter {
   }
 
   /**
-   * Save embeddings to disk for future use.
+   * Save embeddings through the blob port for future use.
    */
-  async saveCached(cachePath: string): Promise<void> {
+  async saveCached(blobs: BlobStorePort): Promise<void> {
     // putJson pretty-prints (byte-identical to the prior write) + creates parents.
-    await new FsBlobStore(cachePath).putJson('profile_embeddings.json', this.profileEmbeddings);
+    await blobs.putJson('profile_embeddings.json', this.profileEmbeddings);
   }
 
   /**
@@ -291,18 +291,19 @@ export class QueryRouter {
 export async function createQueryRouter(
   project: string,
   embedder: EmbeddingProvider,
+  config?: KnowledgeConfig,
 ): Promise<QueryRouter | null> {
   // Collect repo profiles through the shared (port-backed) loader; keep only
   // those carrying the fields routing needs.
-  const profiles = (await loadAllProfiles(project)).filter((p) => p.name && p.role);
+  const profiles = (await loadAllProfiles(project, config)).filter((p) => p.name && p.role);
 
   if (profiles.length === 0) return null;
 
-  const kbPath = getKnowledgeBasePath(project);
+  const blobs = resolveStorage(project, config).blobs;
   const router = new QueryRouter(embedder);
 
   // Try loading cached embeddings first
-  if (await router.loadCached(kbPath)) {
+  if (await router.loadCached(blobs)) {
     // Verify cache is still consistent: same repos, same count
     const cachedRepos = new Set(router.getAllRepos());
     const currentRepos = new Set(profiles.map((p) => p.name));
@@ -318,7 +319,7 @@ export async function createQueryRouter(
 
   // Embed all profiles and cache for next time
   await router.init(profiles);
-  await router.saveCached(kbPath);
+  await router.saveCached(blobs);
 
   return router;
 }

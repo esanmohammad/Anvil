@@ -478,7 +478,7 @@ async function trackedIndex(
 
 async function autoIndex(ctx: ServerContext, opts?: { readOnly?: boolean }): Promise<void> {
   try {
-    const blobs = getBlobStore(ctx.projectName);
+    const blobs = getBlobStore(ctx.projectName, toKnowledgeConfig(loadServerConfig().__unified));
     const hasLanceDB = await blobs.exists('lancedb');
     // System graph is now SQLite (system_graph.sqlite); accept the legacy JSON
     // too so pre-migration indexes still read as ready.

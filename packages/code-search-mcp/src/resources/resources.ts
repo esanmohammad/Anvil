@@ -5,6 +5,7 @@
 import type { ServerContext } from '../server.js';
 import { getKnowledgeBasePath, getBlobStore, openSystemGraphStore } from '@esankhan3/anvil-knowledge-core';
 import { loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
+import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import { loadProfile } from '@esankhan3/anvil-knowledge-core';
 
 export function registerResources(ctx: ServerContext) {
@@ -34,7 +35,7 @@ export async function handleResource(
 
     if (uri === 'code-search://repos') {
       // (imported at top)
-      const profiles = await loadAllProfiles(ctx.projectName);
+      const profiles = await loadAllProfiles(ctx.projectName, resolvedKnowledgeConfig());
       return {
         contents: [{
           uri,
@@ -76,7 +77,7 @@ export async function handleResource(
     const profileMatch = uri.match(/^code-search:\/\/repo\/([^/]+)\/profile$/);
     if (profileMatch) {
       // (imported at top)
-      const profile = await loadProfile(ctx.projectName, profileMatch[1]);
+      const profile = await loadProfile(ctx.projectName, profileMatch[1], resolvedKnowledgeConfig());
       return {
         contents: [{
           uri,
@@ -89,7 +90,7 @@ export async function handleResource(
     // Dynamic resource: code-search://repo/{name}/graph
     const graphMatch = uri.match(/^code-search:\/\/repo\/([^/]+)\/graph$/);
     if (graphMatch) {
-      const graphJson = await getBlobStore(ctx.projectName).getText(`${graphMatch[1]}/graph.json`);
+      const graphJson = await getBlobStore(ctx.projectName, resolvedKnowledgeConfig()).getText(`${graphMatch[1]}/graph.json`);
       return {
         contents: [{
           uri,

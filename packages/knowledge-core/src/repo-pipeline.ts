@@ -18,9 +18,12 @@ import { detectWorkspace } from './workspace-detector.js';
 import { getAllChanges, getChangedFilesList, getDeletedFilesList } from './git-diff.js';
 import { createChunkWriter } from './chunks-io.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
+import { resolveStorage } from './storage/resolve.js';
+import type { BlobStorePort } from './storage/ports.js';
 import { initTreeSitter } from './tree-sitter-parser.js';
 // Type-only (erased at runtime — keeps the worker lean): from the package barrel.
 import type { FileIndexEntry, WorkspaceMap, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
+import type { KnowledgeConfig, KnowledgeStorageConfig } from './config.js';
 
 export interface RepoIndexMeta {
   lastIndexedSha: string;
@@ -38,9 +41,14 @@ export function getRepoSha(repoPath: string): string | null {
   }
 }
 
-export async function readRepoIndexMeta(basePath: string, repoName: string): Promise<RepoIndexMeta | null> {
+export async function readRepoIndexMeta(
+  basePath: string,
+  repoName: string,
+  blobs?: BlobStorePort,
+): Promise<RepoIndexMeta | null> {
   try {
-    return await new FsBlobStore(basePath).getJson<RepoIndexMeta>(`${repoName}/index_meta.json`);
+    const store = blobs ?? new FsBlobStore(basePath);
+    return await store.getJson<RepoIndexMeta>(`${repoName}/index_meta.json`);
   } catch {
     return null;
   }
@@ -55,6 +63,10 @@ export interface RepoJob {
   chunking: { maxTokens: number; contextEnrichment: 'structural' | 'llm' | 'none' };
   doChunk: boolean;
   force: boolean;
+  /** Serializable storage config — a live BlobStorePort cannot cross the
+   *  worker_thread boundary, so the worker reconstructs its own port from
+   *  this block. Unset ⇒ FsBlobStore(basePath), today's behavior. */
+  storage?: KnowledgeStorageConfig;
 }
 
 export interface RepoResult {
@@ -77,10 +89,18 @@ export interface RepoResult {
 export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
   await initTreeSitter(); // idempotent; first call per worker loads the WASM grammars
   const { repoName, repoPath, basePath, project, chunking, doChunk, force } = job;
+  // Chunk shards are LOCAL SCRATCH (streamed to disk, folded into chunks.json by
+  // the indexer) — they stay on the local fs regardless of blob backend.
   const repoKbDir = join(basePath, repoName);
   mkdirSync(repoKbDir, { recursive: true });
 
-  const meta = force ? null : await readRepoIndexMeta(basePath, repoName);
+  // KB artifacts (index_meta, graph.json, GRAPH_REPORT.md) go through the blob
+  // port, reconstructed from the job's serializable storage block.
+  const blobs: BlobStorePort = job.storage
+    ? resolveStorage(project, { storage: job.storage } as KnowledgeConfig).blobs
+    : new FsBlobStore(basePath);
+
+  const meta = force ? null : await readRepoIndexMeta(basePath, repoName, blobs);
   const diff = force ? null : (meta?.lastIndexedSha ? getAllChanges(repoPath, meta.lastIndexedSha) : null);
   const useIncremental =
     !!diff && !diff.fallbackToFull && diff.added.length + diff.modified.length + diff.deleted.length > 0;
@@ -120,7 +140,6 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
 
   let graph: GraphifyOutput | null = null;
   try {
-    const blobs = new FsBlobStore(basePath);
     const graphKey = `${repoName}/graph.json`;
     const existingGraph = useIncremental ? await blobs.getJson<GraphifyOutput>(graphKey) : null;
     if (existingGraph) {

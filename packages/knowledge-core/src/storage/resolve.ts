@@ -10,6 +10,8 @@
  */
 
 import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import type { KnowledgeConfig } from '../config.js';
 import type { CodeChunk } from '../types.js';
 import { getKnowledgeBasePath } from '../config.js';
@@ -71,7 +73,20 @@ export function resolveStorage(project: string, config?: KnowledgeConfig): Stora
     basePath,
     blobs,
     vectors: new VectorStore(vectorUri, vectorStorageOptions, vectorCache, lancedb?.index),
-    graph: () => openSystemGraphStore(basePath),
+    graph: async () => {
+      if (blobs instanceof FsBlobStore) return openSystemGraphStore(basePath);
+      // Non-fs backend: the sqlite system graph is a blob artifact — pull it to
+      // the local cache dir and open it there (read-only usage). Re-pulled
+      // whenever the retriever rebuilds (invalidate-on-reindex), so readers see
+      // the writer's latest graph.
+      if (!(await blobs.exists('system_graph.sqlite'))) return null;
+      const cacheDir = storage?.cache?.dir
+        ? join(storage.cache.dir, project)
+        : join(tmpdir(), 'code-search-graph-cache', project);
+      mkdirSync(cacheDir, { recursive: true });
+      await blobs.getBytes('system_graph.sqlite', { toFile: join(cacheDir, 'system_graph.sqlite') });
+      return openSystemGraphStore(cacheDir);
+    },
   };
 }
 

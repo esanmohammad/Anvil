@@ -13,10 +13,11 @@
 export { ProjectGraphBuilder } from './project-graph-builder-core.js';
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { execSync, execFileSync } from 'node:child_process';
 import { FsBlobStore } from './storage/fs-blob-store.js';
+import { resolveStorage } from './storage/resolve.js';
+import type { StorageBundle } from './storage/ports.js';
+import type { KnowledgeConfig } from './config.js';
 import type {
   ProjectGraph,
   ProjectGraphMeta,
@@ -30,11 +31,6 @@ import type {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const KB_DIR = join(
-  process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil'),
-  'knowledge-base',
-);
 
 const PROJECT_GRAPH_FILE = 'PROJECT_GRAPH.json';
 const PROJECT_SUMMARY_FILE = 'PROJECT_SUMMARY.md';
@@ -429,6 +425,40 @@ export interface BuildProjectGraphOptions {
   model?: string;
   dryRun?: boolean;
   onProgress?: (message: string) => void;
+  /** Storage resolution — omit ⇒ fs defaults (today's behavior). */
+  config?: KnowledgeConfig;
+}
+
+/** Enumerate `<repo>/GRAPH_REPORT.md` across the project. fs fast-path scans
+ *  top-level dirs (a recursive blob list would descend into lancedb/); non-fs
+ *  backends use list() — a metadata query. */
+async function collectGraphReports(
+  storage: StorageBundle,
+): Promise<Array<{ repo: string; report: string }>> {
+  const graphReports: Array<{ repo: string; report: string }> = [];
+  const blobs = storage.blobs;
+  try {
+    if (blobs instanceof FsBlobStore) {
+      if (!existsSync(storage.basePath)) return graphReports;
+      const { readdirSync } = await import('node:fs');
+      for (const entry of readdirSync(storage.basePath)) {
+        try {
+          const report = await blobs.getText(`${entry}/GRAPH_REPORT.md`);
+          if (report !== null) graphReports.push({ repo: entry, report });
+        } catch { /* skip unreadable */ }
+      }
+      return graphReports;
+    }
+    for (const key of await blobs.list('')) {
+      const m = /^([^/]+)\/GRAPH_REPORT\.md$/.exec(key);
+      if (!m) continue;
+      try {
+        const report = await blobs.getText(key);
+        if (report !== null) graphReports.push({ repo: m[1], report });
+      } catch { /* skip unreadable */ }
+    }
+  } catch { /* KB location doesn't exist or isn't readable */ }
+  return graphReports;
 }
 
 /**
@@ -440,7 +470,9 @@ export async function buildProjectGraph(
   options?: BuildProjectGraphOptions,
 ): Promise<ProjectGraph> {
   const log = options?.onProgress ?? (() => {});
-  const projectDir = join(KB_DIR, project);
+  const storage = resolveStorage(project, options?.config);
+  const blobs = storage.blobs;
+  const projectDir = storage.basePath;
   const startTime = Date.now();
 
   // 1. Read factory.yaml
@@ -452,17 +484,7 @@ export async function buildProjectGraph(
 
   // 2. Collect per-repo graph reports
   log('Collecting per-repo graph reports...');
-  const graphReports: Array<{ repo: string; report: string }> = [];
-  const blobs = new FsBlobStore(projectDir);
-  if (existsSync(projectDir)) {
-    const { readdirSync } = await import('node:fs');
-    for (const entry of readdirSync(projectDir)) {
-      try {
-        const report = await blobs.getText(`${entry}/GRAPH_REPORT.md`);
-        if (report !== null) graphReports.push({ repo: entry, report });
-      } catch { /* skip unreadable */ }
-    }
-  }
+  const graphReports = await collectGraphReports(storage);
 
   if (graphReports.length === 0) {
     log('Warning: No per-repo graph reports found. Run "anvil index" or refresh KB first for better results.');
@@ -586,24 +608,24 @@ export async function buildProjectGraph(
 // Load existing project graph
 // ---------------------------------------------------------------------------
 
-export async function loadProjectGraph(project: string): Promise<ProjectGraph | null> {
+export async function loadProjectGraph(project: string, config?: KnowledgeConfig): Promise<ProjectGraph | null> {
   try {
-    return await new FsBlobStore(join(KB_DIR, project)).getJson<ProjectGraph>(PROJECT_GRAPH_FILE);
+    return await resolveStorage(project, config).blobs.getJson<ProjectGraph>(PROJECT_GRAPH_FILE);
   } catch {
     return null;
   }
 }
 
-export async function loadProjectSummary(project: string): Promise<string | null> {
+export async function loadProjectSummary(project: string, config?: KnowledgeConfig): Promise<string | null> {
   try {
-    return await new FsBlobStore(join(KB_DIR, project)).getText(PROJECT_SUMMARY_FILE);
+    return await resolveStorage(project, config).blobs.getText(PROJECT_SUMMARY_FILE);
   } catch {
     return null;
   }
 }
 
-export async function getProjectGraphStatus(project: string): Promise<ProjectGraphStatus> {
-  const graph = await loadProjectGraph(project);
+export async function getProjectGraphStatus(project: string, config?: KnowledgeConfig): Promise<ProjectGraphStatus> {
+  const graph = await loadProjectGraph(project, config);
   if (!graph) {
     return { exists: false, generatedAt: null, model: null, costUsd: null };
   }
@@ -623,23 +645,13 @@ export async function estimateProjectGraphCost(
   project: string,
   factoryYamlPath: string,
   provider?: string,
+  config?: KnowledgeConfig,
 ): Promise<{ estimatedInputTokens: number; estimatedOutputTokens: number; estimatedCostUsd: number; model: string; provider: string }> {
   const factoryYaml = existsSync(factoryYamlPath)
     ? readFileSync(factoryYamlPath, 'utf-8')
     : '';
 
-  const graphReports: Array<{ repo: string; report: string }> = [];
-  const projectDir = join(KB_DIR, project);
-  if (existsSync(projectDir)) {
-    try {
-      const { readdirSync } = await import('node:fs');
-      const blobs = new FsBlobStore(projectDir);
-      for (const entry of readdirSync(projectDir)) {
-        const report = await blobs.getText(`${entry}/GRAPH_REPORT.md`);
-        if (report !== null) graphReports.push({ repo: entry, report });
-      }
-    } catch { /* skip */ }
-  }
+  const graphReports = await collectGraphReports(resolveStorage(project, config));
 
   const userPrompt = assembleUserPrompt(factoryYaml, graphReports, []);
   const inputTokens = Math.ceil((SYSTEM_PROMPT.length + userPrompt.length) / 4);

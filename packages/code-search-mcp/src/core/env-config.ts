@@ -12,7 +12,9 @@ import {
   resolveCodeSearchConfig,
   type CodeSearchConfig,
   parseCliFlags,
+  toKnowledgeConfig,
 } from './config.js';
+import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import { normalizeRerankerConfig } from '@esankhan3/anvil-knowledge-core';
 
 export interface ServerConfig {
@@ -95,6 +97,13 @@ function resolveLlmMode(
     `Set CODE_SEARCH_LLM_API_KEY for API mode, or install Claude CLI for CLI mode.`,
   );
   return 'none';
+}
+
+/** The fully-resolved KnowledgeConfig for this process — the object every
+ *  knowledge-core helper takes so storage backends (mongo/S3) reach reads and
+ *  writes alike. Cached via loadServerConfig. */
+export function resolvedKnowledgeConfig(): KnowledgeConfig {
+  return toKnowledgeConfig(loadServerConfig().__unified);
 }
 
 export function loadServerConfig(opts?: { argv?: string[]; workspaceDir?: string }): ServerConfig {

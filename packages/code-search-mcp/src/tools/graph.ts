@@ -22,6 +22,7 @@ import {
   getChangedFilesList,
   openSystemGraphStore,
 } from '@esankhan3/anvil-knowledge-core';
+import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import type { GraphStore, GraphDirection } from '@esankhan3/anvil-knowledge-core';
 
 const GRAPH_TOOL_NAMES = [
@@ -232,7 +233,7 @@ export async function handleGraphTool(
 
   try {
     const kbPath = getKnowledgeBasePath(ctx.projectName);
-    const blobs = getBlobStore(ctx.projectName);
+    const blobs = getBlobStore(ctx.projectName, resolvedKnowledgeConfig());
 
     if (name === 'get_repo_graph') {
       const repo = args.repo as string;
@@ -363,7 +364,7 @@ export async function handleGraphTool(
       const repo = args.repo as string | undefined;
 
       if (repo) {
-        const profile = await loadProfile(ctx.projectName, repo);
+        const profile = await loadProfile(ctx.projectName, repo, resolvedKnowledgeConfig());
         if (!profile) return text(`No profile for "${repo}". Run profiling (requires LLM) to generate one.`);
         const ep = (xs: any[]) => xs?.length ? xs.map((e) => `  - ${e.type}: ${e.identifier} — ${e.description}`).join('\n') : '  - (none)';
         const body = [
@@ -402,7 +403,7 @@ export async function handleGraphTool(
       const summaryText = await blobs.getText('PROJECT_SUMMARY.md');
       if (summaryText !== null) return text(summaryText);
 
-      const profiles = await loadAllProfiles(ctx.projectName);
+      const profiles = await loadAllProfiles(ctx.projectName, resolvedKnowledgeConfig());
       if (profiles.length) {
         return text(`# Project Repos\n\n${profiles.map((p) => `- **${p.name}** — ${p.role} (${p.domain}): ${p.description}`).join('\n')}\n\n_Run project-graph generation (requires LLM) for a full architecture view._`);
       }

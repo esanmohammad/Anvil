@@ -4,6 +4,7 @@
 
 import type { ServerContext } from '../server.js';
 import { getRetriever, getBlobStore, findChunksInProject } from '@esankhan3/anvil-knowledge-core';
+import { resolvedKnowledgeConfig } from '../core/env-config.js';
 
 export function registerSearchTools() {
   return [
@@ -77,7 +78,7 @@ export async function handleSearchTool(
 
   try {
     // getRetriever imported at top
-    const retriever = await getRetriever(ctx.projectName);
+    const retriever = await getRetriever(ctx.projectName, resolvedKnowledgeConfig());
 
     const query = args.query as string;
     const maxResults = (args.maxResults as number) || 10;
@@ -135,7 +136,7 @@ async function handleGetCodeSnippet(
     return { content: [{ type: 'text', text: 'Provide id="repo::file::entity" or repo + file (entity optional).' }] };
   }
 
-  if (!(await getBlobStore(ctx.projectName).exists('chunks.json'))) {
+  if (!(await getBlobStore(ctx.projectName, resolvedKnowledgeConfig()).exists('chunks.json'))) {
     return { content: [{ type: 'text', text: 'No index found — chunks.json missing. Index the project first.' }] };
   }
 
@@ -146,10 +147,11 @@ async function handleGetCodeSnippet(
       ctx.projectName,
       (c) => c.repoName === repo && c.filePath === file && (!entity || c.entityName === entity),
       5,
+      resolvedKnowledgeConfig(),
     );
     // Fallback: entity may live in a differently-named file — match by entity within repo.
     if (matches.length === 0 && entity) {
-      matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && c.entityName === entity, 5);
+      matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && c.entityName === entity, 5, resolvedKnowledgeConfig());
     }
     if (matches.length === 0) {
       return { content: [{ type: 'text', text: `No snippet found for ${repo}::${file}${entity ? `::${entity}` : ''}` }] };
