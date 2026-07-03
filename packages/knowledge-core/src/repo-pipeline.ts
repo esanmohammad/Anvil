@@ -9,7 +9,7 @@
  * graph + metadata cross the worker boundary (never the chunks themselves).
  */
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
 import { chunkRepo, chunkChangedFiles } from './chunker.js';
@@ -41,6 +41,21 @@ export function getRepoSha(repoPath: string): string | null {
   }
 }
 
+/** HEAD sha of a REMOTE repo without cloning (`git ls-remote`) — lets the
+ *  writer skip unchanged repos before paying for a clone (the k8s CronJob
+ *  writer has no persistent clones; most repos are unchanged most cycles). */
+export function getRemoteSha(cloneUrl: string): string | null {
+  try {
+    const out = execSync(`git ls-remote ${JSON.stringify(cloneUrl)} HEAD`, {
+      stdio: 'pipe', encoding: 'utf-8', timeout: 30_000,
+    });
+    const sha = out.split(/\s/)[0]?.trim();
+    return sha && /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function readRepoIndexMeta(
   basePath: string,
   repoName: string,
@@ -67,6 +82,11 @@ export interface RepoJob {
    *  worker_thread boundary, so the worker reconstructs its own port from
    *  this block. Unset ⇒ FsBlobStore(basePath), today's behavior. */
   storage?: KnowledgeStorageConfig;
+  /** Bounded-scratch writer mode: shallow-clone this URL to repoPath before
+   *  processing and DELETE the clone afterwards. Peak disk = concurrency ×
+   *  largest repo, never the whole org (~95GB). Unset ⇒ repoPath is a
+   *  pre-existing local checkout, today's behavior. */
+  cloneUrl?: string;
 }
 
 export interface RepoResult {
@@ -88,6 +108,21 @@ export interface RepoResult {
  *  local FS — safe to run in a worker_thread. */
 export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
   await initTreeSitter(); // idempotent; first call per worker loads the WASM grammars
+  if (!job.cloneUrl) return processCheckout(job);
+  // Bounded-scratch writer mode: clone → process → ALWAYS discard the clone,
+  // so a failed repo can't leak scratch across the run.
+  execSync(
+    `git clone --depth=1 --quiet ${JSON.stringify(job.cloneUrl)} ${JSON.stringify(job.repoPath)}`,
+    { stdio: 'pipe', timeout: 600_000 },
+  );
+  try {
+    return await processCheckout(job);
+  } finally {
+    try { rmSync(job.repoPath, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+async function processCheckout(job: RepoJob): Promise<RepoResult> {
   const { repoName, repoPath, basePath, project, chunking, doChunk, force } = job;
   // Chunk shards are LOCAL SCRATCH (streamed to disk, folded into chunks.json by
   // the indexer) — they stay on the local fs regardless of blob backend.

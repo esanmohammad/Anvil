@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, rmSync } from 'node:fs';
 import { join, basename } from 'node:path';
+import { tmpdir } from 'node:os';
 
 import type { FileIndexEntry } from '@esankhan3/anvil-knowledge-core';
 import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
@@ -19,7 +20,7 @@ import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { iterateChunksFile } from './chunks-io.js';
 import { writeSystemGraphSqlite, createSystemGraphSqliteWriter } from './graph-store.js';
 import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
-import { processRepoPipeline, getRepoSha, readRepoIndexMeta } from './repo-pipeline.js';
+import { processRepoPipeline, getRepoSha, getRemoteSha, readRepoIndexMeta } from './repo-pipeline.js';
 import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,7 @@ export class KnowledgeIndexer {
 
   async buildKB(
     project: string,
-    repos: Array<{ name: string; path: string; language: string }>,
+    repos: Array<{ name: string; path: string; language: string; cloneUrl?: string }>,
     config: KnowledgeConfig,
     opts?: {
       onProgress?: (msg: string) => void;
@@ -135,7 +136,8 @@ export class KnowledgeIndexer {
         reposToIndex.push(repo);
         continue;
       }
-      const currentSha = getRepoSha(repo.path);
+      // Remote repos: compare the ls-remote HEAD sha — unchanged repos never clone.
+      const currentSha = repo.cloneUrl ? getRemoteSha(repo.cloneUrl) : getRepoSha(repo.path);
       const meta = await readRepoIndexMeta(basePath, repo.name, storage.blobs);
       if (meta && currentSha && meta.lastIndexedSha === currentSha) {
         skippedRepos.push(repo.name);
@@ -208,6 +210,7 @@ export class KnowledgeIndexer {
       doChunk: toIndex.has(r.name),
       force: !!opts?.force,
       storage: config.storage,
+      cloneUrl: r.cloneUrl,
     }));
     const concurrency = resolveIndexConcurrency(jobs.length);
     const workerUrl = concurrency > 1 ? new URL('./index-worker.js', import.meta.url) : null;
@@ -816,6 +819,34 @@ export async function embedFromPath(
 /**
  * Full index from a directory path — buildKB + embed in one call.
  */
+/** Bounded-scratch writer entry (k8s CronJob): index repos straight from
+ *  their clone URLs. Unchanged repos are skipped via `git ls-remote` without
+ *  cloning; changed ones are shallow-cloned into scratchDir, processed, and
+ *  discarded — peak disk = pool concurrency × largest repo. */
+export async function indexFromRemotes(
+  project: string,
+  remotes: Array<{ name: string; cloneUrl: string; language?: string }>,
+  opts: {
+    config: KnowledgeConfig;
+    scratchDir?: string;
+    force?: boolean;
+    onProgress?: (msg: string) => void;
+    onDetailedProgress?: (progress: IndexProgress) => void;
+  },
+): Promise<IndexStats> {
+  const scratch = opts.scratchDir ?? join(tmpdir(), 'code-search-scratch', project);
+  mkdirSync(scratch, { recursive: true });
+  const repos = remotes.map((r) => ({
+    name: r.name,
+    path: join(scratch, r.name),
+    language: r.language ?? '',
+    cloneUrl: r.cloneUrl,
+  }));
+  const indexer = new KnowledgeIndexer();
+  await indexer.buildKB(project, repos, opts.config, opts);
+  return indexer.embedChunks(project, opts.config, opts);
+}
+
 export async function indexFromPath(
   projectName: string,
   directoryPath: string,
