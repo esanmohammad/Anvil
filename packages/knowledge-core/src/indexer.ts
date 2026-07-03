@@ -8,7 +8,7 @@ import type { BlobStorePort } from './storage/ports.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { detectCrossRepoEdges } from '@esankhan3/anvil-knowledge-core';
 import { HybridRetriever } from './retriever.js';
-import { loadKnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
+import { loadKnowledgeConfig, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
 import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap } from '@esankhan3/anvil-knowledge-core';
 import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
@@ -449,8 +449,12 @@ export class KnowledgeIndexer {
       // the only one a re-run reaches. Cheap relative to embedding; idempotent.
       log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
       await vectorStore.ensureFtsIndex();
-      // Heal a missing IVF_PQ index too (a prior run could have aborted before
-      // building it); no-op unless storage.vector.lancedb.index is configured.
+      // Heal missing scalar + vector indexes too (a prior run could have aborted
+      // before building them) so filtered search / graph expansion / vector search
+      // stay index-backed rather than full-scanning. The vector index shape
+      // (IVF_FLAT default / IVF_PQ when storage.vector.lancedb.index is set)
+      // resolves inside ensureVectorIndex.
+      await vectorStore.ensureScalarIndexes();
       await vectorStore.ensureVectorIndex();
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
       return {
@@ -581,15 +585,21 @@ export class KnowledgeIndexer {
     await Promise.all(inFlight);
     if (aborted) throw aborted; // no zombies left running; fail the run cleanly
 
-    // Build the full-text index once, after all batches are inserted.
-    report({ phase: 'storing', message: 'Building full-text index...', percent: 92, etaSeconds: -1 });
+    // Build the full-text + scalar indexes once, after all batches are inserted.
+    report({ phase: 'storing', message: 'Building search indexes...', percent: 92, etaSeconds: -1 });
     if (newChunkCount > 0) {
       await vectorStore.ensureFtsIndex();
     }
-    // Build/retrain the IVF_PQ vector index (no-op unless configured + table ≥
-    // minRows). After a full rebuild the table was recreated, so this trains
-    // fresh centroids; incremental adds are absorbed by the existing index.
+    // Scalar indexes (repoName/project/filePath/entityName/id) turn graph-expansion
+    // + filtered search from full-table scans into indexed lookups; the vector
+    // index (IVF_FLAT default, IVF_PQ when storage.vector.lancedb.index is set)
+    // turns brute-force KNN into probed-partition reads — together the
+    // query-latency win at org scale. After a full rebuild the table was
+    // recreated, so this trains fresh centroids; incremental adds are folded in
+    // by optimizeIndexes.
+    await vectorStore.ensureScalarIndexes();
     await vectorStore.ensureVectorIndex();
+    await vectorStore.optimizeIndexes();
     log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
 
     // Update metadata (repoNames was computed during pass 1).
@@ -846,11 +856,97 @@ function formatEta(seconds: number): string {
  * before any vector search runs — silent vector-space drift is the
  * canonical "results are garbage and there's no error" symptom.
  */
+/**
+ * Retriever cache. Building a retriever opens LanceDB + SQLite, reads every
+ * repo's index_meta, and loads the query router — seconds of work that used to
+ * run on EVERY query (getRetriever was called per search). We build it once per
+ * (project, embedding-space) and reuse it; the embedding space is in the key so
+ * a config change to the embedder rebuilds rather than serving a mismatched
+ * store. Promises are cached so concurrent first-hits share one build.
+ *
+ * Invalidated by {@link invalidateRetriever} when a reindex writes new data (the
+ * writer serve process); read-only replicas that don't reindex in-process get
+ * freshness separately (Step 2 — checkoutLatest).
+ */
+interface RetrieverCacheEntry {
+  retriever: Promise<HybridRetriever>;
+  fingerprint: string; // on-disk index fingerprint at build time
+  checkedAt: number;   // last freshness check (ms epoch)
+}
+const retrieverCache = new Map<string, RetrieverCacheEntry>();
+
+/**
+ * How often a cached retriever re-checks whether the on-disk index changed.
+ * The in-process writer invalidates its own cache on reindex (immediate); a
+ * READ-ONLY replica (separate process sharing the same volume) can't be
+ * invalidated that way, so it relies on this TTL check to notice the writer's
+ * reindex and rebuild. 0 disables. env: CODE_SEARCH_RETRIEVER_TTL_MS.
+ */
+const RETRIEVER_FRESHNESS_MS = Math.max(0, parseInt(process.env.CODE_SEARCH_RETRIEVER_TTL_MS ?? '', 10) || 30_000);
+
+function retrieverCacheKey(project: string, config: KnowledgeConfig): string {
+  const e = config.embedding;
+  return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}`;
+}
+
+/** Cheap change-signal for a project's index: mtimes of the LanceDB dir + the
+ *  system-graph sqlite. Both change when the writer commits a reindex. */
+function indexFingerprint(basePath: string): string {
+  const mt = (p: string): number => { try { return statSync(p).mtimeMs; } catch { return 0; } };
+  return `${mt(join(basePath, 'lancedb'))}:${mt(join(basePath, 'system_graph.sqlite'))}`;
+}
+
 export async function getRetriever(
   project: string,
   configOverride?: KnowledgeConfig,
 ): Promise<HybridRetriever> {
   const config = configOverride ?? loadKnowledgeConfig(project);
+  const key = retrieverCacheKey(project, config);
+  const basePath = getKnowledgeBasePath(project);
+  const entry = retrieverCache.get(key);
+  if (entry) {
+    const now = Date.now();
+    if (RETRIEVER_FRESHNESS_MS === 0 || now - entry.checkedAt < RETRIEVER_FRESHNESS_MS) {
+      return entry.retriever; // within TTL — serve cached, no disk touch
+    }
+    // TTL elapsed: one cheap stat; rebuild ONLY if the index actually advanced
+    // (i.e. a sole-writer replica reindexed). Steady state = a stat every TTL.
+    if (indexFingerprint(basePath) === entry.fingerprint) {
+      entry.checkedAt = now;
+      return entry.retriever;
+    }
+    retrieverCache.delete(key);
+    entry.retriever.then((r) => r.close()).catch(() => { /* ignore */ });
+  }
+  const fingerprint = indexFingerprint(basePath);
+  const building = buildRetriever(project, config);
+  retrieverCache.set(key, { retriever: building, fingerprint, checkedAt: Date.now() });
+  // Evict a failed build so a transient error doesn't poison the cache forever.
+  building.catch(() => { const e = retrieverCache.get(key); if (e && e.retriever === building) retrieverCache.delete(key); });
+  return building;
+}
+
+/**
+ * Drop cached retrievers (closing their SQLite handles) so the next query
+ * rebuilds against fresh index data. Called after an in-process reindex. No arg
+ * = clear all projects. (Read replicas refresh via the freshness TTL instead.)
+ */
+export async function invalidateRetriever(project?: string): Promise<void> {
+  const entries = [...retrieverCache.entries()].filter(([k]) => !project || k.startsWith(`${project}::`));
+  for (const [k, e] of entries) {
+    retrieverCache.delete(k);
+    try { (await e.retriever).close(); } catch { /* already closed / build failed */ }
+  }
+}
+
+async function buildRetriever(
+  project: string,
+  config: KnowledgeConfig,
+): Promise<HybridRetriever> {
+  // All storage (vectors / blobs / graph) resolves through the bundle so the
+  // retriever serves fs/LanceDB-local AND object-store deployments alike. Note:
+  // the freshness fingerprint in getRetriever stats the LOCAL layout — on a
+  // remote backend it degrades to invalidate-on-reindex only.
   const storage = resolveStorage(project, config);
   const basePath = storage.basePath;
 
@@ -906,8 +1002,7 @@ export async function getRetriever(
   try {
     queryRouter = await createQueryRouter(project, embedder);
     if (queryRouter) {
-      // eslint-disable-next-line no-console
-      console.log(`[knowledge] Query router ready (${queryRouter.repoCount} repo profiles)`);
+      console.error(`[knowledge] Query router ready (${queryRouter.repoCount} repo profiles)`);
     }
   } catch {
     // Query routing unavailable — search all repos

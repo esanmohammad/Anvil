@@ -34,8 +34,15 @@ export interface IvfPqIndexConfig {
 export interface VectorStorePort {
   init(opts?: { healCorrupt?: boolean }): Promise<void>;
   ensureFtsIndex(): Promise<void>;
-  /** (Re)build the IVF_PQ vector index — write path only; no-op unless configured. */
-  ensureVectorIndex(): Promise<void>;
+  /** (Re)build the vector index (IVF_FLAT default, IVF_PQ when
+   *  `storage.vector.lancedb.index` is configured) — write path only. */
+  ensureVectorIndex(opts?: { minRows?: number }): Promise<void>;
+  /** Build scalar (bitmap/btree) indexes on filterable columns — write path only. */
+  ensureScalarIndexes(): Promise<void>;
+  /** Fold newly-appended rows into existing indexes (post-incremental-embed). */
+  optimizeIndexes(): Promise<void>;
+  /** Exact-symbol lookup by entityName (indexed equality) — the literal tier. */
+  searchByEntityName(names: string[], limit?: number, filter?: string): Promise<ScoredChunk[]>;
   upsertChunks(chunks: Array<CodeChunk & { embedding: number[] }>): Promise<void>;
   addChunks(chunks: Array<CodeChunk & { embedding: number[] }>, opts?: { skipIndex?: boolean }): Promise<void>;
   vectorSearch(queryEmbedding: number[], opts?: { limit?: number; filter?: string }): Promise<ScoredChunk[]>;

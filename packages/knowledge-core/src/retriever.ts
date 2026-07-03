@@ -40,6 +40,27 @@ function cacheEmbedding(query: string, embedding: number[]): void {
   queryEmbeddingCache.set(query, { embedding, timestamp: Date.now() });
 }
 
+// Auto repo-routing (WS-8) is OFF by default. At org scale (>10 repos) the
+// router hard-filters to ≤60% of repos by *repo-profile* similarity — so a
+// distinctive symbol whose defining repo doesn't resemble the query is
+// excluded from BOTH vector and BM25 search before retrieval even runs. That
+// pre-filter was the dominant exact-symbol recall loss. Callers still scope
+// explicitly via `repos`/`repoFilter`; opt the auto-router back in per-deploy.
+const AUTO_ROUTE_REPOS =
+  process.env.CODE_SEARCH_AUTO_ROUTE === '1' || process.env.CODE_SEARCH_AUTO_ROUTE === 'true';
+
+// RRF rank constant. The TREC default (60) deliberately flattens rank gaps —
+// wrong for code search, where the exact definition (found only by BM25, at
+// rank 1) must not be outscored by a semantically-adjacent file that merely
+// appears in BOTH lists at mid-rank. Smaller k sharpens rank sensitivity.
+// Env-tunable without a redeploy.
+const RRF_K = Number(process.env.CODE_SEARCH_RRF_K) || 10;
+
+// Cap on chunks per (repo, file) in the result surface. One hot file can fill
+// several top-K slots with adjacent chunks — wasted slots at K=5/10, since
+// relevance is judged per file. Env-tunable without a redeploy.
+const MAX_CHUNKS_PER_FILE = Math.max(1, Number(process.env.CODE_SEARCH_MAX_PER_FILE) || 2);
+
 /**
  * Normalize a repos filter from whatever shape an MCP client sent into a clean
  * `string[]`. Clients pass `repos` inconsistently — a JSON array, a single
@@ -114,7 +135,7 @@ export class HybridRetriever {
     // hand back a non-array. Coercing here fixes the `filterRepos.map is not a
     // function` crash and makes repo-scoping behave the same for every tool.
     let filterRepos = toRepoArray(opts?.repoFilter ?? opts?.repos);
-    if (filterRepos.length === 0 && this.queryRouter) {
+    if (AUTO_ROUTE_REPOS && filterRepos.length === 0 && this.queryRouter) {
       try {
         const routeResult = await this.queryRouter.route(query);
         if (routeResult.strategy === 'filtered') {
@@ -131,32 +152,52 @@ export class HybridRetriever {
     // ---------------------------------------------------------------
     // Phase 1 — Parallel retrieval (fetch 50 from each)
     // ---------------------------------------------------------------
-    let queryEmbedding: number[] | null = null;
-    if (useVector) {
-      // Check embedding cache first (WS-7 optimization)
-      queryEmbedding = getCachedEmbedding(query);
-      if (!queryEmbedding) {
-        queryEmbedding = await this.embedder.embedSingle(query);
-        cacheEmbedding(query, queryEmbedding);
-      }
-    }
-
-    const [vectorResults, bm25Results] = await Promise.all([
-      useVector && queryEmbedding
-        ? this.vectorStore.vectorSearch(queryEmbedding, { limit: 50, filter })
-        : Promise.resolve([] as ScoredChunk[]),
-      useBm25
-        ? this.vectorStore.fullTextSearch(query, 50, filter)
-        : Promise.resolve([] as ScoredChunk[]),
+    // BM25 needs no embedding, so run it CONCURRENTLY with the embed round-trip
+    // (the ~0.5s OpenAI embed dominates single-query latency) rather than after
+    // it — the embed latency is hidden behind the FTS query. Vector path embeds
+    // (cache-first) then searches, all inside its own promise.
+    const vectorPromise: Promise<ScoredChunk[]> = useVector
+      ? (async () => {
+          let emb = getCachedEmbedding(query);
+          if (!emb) {
+            emb = await this.embedder.embedSingle(query);
+            cacheEmbedding(query, emb);
+          }
+          return this.vectorStore.vectorSearch(emb, { limit: 50, filter });
+        })()
+      : Promise.resolve([] as ScoredChunk[]);
+    const bm25Promise: Promise<ScoredChunk[]> = useBm25
+      ? this.vectorStore.fullTextSearch(query, 50, filter)
+      : Promise.resolve([] as ScoredChunk[]);
+    // Literal exact-symbol tier — for a bare identifier query, fetch chunks
+    // whose entityName equals the query via the BTREE-indexed lookup. Vector
+    // and BM25 can BOTH miss an exact definition (its embedding sits far from
+    // the bare token's; BM25 buries rare-token files under chattier ones), and
+    // the downstream boost can only reorder candidates that were retrieved.
+    // Single-source modes return early below and skip fusion, so skip it there.
+    const trimmed = query.trim();
+    const isBareIdentifier =
+      trimmed.length > 0 && !/\s/.test(trimmed) && classification.type !== 'natural-language';
+    const exactPromise: Promise<ScoredChunk[]> =
+      isBareIdentifier && mode !== 'vector'
+        ? this.vectorStore.searchByEntityName([trimmed], 20, filter)
+        : Promise.resolve([] as ScoredChunk[]);
+    const [vectorResults, bm25Results, exactResults] = await Promise.all([
+      vectorPromise,
+      bm25Promise,
+      exactPromise,
     ]);
 
     // Single-source shortcuts — no fusion needed
     if (mode === 'vector') {
-      const selected = packWithinBudget(vectorResults, maxTokens, maxChunks);
+      const selected = packWithinBudget(diversifyByFile(vectorResults), maxTokens, maxChunks);
       return { chunks: selected, graphContext: '', totalTokens: sumTokens(selected), query };
     }
     if (mode === 'bm25') {
-      const selected = packWithinBudget(bm25Results, maxTokens, maxChunks);
+      // Exact-tier candidates lead — this mode backs the search_exact tool,
+      // and an entityName equality hit is the most exact evidence available.
+      const merged = dedupeExactContent(deduplicateChunks([...exactResults, ...bm25Results]));
+      const selected = packWithinBudget(diversifyByFile(merged), maxTokens, maxChunks);
       return { chunks: selected, graphContext: '', totalTokens: sumTokens(selected), query };
     }
 
@@ -170,16 +211,36 @@ export class HybridRetriever {
     const weights: number[] = [];
     if (vectorResults.length > 0) { retrievalSets.push(vectorResults); weights.push(wV); }
     if (bm25Results.length > 0) { retrievalSets.push(bm25Results); weights.push(wB); }
+    // Exact tier outweighs both probabilistic sets — entityName equality is
+    // stronger evidence than any rank position (and boostExactSymbol pins
+    // matching candidates to the front regardless).
+    if (exactResults.length > 0) { retrievalSets.push(exactResults); weights.push(1); }
 
-    const fused = retrievalSets.length > 1
-      ? reciprocalRankFusion(retrievalSets, weights)
+    const fusedRaw = retrievalSets.length > 1
+      ? reciprocalRankFusion(retrievalSets, weights, RRF_K)
       : (retrievalSets[0] ?? []);
+
+    // Exact-symbol boost — pin candidates whose entity name equals a bare
+    // identifier query to the top. RRF buries the exact definition (found only
+    // by BM25) under adjacent files that appear in both lists; with no reranker
+    // downstream, this fused order IS the final order.
+    const fused = boostExactSymbol(fusedRaw, query, classification.type);
+
+    // Result-surface shaping on the fused ORDER (best-ranked copy survives):
+    // drop exact-content duplicates (vendored copies of the same file across
+    // repos), then cap chunks-per-file so top-K slots go to distinct files.
+    const fusedPool = diversifyByFile(dedupeExactContent(fused)).slice(0, 15);
 
     // ---------------------------------------------------------------
     // Phase 3 — AST tripartite expansion from fused seeds
     // ---------------------------------------------------------------
+    // With no reranker downstream, expansion candidates are appended AFTER the
+    // fused pool and can only surface when the pool can't fill maxChunks by
+    // itself. Skip the expansion (synchronous SQLite on the event loop)
+    // entirely otherwise — it was pure per-query latency.
     let astChunks: ScoredChunk[] = [];
-    if (useGraph && this.graphStore) {
+    const graphCanSurface = this.reranker !== null || fusedPool.length < maxChunks;
+    if (useGraph && this.graphStore && graphCanSurface) {
       // 3a. Diversified seed selection from FUSED results (not vector-only)
       const seedNodeIds = this.resolveFusedSeeds(fused, 5);
 
@@ -207,8 +268,11 @@ export class HybridRetriever {
     // ---------------------------------------------------------------
     // Phase 4 — Cross-encoder reranking
     // ---------------------------------------------------------------
-    // Combine top-15 RRF + AST expanded chunks, deduplicate
-    const candidatePool = deduplicateChunks([...fused.slice(0, 15), ...astChunks]);
+    // Combine the shaped fused pool + AST expanded chunks; re-apply the
+    // per-file cap since expansion can re-add files already at the cap.
+    const candidatePool = diversifyByFile(
+      dedupeExactContent(deduplicateChunks([...fusedPool, ...astChunks])),
+    );
 
     let finalChunks: ScoredChunk[];
 
@@ -318,7 +382,7 @@ export class HybridRetriever {
 function reciprocalRankFusion(
   resultSets: ScoredChunk[][],
   weights: number[],
-  k: number = 60,
+  k: number = RRF_K,
 ): ScoredChunk[] {
   const scoreMap = new Map<string, { chunk: ScoredChunk['chunk']; score: number }>();
 
@@ -348,6 +412,30 @@ function reciprocalRankFusion(
 }
 
 // ---------------------------------------------------------------------------
+// Exact-symbol boost
+// ---------------------------------------------------------------------------
+
+/**
+ * For a bare single-token identifier query, move candidates whose entityName
+ * exactly matches the query to the front (preserving their relative order).
+ * Repairs RRF's under-ranking of exact definitions for symbol lookups. No-op
+ * for multi-word / natural-language queries and when nothing matches.
+ */
+function boostExactSymbol(fused: ScoredChunk[], query: string, type: string): ScoredChunk[] {
+  const q = query.trim();
+  if (q.length === 0 || /\s/.test(q) || type === 'natural-language') return fused;
+  const target = q.toLowerCase();
+  const norm = (s?: string) => (s ?? '').replace(/\$\d+$/, '').toLowerCase();
+  const exact: ScoredChunk[] = [];
+  const rest: ScoredChunk[] = [];
+  for (const sc of fused) {
+    if (norm(sc.chunk.entityName) === target) exact.push(sc);
+    else rest.push(sc);
+  }
+  return exact.length > 0 ? [...exact, ...rest] : fused;
+}
+
+// ---------------------------------------------------------------------------
 // Deduplication
 // ---------------------------------------------------------------------------
 
@@ -357,6 +445,37 @@ function deduplicateChunks(chunks: ScoredChunk[]): ScoredChunk[] {
   for (const sc of chunks) {
     if (seen.has(sc.chunk.id)) continue;
     seen.add(sc.chunk.id);
+    result.push(sc);
+  }
+  return result;
+}
+
+/** Drop chunks whose content is byte-identical to an earlier one — vendored
+ *  copies of the same file across repos rank as distinct results and waste
+ *  top-K slots. Exact equality only: near-duplicates (diverged copies) are
+ *  genuinely different files and are kept. */
+function dedupeExactContent(chunks: ScoredChunk[]): ScoredChunk[] {
+  if (chunks.length <= 1) return chunks;
+  const seen = new Set<string>();
+  const result: ScoredChunk[] = [];
+  for (const sc of chunks) {
+    if (seen.has(sc.chunk.content)) continue;
+    seen.add(sc.chunk.content);
+    result.push(sc);
+  }
+  return result;
+}
+
+/** Cap chunks per (repo, file), preserving order — one hot file must not fill
+ *  the top-K with adjacent chunks. */
+function diversifyByFile(chunks: ScoredChunk[], cap: number = MAX_CHUNKS_PER_FILE): ScoredChunk[] {
+  const counts = new Map<string, number>();
+  const result: ScoredChunk[] = [];
+  for (const sc of chunks) {
+    const key = `${sc.chunk.repoName}::${sc.chunk.filePath}`;
+    const n = counts.get(key) ?? 0;
+    if (n >= cap) continue;
+    counts.set(key, n + 1);
     result.push(sc);
   }
   return result;

@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, relative, extname, basename, dirname } from 'node:path';
 import type { CodeChunk } from '@esankhan3/anvil-knowledge-core';
-import { SOURCE_EXTENSIONS, SKIP_DIRS, walkDir, langFromExt, extractImports } from './file-walker.js';
+import { walkDir, langFromExt, extractImports, isSourceFile } from './file-walker.js';
 
 // ---------------------------------------------------------------------------
 // Language → boundary patterns
@@ -171,6 +171,11 @@ function patternsForLanguage(lang: string): BoundaryPattern[] {
       return rsPatterns();
     case 'java':
       return javaPatterns();
+    case 'yaml':
+    case 'hcl':
+    case 'toml':
+      // Config formats have no entity boundaries — whole-file module chunk.
+      return [];
     default:
       return tsPatterns();
   }
@@ -202,7 +207,7 @@ function buildContextPrefix(
   lang: string,
   imports: string[],
 ): string {
-  const commentPrefix = lang === 'python' ? '#' : '//';
+  const commentPrefix = ['python', 'shell', 'yaml', 'toml', 'hcl'].includes(lang) ? '#' : '//';
   const moduleName = dirname(relPath).split('/').filter(Boolean).pop() ?? basename(relPath);
   const lines = [
     `${commentPrefix} File: ${relPath}`,
@@ -516,8 +521,7 @@ export async function chunkChangedFiles(
   for (const relPath of [...diff.added, ...diff.modified]) {
     const fullPath = join(repoPath, relPath);
     if (!existsSync(fullPath)) continue;
-    const ext = extname(fullPath);
-    if (!SOURCE_EXTENSIONS.has(ext)) continue;
+    if (!isSourceFile(basename(fullPath))) continue;
 
     let contents: string;
     try {

@@ -221,4 +221,22 @@ describe('chunkRepo', () => {
     const filePaths = result.chunks.map((c) => c.filePath);
     assert.ok(filePaths.every((p) => p.endsWith('.ts')), 'Only TS files should be chunked');
   });
+
+  it('chunks infra files (Dockerfile, shell, yaml, terraform) as module chunks', async () => {
+    writeFileSync(join(tempDir, 'Dockerfile'), 'FROM node:22\nENV CODE_SEARCH_WORKERS=4\nCMD ["node"]');
+    writeFileSync(join(tempDir, 'entrypoint.sh'), '#!/bin/bash\nsync_repos() {\n  git fetch\n}\nsync_repos');
+    writeFileSync(join(tempDir, 'deploy.yaml'), 'apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: svc');
+    writeFileSync(join(tempDir, 'main.tf'), 'resource "google_compute_instance" "vm" {\n  name = "vm-1"\n}');
+
+    const result = await chunkRepo(tempDir, 'test-repo', 'test-project', { maxTokens: 512 });
+
+    const byFile = new Map(result.chunks.map((c) => [c.filePath, c]));
+    assert.ok(byFile.has('Dockerfile'), 'Dockerfile must be chunked');
+    assert.ok(byFile.has('entrypoint.sh'), 'shell script must be chunked');
+    assert.ok(byFile.has('deploy.yaml'), 'yaml must be chunked');
+    assert.ok(byFile.has('main.tf'), 'terraform must be chunked');
+    assert.equal(byFile.get('deploy.yaml')!.entityType, 'module', 'yaml is a whole-file module chunk');
+    assert.equal(byFile.get('deploy.yaml')!.language, 'yaml');
+    assert.ok(byFile.get('Dockerfile')!.content.includes('CODE_SEARCH_WORKERS'), 'content indexed verbatim');
+  });
 });

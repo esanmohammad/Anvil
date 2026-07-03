@@ -14,7 +14,23 @@ import { join, extname } from 'node:path';
 
 export const SOURCE_EXTENSIONS = new Set([
   '.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.php',
+  // Infra/config formats — chunked as whole-file module chunks (no boundary
+  // patterns). Without these, deployment/IaC repos (Dockerfile, shell, yaml,
+  // terraform) are entirely invisible to search.
+  '.sh', '.bash', '.yaml', '.yml', '.tf', '.hcl', '.toml',
 ]);
+
+// Extensionless infra files matched by name (Dockerfile.prod-style variants too).
+export const SOURCE_FILENAMES = new Set(['Dockerfile', 'Makefile', 'Jenkinsfile']);
+
+/** True when a file should be indexed — by extension or by well-known name. */
+export function isSourceFile(fileName: string): boolean {
+  return (
+    SOURCE_EXTENSIONS.has(extname(fileName)) ||
+    SOURCE_FILENAMES.has(fileName) ||
+    fileName.startsWith('Dockerfile.')
+  );
+}
 
 export const SKIP_DIRS = new Set([
   'node_modules', 'dist', 'build', '.git', 'vendor', '__pycache__', '.next',
@@ -42,6 +58,17 @@ export function langFromExt(ext: string): string {
       return 'java';
     case '.php':
       return 'php';
+    case '.sh':
+    case '.bash':
+      return 'shell';
+    case '.yaml':
+    case '.yml':
+      return 'yaml';
+    case '.tf':
+    case '.hcl':
+      return 'hcl';
+    case '.toml':
+      return 'toml';
     default:
       return 'unknown';
   }
@@ -69,7 +96,7 @@ export function walkDir(dir: string, collected: string[]): void {
     }
     if (stat.isDirectory()) {
       walkDir(full, collected);
-    } else if (stat.isFile() && SOURCE_EXTENSIONS.has(extname(entry))) {
+    } else if (stat.isFile() && isSourceFile(entry)) {
       collected.push(full);
     }
   }
