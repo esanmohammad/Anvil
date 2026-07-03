@@ -185,7 +185,13 @@ export class VectorStore implements VectorStorePort {
   async optimizeIndexes(): Promise<void> {
     if (!this.table) return;
     try {
-      await this.table.optimize();
+      // Also prune old dataset versions: Lance is MVCC and optimize() alone
+      // keeps every version, so a 6h reindex cycle grows the bucket forever
+      // (measured: +50-100% of dataset size per cycle). Retention must exceed
+      // the readers' refresh window (retriever TTL / invalidate broadcast) so
+      // an in-flight reader never loses the version it has open.
+      const hours = Number(process.env.CODE_SEARCH_LANCE_RETENTION_HOURS) || 24;
+      await this.table.optimize({ cleanupOlderThan: new Date(Date.now() - hours * 3_600_000) });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[knowledge-core] index optimize skipped: ${msg.slice(0, 160)}`);
