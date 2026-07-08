@@ -47,6 +47,8 @@ const store = {
     { chunk: exactDef, score: 0.7, source: 'bm25' },
   ],
   searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+  searchByEntitySubstring: async (): Promise<ScoredChunk[]> => [],
+  phraseSearch: async (): Promise<ScoredChunk[]> => [],
 } as any;
 
 // Stub store where BOTH probabilistic retrievers miss the definition entirely —
@@ -58,10 +60,12 @@ const storeMissingDef = {
   fullTextSearch: async (): Promise<ScoredChunk[]> => [
     { chunk: adjacent, score: 0.8, source: 'bm25' },
   ],
-  searchByEntityName: async (names: string[]): Promise<ScoredChunk[]> =>
-    names.includes('CompanySearchResponse')
+  searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+  searchByEntitySubstring: async (q: string): Promise<ScoredChunk[]> =>
+    'CompanySearchResponse'.toLowerCase().includes(q.toLowerCase())
       ? [{ chunk: exactDef, score: 1, source: 'exact' }]
       : [],
+  phraseSearch: async (): Promise<ScoredChunk[]> => [],
 } as any;
 
 const embedder = {
@@ -94,6 +98,34 @@ describe('hybrid fusion — exact-symbol boost', () => {
     assert.ok(res.chunks.some((c) => c.chunk.id === 'adjacent'), 'fused candidates are kept');
   });
 
+  it('recovers a definition from a PARTIAL identifier via the substring tier', async () => {
+    const r = new HybridRetriever(storeMissingDef, embedder, null, config, null, null);
+    // Zoekt-style: 'SearchResponse' is a substring of the defining entityName.
+    const res = await r.retrieve('SearchResponse', { mode: 'vector+bm25' });
+    assert.equal(res.chunks[0].chunk.id, 'exact', 'substring tier must surface the definition first');
+  });
+
+  it('surfaces an exact-phrase hit first for a multi-token literal query', async () => {
+    const errDef = chunk('errdef', 'renderFailure', 'render.ts');
+    const store = {
+      vectorSearch: async (): Promise<ScoredChunk[]> => [
+        { chunk: adjacent, score: 0.9, source: 'vector' },
+      ],
+      fullTextSearch: async (): Promise<ScoredChunk[]> => [
+        { chunk: adjacent, score: 0.8, source: 'bm25' },
+      ],
+      searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+      searchByEntitySubstring: async (): Promise<ScoredChunk[]> => [],
+      phraseSearch: async (q: string): Promise<ScoredChunk[]> =>
+        q === 'failed to render template'
+          ? [{ chunk: errDef, score: 2.1, source: 'phrase' }]
+          : [],
+    } as any;
+    const r = new HybridRetriever(store, embedder, null, config, null, null);
+    const res = await r.retrieve('failed to render template', { mode: 'vector+bm25' });
+    assert.equal(res.chunks[0].chunk.id, 'errdef', 'phrase hit must outrank token-bag matches');
+  });
+
   it('applies the exact tier in bm25 mode (search_exact tool path)', async () => {
     const r = new HybridRetriever(storeMissingDef, embedder, null, config, null, null);
     const res = await r.retrieve('CompanySearchResponse', { mode: 'bm25' });
@@ -112,6 +144,8 @@ describe('hybrid fusion — result-surface shaping', () => {
         { chunk: other, score: 0.8, source: 'bm25' },
       ],
       searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+      searchByEntitySubstring: async (): Promise<ScoredChunk[]> => [],
+      phraseSearch: async (): Promise<ScoredChunk[]> => [],
     } as any;
     const r = new HybridRetriever(store, embedder, null, config, null, null);
     const res = await r.retrieve('how does it work', { mode: 'vector+bm25' });
@@ -130,6 +164,8 @@ describe('hybrid fusion — result-surface shaping', () => {
       ],
       fullTextSearch: async (): Promise<ScoredChunk[]> => [],
       searchByEntityName: async (): Promise<ScoredChunk[]> => [],
+      searchByEntitySubstring: async (): Promise<ScoredChunk[]> => [],
+      phraseSearch: async (): Promise<ScoredChunk[]> => [],
     } as any;
     const r = new HybridRetriever(store, embedder, null, config, null, null);
     const res = await r.retrieve('how does dup work', { mode: 'vector+bm25' });

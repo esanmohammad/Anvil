@@ -43,6 +43,10 @@ export interface VectorStorePort {
   optimizeIndexes(): Promise<void>;
   /** Exact-symbol lookup by entityName (indexed equality) — the literal tier. */
   searchByEntityName(names: string[], limit?: number, filter?: string): Promise<ScoredChunk[]>;
+  /** Substring symbol lookup (Zoekt-style partial-identifier tier). */
+  searchByEntitySubstring(query: string, limit?: number, filter?: string): Promise<ScoredChunk[]>;
+  /** Exact-phrase search over the code text (multi-token literal tier). */
+  phraseSearch(queryText: string, limit?: number, filter?: string): Promise<ScoredChunk[]>;
   upsertChunks(chunks: Array<CodeChunk & { embedding: number[] }>): Promise<void>;
   addChunks(chunks: Array<CodeChunk & { embedding: number[] }>, opts?: { skipIndex?: boolean }): Promise<void>;
   vectorSearch(queryEmbedding: number[], opts?: { limit?: number; filter?: string }): Promise<ScoredChunk[]>;
