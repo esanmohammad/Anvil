@@ -59,7 +59,7 @@ export interface WorkspaceMap {
 export interface ScoredChunk {
   chunk: CodeChunk;
   score: number;
-  source: 'vector' | 'bm25' | 'graph' | 'fused' | 'exact';
+  source: 'vector' | 'bm25' | 'graph' | 'fused' | 'exact' | 'phrase';
 }
 
 // `RetrievalMode` is re-exported via retriever.ts now that retriever lives in

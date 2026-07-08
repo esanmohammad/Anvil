@@ -77,8 +77,14 @@ export class VectorStore {
     if (!this.table) return;
     try {
       const lancedb = await import('@lancedb/lancedb');
+      // withPosition: term positions enable PhraseQuery (multi-token literal
+      // matching). removeStopWords: the default drops 'to'/'if'/'in' etc.,
+      // which silently breaks phrases containing them — and stop words are
+      // meaningful tokens in code and error strings. The index is rebuilt
+      // every embed cycle, so this takes effect at the next reindex without
+      // a migration.
       await this.table.createIndex('contextualizedContent', {
-        config: lancedb.Index.fts(),
+        config: lancedb.Index.fts({ withPosition: true, removeStopWords: false }),
         replace: true,
       });
     } catch {
@@ -269,6 +275,65 @@ export class VectorStore {
         source: 'exact' as const,
       }));
     } catch {
+      return [];
+    }
+  }
+
+  /** Substring symbol lookup: chunks whose entityName CONTAINS the query,
+   *  case-insensitively — the Zoekt-style partial-identifier tier
+   *  (`SearchResponse` finds `CompanySearchResponse`). A projected ILIKE scan
+   *  over the short entityName column: measured ~50ms cold / ~3ms warm at
+   *  450k rows. Results ranked exact > prefix > infix, then shorter names
+   *  (tighter match) first. */
+  async searchByEntitySubstring(query: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
+    if (!this.table || query.length === 0) return [];
+    const esc = query.replace(/'/g, "''").replace(/([%_\\])/g, '\\$1');
+    const cond = `entityName ILIKE '%${esc}%'`;
+    const where = filter ? `(${cond}) AND (${filter})` : cond;
+    try {
+      // Over-fetch so the JS ranking below sees enough candidates to prefer
+      // exact/prefix matches over incidental infix hits.
+      const rows = await this.table.query().where(where).limit(limit * 4).toArray();
+      const q = query.toLowerCase();
+      const rank = (name: string): number => {
+        const n = name.replace(/\$\d+$/, '').toLowerCase();
+        if (n === q) return 0;
+        if (n.startsWith(q) || n.endsWith(q)) return 1;
+        return 2;
+      };
+      return rows
+        .map((r: any) => ({ row: r, r: rank(r.entityName ?? ''), len: (r.entityName ?? '').length }))
+        .sort((a: any, b: any) => a.r - b.r || a.len - b.len)
+        .slice(0, limit)
+        .map(({ row, r }: any) => ({
+          chunk: rowToChunk(row),
+          score: 1 - r * 0.2,
+          source: 'exact' as const,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  /** Exact-phrase search over the code text (tantivy PhraseQuery) — multi-token
+   *  literals (error strings, exact statements) match as an adjacent phrase
+   *  instead of a bag of tokens. Requires the FTS index built withPosition;
+   *  until the next reindex provides that, this returns [] (non-fatal). */
+  async phraseSearch(queryText: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
+    if (!this.table) return [];
+    try {
+      const lancedb = await import('@lancedb/lancedb');
+      const pq = new (lancedb as any).PhraseQuery(queryText, 'contextualizedContent');
+      let q = this.table.query().fullTextSearch(pq).limit(limit);
+      if (filter) q = q.where(filter);
+      const results = await q.toArray();
+      return results.map((r: any) => ({
+        chunk: rowToChunk(r),
+        score: r._score ?? r._relevance_score ?? 0.5,
+        source: 'phrase' as const,
+      }));
+    } catch {
+      // PhraseQuery unavailable (old binding) or index lacks positions — no-op.
       return [];
     }
   }
