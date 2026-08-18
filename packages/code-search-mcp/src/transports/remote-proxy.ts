@@ -20,14 +20,8 @@
  *   }
  */
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+import { Server } from '@modelcontextprotocol/server';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 
 interface RemoteProxyConfig {
   serverUrl: string;
@@ -159,7 +153,7 @@ export async function startRemoteProxy(config: RemoteProxyConfig): Promise<void>
   );
 
   // Forward tools/list — fetch from remote
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
+  server.setRequestHandler('tools/list', async () => {
     try {
       const response = await remote.request('tools/list');
       return response.result ?? { tools: [] };
@@ -170,7 +164,7 @@ export async function startRemoteProxy(config: RemoteProxyConfig): Promise<void>
   });
 
   // Forward tools/call — proxy to remote
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler('tools/call', async (request) => {
     try {
       const response = await remote.request('tools/call', {
         name: request.params.name,
@@ -189,7 +183,7 @@ export async function startRemoteProxy(config: RemoteProxyConfig): Promise<void>
   });
 
   // Forward resources/list
-  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  server.setRequestHandler('resources/list', async () => {
     try {
       const response = await remote.request('resources/list');
       return response.result ?? { resources: [] };
@@ -199,7 +193,7 @@ export async function startRemoteProxy(config: RemoteProxyConfig): Promise<void>
   });
 
   // Forward resources/read
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  server.setRequestHandler('resources/read', async (request) => {
     try {
       const response = await remote.request('resources/read', {
         uri: request.params.uri,

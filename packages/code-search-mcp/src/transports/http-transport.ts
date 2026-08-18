@@ -1,25 +1,30 @@
 /**
  * HTTP transport for code-search-mcp.
  *
- * Exposes the MCP server over Streamable HTTP (POST /mcp)
- * with a health endpoint. Each session gets its own Server + Transport pair.
+ * Exposes the MCP server over Streamable HTTP (POST /mcp) with a health
+ * endpoint. Serving is stateless on every request: `createMcpHandler` answers
+ * modern (2026-07-28) envelope traffic natively and 2025-era clients via its
+ * per-request legacy fallback — a fresh Server instance per exchange, no
+ * session map. This is what cluster workers behind a per-request proxy need,
+ * so there is no separate stateless mode any more.
  */
 
 import { createServer, type IncomingMessage, type Server as NodeHttpServer, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createMcpHandler, type Server } from '@modelcontextprotocol/server';
+import { toNodeHandler } from '@modelcontextprotocol/node';
 import type { ServerConfig } from '../core/env-config.js';
 import { createAuthMiddleware, type AuthIdentity } from '../middleware/auth.js';
 import { registry, metrics } from '../observability/metrics.js';
 
 /** Factory that creates a fresh, fully-wired MCP Server instance */
 export type McpServerFactory = () => Promise<{
-  server: { connect(transport: any): Promise<void> };
+  server: Server;
 }>;
 
 export interface HttpTransportOptions {
   config: ServerConfig;
-  /** Called for each new session to produce an independent MCP Server */
+  /** Called for each request to produce an independent MCP Server */
   createMcpServer: McpServerFactory;
   onReady?: (url: string) => void;
   getHealth?: () => Record<string, unknown>;
@@ -27,15 +32,6 @@ export interface HttpTransportOptions {
   getStatus?: () => Record<string, unknown>;
   /** Handler for POST /index — allows triggering indexing via REST */
   onIndex?: (body: { path: string; project?: string; force?: boolean }) => Promise<Record<string, unknown>>;
-  /** Stateless MCP mode: a fresh Server+Transport pair per POST, no session
-   *  map. Required for cluster workers — a proxy that opens a new upstream
-   *  connection per request lands each request on a different worker, so
-   *  in-memory sessions cannot stick. GET (SSE) and DELETE return 405. */
-  stateless?: boolean;
-}
-
-interface Session {
-  transport: StreamableHTTPServerTransport;
 }
 
 export async function startHttpTransport(opts: HttpTransportOptions): Promise<NodeHttpServer> {
@@ -45,25 +41,14 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
   // P7 — uptime for /admin/api/status.
   const startedAt = Date.now();
 
-  // Map of sessionId → session (with TTL + max limit)
-  const sessions = new Map<string, Session & { lastActivity: number }>();
-  // Idle session lifetime. 30 min was too aggressive for an all-day interactive
-  // MCP client — an idle gap > 30 min got the session reaped, and the next call
-  // then failed. Default 120 min, env-overridable; any POST/GET refreshes it.
-  const ttlMin = parseInt(process.env.CODE_SEARCH_SESSION_TTL_MINUTES ?? '', 10);
-  const SESSION_TTL_MS = (Number.isFinite(ttlMin) && ttlMin > 0 ? ttlMin : 120) * 60 * 1000;
-  const maxEnv = parseInt(process.env.CODE_SEARCH_MAX_SESSIONS ?? '', 10);
-  const MAX_SESSIONS = Number.isFinite(maxEnv) && maxEnv > 0 ? maxEnv : 100;
-
-  // Clean up stale sessions every 5 minutes
-  setInterval(() => {
-    const now = Date.now();
-    for (const [id, session] of sessions) {
-      if (now - session.lastActivity > SESSION_TTL_MS) {
-        sessions.delete(id);
-      }
-    }
-  }, 5 * 60 * 1000).unref();
+  // One handler serves every /mcp request: modern 2026-07-28 traffic on the
+  // per-request micro-transport, 2025-era clients via the stateless legacy
+  // fallback (fresh instance per exchange). GET/DELETE (legacy session verbs)
+  // are answered 405 by the handler itself.
+  const mcpHandler = createMcpHandler(async () => (await createMcpServer()).server, {
+    onerror: (err) => console.error(`[code-search-mcp] MCP handler error: ${err.message}`),
+  });
+  const handleMcp = toNodeHandler(mcpHandler);
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
@@ -79,7 +64,6 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
-        activeSessions: sessions.size,
         ...health,
       }));
       return;
@@ -132,7 +116,6 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
       res.end(JSON.stringify({
         version: '0.1.0',
         uptime: Math.floor((Date.now() - startedAt) / 1000),
-        sessions: sessions.size,
         ...status,
       }, null, 2));
       return;
@@ -183,128 +166,7 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
         if (!identity) return;
       }
 
-      if (req.method === 'POST' && opts.stateless) {
-        // Stateless: fresh Server+Transport per request; every worker can
-        // serve every request. JSON responses (no SSE) keep it proxy-friendly.
-        try {
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined,
-            enableJsonResponse: true,
-          });
-          const { server: mcpServer } = await createMcpServer();
-          res.on('close', () => {
-            void transport.close();
-          });
-          await mcpServer.connect(transport);
-          await transport.handleRequest(req, res);
-        } catch {
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Request handling failed' }));
-          }
-        }
-        return;
-      }
-
-      if ((req.method === 'GET' || req.method === 'DELETE') && opts.stateless) {
-        // No sessions to stream from or delete in stateless mode. 405 is the
-        // spec-compliant "server does not offer SSE / session teardown" answer.
-        res.writeHead(405, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Stateless mode: sessions are not supported' }));
-        return;
-      }
-
-      if (req.method === 'POST') {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-
-        if (sessionId && sessions.has(sessionId)) {
-          // Existing session — route to its transport
-          sessions.get(sessionId)!.lastActivity = Date.now();
-          await sessions.get(sessionId)!.transport.handleRequest(req, res);
-          return;
-        }
-
-        if (sessionId && !sessions.has(sessionId)) {
-          // 404 (not 400) so a spec-compliant client re-initializes a new
-          // session instead of treating it as a fatal error.
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Session expired or unknown — reinitialize.' }));
-          return;
-        }
-
-        // Enforce max session limit
-        if (sessions.size >= MAX_SESSIONS) {
-          res.writeHead(503, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Too many active sessions. Try again later.' }));
-          return;
-        }
-
-        // New session — create a dedicated Server + Transport pair
-        try {
-          const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-          });
-
-          const { server: mcpServer } = await createMcpServer();
-          await mcpServer.connect(transport);
-
-          // Clean up on close
-          transport.onclose = () => {
-            for (const [id, s] of sessions) {
-              if (s.transport === transport) {
-                sessions.delete(id);
-                break;
-              }
-            }
-          };
-
-          // Handle the request (this sends the response with session ID header)
-          await transport.handleRequest(req, res);
-
-          // Store session using the ID from response headers
-          const newSessionId = res.getHeader('mcp-session-id') as string | undefined;
-          if (newSessionId) {
-            sessions.set(newSessionId, { transport, lastActivity: Date.now() });
-          }
-        } catch (err) {
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Failed to create session' }));
-          }
-        }
-        return;
-      }
-
-      if (req.method === 'GET') {
-        // SSE stream for an existing session. Refresh activity here too — this
-        // long-lived server→client stream is exactly the case the POST-only
-        // refresh missed, so an actively-streaming session was being reaped.
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        if (sessionId && sessions.has(sessionId)) {
-          sessions.get(sessionId)!.lastActivity = Date.now();
-          await sessions.get(sessionId)!.transport.handleRequest(req, res);
-          return;
-        }
-        // Provided-but-unknown session → 404 (reinitialize); missing → 400.
-        res.writeHead(sessionId ? 404 : 400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: sessionId ? 'Session expired or unknown — reinitialize.' : 'Session ID required for GET requests' }));
-        return;
-      }
-
-      if (req.method === 'DELETE') {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        if (sessionId && sessions.has(sessionId)) {
-          await sessions.get(sessionId)!.transport.handleRequest(req, res);
-          sessions.delete(sessionId);
-          return;
-        }
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid session ID' }));
-        return;
-      }
-
-      res.writeHead(405, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      await handleMcp(req, res);
       return;
     }
 

@@ -3,14 +3,8 @@
  * Supports stdio (default) and HTTP transports with auth.
  */
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+import { Server } from '@modelcontextprotocol/server';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import cluster from 'node:cluster';
@@ -65,11 +59,11 @@ function createMcpServerInstance(ctx: ServerContext) {
     ...registerIndexTools(),
   ];
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  server.setRequestHandler('tools/list', async () => ({
     tools: allTools,
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler('tools/call', async (request) => {
     const name = request.params.name;
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
 
@@ -90,11 +84,11 @@ function createMcpServerInstance(ctx: ServerContext) {
 
   const allResources = registerResources(ctx);
 
-  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  server.setRequestHandler('resources/list', async () => ({
     resources: allResources,
   }));
 
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  server.setRequestHandler('resources/read', async (request) => {
     return handleResource(request.params.uri, ctx);
   });
 
@@ -169,10 +163,6 @@ export async function startServer(
 
     await startHttpTransport({
       config,
-      // Workers must be stateless: the fronting proxy opens a new upstream
-      // connection per request, so in-memory MCP sessions cannot stick to one
-      // worker. Also opt-in for single-process deploys via env.
-      stateless: isReadOnlyWorker || process.env.CODE_SEARCH_STATELESS === '1',
       createMcpServer: async () => ({
         server: createMcpServerInstance(ctx),
       }),

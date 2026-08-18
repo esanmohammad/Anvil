@@ -245,10 +245,11 @@ Every index call lands in a 50-entry FIFO history with start
 timestamp, success / error, last duration. Available at
 `GET /status`.
 
-### Streamable HTTP sessions
-Per-session `StreamableHTTPServerTransport`, max 100 concurrent
-sessions, 30 min TTL. The remote proxy captures `mcp-session-id`
-for continuity. SSE transport available as a fallback.
+### Stateless Streamable HTTP
+Every `/mcp` request is served statelessly by a fresh Server
+instance: modern (2026-07-28) clients negotiate via
+`server/discover`; 2025-era clients are answered by the SDK's
+per-request legacy fallback. No session map, no TTL.
 
 ### Admin index endpoint
 `POST /index` with `{ project, dirPath?, opts? }` triggers a
@@ -374,9 +375,9 @@ the same router, retries, and cost ledger as the rest of Anvil.
 **Three modes, one binary.** Remote proxy for hosted, local for
 solo, serve for teams. The dispatcher is `src/index.ts:argv`.
 
-**Stateless sessions.** HTTP sessions are in-memory by design.
-Restart drops them; clients re-init on first request. No persistent
-session store to maintain.
+**Stateless serving.** Every `/mcp` request is an independent
+exchange — no session state at all, so restarts and per-request
+proxies (cluster workers) are free.
 
 **Security defaults that don't bite.** Default bind is `127.0.0.1`
 when auth is `none`. API keys compared timing-safe. JWT

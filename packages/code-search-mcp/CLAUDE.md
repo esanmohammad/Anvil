@@ -83,9 +83,10 @@ All implemented in `src/tools/`:
   (stdio or HTTP), schedules optional reindex via
   `CODE_SEARCH_REINDEX_INTERVAL`.
 - `src/transports/http-transport.ts:startHttpTransport(opts)` —
-  `node:http` server with per-session `StreamableHTTPServerTransport`
-  (max 100 sessions, 30 min TTL). Routes: `/health`, `/status`,
-  `/index`, `/mcp` (POST/GET/DELETE).
+  `node:http` server; `/mcp` is served statelessly by one SDK-v2
+  `createMcpHandler` (modern 2026-07-28 era + per-request legacy
+  fallback; GET/DELETE answer 405). Routes: `/health`, `/status`,
+  `/index`, `/mcp`.
 - `src/middleware/auth.ts:createAuthMiddleware(config)` — `none` /
   `api-key` / `jwt` (HS256). In-memory rate limiter (sliding 1 min
   window) keyed by identity subject.
@@ -312,8 +313,9 @@ Parsed by `parseReindexInterval()`. Skips when
 - No vendor LLM SDK — anything LLM-driven (repo profiling, service
   mesh inference) goes through `@anvil/knowledge-core`'s
   `claude-runner.ts` shim → `@anvil/agent-core`'s single-shot.
-- No persistent session store. HTTP sessions are in-memory; restart
-  drops them. Remote-proxy clients re-init on first request.
+- No session state at all — every `/mcp` request is an independent
+  stateless exchange (SDK v2 / spec 2026-07-28). Remote-proxy clients
+  re-init on first request.
 - No web framework — `http-transport.ts` is hand-rolled `node:http`
   with a single dispatch function so zero-runtime-dep stays a goal.
 - No chokidar / native file-watcher dep — the daemon uses Node's
@@ -346,6 +348,6 @@ Parsed by `parseReindexInterval()`. Skips when
 ## Architecture + flow docs
 
 - `ARCHITECTURE.md` — module map, mode dispatch, HTTP routes, tool
-  surface, session lifecycle.
+  surface.
 - `FLOW.md` — sequence diagrams: remote-proxy startup, serve-mode
   startup, search call, graph call, admin index, auto-reindex.
