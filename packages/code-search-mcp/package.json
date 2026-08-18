@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/code-search-mcp",
-  "version": "0.4.12",
+  "version": "0.5.0",
   "description": "MCP server for multi-repo code search \u2014 GitHub org or local path, zero config",
   "type": "module",
   "license": "MIT",
@@ -23,8 +23,8 @@
     "smoke": "bash scripts/smoke/run-smoke.sh"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.4.0",
-    "@esankhan3/anvil-knowledge-core": "^0.3.1",
+    "@esankhan3/anvil-agent-core": "^0.5.0",
+    "@esankhan3/anvil-knowledge-core": "^0.4.0",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0"
   },

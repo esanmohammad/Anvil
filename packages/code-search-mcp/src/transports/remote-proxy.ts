@@ -110,7 +110,7 @@ class RemoteConnection {
     return this.request('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
-      clientInfo: { name: 'code-search-mcp-proxy', version: '0.1.0' },
+      clientInfo: { name: 'code-search-mcp-proxy', version: '0.5.0' },
     });
   }
 
@@ -148,7 +148,7 @@ export async function startRemoteProxy(config: RemoteProxyConfig): Promise<void>
 
   // Create local stdio MCP server
   const server = new Server(
-    { name: 'code-search-mcp', version: '0.1.0' },
+    { name: 'code-search-mcp', version: '0.5.0' },
     { capabilities: { tools: {}, resources: {} } },
   );
 
