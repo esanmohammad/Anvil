@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 
 import type { FileIndexEntry } from '@esankhan3/anvil-knowledge-core';
 import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
-import { resolveStorage } from './storage/resolve.js';
+import { resolveStorage, invalidateGraphStores } from './storage/resolve.js';
 import type { BlobStorePort, StorageBundle } from './storage/ports.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
@@ -949,6 +949,10 @@ async function uploadSystemGraphIfRemote(
   try {
     await storage.blobs.putBytes('system_graph.sqlite', readFileSync(localPath));
     log('Uploaded system_graph.sqlite to the blob backend');
+    // On a remote backend the local copy is writer scratch — the blob store is
+    // the durable home (readers pull it to their cache dir). Discard it so a
+    // remote deployment leaves zero durable artifacts on the local fs.
+    rmSync(localPath, { force: true });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[knowledge-core] system graph upload failed (readers keep the previous graph): ${msg.slice(0, 160)}`);
@@ -1019,6 +1023,8 @@ export async function invalidateRetriever(project?: string): Promise<void> {
     retrieverCache.delete(k);
     try { (await e.retriever).close(); } catch { /* already closed / build failed */ }
   }
+  // The shared graph-store cache follows the same reindex lifecycle.
+  await invalidateGraphStores(project);
 }
 
 async function buildRetriever(

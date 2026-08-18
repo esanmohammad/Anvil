@@ -323,8 +323,9 @@ function envStorageBackends(env: (k: string) => string | undefined): KnowledgeSt
   const s3Region = env('STORAGE_S3_REGION');
   const s3AllowHttp = env('STORAGE_S3_ALLOW_HTTP');
   const cacheMaxBytes = env('STORAGE_CACHE_MAX_BYTES');
+  const cacheDir = env('STORAGE_CACHE_DIR');
 
-  if (!blobBackend && !mongoUri && !vectorUri && !cacheMaxBytes) return undefined;
+  if (!blobBackend && !mongoUri && !vectorUri && !cacheMaxBytes && !cacheDir) return undefined;
 
   const out: KnowledgeStorageConfig = {};
   if (blobBackend || mongoUri) {
@@ -345,15 +346,15 @@ function envStorageBackends(env: (k: string) => string | undefined): KnowledgeSt
         : undefined;
     out.vector = { lancedb: { uri: vectorUri, ...(s3 ? { s3 } : {}) } };
   }
-  if (cacheMaxBytes) {
-    const max = parseInt(cacheMaxBytes, 10);
-    if (Number.isFinite(max) && max > 0) {
-      out.cache = {
-        dir: env('STORAGE_CACHE_DIR') ?? join(tmpdir(), 'code-search-cache'),
-        maxBytes: max,
-        mode: 'ram',
-      };
-    }
+  // CACHE_DIR (sqlite graph pull target) and CACHE_MAX_BYTES (LanceDB RAM
+  // Session bound) are independent knobs — a reader pod mounting an emptyDir
+  // cache sets the dir without necessarily bounding the RAM cache.
+  const max = cacheMaxBytes ? parseInt(cacheMaxBytes, 10) : NaN;
+  if (cacheDir || (Number.isFinite(max) && max > 0)) {
+    out.cache = {
+      dir: cacheDir ?? join(tmpdir(), 'code-search-cache'),
+      ...(Number.isFinite(max) && max > 0 ? { maxBytes: max, mode: 'ram' as const } : {}),
+    };
   }
   return out;
 }

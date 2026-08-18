@@ -13,4 +13,4 @@ export type {
 export { FsBlobStore } from './fs-blob-store.js';
 export { MongoBlobStore, closeMongoClients } from './mongo-blob-store.js';
 export type { MongoBlobConfig } from './mongo-blob-store.js';
-export { resolveStorage, getBlobStore, findChunksInProject, lanceStorageOptions, lanceCacheBudget } from './resolve.js';
+export { resolveStorage, getBlobStore, getGraphStore, invalidateGraphStores, findChunksInProject, lanceStorageOptions, lanceCacheBudget } from './resolve.js';

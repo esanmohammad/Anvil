@@ -19,7 +19,7 @@ import { VectorStore } from '../vector-store.js';
 import { openSystemGraphStore } from '../graph-store.js';
 import { FsBlobStore } from './fs-blob-store.js';
 import { MongoBlobStore } from './mongo-blob-store.js';
-import type { StorageBundle, BlobStorePort } from './ports.js';
+import type { StorageBundle, BlobStorePort, GraphStorePort } from './ports.js';
 
 function notYet(concern: string, backend: string): never {
   throw new Error(
@@ -139,6 +139,55 @@ export function lanceCacheBudget(
   const metadataCacheBytes = Math.min(Math.floor(max * 0.25), 1024 ** 3);
   const indexCacheBytes = max - metadataCacheBytes;
   return { indexCacheBytes, metadataCacheBytes };
+}
+
+/**
+ * Shared, cached system-graph store for a project (ADR §4b / P2c).
+ *
+ * The per-call pattern (open → query → close) is fine on the fs backend where
+ * opening is a local SQLite handle, but on a remote blob backend the bundle's
+ * graph thunk DOWNLOADS system_graph.sqlite before opening — per tool call
+ * that would re-pull the whole file every time. This memoizes the opened
+ * store per (project, blob identity); callers must NOT close() it. Freshness
+ * matches the retriever: reindex invalidates via indexer.invalidateRetriever
+ * (which calls {@link invalidateGraphStores}); remote read replicas refresh
+ * on redeploy, same as the retriever's invalidate-on-reindex contract.
+ *
+ * A null resolution (KB not built yet) is not pinned — the next call re-checks
+ * so readers pick up the graph as soon as the writer publishes it.
+ */
+const graphStoreCache = new Map<string, Promise<GraphStorePort | null>>();
+
+function graphCacheKey(project: string, config?: KnowledgeConfig): string {
+  const b = config?.storage?.blob;
+  const id = b?.backend === 'mongo'
+    ? `mongo:${b.mongo?.uri}/${b.mongo?.db}`
+    : `fs:${b?.basePath ?? getKnowledgeBasePath(project)}`;
+  return `${project}::${id}`;
+}
+
+export function getGraphStore(project: string, config?: KnowledgeConfig): Promise<GraphStorePort | null> {
+  const key = graphCacheKey(project, config);
+  let p = graphStoreCache.get(key);
+  if (!p) {
+    p = resolveStorage(project, config).graph();
+    graphStoreCache.set(key, p);
+    p.then(
+      (store) => { if (!store) graphStoreCache.delete(key); },
+      () => graphStoreCache.delete(key),
+    );
+  }
+  return p;
+}
+
+/** Close + drop cached graph stores so the next call reopens against fresh
+ *  data. No arg = all projects. Called from indexer.invalidateRetriever. */
+export async function invalidateGraphStores(project?: string): Promise<void> {
+  const entries = [...graphStoreCache.entries()].filter(([k]) => !project || k.startsWith(`${project}::`));
+  for (const [k, p] of entries) {
+    graphStoreCache.delete(k);
+    try { (await p)?.close(); } catch { /* already closed / open failed */ }
+  }
 }
 
 /**

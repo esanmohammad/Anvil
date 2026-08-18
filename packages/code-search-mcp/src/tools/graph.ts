@@ -14,13 +14,12 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
 import {
-  getKnowledgeBasePath,
   getBlobStore,
+  getGraphStore,
   loadAllProfiles,
   loadProfile,
   getAllChanges,
   getChangedFilesList,
-  openSystemGraphStore,
 } from '@esankhan3/anvil-knowledge-core';
 import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import type { GraphStore, GraphDirection } from '@esankhan3/anvil-knowledge-core';
@@ -232,7 +231,6 @@ export async function handleGraphTool(
   const NO_GRAPH = 'No system graph found. Build KB first.';
 
   try {
-    const kbPath = getKnowledgeBasePath(ctx.projectName);
     const blobs = getBlobStore(ctx.projectName, resolvedKnowledgeConfig());
 
     if (name === 'get_repo_graph') {
@@ -244,101 +242,93 @@ export async function handleGraphTool(
     }
 
     if (name === 'get_cross_repo_edges') {
-      const store = await openSystemGraphStore(kbPath);
+      const store = await getGraphStore(ctx.projectName, resolvedKnowledgeConfig());
       if (!store) return text(NO_GRAPH);
-      try {
-        const repo = args.repo as string | undefined;
-        const { edges, total } = store.crossRepoEdges(repo, 50);
-        if (total === 0) return text(repo ? `No cross-repo edges found for "${repo}"` : 'No cross-repo edges found');
-        const body = edges.map((e) => `- ${repoOf(e.source)} → ${repoOf(e.target)} (${e.type ?? 'edge'})`).join('\n');
-        return text(`# Cross-Repo Edges${repo ? ` for ${repo}` : ''}\n\n${total} edges found:\n\n${body}${total > edges.length ? `\n\n... and ${total - edges.length} more` : ''}`);
-      } finally { store.close(); }
+      const repo = args.repo as string | undefined;
+      const { edges, total } = store.crossRepoEdges(repo, 50);
+      if (total === 0) return text(repo ? `No cross-repo edges found for "${repo}"` : 'No cross-repo edges found');
+      const body = edges.map((e) => `- ${repoOf(e.source)} → ${repoOf(e.target)} (${e.type ?? 'edge'})`).join('\n');
+      return text(`# Cross-Repo Edges${repo ? ` for ${repo}` : ''}\n\n${total} edges found:\n\n${body}${total > edges.length ? `\n\n... and ${total - edges.length} more` : ''}`);
     }
 
     if (name === 'find_callers' || name === 'find_dependencies') {
-      const store = await openSystemGraphStore(kbPath);
+      const store = await getGraphStore(ctx.projectName, resolvedKnowledgeConfig());
       if (!store) return text('No system graph found.');
-      try {
-        const funcName = args.function as string;
-        const repoFilter = args.repo as string | undefined;
-        const fuzzy = args.fuzzy === true;
-        const matched = store.resolveNodes(funcName, repoFilter, fuzzy);
-        if (matched.length === 0) {
-          return text(`No entity found matching "${funcName}"${repoFilter ? ` in ${repoFilter}` : ''}. Try fuzzy:true for substring matching.`);
-        }
-        const keys = matched.map((m) => m.key);
-        const unique = name === 'find_callers' ? store.callers(keys, 30) : store.dependencies(keys, 30);
-        const direction = name === 'find_callers' ? 'Callers of' : 'Dependencies of';
-        if (unique.length === 0) {
-          return text(`# ${direction} "${funcName}"\n\nMatched ${matched.length} entit${matched.length === 1 ? 'y' : 'ies'}, but no ${name === 'find_callers' ? 'callers' : 'dependencies'} found.`);
-        }
-        return text(`# ${direction} "${funcName}"\n\n${unique.length} found:\n${unique.map((r) => `- \`${r}\``).join('\n')}`);
-      } finally { store.close(); }
+      const funcName = args.function as string;
+      const repoFilter = args.repo as string | undefined;
+      const fuzzy = args.fuzzy === true;
+      const matched = store.resolveNodes(funcName, repoFilter, fuzzy);
+      if (matched.length === 0) {
+        return text(`No entity found matching "${funcName}"${repoFilter ? ` in ${repoFilter}` : ''}. Try fuzzy:true for substring matching.`);
+      }
+      const keys = matched.map((m) => m.key);
+      const unique = name === 'find_callers' ? store.callers(keys, 30) : store.dependencies(keys, 30);
+      const direction = name === 'find_callers' ? 'Callers of' : 'Dependencies of';
+      if (unique.length === 0) {
+        return text(`# ${direction} "${funcName}"\n\nMatched ${matched.length} entit${matched.length === 1 ? 'y' : 'ies'}, but no ${name === 'find_callers' ? 'callers' : 'dependencies'} found.`);
+      }
+      return text(`# ${direction} "${funcName}"\n\n${unique.length} found:\n${unique.map((r) => `- \`${r}\``).join('\n')}`);
     }
 
     if (name === 'impact_analysis') {
-      const store = await openSystemGraphStore(kbPath);
+      const store = await getGraphStore(ctx.projectName, resolvedKnowledgeConfig());
       if (!store) return text('No system graph found.');
-      try {
-        const file = args.file as string;
-        const repo = args.repo as string;
-        const entity = args.entity as string | undefined;
-        const fileKeys = store.nodesInFiles(repo, [file], entity);
-        const { edges: dependents, total, repos } = store.dependents(fileKeys, 30);
-        const body = [
-          `# Impact Analysis: ${repo}/${file}${entity ? `::${entity}` : ''}`,
-          '',
-          `## Entities in scope: ${fileKeys.length}`,
-          ...fileKeys.slice(0, 20).map((k) => `- \`${k}\``),
-          '',
-          `## Dependents: ${total} edges from ${repos.length} repos`,
-          ...dependents.map((e) => `- \`${e.source}\` → \`${e.target}\` (${e.type ?? 'edge'})`),
-          total > dependents.length ? `\n... and ${total - dependents.length} more` : '',
-          '',
-          `## Affected repos: ${repos.join(', ') || 'none'}`,
-        ].join('\n');
-        return text(body);
-      } finally { store.close(); }
+      const file = args.file as string;
+      const repo = args.repo as string;
+      const entity = args.entity as string | undefined;
+      const fileKeys = store.nodesInFiles(repo, [file], entity);
+      const { edges: dependents, total, repos } = store.dependents(fileKeys, 30);
+      const body = [
+        `# Impact Analysis: ${repo}/${file}${entity ? `::${entity}` : ''}`,
+        '',
+        `## Entities in scope: ${fileKeys.length}`,
+        ...fileKeys.slice(0, 20).map((k) => `- \`${k}\``),
+        '',
+        `## Dependents: ${total} edges from ${repos.length} repos`,
+        ...dependents.map((e) => `- \`${e.source}\` → \`${e.target}\` (${e.type ?? 'edge'})`),
+        total > dependents.length ? `\n... and ${total - dependents.length} more` : '',
+        '',
+        `## Affected repos: ${repos.join(', ') || 'none'}`,
+      ].join('\n');
+      return text(body);
     }
 
     if (name === 'trace_path') {
-      const store = await openSystemGraphStore(kbPath);
+      const store = await getGraphStore(ctx.projectName, resolvedKnowledgeConfig());
       if (!store) return text('No system graph found.');
-      try {
-        const from = args.from as string;
-        const to = args.to as string | undefined;
-        const repo = args.repo as string | undefined;
-        const fuzzy = args.fuzzy === true;
-        const direction = ((args.direction as GraphDirection) ?? 'callees');
-        const maxDepth = Math.max(1, Math.min(10, (args.maxDepth as number) || 4));
+      const from = args.from as string;
+      const to = args.to as string | undefined;
+      const repo = args.repo as string | undefined;
+      const fuzzy = args.fuzzy === true;
+      const direction = ((args.direction as GraphDirection) ?? 'callees');
+      const maxDepth = Math.max(1, Math.min(10, (args.maxDepth as number) || 4));
 
-        const fromKeys = store.resolveNodes(from, repo, fuzzy).map((m) => m.key);
-        if (fromKeys.length === 0) return text(`No entity found matching "${from}". Try fuzzy:true.`);
-        const getNeighbors = makeNeighborGetter(store, direction);
+      const fromKeys = store.resolveNodes(from, repo, fuzzy).map((m) => m.key);
+      if (fromKeys.length === 0) return text(`No entity found matching "${from}". Try fuzzy:true.`);
+      const getNeighbors = makeNeighborGetter(store, direction);
 
-        if (to) {
-          const toKeys = new Set(store.resolveNodes(to, repo, fuzzy).map((m) => m.key));
-          if (toKeys.size === 0) return text(`No entity found matching target "${to}". Try fuzzy:true.`);
-          const path = shortestPath(getNeighbors, fromKeys, toKeys, maxDepth);
-          if (!path) return text(`No path from "${from}" to "${to}" within ${maxDepth} hops (direction: ${direction}).`);
-          const labelOf = store.labelsOf(path);
-          const arrow = direction === 'callers' ? ' ← ' : ' → ';
-          const rendered = path.map((k) => labelOf.get(k) ?? k).join(arrow);
-          return text(`# Path (${path.length - 1} hops)\n\n${rendered}\n\n${path.map((k) => `- \`${k}\``).join('\n')}`);
-        }
+      if (to) {
+        const toKeys = new Set(store.resolveNodes(to, repo, fuzzy).map((m) => m.key));
+        if (toKeys.size === 0) return text(`No entity found matching target "${to}". Try fuzzy:true.`);
+        const path = shortestPath(getNeighbors, fromKeys, toKeys, maxDepth);
+        if (!path) return text(`No path from "${from}" to "${to}" within ${maxDepth} hops (direction: ${direction}).`);
+        const labelOf = store.labelsOf(path);
+        const arrow = direction === 'callers' ? ' ← ' : ' → ';
+        const rendered = path.map((k) => labelOf.get(k) ?? k).join(arrow);
+        return text(`# Path (${path.length - 1} hops)\n\n${rendered}\n\n${path.map((k) => `- \`${k}\``).join('\n')}`);
+      }
 
-        const nodes = reachable(getNeighbors, fromKeys, maxDepth);
-        if (nodes.length === 0) return text(`No ${direction} reachable from "${from}" within ${maxDepth} hops.`);
-        const labelOf = store.labelsOf(nodes.map((n) => n.key));
-        const byDepth = new Map<number, string[]>();
-        for (const { key, depth } of nodes) {
-          if (!byDepth.has(depth)) byDepth.set(depth, []);
-          byDepth.get(depth)!.push(`\`${labelOf.get(key) ?? key}\` (${key})`);
-        }
-        const sections = [...byDepth.entries()].sort((a, b) => a[0] - b[0])
-          .map(([d, ks]) => `## Depth ${d}\n${ks.map((k) => `- ${k}`).join('\n')}`).join('\n\n');
-        return text(`# Reachable from "${from}" (${direction}, ≤${maxDepth} hops)\n\n${nodes.length} nodes:\n\n${sections}`);
-      } finally { store.close(); }
+      const nodes = reachable(getNeighbors, fromKeys, maxDepth);
+      if (nodes.length === 0) return text(`No ${direction} reachable from "${from}" within ${maxDepth} hops.`);
+      const labelOf = store.labelsOf(nodes.map((n) => n.key));
+      const byDepth = new Map<number, string[]>();
+      for (const { key, depth } of nodes) {
+        if (!byDepth.has(depth)) byDepth.set(depth, []);
+        byDepth.get(depth)!.push(`\`${labelOf.get(key) ?? key}\` (${key})`);
+      }
+      const sections = [...byDepth.entries()].sort((a, b) => a[0] - b[0])
+        .map(([d, ks]) => `## Depth ${d}\n${ks.map((k) => `- ${k}`).join('\n')}`).join('\n\n');
+      return text(`# Reachable from "${from}" (${direction}, ≤${maxDepth} hops)\n\n${nodes.length} nodes:\n\n${sections}`);
     }
 
     if (name === 'find_dead_code') {
@@ -411,20 +401,18 @@ export async function handleGraphTool(
     }
 
     if (name === 'search_graph') {
-      const store = await openSystemGraphStore(kbPath);
+      const store = await getGraphStore(ctx.projectName, resolvedKnowledgeConfig());
       if (!store) return text(NO_GRAPH);
-      try {
-        const { rows, total } = store.searchNodes({
-          name: args.name as string | undefined,
-          type: args.type as string | undefined,
-          file: args.file as string | undefined,
-          repo: args.repo as string | undefined,
-          minDegree: (args.minDegree as number) ?? 0,
-        }, (args.limit as number) || 50);
-        if (total === 0) return text('No entities match the given filters.');
-        const body = rows.map((m) => `- \`${m.label}\` (${m.type}, ${m.file}) — degree ${m.degree}  \`${m.key}\``).join('\n');
-        return text(`# search_graph — ${total} match${total === 1 ? '' : 'es'}\n\n${body}${total > rows.length ? `\n\n... and ${total - rows.length} more` : ''}`);
-      } finally { store.close(); }
+      const { rows, total } = store.searchNodes({
+        name: args.name as string | undefined,
+        type: args.type as string | undefined,
+        file: args.file as string | undefined,
+        repo: args.repo as string | undefined,
+        minDegree: (args.minDegree as number) ?? 0,
+      }, (args.limit as number) || 50);
+      if (total === 0) return text('No entities match the given filters.');
+      const body = rows.map((m) => `- \`${m.label}\` (${m.type}, ${m.file}) — degree ${m.degree}  \`${m.key}\``).join('\n');
+      return text(`# search_graph — ${total} match${total === 1 ? '' : 'es'}\n\n${body}${total > rows.length ? `\n\n... and ${total - rows.length} more` : ''}`);
     }
 
     if (name === 'detect_changes') {
@@ -451,17 +439,15 @@ export async function handleGraphTool(
       const changedFiles = getChangedFilesList(diff);
       if (changedFiles.length === 0 && diff.deleted.length === 0) return text(`No source changes since ${baseSha.slice(0, 7)}.`);
 
-      const store = await openSystemGraphStore(kbPath);
+      const store = await getGraphStore(ctx.projectName, resolvedKnowledgeConfig());
       let changedKeys: string[] = [];
       let dependents: Array<{ source: string; target: string; type?: string }> = [];
       let depTotal = 0;
       let depRepos: string[] = [];
       if (store) {
-        try {
-          changedKeys = store.nodesInFiles(repo, changedFiles);
-          const d = store.dependents(changedKeys, limit);
-          dependents = d.edges; depTotal = d.total; depRepos = d.repos;
-        } finally { store.close(); }
+        changedKeys = store.nodesInFiles(repo, changedFiles);
+        const d = store.dependents(changedKeys, limit);
+        dependents = d.edges; depTotal = d.total; depRepos = d.repos;
       }
 
       const lines = [
