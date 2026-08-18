@@ -87,7 +87,7 @@ buildKB(project, repos, config, opts):
   │       write graph.json + GRAPH_REPORT.md
   │
   ├─ Step 7 — Cross-repo edges (when repos.length > 1 or workspaces present)
-  │     edges = await detectCrossRepoEdges(repos, workspaceMaps)
+  │     edges = correlateCrossRepoEdges(signalsFromBlobs, workspaceMaps)
   │           └─ 14 strategies (kafka, http, grpc, db, env vars, npm/workspace deps,
   │              k8s, docker-compose, proto, redis, s3, shared types, shared constants)
   │     graphBuilder.addCrossRepoEdges(edges)

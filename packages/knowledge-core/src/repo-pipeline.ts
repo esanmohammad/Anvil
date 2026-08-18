@@ -22,7 +22,8 @@ import { resolveStorage } from './storage/resolve.js';
 import type { BlobStorePort } from './storage/ports.js';
 import { initTreeSitter } from './tree-sitter-parser.js';
 // Type-only (erased at runtime — keeps the worker lean): from the package barrel.
-import type { FileIndexEntry, WorkspaceMap, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
+import type { FileIndexEntry, WorkspaceMap, WorkspacePackage, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
+import { extractCrossRepoSignals } from './cross-repo-detector.js';
 import type { KnowledgeConfig, KnowledgeStorageConfig } from './config.js';
 
 export interface RepoIndexMeta {
@@ -31,6 +32,9 @@ export interface RepoIndexMeta {
   chunkCount: number;
   embeddingProvider: string;
   files?: Record<string, FileIndexEntry>;
+  /** Serializable workspace packages (WorkspaceMap holds Maps, which don't
+   *  survive JSON) — rehydrated for cross-repo correlation on skipped repos. */
+  workspacePackages?: WorkspacePackage[];
 }
 
 export function getRepoSha(repoPath: string): string | null {
@@ -96,6 +100,11 @@ export interface RepoResult {
   graph: GraphifyOutput | null;
   workspaceMap: WorkspaceMap | null;
   chunked: boolean;
+  /** True when the shard holds ONLY changed files' chunks (git-diff incremental
+   *  re-chunk) — the indexer must carry this repo's untouched-file chunks
+   *  forward from the previous chunks.json. False = the shard is the repo's
+   *  complete chunk set. */
+  incremental: boolean;
   shardPath: string | null;
   fileIndex: Record<string, FileIndexEntry> | null;
   changedFiles: string[];
@@ -149,6 +158,7 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
   }
 
   let chunkCount = 0;
+  let incremental = false;
   let shardPath: string | null = null;
   let fileIndex: Record<string, FileIndexEntry> | null = null;
   let changedFiles: string[] = [];
@@ -167,6 +177,7 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     } finally {
       writer.close();
     }
+    incremental = useIncremental;
     fileIndex = result.fileIndex;
     chunkCount = Object.values(result.fileIndex).reduce((s, f) => s + (f as FileIndexEntry).chunkCount, 0);
     changedFiles = result.changedFiles ?? [];
@@ -195,6 +206,16 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     graph = null; // AST failure is non-fatal (matches prior buildKB behavior)
   }
 
+  // Cross-repo signals: extracted HERE because this is the only moment the
+  // working tree is guaranteed to exist (the bounded-scratch writer discards
+  // the clone right after this function returns). Correlation joins these
+  // persisted bundles later, on the main thread, without any tree.
+  try {
+    await blobs.putJson(`${repoName}/signals.json`, extractCrossRepoSignals(repoPath));
+  } catch {
+    // Non-fatal: this repo contributes no cross-repo edges until its next index.
+  }
+
   return {
     repoName,
     language: job.language,
@@ -202,6 +223,7 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     graph,
     workspaceMap,
     chunked: doChunk,
+    incremental,
     shardPath,
     fileIndex,
     changedFiles,

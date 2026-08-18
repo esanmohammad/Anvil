@@ -136,22 +136,37 @@ async function handleGetCodeSnippet(
     return { content: [{ type: 'text', text: 'Provide id="repo::file::entity" or repo + file (entity optional).' }] };
   }
 
-  if (!(await getBlobStore(ctx.projectName, resolvedKnowledgeConfig()).exists('chunks.json'))) {
-    return { content: [{ type: 'text', text: 'No index found — chunks.json missing. Index the project first.' }] };
-  }
-
   try {
-    // Stream with early-exit through the blob port. chunks.json is NDJSON at
-    // org scale; the fs adapter also reads the legacy single-array format.
-    let matches = await findChunksInProject(
-      ctx.projectName,
-      (c) => c.repoName === repo && c.filePath === file && (!entity || c.entityName === entity),
-      5,
-      resolvedKnowledgeConfig(),
-    );
-    // Fallback: entity may live in a differently-named file — match by entity within repo.
-    if (matches.length === 0 && entity) {
-      matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && c.entityName === entity, 5, resolvedKnowledgeConfig());
+    // Primary: indexed lookup in the vector store (scalar indexes on
+    // repoName/filePath/entityName) — one bounded query instead of streaming
+    // the whole chunks.json per call (a full GridFS download at org scale on
+    // remote backends). The retriever is cached + generation-invalidated.
+    const esc = (v: string) => v.replace(/'/g, "''");
+    let matches: Array<{ repoName: string; filePath: string; entityName?: string; startLine?: number; endLine?: number; language?: string; content: string }> = [];
+    try {
+      const store = (await getRetriever(ctx.projectName, resolvedKnowledgeConfig())).vectorStore;
+      let scored = await store.getChunksByEntity([
+        { repoName: repo, filePath: file, ...(entity ? { entityName: entity } : {}) },
+      ]);
+      // Entity may live in a differently-named file — match by entity within repo.
+      if (scored.length === 0 && entity) {
+        scored = await store.searchByEntityName([entity], 5, `repoName = '${esc(repo)}'`);
+      }
+      matches = scored.slice(0, 5).map((sc) => sc.chunk);
+    } catch { /* vector store unavailable — fall through to chunks.json */ }
+
+    // Fallback for indexes that are built but not yet embedded (empty Lance
+    // table): stream chunks.json with early-exit through the blob port.
+    if (matches.length === 0 && (await getBlobStore(ctx.projectName, resolvedKnowledgeConfig()).exists('chunks.json'))) {
+      matches = await findChunksInProject(
+        ctx.projectName,
+        (c) => c.repoName === repo && c.filePath === file && (!entity || c.entityName === entity),
+        5,
+        resolvedKnowledgeConfig(),
+      );
+      if (matches.length === 0 && entity) {
+        matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && c.entityName === entity, 5, resolvedKnowledgeConfig());
+      }
     }
     if (matches.length === 0) {
       return { content: [{ type: 'text', text: `No snippet found for ${repo}::${file}${entity ? `::${entity}` : ''}` }] };

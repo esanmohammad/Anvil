@@ -31,7 +31,11 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 - `buildProjectGraph` / `loadProjectGraph` / `loadProjectSummary` /
   `getProjectGraphStatus` / `estimateProjectGraphCost`
   (`src/project-graph-builder.ts`) — LLM-powered semantic project graph.
-- `detectCrossRepoEdges` (`src/cross-repo-detector.ts`) — 14 strategies
+- `detectCrossRepoEdges` (`src/cross-repo-detector.ts`) — 14 strategies,
+  split into `extractCrossRepoSignals(repoPath)` (per-repo tree scan, runs in
+  the worker while the clone exists, persisted as `<repo>/signals.json`) +
+  `correlateCrossRepoEdges(signals, workspaceMaps)` (pure data join — partial
+  cycles correlate stored signals without cloning unchanged repos)
   for inter-repo edges (shared types, kafka, http, grpc, db, env vars,
   npm/workspace deps, k8s, docker-compose, proto, redis, s3, shared
   constants).
@@ -196,8 +200,9 @@ ideally add a structural-hasher comment-style entry to
 
 ### Adding a cross-repo edge type
 
-Add a strategy function inside `cross-repo-detector.ts` and call it
-from `detectCrossRepoEdges`. Edge types are an open string union in
+Add an extract function (per-repo tree scan → field on `CrossRepoSignals`)
+plus a correlate strategy (join over the persisted signals) inside
+`cross-repo-detector.ts`. Edge types are an open string union in
 `CrossRepoEdge.edgeType` — add the new value to `types.ts`.
 
 ### Incremental indexing path

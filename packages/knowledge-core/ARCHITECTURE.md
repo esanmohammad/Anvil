@@ -471,7 +471,7 @@ hallucination_count?, similarity?, overall }, costs, durations }`.
 5. Workspace detection.
 6. AST graphs: `incrementalGraphUpdate` if possible; else `buildAstGraph`.
    Write `<repo>/graph.json` + `GRAPH_REPORT.md`.
-7. Cross-repo edges (14 strategies via `detectCrossRepoEdges`).
+7. Cross-repo edges (14 strategies): `correlateCrossRepoEdges` over per-repo `signals.json` bundles persisted at index time (extracted in the worker while the tree exists).
 8. LLM service mesh inference.
 9. Louvain community detection.
 10. Save `system_graph_v2.json`.

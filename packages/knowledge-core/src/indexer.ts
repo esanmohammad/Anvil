@@ -8,11 +8,12 @@ import { resolveStorage, invalidateGraphStores } from './storage/resolve.js';
 import type { BlobStorePort, StorageBundle } from './storage/ports.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
-import { detectCrossRepoEdges } from '@esankhan3/anvil-knowledge-core';
+import { correlateCrossRepoEdges } from './cross-repo-detector.js';
+import type { CrossRepoSignals } from './cross-repo-detector.js';
 import { HybridRetriever } from './retriever.js';
 import { loadKnowledgeConfig, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
 import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
-import type { CodeChunk, IndexStats, WorkspaceMap } from '@esankhan3/anvil-knowledge-core';
+import type { CodeChunk, IndexStats, WorkspaceMap, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
 import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
 import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
 import { computeStructuralHash } from '@esankhan3/anvil-knowledge-core';
@@ -47,17 +48,33 @@ async function dedupShardsToChunks(
   shardPaths: string[],
   blobs: BlobStorePort,
   chunksKey: string,
+  /** Local NDJSON copy of the PREVIOUS chunks.json + which of its chunks to
+   *  keep. Absent on a full rebuild (every repo re-chunked) — the shards are
+   *  then the complete corpus, today's behavior. */
+  carryForward?: { prevPath: string; keep: (c: CodeChunk) => boolean },
 ): Promise<{ kept: number; dropped: number; tokens: number }> {
   // Shards are transient local scratch — read raw. Survivors stream straight
   // into the durable chunks blob via putNdjson (byte-identical NDJSON to the
   // prior createChunkWriter); counts are tallied inside the generator and read
-  // back after putNdjson drains it.
+  // back after putNdjson drains it. Fresh shards stream FIRST so a re-chunked
+  // file's new chunk wins the structural-hash dedup over a stale twin.
   const seen = new Set<string>();
   let kept = 0, dropped = 0, tokens = 0;
   async function* survivors(): AsyncGenerator<CodeChunk> {
     for (const sp of shardPaths) {
       if (!existsSync(sp)) continue;
       for await (const c of iterateChunksFile(sp)) {
+        const h = computeStructuralHash(c.content, c.language).hash;
+        if (seen.has(h)) { dropped++; continue; }
+        seen.add(h);
+        kept++;
+        tokens += c.tokens;
+        yield c;
+      }
+    }
+    if (carryForward && existsSync(carryForward.prevPath)) {
+      for await (const c of iterateChunksFile(carryForward.prevPath)) {
+        if (!carryForward.keep(c)) continue;
         const h = computeStructuralHash(c.content, c.language).hash;
         if (seen.has(h)) { dropped++; continue; }
         seen.add(h);
@@ -130,6 +147,7 @@ export class KnowledgeIndexer {
     // 1. Determine which repos need re-indexing (SHA check)
     const reposToIndex: typeof repos = [];
     const skippedRepos: string[] = [];
+    const skippedMeta = new Map<string, RepoIndexMeta>();
 
     for (const repo of repos) {
       if (opts?.force) {
@@ -140,8 +158,20 @@ export class KnowledgeIndexer {
       const currentSha = repo.cloneUrl ? getRemoteSha(repo.cloneUrl) : getRepoSha(repo.path);
       const meta = await readRepoIndexMeta(basePath, repo.name, storage.blobs);
       if (meta && currentSha && meta.lastIndexedSha === currentSha) {
-        skippedRepos.push(repo.name);
-        log(`Skipping ${repo.name} — unchanged (${currentSha.slice(0, 7)})`);
+        // A skipped repo is served entirely from its stored artifacts (graph +
+        // cross-repo signals) — no clone, no AST re-parse. An index written
+        // before signals existed must be re-indexed once to backfill them.
+        const hasArtifacts =
+          (await storage.blobs.exists(`${repo.name}/graph.json`)) &&
+          (await storage.blobs.exists(`${repo.name}/signals.json`));
+        if (hasArtifacts) {
+          skippedRepos.push(repo.name);
+          skippedMeta.set(repo.name, meta);
+          log(`Skipping ${repo.name} — unchanged (${currentSha.slice(0, 7)})`);
+        } else {
+          reposToIndex.push(repo);
+          log(`Re-indexing ${repo.name} — unchanged but stored graph/signals missing (pre-upgrade index)`);
+        }
       } else {
         reposToIndex.push(repo);
       }
@@ -187,7 +217,7 @@ export class KnowledgeIndexer {
     // metadata, so the main thread never accumulates the whole corpus (bounded
     // memory). Concurrency is adaptive; a worker failure falls back to in-thread.
     const repoStats: Array<{ name: string; chunkCount: number; language: string }> = [];
-    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry>; sha: string | null }>();
+    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry>; sha: string | null; incremental: boolean }>();
     const workspaceMaps = new Map<string, WorkspaceMap>();
     const shardPaths: string[] = [];
     // System graph: stream per-repo nodes/edges straight to SQLite as repos
@@ -199,15 +229,17 @@ export class KnowledgeIndexer {
     const graphBuilder = graphWriter ? null : new ProjectGraphBuilder();
     if (graphBuilder) await graphBuilder.init();
 
-    const toIndex = new Set(reposToIndex.map((r) => r.name));
-    const jobs: RepoJob[] = repos.map((r) => ({
+    // Only changed repos get jobs — skipped repos are served from their stored
+    // graph.json/signals.json below, so they are never cloned or re-parsed.
+    // This is what makes a partial cycle O(changed), not O(org).
+    const jobs: RepoJob[] = reposToIndex.map((r) => ({
       repoName: r.name,
       repoPath: r.path,
       language: r.language,
       basePath,
       project,
       chunking: config.chunking,
-      doChunk: toIndex.has(r.name),
+      doChunk: true,
       force: !!opts?.force,
       storage: config.storage,
       cloneUrl: r.cloneUrl,
@@ -234,7 +266,7 @@ export class KnowledgeIndexer {
         if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
         repoStats.push({ name: res.repoName, chunkCount: res.chunkCount, language: res.language });
         if (res.chunked) {
-          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {}, sha: res.sha });
+          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {}, sha: res.sha, incremental: res.incremental });
           if (res.shardPath) shardPaths.push(res.shardPath);
         }
         processed++;
@@ -243,32 +275,92 @@ export class KnowledgeIndexer {
         }
       },
     });
+    // Skipped repos: their per-repo graphs were persisted when they were last
+    // indexed — stream each into the system-graph writer (one at a time, the
+    // graph never accumulates) and rehydrate the persisted workspace packages
+    // for cross-repo correlation. No clone, no AST parse.
     for (const name of skippedRepos) {
-      const meta = await readRepoIndexMeta(basePath, name, storage.blobs);
+      const meta = skippedMeta.get(name);
       repoStats.push({ name, chunkCount: meta?.chunkCount ?? 0, language: '' });
+      try {
+        const g = await storage.blobs.getJson<GraphifyOutput>(`${name}/graph.json`);
+        if (g) {
+          if (graphWriter) graphWriter.addRepoGraph(name, g);
+          else graphBuilder!.addRepoGraph(name, g);
+        }
+      } catch (e) { log(`Warning: stored graph load failed for ${name}: ${e}`); }
+      if (meta?.workspacePackages?.length) {
+        workspaceMaps.set(name, {
+          repoPath: '',
+          packages: meta.workspacePackages,
+          nameToPackage: new Map(meta.workspacePackages.map((pkg) => [pkg.name, pkg])),
+          pathAliases: new Map(),
+        });
+      }
     }
 
     // Structural dedup — streaming over the per-repo shards into chunks.json
     // (bounded memory; replaces the in-RAM dedup that OOM'd at org scale).
+    // PARTIAL CYCLES: the shards only cover repos re-chunked THIS cycle —
+    // skipped repos' chunks and an incrementally-chunked repo's untouched
+    // files must be carried forward from the previous chunks.json, or every
+    // scheduled reindex silently shrinks the corpus to the changed set.
     report({ phase: 'dedup', message: 'Deduplicating chunks (streaming)...', percent: 68, etaSeconds: -1 });
     const chunksPath = join(basePath, 'chunks.json');
-    const dedup = await dedupShardsToChunks(shardPaths, storage.blobs, 'chunks.json');
+    const anyIncremental = [...repoChunkResults.values()].some((r) => r.incremental);
+    const needCarry = (skippedRepos.length > 0 || anyIncremental) && (await storage.blobs.exists('chunks.json'));
+    let carryForward: { prevPath: string; keep: (c: CodeChunk) => boolean } | undefined;
+    if (needCarry) {
+      // Pull the previous corpus to local scratch first — putNdjson overwrites
+      // the blob (Mongo deletes the GridFS file before upload), so reading and
+      // writing the same key concurrently would corrupt or truncate it.
+      const prevPath = join(basePath, 'chunks.prev.ndjson');
+      await storage.blobs.getBytes('chunks.json', { toFile: prevPath });
+      const currentRepos = new Set(repos.map((r) => r.name));
+      const fullyRechunked = new Set(
+        [...repoChunkResults.entries()].filter(([, r]) => !r.incremental).map(([name]) => name),
+      );
+      const removedFiles = new Map<string, Set<string>>(
+        [...repoChunkResults.entries()]
+          .filter(([, r]) => r.incremental)
+          .map(([name, r]) => [name, new Set([...r.changedFiles, ...r.deletedFiles])]),
+      );
+      carryForward = {
+        prevPath,
+        keep: (c) =>
+          currentRepos.has(c.repoName) &&          // repos removed from the org drop out
+          !fullyRechunked.has(c.repoName) &&       // full re-chunk = shard is complete
+          !removedFiles.get(c.repoName)?.has(c.filePath), // incremental: changed/deleted files replaced by the shard
+      };
+    }
+    const dedup = await dedupShardsToChunks(shardPaths, storage.blobs, 'chunks.json', carryForward);
+    if (carryForward) { try { rmSync(carryForward.prevPath, { force: true }); } catch { /* scratch */ } }
     const dedupedChunkCount = dedup.kept;
     const dedupedTokenSum = dedup.tokens;
     if (dedup.dropped > 0) log(`Structural dedup: ${dedup.dropped} duplicates removed`);
     log(`Saved ${dedupedChunkCount} chunks to ${chunksPath}`);
     for (const sp of shardPaths) { try { rmSync(sp, { force: true }); } catch { /* ok */ } }
 
-    // 7. Detect cross-repo edges (14 strategies)
+    // 7. Detect cross-repo edges (14 strategies) — correlated from the
+    // per-repo signals persisted at index time. In the bounded-scratch writer
+    // the clones are already discarded (and skipped repos were never cloned),
+    // so the join runs on stored signals, not working trees.
     report({ phase: 'graphing', message: 'Detecting cross-repo edges...', percent: 70, etaSeconds: -1 });
     let crossRepoEdgeCount = 0;
     const hasWorkspaces = workspaceMaps.size > 0;
     if (repos.length > 1 || hasWorkspaces) {
-      const crossEdges = await detectCrossRepoEdges(repos, workspaceMaps);
+      const signalsMap = new Map<string, CrossRepoSignals>();
+      for (const r of repos) {
+        try {
+          const sig = await storage.blobs.getJson<CrossRepoSignals>(`${r.name}/signals.json`);
+          if (sig) signalsMap.set(r.name, sig);
+        } catch { /* a repo without signals just contributes no edges this cycle */ }
+      }
+      const crossEdges = correlateCrossRepoEdges(signalsMap, workspaceMaps);
       if (graphWriter) graphWriter.addCrossRepoEdges(crossEdges);
       else graphBuilder!.addCrossRepoEdges(crossEdges);
       crossRepoEdgeCount = crossEdges.length;
-      log(`Detected ${crossEdges.length} cross-repo edges`);
+      log(`Detected ${crossEdges.length} cross-repo edges (signals from ${signalsMap.size}/${repos.length} repos)`);
     }
 
     // 8. LLM Service Mesh Inference (WS-2) — skipped if LLM_MODE=none
@@ -371,9 +463,28 @@ export class KnowledgeIndexer {
           chunkCount: totalChunkCount,
           embeddingProvider: 'pending',
           files: result?.fileIndex,
+          // Serializable form (WorkspaceMap holds Maps) — rehydrated when this
+          // repo is later skipped, for cross-repo workspace-dep correlation.
+          workspacePackages: workspaceMaps.get(repo.name)?.packages,
         });
       }
     }
+
+    // Rolled-up stats: index_status / GET /status read ONE small blob instead
+    // of walking every repo's index_meta (800 reads per call at org scale).
+    try {
+      await storage.blobs.putJson('index_stats.json', {
+        repos: repoStats,
+        totalChunks: dedupedChunkCount,
+        totalTokens: dedupedTokenSum,
+        crossRepoEdges: crossRepoEdgeCount,
+        embeddingProvider: 'pending',
+        lastIndexed: new Date().toISOString(),
+      });
+    } catch { /* rollup is an optimization — getStats falls back to the walk */ }
+
+    // Signal read replicas: chunks + graph + metas for this cycle are visible.
+    await bumpIndexGeneration(storage.blobs);
 
     const durationMs = Date.now() - startTime;
     report({ phase: 'done', message: `KB built: ${dedupedChunkCount} chunks, ${crossRepoEdgeCount} edges in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0, skippedRepos });
@@ -626,6 +737,20 @@ export class KnowledgeIndexer {
     }
 
     const durationMs = Date.now() - startTime;
+    // Patch the stats rollup now that the embedding provider is committed.
+    try {
+      const rollup = await storage.blobs.getJson<Record<string, unknown>>('index_stats.json');
+      if (rollup) {
+        await storage.blobs.putJson('index_stats.json', {
+          ...rollup,
+          embeddingProvider: embedder.name,
+          lastIndexed: new Date().toISOString(),
+        });
+      }
+    } catch { /* optimization only */ }
+
+    // Signal read replicas: the vector + FTS state for this cycle is visible.
+    await bumpIndexGeneration(storage.blobs);
     report({ phase: 'done', message: `Embedded ${newChunkCount} new chunks (${deletedFiles.length} removed) in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0 });
 
     return {
@@ -675,6 +800,33 @@ export class KnowledgeIndexer {
   async getStats(project: string, config?: KnowledgeConfig): Promise<IndexStats> {
     const storage = resolveStorage(project, config);
     const basePath = storage.basePath;
+
+    // Fast path: the writer's rolled-up stats — one small blob read instead of
+    // a vector-store connect + a meta read per repo.
+    try {
+      const rollup = await storage.blobs.getJson<{
+        repos: Array<{ name: string; chunkCount: number; language: string }>;
+        totalChunks: number;
+        totalTokens: number;
+        crossRepoEdges: number;
+        embeddingProvider: string;
+        lastIndexed: string;
+      }>('index_stats.json');
+      if (rollup) {
+        return {
+          project,
+          repos: rollup.repos,
+          totalChunks: rollup.totalChunks,
+          totalTokens: rollup.totalTokens,
+          embeddingProvider: rollup.embeddingProvider,
+          embeddingDimensions: 0,
+          crossRepoEdges: rollup.crossRepoEdges,
+          lastIndexed: rollup.lastIndexed,
+          indexDurationMs: 0,
+        };
+      }
+    } catch { /* fall back to the walk */ }
+
     const store = storage.vectors;
     await store.init();
     const stats = await store.getStats();
@@ -926,11 +1078,30 @@ function retrieverCacheKey(project: string, config: KnowledgeConfig): string {
   return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}`;
 }
 
-/** Cheap change-signal for a project's index: mtimes of the LanceDB dir + the
- *  system-graph sqlite. Both change when the writer commits a reindex. */
-function indexFingerprint(basePath: string): string {
+/** Cheap change-signal for a project's index. Primary: the `index_generation`
+ *  blob the writer bumps after every cycle — works on EVERY backend (a Mongo
+ *  findOne / a local file read) and is what lets remote read replicas notice a
+ *  reindex without a redeploy. Fallback for indexes written before the
+ *  generation blob existed: mtimes of the local LanceDB dir + system-graph
+ *  sqlite (meaningful on the fs backend only). */
+async function indexFingerprint(basePath: string, blobs: BlobStorePort): Promise<string> {
+  try {
+    const gen = await blobs.getJson<{ generation?: number }>('index_generation');
+    if (gen?.generation !== undefined) return `gen:${gen.generation}`;
+  } catch { /* fall through to local mtimes */ }
   const mt = (p: string): number => { try { return statSync(p).mtimeMs; } catch { return 0; } };
   return `${mt(join(basePath, 'lancedb'))}:${mt(join(basePath, 'system_graph.sqlite'))}`;
+}
+
+/** Bump the change-signal read replicas poll on their freshness TTL. Written
+ *  after every completed write phase (buildKB, embedChunks) — non-fatal, the
+ *  in-process invalidate still covers the writer's own cache. */
+async function bumpIndexGeneration(blobs: BlobStorePort): Promise<void> {
+  try {
+    await blobs.putJson('index_generation', { generation: Date.now(), updatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error(`[knowledge-core] index_generation bump failed (read replicas will not refresh until redeploy): ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** Non-fs backends only: the sqlite system graph is produced on local scratch
@@ -990,21 +1161,25 @@ export async function getRetriever(
   const key = retrieverCacheKey(project, config);
   const basePath = getKnowledgeBasePath(project);
   const entry = retrieverCache.get(key);
+  const freshnessBlobs = resolveStorage(project, config).blobs;
   if (entry) {
     const now = Date.now();
     if (RETRIEVER_FRESHNESS_MS === 0 || now - entry.checkedAt < RETRIEVER_FRESHNESS_MS) {
-      return entry.retriever; // within TTL — serve cached, no disk touch
+      return entry.retriever; // within TTL — serve cached, no storage touch
     }
-    // TTL elapsed: one cheap stat; rebuild ONLY if the index actually advanced
-    // (i.e. a sole-writer replica reindexed). Steady state = a stat every TTL.
-    if (indexFingerprint(basePath) === entry.fingerprint) {
+    // TTL elapsed: one cheap generation read; rebuild ONLY if the index
+    // actually advanced (the sole writer reindexed). Steady state = one small
+    // read every TTL.
+    if (await indexFingerprint(basePath, freshnessBlobs) === entry.fingerprint) {
       entry.checkedAt = now;
       return entry.retriever;
     }
     retrieverCache.delete(key);
     entry.retriever.then((r) => r.close()).catch(() => { /* ignore */ });
+    // The graph tools' shared store is part of the same index generation.
+    await invalidateGraphStores(project);
   }
-  const fingerprint = indexFingerprint(basePath);
+  const fingerprint = await indexFingerprint(basePath, freshnessBlobs);
   const building = buildRetriever(project, config);
   retrieverCache.set(key, { retriever: building, fingerprint, checkedAt: Date.now() });
   // Evict a failed build so a transient error doesn't poison the cache forever.
