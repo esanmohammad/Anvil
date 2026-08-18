@@ -217,7 +217,7 @@ export class KnowledgeIndexer {
     // metadata, so the main thread never accumulates the whole corpus (bounded
     // memory). Concurrency is adaptive; a worker failure falls back to in-thread.
     const repoStats: Array<{ name: string; chunkCount: number; language: string }> = [];
-    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry>; sha: string | null; incremental: boolean }>();
+    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry>; sha: string | null; shardComplete: boolean }>();
     const workspaceMaps = new Map<string, WorkspaceMap>();
     const shardPaths: string[] = [];
     // System graph: stream per-repo nodes/edges straight to SQLite as repos
@@ -266,7 +266,7 @@ export class KnowledgeIndexer {
         if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
         repoStats.push({ name: res.repoName, chunkCount: res.chunkCount, language: res.language });
         if (res.chunked) {
-          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {}, sha: res.sha, incremental: res.incremental });
+          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {}, sha: res.sha, shardComplete: res.shardComplete });
           if (res.shardPath) shardPaths.push(res.shardPath);
         }
         processed++;
@@ -307,8 +307,8 @@ export class KnowledgeIndexer {
     // scheduled reindex silently shrinks the corpus to the changed set.
     report({ phase: 'dedup', message: 'Deduplicating chunks (streaming)...', percent: 68, etaSeconds: -1 });
     const chunksPath = join(basePath, 'chunks.json');
-    const anyIncremental = [...repoChunkResults.values()].some((r) => r.incremental);
-    const needCarry = (skippedRepos.length > 0 || anyIncremental) && (await storage.blobs.exists('chunks.json'));
+    const anyPartialShard = [...repoChunkResults.values()].some((r) => !r.shardComplete);
+    const needCarry = (skippedRepos.length > 0 || anyPartialShard) && (await storage.blobs.exists('chunks.json'));
     let carryForward: { prevPath: string; keep: (c: CodeChunk) => boolean } | undefined;
     if (needCarry) {
       // Pull the previous corpus to local scratch first — putNdjson overwrites
@@ -318,19 +318,19 @@ export class KnowledgeIndexer {
       await storage.blobs.getBytes('chunks.json', { toFile: prevPath });
       const currentRepos = new Set(repos.map((r) => r.name));
       const fullyRechunked = new Set(
-        [...repoChunkResults.entries()].filter(([, r]) => !r.incremental).map(([name]) => name),
+        [...repoChunkResults.entries()].filter(([, r]) => r.shardComplete).map(([name]) => name),
       );
       const removedFiles = new Map<string, Set<string>>(
         [...repoChunkResults.entries()]
-          .filter(([, r]) => r.incremental)
+          .filter(([, r]) => !r.shardComplete)
           .map(([name, r]) => [name, new Set([...r.changedFiles, ...r.deletedFiles])]),
       );
       carryForward = {
         prevPath,
         keep: (c) =>
           currentRepos.has(c.repoName) &&          // repos removed from the org drop out
-          !fullyRechunked.has(c.repoName) &&       // full re-chunk = shard is complete
-          !removedFiles.get(c.repoName)?.has(c.filePath), // incremental: changed/deleted files replaced by the shard
+          !fullyRechunked.has(c.repoName) &&       // complete shard = replaces the repo wholesale
+          !removedFiles.get(c.repoName)?.has(c.filePath), // partial shard: only its changed/deleted files are replaced
       };
     }
     const dedup = await dedupShardsToChunks(shardPaths, storage.blobs, 'chunks.json', carryForward);

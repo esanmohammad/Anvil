@@ -100,11 +100,13 @@ export interface RepoResult {
   graph: GraphifyOutput | null;
   workspaceMap: WorkspaceMap | null;
   chunked: boolean;
-  /** True when the shard holds ONLY changed files' chunks (git-diff incremental
-   *  re-chunk) — the indexer must carry this repo's untouched-file chunks
-   *  forward from the previous chunks.json. False = the shard is the repo's
-   *  complete chunk set. */
-  incremental: boolean;
+  /** True when the shard is the repo's COMPLETE chunk set (first index, force,
+   *  or no prior fileIndex). False whenever a prior fileIndex existed: BOTH
+   *  re-chunk paths then emit only changed files' chunks (chunkChangedFiles by
+   *  git diff; chunkRepo skips content-hash-unchanged files via cachedFiles) —
+   *  the indexer must carry untouched files' chunks forward from the previous
+   *  chunks.json, filtered by changedFiles ∪ deletedFiles. */
+  shardComplete: boolean;
   shardPath: string | null;
   fileIndex: Record<string, FileIndexEntry> | null;
   changedFiles: string[];
@@ -158,7 +160,7 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
   }
 
   let chunkCount = 0;
-  let incremental = false;
+  let shardComplete = false;
   let shardPath: string | null = null;
   let fileIndex: Record<string, FileIndexEntry> | null = null;
   let changedFiles: string[] = [];
@@ -177,7 +179,9 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     } finally {
       writer.close();
     }
-    incremental = useIncremental;
+    // Complete only when nothing could be skipped: no git-diff incremental AND
+    // no prior fileIndex for chunkRepo's content-hash cache to skip against.
+    shardComplete = !useIncremental && !meta?.files;
     fileIndex = result.fileIndex;
     chunkCount = Object.values(result.fileIndex).reduce((s, f) => s + (f as FileIndexEntry).chunkCount, 0);
     changedFiles = result.changedFiles ?? [];
@@ -223,7 +227,7 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     graph,
     workspaceMap,
     chunked: doChunk,
-    incremental,
+    shardComplete,
     shardPath,
     fileIndex,
     changedFiles,

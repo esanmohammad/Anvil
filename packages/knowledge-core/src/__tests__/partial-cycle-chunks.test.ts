@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { execSync } from 'node:child_process';
-import { buildKBFromPath, getBlobStore, getGraphStore, invalidateRetriever } from '@esankhan3/anvil-knowledge-core';
+import { buildKBFromPath, getBlobStore, getGraphStore, invalidateRetriever, KnowledgeIndexer, loadKnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk } from '@esankhan3/anvil-knowledge-core';
 
 const root = join(tmpdir(), `kc-partial-${randomBytes(6).toString('hex')}`);
@@ -109,5 +109,44 @@ describe('partial cycle — chunks.json carry-forward', () => {
       edges.some((e) => /SharedPayload/.test(`${e.source} ${e.target}`)),
       `shared-type cross-repo edge survives the partial cycle (got: ${JSON.stringify(edges).slice(0, 200)})`,
     );
+  });
+
+  it('writer mode (shallow clone → diff fallback → cachedFiles skip) keeps untouched files', async () => {
+    // The bounded-scratch writer clones depth-1, so git diff against the prior
+    // sha ALWAYS falls back to full — and chunkRepo then skips content-hash-
+    // unchanged files via the prior fileIndex, making even that shard partial.
+    // Before the shardComplete fix this cycle dropped the skipped files' chunks.
+    const project = `writer-${randomBytes(4).toString('hex')}`;
+    const origin = join(root, 'writer-origin');
+    mkdirSync(origin, { recursive: true });
+    writeFileSync(join(origin, 'alpha.ts'), 'export function alphaFn(): number {\n  return 1;\n}\n');
+    writeFileSync(join(origin, 'beta.ts'), 'export function betaFn(): number {\n  return 2;\n}\n');
+    git('writer-origin', 'init -q');
+    git('writer-origin', 'add -A');
+    git('writer-origin', 'commit -qm init');
+
+    const config = loadKnowledgeConfig(project);
+    const scratch = join(root, 'writer-scratch');
+    mkdirSync(scratch, { recursive: true });
+    // buildKB directly (no embed phase — chunks.json is what's under test) with
+    // cloneUrl repos, exactly how indexFromRemotes drives the writer.
+    const indexer = new KnowledgeIndexer();
+    const remotes = [{ name: 'writer-origin', path: join(scratch, 'writer-origin'), language: '', cloneUrl: `file://${origin}` }];
+
+    await indexer.buildKB(project, remotes, config);
+    const c1 = await readChunks(project);
+    assert.ok(c1.some((c) => c.entityName === 'alphaFn') && c1.some((c) => c.entityName === 'betaFn'));
+
+    // Purely additive change — nothing should be lost.
+    writeFileSync(join(origin, 'gamma.ts'), 'export function gammaFn(): number {\n  return 3;\n}\n');
+    git('writer-origin', 'add -A');
+    git('writer-origin', 'commit -qm add-gamma');
+
+    await indexer.buildKB(project, remotes, config);
+    const c2 = await readChunks(project);
+    assert.ok(c2.some((c) => c.entityName === 'gammaFn'), 'new file chunked');
+    assert.ok(c2.some((c) => c.entityName === 'alphaFn'), 'cache-skipped alpha.ts carried forward');
+    assert.ok(c2.some((c) => c.entityName === 'betaFn'), 'cache-skipped beta.ts carried forward');
+    assert.ok(c2.length >= c1.length, `additive commit must not shrink the corpus (${c1.length} -> ${c2.length})`);
   });
 });

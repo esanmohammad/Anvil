@@ -469,12 +469,18 @@ async function trackedIndex(
 async function autoIndex(ctx: ServerContext, opts?: { readOnly?: boolean }): Promise<void> {
   try {
     const blobs = getBlobStore(ctx.projectName, toKnowledgeConfig(loadServerConfig().__unified));
+    // Remote backends: `lancedb` is NOT a blob key (vectors live in object
+    // storage), so existence-of-lancedb can never turn a Mongo/S3 reader
+    // ready. The writer's stats rollup is the cross-backend readiness signal —
+    // its embeddingProvider is patched from 'pending' when embedding finishes,
+    // i.e. exactly when search is servable.
+    const stats = await blobs.getJson<{ embeddingProvider?: string }>('index_stats.json');
+    const statsReady = !!stats && stats.embeddingProvider !== 'pending';
+    // Legacy local layout (pre-rollup indexes): lancedb dir + system graph.
     const hasLanceDB = await blobs.exists('lancedb');
-    // System graph is now SQLite (system_graph.sqlite); accept the legacy JSON
-    // too so pre-migration indexes still read as ready.
     const hasGraph = (await blobs.exists('system_graph.sqlite')) || (await blobs.exists('system_graph_v2.json'));
 
-    if (hasLanceDB && hasGraph) {
+    if (statsReady || (hasLanceDB && hasGraph)) {
       ctx.indexReady = true;
       console.error(`[code-search-mcp] Index loaded for "${ctx.projectName}"`);
       return;
