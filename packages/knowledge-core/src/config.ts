@@ -82,7 +82,7 @@ export interface KnowledgeStorageConfig {
       /** S3/MinIO connection (only when uri is s3://). Access key/secret come from
        *  env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY via Vault), not config. */
       s3?: {
-        endpoint?: string;            // e.g. lb-object-storage-internal.brevo.tech
+        endpoint?: string;            // e.g. lb-object-storage-internal.tech
         region?: string;              // required by LanceDB even for MinIO (any label)
         virtualHostedStyle?: boolean; // MUST be false for MinIO (path-style)
         allowHttp?: boolean;          // true if endpoint is plain http
