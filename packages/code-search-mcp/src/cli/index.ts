@@ -209,6 +209,9 @@ async function cmdStatus(rest: string[]): Promise<void> {
   const indexer = new KnowledgeIndexer();
   const stats = await indexer.getStats(project);
   const socketPath = daemonSocketPath(cfg.storage.dataDir, project);
+  const profilesAvailable = await Promise.all(
+    stats.repos.map(async (r) => ({ name: r.name, hasProfile: !!(await loadProfile(project, r.name)) })),
+  );
   process.stdout.write(JSON.stringify({
     project,
     dataDir: cfg.storage.dataDir,
@@ -218,10 +221,7 @@ async function cmdStatus(rest: string[]): Promise<void> {
     embeddingProvider: stats.embeddingProvider,
     lastIndexedAt: stats.lastIndexed || null,
     repos: stats.repos,
-    profilesAvailable: stats.repos.map((r) => ({
-      name: r.name,
-      hasProfile: !!loadProfile(project, r.name),
-    })),
+    profilesAvailable,
   }, null, 2) + '\n');
 }
 

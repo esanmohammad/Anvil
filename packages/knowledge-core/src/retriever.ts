@@ -9,8 +9,7 @@
  */
 
 import type { ScoredChunk, RetrievalResult, EmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
-import type { VectorStore } from '@esankhan3/anvil-knowledge-core';
-import type { GraphStore } from '@esankhan3/anvil-knowledge-core';
+import type { VectorStorePort, GraphStorePort } from '@esankhan3/anvil-knowledge-core';
 import type { Reranker } from '@esankhan3/anvil-knowledge-core';
 import type { QueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { classifyQuery } from '@esankhan3/anvil-knowledge-core';
@@ -77,18 +76,18 @@ function toRepoArray(v: unknown): string[] {
 
 export class HybridRetriever {
   // Expose for testing/debugging
-  readonly vectorStore: VectorStore;
+  readonly vectorStore: VectorStorePort;
   readonly embedder: EmbeddingProvider;
   // System graph is read through the SQLite-backed GraphStore (bounded slice
   // queries) — NOT an in-memory graphology graph. At org scale the graphology
   // graph either didn't exist (only system_graph.sqlite is written) or was
   // multi-GB to load per query; the store keeps graph expansion O(slice).
-  readonly graphStore: GraphStore | null;
+  readonly graphStore: GraphStorePort | null;
 
   constructor(
-    vectorStore: VectorStore,
+    vectorStore: VectorStorePort,
     embedder: EmbeddingProvider,
-    graphStore: GraphStore | null,
+    graphStore: GraphStorePort | null,
     private config: {
       maxChunks: number;
       maxTokens: number;
@@ -170,23 +169,35 @@ export class HybridRetriever {
     const bm25Promise: Promise<ScoredChunk[]> = useBm25
       ? this.vectorStore.fullTextSearch(query, 50, filter)
       : Promise.resolve([] as ScoredChunk[]);
-    // Literal exact-symbol tier — for a bare identifier query, fetch chunks
-    // whose entityName equals the query via the BTREE-indexed lookup. Vector
-    // and BM25 can BOTH miss an exact definition (its embedding sits far from
-    // the bare token's; BM25 buries rare-token files under chattier ones), and
-    // the downstream boost can only reorder candidates that were retrieved.
-    // Single-source modes return early below and skip fusion, so skip it there.
+    // Literal symbol tier — for a bare identifier query, fetch chunks whose
+    // entityName matches. Substring semantics (Zoekt-style: `SearchResponse`
+    // finds `CompanySearchResponse`) via a ranked ILIKE scan for queries ≥3
+    // chars; indexed equality below that (substring would flood). Vector and
+    // BM25 can BOTH miss a definition (embedding far from the bare token; BM25
+    // only matches whole tokens), and the downstream boost can only reorder
+    // candidates that were retrieved. `vector` mode returns early and skips it.
     const trimmed = query.trim();
     const isBareIdentifier =
       trimmed.length > 0 && !/\s/.test(trimmed) && classification.type !== 'natural-language';
     const exactPromise: Promise<ScoredChunk[]> =
       isBareIdentifier && mode !== 'vector'
-        ? this.vectorStore.searchByEntityName([trimmed], 20, filter)
+        ? (trimmed.length >= 3
+            ? this.vectorStore.searchByEntitySubstring(trimmed, 20, filter)
+            : this.vectorStore.searchByEntityName([trimmed], 20, filter))
         : Promise.resolve([] as ScoredChunk[]);
-    const [vectorResults, bm25Results, exactResults] = await Promise.all([
+    // Literal phrase tier — multi-token queries also run as an exact tantivy
+    // phrase (adjacent terms in order) so error strings / exact statements
+    // match as literals, not bags of tokens. Empty until the FTS index carries
+    // positions (next reindex) and for queries with no adjacent occurrence.
+    const phrasePromise: Promise<ScoredChunk[]> =
+      /\s/.test(trimmed) && trimmed.length >= 8 && mode !== 'vector'
+        ? this.vectorStore.phraseSearch(trimmed, 20, filter)
+        : Promise.resolve([] as ScoredChunk[]);
+    const [vectorResults, bm25Results, exactResults, phraseResults] = await Promise.all([
       vectorPromise,
       bm25Promise,
       exactPromise,
+      phrasePromise,
     ]);
 
     // Single-source shortcuts — no fusion needed
@@ -195,9 +206,11 @@ export class HybridRetriever {
       return { chunks: selected, graphContext: '', totalTokens: sumTokens(selected), query };
     }
     if (mode === 'bm25') {
-      // Exact-tier candidates lead — this mode backs the search_exact tool,
-      // and an entityName equality hit is the most exact evidence available.
-      const merged = dedupeExactContent(deduplicateChunks([...exactResults, ...bm25Results]));
+      // Literal tiers lead — this mode backs the search_exact tool, and an
+      // entityName match / exact phrase hit is the most exact evidence there is.
+      const merged = dedupeExactContent(
+        deduplicateChunks([...exactResults, ...phraseResults, ...bm25Results]),
+      );
       const selected = packWithinBudget(diversifyByFile(merged), maxTokens, maxChunks);
       return { chunks: selected, graphContext: '', totalTokens: sumTokens(selected), query };
     }
@@ -212,10 +225,11 @@ export class HybridRetriever {
     const weights: number[] = [];
     if (vectorResults.length > 0) { retrievalSets.push(vectorResults); weights.push(wV); }
     if (bm25Results.length > 0) { retrievalSets.push(bm25Results); weights.push(wB); }
-    // Exact tier outweighs both probabilistic sets — entityName equality is
-    // stronger evidence than any rank position (and boostExactSymbol pins
-    // matching candidates to the front regardless).
+    // Literal tiers outweigh both probabilistic sets — an entityName match or
+    // exact phrase hit is stronger evidence than any rank position (and
+    // boostExactSymbol pins true-exact candidates to the front regardless).
     if (exactResults.length > 0) { retrievalSets.push(exactResults); weights.push(1); }
+    if (phraseResults.length > 0) { retrievalSets.push(phraseResults); weights.push(1); }
 
     const fusedRaw = retrievalSets.length > 1
       ? reciprocalRankFusion(retrievalSets, weights, RRF_K)

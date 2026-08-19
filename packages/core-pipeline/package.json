@@ -1,7 +1,7 @@
 {
   "name": "@esankhan3/anvil-core-pipeline",
-  "version": "0.4.0",
-  "description": "Core pipeline runner for Anvil — typed Step<I,O> graph, EventBus, StepRegistry, lifecycle hooks. Replaces cli's monolithic orchestrator if-tree.",
+  "version": "0.4.1",
+  "description": "Core pipeline runner for Anvil \u2014 typed Step<I,O> graph, EventBus, StepRegistry, lifecycle hooks. Replaces cli's monolithic orchestrator if-tree.",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -26,7 +26,7 @@
     "lint:stages": "tsc -b && node scripts/lint-stages.js"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.4.0",
+    "@esankhan3/anvil-agent-core": "^0.5.0",
     "@esankhan3/anvil-memory-core": "^0.3.0",
     "better-sqlite3": "^11.7.0",
     "yaml": "^2.8.3"

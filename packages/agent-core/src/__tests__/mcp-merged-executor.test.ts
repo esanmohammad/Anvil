@@ -14,12 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import {
-  ListToolsRequestSchema,
-  CallToolRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+import { Server, InMemoryTransport } from '@modelcontextprotocol/server';
 
 import { McpAgentClient } from '../mcp/client.js';
 import { McpClientPool } from '../mcp/pool.js';
@@ -51,16 +46,16 @@ async function makeInMemoryMcpClient(opts: FakeServerOpts): Promise<McpAgentClie
     { capabilities: { tools: {} } },
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  server.setRequestHandler('tools/list', async () => ({
     tools: opts.tools.map((t) => ({
       name: t.name,
       description: t.description,
-      inputSchema: t.inputSchema ?? { type: 'object' },
+      inputSchema: (t.inputSchema ?? { type: 'object' }) as { type: 'object' },
       ...(t.annotations ? { annotations: t.annotations } : {}),
     })),
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler('tools/call', async (req) => {
     const tool = opts.tools.find((t) => t.name === req.params.name);
     if (!tool) {
       return {
@@ -71,7 +66,7 @@ async function makeInMemoryMcpClient(opts: FakeServerOpts): Promise<McpAgentClie
     const result = tool.onCall?.(req.params.arguments ?? {}) ?? {
       content: [{ type: 'text', text: 'ok' }],
     };
-    return result as { content: unknown[] };
+    return result as { content: Array<{ type: 'text'; text: string }> };
   });
 
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();

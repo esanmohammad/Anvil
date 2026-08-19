@@ -12,9 +12,8 @@
  * underscore, matching Claude Code / Anthropic SDK). The bare tool name is
  * sent to the server during dispatch.
  */
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { mkdirSync, createWriteStream, type WriteStream } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -93,7 +92,9 @@ export class McpAgentClient {
     this.opts = opts;
     this.client = new Client(
       { name: CLIENT_NAME, version: VERSION },
-      { capabilities: {} },
+      // 'auto' probes the modern (2026-07-28) era via server/discover and
+      // falls back to the legacy initialize handshake for older servers.
+      { capabilities: {}, versionNegotiation: { mode: 'auto' } },
     );
     this.wireProgressHandler();
   }
@@ -208,7 +209,7 @@ export class McpAgentClient {
     try {
       // The SDK's callTool accepts an AbortSignal in the request options —
       // it emits `notifications/cancelled` on the wire when fired.
-      const result = await this.client.callTool({ name: bare, arguments: args }, undefined, {
+      const result = await this.client.callTool({ name: bare, arguments: args }, {
         signal: inner.signal,
       });
       return result;
@@ -265,24 +266,17 @@ export class McpAgentClient {
     };
     // setNotificationHandler is the public hook on the Client class —
     // the SDK calls it for every server-initiated notification matching
-    // the schema's method.
-    try {
-      (this.client as unknown as {
-        setNotificationHandler: (schema: { method: string }, handler: (n: ProgressNotification) => void) => void;
-      }).setNotificationHandler({ method: 'notifications/progress' }, (n) => {
-        const p = n.params ?? {};
-        fallbackProgress({
-          serverName: this.config.name,
-          toolName: String(p.progressToken ?? ''),
-          progress: typeof p.progress === 'number' ? p.progress : 0,
-          total: typeof p.total === 'number' ? p.total : undefined,
-          message: typeof p.message === 'string' ? p.message : undefined,
-        });
+    // the method string.
+    this.client.setNotificationHandler('notifications/progress', (n: ProgressNotification) => {
+      const p = n.params ?? {};
+      fallbackProgress({
+        serverName: this.config.name,
+        toolName: String(p.progressToken ?? ''),
+        progress: typeof p.progress === 'number' ? p.progress : 0,
+        total: typeof p.total === 'number' ? p.total : undefined,
+        message: typeof p.message === 'string' ? p.message : undefined,
       });
-    } catch {
-      // Older SDK versions may not expose setNotificationHandler the same way;
-      // progress is a nice-to-have, not a blocker.
-    }
+    });
   }
 }
 

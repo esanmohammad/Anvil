@@ -151,8 +151,8 @@ export function projectGraphRoutes(): Record<string, Handler> {
         const project = input.project ?? '';
         try {
           const { getProjectGraphStatus, loadProjectSummary } = await import('@esankhan3/anvil-knowledge-core');
-          const status = getProjectGraphStatus(project);
-          const summary = status.exists ? loadProjectSummary(project) : null;
+          const status = await getProjectGraphStatus(project);
+          const summary = status.exists ? await loadProjectSummary(project) : null;
           return { ...status, summary };
         } catch {
           return { exists: false, generatedAt: null, model: null, costUsd: null, summary: null };

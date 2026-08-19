@@ -1,7 +1,7 @@
 {
   "name": "@esankhan3/code-search-mcp",
-  "version": "0.4.12",
-  "description": "MCP server for multi-repo code search — GitHub org or local path, zero config",
+  "version": "1.0.0",
+  "description": "MCP server for multi-repo code search \u2014 GitHub org or local path, zero config",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -23,9 +23,10 @@
     "smoke": "bash scripts/smoke/run-smoke.sh"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.4.0",
-    "@esankhan3/anvil-knowledge-core": "^0.3.1",
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@esankhan3/anvil-agent-core": "^0.5.0",
+    "@esankhan3/anvil-knowledge-core": "^0.4.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0"
   },
   "optionalDependencies": {
     "@lancedb/lancedb-darwin-arm64": "0.27.2",
@@ -35,6 +36,7 @@
     "@lancedb/lancedb-win32-x64-msvc": "0.27.2"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
     "@types/node": "^22.15.2"
   },
   "repository": {

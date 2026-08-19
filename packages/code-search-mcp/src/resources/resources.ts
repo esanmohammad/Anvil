@@ -2,11 +2,10 @@
  * MCP Resources — expose repos, profiles, graphs as readable resources.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { ServerContext } from '../server.js';
-import { getKnowledgeBasePath, openSystemGraphStore } from '@esankhan3/anvil-knowledge-core';
+import { getBlobStore, getGraphStore } from '@esankhan3/anvil-knowledge-core';
 import { loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
+import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import { loadProfile } from '@esankhan3/anvil-knowledge-core';
 
 export function registerResources(ctx: ServerContext) {
@@ -31,12 +30,10 @@ export async function handleResource(
   ctx: ServerContext,
 ): Promise<{ contents: Array<{ uri: string; mimeType: string; text: string }> }> {
   try {
-    // (imported at top)
-    const kbPath = getKnowledgeBasePath(ctx.projectName);
 
     if (uri === 'code-search://repos') {
       // (imported at top)
-      const profiles = loadAllProfiles(ctx.projectName);
+      const profiles = await loadAllProfiles(ctx.projectName, resolvedKnowledgeConfig());
       return {
         contents: [{
           uri,
@@ -52,33 +49,29 @@ export async function handleResource(
       // OOM the sqlite migration removed, so serve a bounded overview — the
       // highest-degree nodes + cross-repo edges + totals. Full traversal is via
       // the graph tools (search_graph, find_callers, impact_analysis, …).
-      const store = await openSystemGraphStore(kbPath);
+      const store = await getGraphStore(ctx.projectName, resolvedKnowledgeConfig());
       if (!store) {
         return { contents: [{ uri, mimeType: 'application/json', text: '{"nodes":[],"crossRepoEdges":[],"totals":{"nodes":0,"crossRepoEdges":0}}' }] };
       }
-      try {
-        const NODE_LIMIT = 200;
-        const EDGE_LIMIT = 200;
-        const { rows: nodes, total: nodeTotal } = store.searchNodes({ minDegree: 0 }, NODE_LIMIT);
-        const { edges: crossRepoEdges, total: edgeTotal } = store.crossRepoEdges(undefined, EDGE_LIMIT);
-        const payload = {
-          nodes,
-          crossRepoEdges,
-          totals: { nodes: nodeTotal, crossRepoEdges: edgeTotal },
-          truncated: nodeTotal > nodes.length || edgeTotal > crossRepoEdges.length,
-          note: 'Bounded overview (top nodes by degree + cross-repo edges). Use the graph tools for full traversal.',
-        };
-        return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(payload, null, 2) }] };
-      } finally {
-        store.close();
-      }
+      const NODE_LIMIT = 200;
+      const EDGE_LIMIT = 200;
+      const { rows: nodes, total: nodeTotal } = store.searchNodes({ minDegree: 0 }, NODE_LIMIT);
+      const { edges: crossRepoEdges, total: edgeTotal } = store.crossRepoEdges(undefined, EDGE_LIMIT);
+      const payload = {
+        nodes,
+        crossRepoEdges,
+        totals: { nodes: nodeTotal, crossRepoEdges: edgeTotal },
+        truncated: nodeTotal > nodes.length || edgeTotal > crossRepoEdges.length,
+        note: 'Bounded overview (top nodes by degree + cross-repo edges). Use the graph tools for full traversal.',
+      };
+      return { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(payload, null, 2) }] };
     }
 
     // Dynamic resource: code-search://repo/{name}/profile
     const profileMatch = uri.match(/^code-search:\/\/repo\/([^/]+)\/profile$/);
     if (profileMatch) {
       // (imported at top)
-      const profile = loadProfile(ctx.projectName, profileMatch[1]);
+      const profile = await loadProfile(ctx.projectName, profileMatch[1], resolvedKnowledgeConfig());
       return {
         contents: [{
           uri,
@@ -91,12 +84,12 @@ export async function handleResource(
     // Dynamic resource: code-search://repo/{name}/graph
     const graphMatch = uri.match(/^code-search:\/\/repo\/([^/]+)\/graph$/);
     if (graphMatch) {
-      const graphPath = join(kbPath, graphMatch[1], 'graph.json');
+      const graphJson = await getBlobStore(ctx.projectName, resolvedKnowledgeConfig()).getText(`${graphMatch[1]}/graph.json`);
       return {
         contents: [{
           uri,
           mimeType: 'application/json',
-          text: existsSync(graphPath) ? readFileSync(graphPath, 'utf-8') : '{"nodes":[],"links":[]}',
+          text: graphJson ?? '{"nodes":[],"links":[]}',
         }],
       };
     }

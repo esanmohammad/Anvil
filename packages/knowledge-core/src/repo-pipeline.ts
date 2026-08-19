@@ -9,7 +9,7 @@
  * graph + metadata cross the worker boundary (never the chunks themselves).
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
 import { chunkRepo, chunkChangedFiles } from './chunker.js';
@@ -17,9 +17,14 @@ import { buildAstGraph, incrementalGraphUpdate, generateGraphReport } from './as
 import { detectWorkspace } from './workspace-detector.js';
 import { getAllChanges, getChangedFilesList, getDeletedFilesList } from './git-diff.js';
 import { createChunkWriter } from './chunks-io.js';
+import { FsBlobStore } from './storage/fs-blob-store.js';
+import { resolveStorage } from './storage/resolve.js';
+import type { BlobStorePort } from './storage/ports.js';
 import { initTreeSitter } from './tree-sitter-parser.js';
 // Type-only (erased at runtime — keeps the worker lean): from the package barrel.
-import type { FileIndexEntry, WorkspaceMap, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
+import type { FileIndexEntry, WorkspaceMap, WorkspacePackage, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
+import { extractCrossRepoSignals } from './cross-repo-detector.js';
+import type { KnowledgeConfig, KnowledgeStorageConfig } from './config.js';
 
 export interface RepoIndexMeta {
   lastIndexedSha: string;
@@ -27,6 +32,9 @@ export interface RepoIndexMeta {
   chunkCount: number;
   embeddingProvider: string;
   files?: Record<string, FileIndexEntry>;
+  /** Serializable workspace packages (WorkspaceMap holds Maps, which don't
+   *  survive JSON) — rehydrated for cross-repo correlation on skipped repos. */
+  workspacePackages?: WorkspacePackage[];
 }
 
 export function getRepoSha(repoPath: string): string | null {
@@ -37,11 +45,29 @@ export function getRepoSha(repoPath: string): string | null {
   }
 }
 
-export function readRepoIndexMeta(basePath: string, repoName: string): RepoIndexMeta | null {
-  const metaPath = join(basePath, repoName, 'index_meta.json');
-  if (!existsSync(metaPath)) return null;
+/** HEAD sha of a REMOTE repo without cloning (`git ls-remote`) — lets the
+ *  writer skip unchanged repos before paying for a clone (the k8s CronJob
+ *  writer has no persistent clones; most repos are unchanged most cycles). */
+export function getRemoteSha(cloneUrl: string): string | null {
   try {
-    return JSON.parse(readFileSync(metaPath, 'utf-8'));
+    const out = execSync(`git ls-remote ${JSON.stringify(cloneUrl)} HEAD`, {
+      stdio: 'pipe', encoding: 'utf-8', timeout: 30_000,
+    });
+    const sha = out.split(/\s/)[0]?.trim();
+    return sha && /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function readRepoIndexMeta(
+  basePath: string,
+  repoName: string,
+  blobs?: BlobStorePort,
+): Promise<RepoIndexMeta | null> {
+  try {
+    const store = blobs ?? new FsBlobStore(basePath);
+    return await store.getJson<RepoIndexMeta>(`${repoName}/index_meta.json`);
   } catch {
     return null;
   }
@@ -56,6 +82,15 @@ export interface RepoJob {
   chunking: { maxTokens: number; contextEnrichment: 'structural' | 'llm' | 'none' };
   doChunk: boolean;
   force: boolean;
+  /** Serializable storage config — a live BlobStorePort cannot cross the
+   *  worker_thread boundary, so the worker reconstructs its own port from
+   *  this block. Unset ⇒ FsBlobStore(basePath), today's behavior. */
+  storage?: KnowledgeStorageConfig;
+  /** Bounded-scratch writer mode: shallow-clone this URL to repoPath before
+   *  processing and DELETE the clone afterwards. Peak disk = concurrency ×
+   *  largest repo, never the whole org (~95GB). Unset ⇒ repoPath is a
+   *  pre-existing local checkout, today's behavior. */
+  cloneUrl?: string;
 }
 
 export interface RepoResult {
@@ -65,6 +100,13 @@ export interface RepoResult {
   graph: GraphifyOutput | null;
   workspaceMap: WorkspaceMap | null;
   chunked: boolean;
+  /** True when the shard is the repo's COMPLETE chunk set (first index, force,
+   *  or no prior fileIndex). False whenever a prior fileIndex existed: BOTH
+   *  re-chunk paths then emit only changed files' chunks (chunkChangedFiles by
+   *  git diff; chunkRepo skips content-hash-unchanged files via cachedFiles) —
+   *  the indexer must carry untouched files' chunks forward from the previous
+   *  chunks.json, filtered by changedFiles ∪ deletedFiles. */
+  shardComplete: boolean;
   shardPath: string | null;
   fileIndex: Record<string, FileIndexEntry> | null;
   changedFiles: string[];
@@ -77,11 +119,34 @@ export interface RepoResult {
  *  local FS — safe to run in a worker_thread. */
 export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
   await initTreeSitter(); // idempotent; first call per worker loads the WASM grammars
+  if (!job.cloneUrl) return processCheckout(job);
+  // Bounded-scratch writer mode: clone → process → ALWAYS discard the clone,
+  // so a failed repo can't leak scratch across the run.
+  execSync(
+    `git clone --depth=1 --quiet ${JSON.stringify(job.cloneUrl)} ${JSON.stringify(job.repoPath)}`,
+    { stdio: 'pipe', timeout: 600_000 },
+  );
+  try {
+    return await processCheckout(job);
+  } finally {
+    try { rmSync(job.repoPath, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+async function processCheckout(job: RepoJob): Promise<RepoResult> {
   const { repoName, repoPath, basePath, project, chunking, doChunk, force } = job;
+  // Chunk shards are LOCAL SCRATCH (streamed to disk, folded into chunks.json by
+  // the indexer) — they stay on the local fs regardless of blob backend.
   const repoKbDir = join(basePath, repoName);
   mkdirSync(repoKbDir, { recursive: true });
 
-  const meta = force ? null : readRepoIndexMeta(basePath, repoName);
+  // KB artifacts (index_meta, graph.json, GRAPH_REPORT.md) go through the blob
+  // port, reconstructed from the job's serializable storage block.
+  const blobs: BlobStorePort = job.storage
+    ? resolveStorage(project, { storage: job.storage } as KnowledgeConfig).blobs
+    : new FsBlobStore(basePath);
+
+  const meta = force ? null : await readRepoIndexMeta(basePath, repoName, blobs);
   const diff = force ? null : (meta?.lastIndexedSha ? getAllChanges(repoPath, meta.lastIndexedSha) : null);
   const useIncremental =
     !!diff && !diff.fallbackToFull && diff.added.length + diff.modified.length + diff.deleted.length > 0;
@@ -95,6 +160,7 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
   }
 
   let chunkCount = 0;
+  let shardComplete = false;
   let shardPath: string | null = null;
   let fileIndex: Record<string, FileIndexEntry> | null = null;
   let changedFiles: string[] = [];
@@ -113,6 +179,9 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
     } finally {
       writer.close();
     }
+    // Complete only when nothing could be skipped: no git-diff incremental AND
+    // no prior fileIndex for chunkRepo's content-hash cache to skip against.
+    shardComplete = !useIncremental && !meta?.files;
     fileIndex = result.fileIndex;
     chunkCount = Object.values(result.fileIndex).reduce((s, f) => s + (f as FileIndexEntry).chunkCount, 0);
     changedFiles = result.changedFiles ?? [];
@@ -121,9 +190,9 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
 
   let graph: GraphifyOutput | null = null;
   try {
-    const existingGraphPath = join(repoKbDir, 'graph.json');
-    if (useIncremental && existsSync(existingGraphPath)) {
-      const existingGraph = JSON.parse(readFileSync(existingGraphPath, 'utf-8'));
+    const graphKey = `${repoName}/graph.json`;
+    const existingGraph = useIncremental ? await blobs.getJson<GraphifyOutput>(graphKey) : null;
+    if (existingGraph) {
       graph = await incrementalGraphUpdate(
         existingGraph,
         getChangedFilesList(diff!),
@@ -134,10 +203,21 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
     } else {
       graph = await buildAstGraph(repoPath, { workspaceMap: workspaceMap ?? undefined });
     }
-    writeFileSync(existingGraphPath, JSON.stringify(graph));
-    writeFileSync(join(repoKbDir, 'GRAPH_REPORT.md'), generateGraphReport(repoName, graph));
+    // graph.json stays compact (JSON.stringify, no indent) for byte-parity.
+    await blobs.putText(graphKey, JSON.stringify(graph));
+    await blobs.putText(`${repoName}/GRAPH_REPORT.md`, generateGraphReport(repoName, graph));
   } catch {
     graph = null; // AST failure is non-fatal (matches prior buildKB behavior)
+  }
+
+  // Cross-repo signals: extracted HERE because this is the only moment the
+  // working tree is guaranteed to exist (the bounded-scratch writer discards
+  // the clone right after this function returns). Correlation joins these
+  // persisted bundles later, on the main thread, without any tree.
+  try {
+    await blobs.putJson(`${repoName}/signals.json`, extractCrossRepoSignals(repoPath));
+  } catch {
+    // Non-fatal: this repo contributes no cross-repo edges until its next index.
   }
 
   return {
@@ -147,6 +227,7 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
     graph,
     workspaceMap,
     chunked: doChunk,
+    shardComplete,
     shardPath,
     fileIndex,
     changedFiles,

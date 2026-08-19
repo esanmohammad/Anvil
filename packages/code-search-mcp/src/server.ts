@@ -3,16 +3,10 @@
  * Supports stdio (default) and HTTP transports with auth.
  */
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+import { Server } from '@modelcontextprotocol/server';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import cluster from 'node:cluster';
 
 import { registerSearchTools, handleSearchTool } from './tools/search.js';
@@ -20,7 +14,7 @@ import { registerGraphTools, handleGraphTool } from './tools/graph.js';
 import { registerProfileTools, handleProfileTool } from './tools/profile.js';
 import { registerIndexTools, handleIndexTool } from './tools/index-tools';
 import { registerResources, handleResource } from './resources/resources';
-import { getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
+import { getBlobStore } from '@esankhan3/anvil-knowledge-core';
 import { indexFromPath, invalidateRetriever } from '@esankhan3/anvil-knowledge-core';
 import { loadServerConfig, type ServerConfig } from './core/env-config.js';
 import { toKnowledgeConfig } from './core/config.js';
@@ -54,7 +48,7 @@ export interface ServerContext {
 /** Create a wired MCP Server instance (shared logic for stdio and HTTP sessions) */
 function createMcpServerInstance(ctx: ServerContext) {
   const server = new Server(
-    { name: 'code-search-mcp', version: '0.4.0' },
+    { name: 'code-search-mcp', version: '1.0.0' },
     { capabilities: { tools: {}, resources: {} } },
   );
 
@@ -65,11 +59,11 @@ function createMcpServerInstance(ctx: ServerContext) {
     ...registerIndexTools(),
   ];
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  server.setRequestHandler('tools/list', async () => ({
     tools: allTools,
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler('tools/call', async (request) => {
     const name = request.params.name;
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
 
@@ -90,11 +84,11 @@ function createMcpServerInstance(ctx: ServerContext) {
 
   const allResources = registerResources(ctx);
 
-  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+  server.setRequestHandler('resources/list', async () => ({
     resources: allResources,
   }));
 
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  server.setRequestHandler('resources/read', async (request) => {
     return handleResource(request.params.uri, ctx);
   });
 
@@ -169,10 +163,6 @@ export async function startServer(
 
     await startHttpTransport({
       config,
-      // Workers must be stateless: the fronting proxy opens a new upstream
-      // connection per request, so in-memory MCP sessions cannot stick to one
-      // worker. Also opt-in for single-process deploys via env.
-      stateless: isReadOnlyWorker || process.env.CODE_SEARCH_STATELESS === '1',
       createMcpServer: async () => ({
         server: createMcpServerInstance(ctx),
       }),
@@ -478,13 +468,19 @@ async function trackedIndex(
 
 async function autoIndex(ctx: ServerContext, opts?: { readOnly?: boolean }): Promise<void> {
   try {
-    const kbPath = getKnowledgeBasePath(ctx.projectName);
-    const hasLanceDB = existsSync(join(kbPath, 'lancedb'));
-    // System graph is now SQLite (system_graph.sqlite); accept the legacy JSON
-    // too so pre-migration indexes still read as ready.
-    const hasGraph = existsSync(join(kbPath, 'system_graph.sqlite')) || existsSync(join(kbPath, 'system_graph_v2.json'));
+    const blobs = getBlobStore(ctx.projectName, toKnowledgeConfig(loadServerConfig().__unified));
+    // Remote backends: `lancedb` is NOT a blob key (vectors live in object
+    // storage), so existence-of-lancedb can never turn a Mongo/S3 reader
+    // ready. The writer's stats rollup is the cross-backend readiness signal —
+    // its embeddingProvider is patched from 'pending' when embedding finishes,
+    // i.e. exactly when search is servable.
+    const stats = await blobs.getJson<{ embeddingProvider?: string }>('index_stats.json');
+    const statsReady = !!stats && stats.embeddingProvider !== 'pending';
+    // Legacy local layout (pre-rollup indexes): lancedb dir + system graph.
+    const hasLanceDB = await blobs.exists('lancedb');
+    const hasGraph = (await blobs.exists('system_graph.sqlite')) || (await blobs.exists('system_graph_v2.json'));
 
-    if (hasLanceDB && hasGraph) {
+    if (statsReady || (hasLanceDB && hasGraph)) {
       ctx.indexReady = true;
       console.error(`[code-search-mcp] Index loaded for "${ctx.projectName}"`);
       return;

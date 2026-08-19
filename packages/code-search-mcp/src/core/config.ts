@@ -17,8 +17,9 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import type {
+  KnowledgeStorageConfig,
   EmbeddingProviderConfig,
   EmbeddingProviderId,
   KnowledgeConfig,
@@ -45,6 +46,10 @@ export interface CodeSearchConfig {
   };
   storage: {
     dataDir: string;
+    /** Backend selection for the knowledge stores (blob/vector/graph/cache).
+     *  Omit ⇒ local fs/LanceDB/sqlite defaults. Passed through verbatim as
+     *  KnowledgeConfig.storage (resolveStorage owns interpretation). */
+    backends?: KnowledgeStorageConfig;
   };
   embedding: EmbeddingProviderConfig;
   reranker: RerankerProviderConfig;
@@ -299,6 +304,61 @@ function parseReindexMs(raw: string | undefined): number {
   return m[2] === 'h' ? parseInt(m[1], 10) * 60 * 60_000 : parseInt(m[1], 10) * 60_000;
 }
 
+/**
+ * Storage-backend selection from env — the deployment-friendly subset of
+ * KnowledgeStorageConfig (full shapes go via the YAML layers). Returns
+ * undefined when no CODE_SEARCH_STORAGE_* var is set so the env layer never
+ * clobbers a file-configured block. Env vars:
+ *   STORAGE_BLOB_BACKEND=fs|mongo, STORAGE_MONGO_URI, STORAGE_MONGO_DB,
+ *   STORAGE_VECTOR_URI (s3://bucket/prefix), STORAGE_S3_ENDPOINT,
+ *   STORAGE_S3_REGION, STORAGE_S3_ALLOW_HTTP, STORAGE_CACHE_MAX_BYTES,
+ *   STORAGE_CACHE_DIR.
+ */
+function envStorageBackends(env: (k: string) => string | undefined): KnowledgeStorageConfig | undefined {
+  const blobBackend = env('STORAGE_BLOB_BACKEND') as 'fs' | 's3' | 'mongo' | undefined;
+  const mongoUri = env('STORAGE_MONGO_URI');
+  const mongoDb = env('STORAGE_MONGO_DB');
+  const vectorUri = env('STORAGE_VECTOR_URI');
+  const s3Endpoint = env('STORAGE_S3_ENDPOINT');
+  const s3Region = env('STORAGE_S3_REGION');
+  const s3AllowHttp = env('STORAGE_S3_ALLOW_HTTP');
+  const cacheMaxBytes = env('STORAGE_CACHE_MAX_BYTES');
+  const cacheDir = env('STORAGE_CACHE_DIR');
+
+  if (!blobBackend && !mongoUri && !vectorUri && !cacheMaxBytes && !cacheDir) return undefined;
+
+  const out: KnowledgeStorageConfig = {};
+  if (blobBackend || mongoUri) {
+    out.blob = {
+      ...(blobBackend ? { backend: blobBackend } : {}),
+      ...(mongoUri && mongoDb ? { mongo: { uri: mongoUri, db: mongoDb } } : {}),
+    };
+  }
+  if (vectorUri) {
+    const s3 =
+      s3Endpoint || s3Region || s3AllowHttp
+        ? {
+            ...(s3Endpoint ? { endpoint: s3Endpoint } : {}),
+            ...(s3Region ? { region: s3Region } : {}),
+            ...(s3AllowHttp ? { allowHttp: s3AllowHttp === 'true' || s3AllowHttp === '1' } : {}),
+            virtualHostedStyle: false, // MinIO is path-style
+          }
+        : undefined;
+    out.vector = { lancedb: { uri: vectorUri, ...(s3 ? { s3 } : {}) } };
+  }
+  // CACHE_DIR (sqlite graph pull target) and CACHE_MAX_BYTES (LanceDB RAM
+  // Session bound) are independent knobs — a reader pod mounting an emptyDir
+  // cache sets the dir without necessarily bounding the RAM cache.
+  const max = cacheMaxBytes ? parseInt(cacheMaxBytes, 10) : NaN;
+  if (cacheDir || (Number.isFinite(max) && max > 0)) {
+    out.cache = {
+      dir: cacheDir ?? join(tmpdir(), 'code-search-cache'),
+      ...(Number.isFinite(max) && max > 0 ? { maxBytes: max, mode: 'ram' as const } : {}),
+    };
+  }
+  return out;
+}
+
 function envLayer(): DeepPartial<CodeSearchConfig> {
   const env = (k: string): string | undefined => process.env[`CODE_SEARCH_${k}`];
   const authMode = env('AUTH_MODE') as CodeSearchConfig['auth']['mode'] | undefined;
@@ -326,6 +386,7 @@ function envLayer(): DeepPartial<CodeSearchConfig> {
     },
     storage: {
       dataDir: env('DATA_DIR'),
+      backends: envStorageBackends(env),
     },
     embedding: {
       provider: env('EMBEDDING_PROVIDER') as EmbeddingProviderId | undefined,
@@ -514,6 +575,7 @@ export function toKnowledgeConfig(c: CodeSearchConfig): KnowledgeConfig {
       reranker: { ...c.reranker },
     },
     autoIndex: c.indexing.autoIndex,
+    ...(c.storage.backends ? { storage: c.storage.backends } : {}),
   };
 }
 

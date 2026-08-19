@@ -4,6 +4,7 @@
 
 import type { ServerContext } from '../server.js';
 import { loadAllProfiles, loadProfile } from '@esankhan3/anvil-knowledge-core';
+import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import { discoverRepos } from '@esankhan3/anvil-knowledge-core';
 
 export function registerProfileTools() {
@@ -41,7 +42,7 @@ export async function handleProfileTool(
     // imported at top
 
     if (name === 'list_repos') {
-      const profiles = loadAllProfiles(ctx.projectName);
+      const profiles = await loadAllProfiles(ctx.projectName, resolvedKnowledgeConfig());
       if (profiles.length === 0) {
         // Fall back to discovering repos from directory
         if (ctx.directoryPath) {
@@ -62,7 +63,7 @@ export async function handleProfileTool(
 
     if (name === 'get_repo_profile') {
       const repo = args.repo as string;
-      const profile = loadProfile(ctx.projectName, repo);
+      const profile = await loadProfile(ctx.projectName, repo, resolvedKnowledgeConfig());
       if (!profile) {
         return { content: [{ type: 'text', text: `No profile found for "${repo}". Run reindex to generate profiles.` }] };
       }

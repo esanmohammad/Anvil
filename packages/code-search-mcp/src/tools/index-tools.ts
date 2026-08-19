@@ -3,6 +3,7 @@
  */
 
 import type { ServerContext } from '../server.js';
+import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import { KnowledgeIndexer } from '@esankhan3/anvil-knowledge-core';
 
 const TOOL_NAMES = ['index_status'];
@@ -30,7 +31,7 @@ export async function handleIndexTool(
   try {
     if (name === 'index_status') {
       const indexer = new KnowledgeIndexer();
-      const stats = await indexer.getStats(ctx.projectName);
+      const stats = await indexer.getStats(ctx.projectName, resolvedKnowledgeConfig());
 
       const lines = [
         `# Index Status: ${ctx.projectName}`,

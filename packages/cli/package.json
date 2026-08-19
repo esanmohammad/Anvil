@@ -1,7 +1,7 @@
 {
   "name": "@esankhan3/anvil-cli",
-  "version": "0.4.0",
-  "description": "Anvil — AI-powered feature development pipeline (CLI + dashboard)",
+  "version": "0.5.0",
+  "description": "Anvil \u2014 AI-powered feature development pipeline (CLI + dashboard)",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -140,10 +140,10 @@
     "test": "echo 'cli has no per-workspace node:test files (knowledge tests moved to @anvil/knowledge-core; hooks integration test runs via root jest)'"
   },
   "dependencies": {
-    "@esankhan3/anvil-agent-core": "^0.4.0",
+    "@esankhan3/anvil-agent-core": "^0.5.0",
     "@esankhan3/anvil-convention-core": "^0.3.0",
     "@esankhan3/anvil-core-pipeline": "^0.4.0",
-    "@esankhan3/anvil-knowledge-core": "^0.3.0",
+    "@esankhan3/anvil-knowledge-core": "^0.4.0",
     "@esankhan3/anvil-memory-core": "^0.3.0",
     "commander": "^13.1.0",
     "lucide-react": "1.8.0",

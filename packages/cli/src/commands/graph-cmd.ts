@@ -161,14 +161,14 @@ graphCommand.addCommand(
         }
       }
 
-      const status = getProjectGraphStatus(projectName);
+      const status = await getProjectGraphStatus(projectName);
       if (!status.exists) {
         error(`No project graph for "${projectName}". Build one with: anvil graph build ${projectName}`);
         process.exitCode = 1;
         return;
       }
 
-      const summary = loadProjectSummary(projectName);
+      const summary = await loadProjectSummary(projectName);
       if (summary) {
         console.log(summary);
       } else {
@@ -208,7 +208,7 @@ graphCommand.addCommand(
       }
 
       try {
-        const estimate = estimateProjectGraphCost(projectName, found.configPath, opts.provider);
+        const estimate = await estimateProjectGraphCost(projectName, found.configPath, opts.provider);
         console.log('');
         info(`Cost estimate for ${pc.bold(projectName)} project graph:`);
         console.log('');
@@ -251,7 +251,7 @@ graphCommand.addCommand(
       console.log('');
 
       for (const proj of projects) {
-        const status = getProjectGraphStatus(proj.name);
+        const status = await getProjectGraphStatus(proj.name);
         if (status.exists) {
           const age = status.generatedAt
             ? timeSince(new Date(status.generatedAt))

@@ -119,7 +119,7 @@ export function getTokenBudgetForLayer(layer: ContextLayer): number {
 /**
  * Assemble L0 (Project Identity) + L1 (Critical Invariants) — always included.
  */
-export function assembleProjectIdentity(config: LayeredContextConfig): string {
+export async function assembleProjectIdentity(config: LayeredContextConfig): Promise<string> {
   const repoList = config.repoNames?.join(', ') || '(unknown)';
   const repoCount = config.repoNames?.length ?? 0;
 
@@ -150,7 +150,7 @@ export function assembleProjectIdentity(config: LayeredContextConfig): string {
 
   // Load project graph if available (LLM-powered semantic understanding)
   try {
-    const projectGraph = loadProjectGraph(config.project);
+    const projectGraph = await loadProjectGraph(config.project);
     if (projectGraph) {
       const graphContext = formatProjectGraphForPrompt(projectGraph);
       lines.push('', graphContext);
@@ -165,15 +165,15 @@ export function assembleProjectIdentity(config: LayeredContextConfig): string {
 /**
  * Assemble layered context: L0+L1 identity, optionally L2 retrieval results.
  */
-export function assembleLayeredContext(
+export async function assembleLayeredContext(
   config: LayeredContextConfig,
   result: RetrievalResult | null,
-): string {
+): Promise<string> {
   const sections: string[] = [];
   const maxTokens = getTokenBudgetForLayer(config.layer);
 
   // Always include L0+L1
-  const identity = assembleProjectIdentity(config);
+  const identity = await assembleProjectIdentity(config);
   sections.push(identity);
 
   // For minimal layer, we're done

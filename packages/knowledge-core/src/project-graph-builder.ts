@@ -12,10 +12,12 @@
 // Re-export legacy class for backward compat
 export { ProjectGraphBuilder } from './project-graph-builder-core.js';
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
+import { FsBlobStore } from './storage/fs-blob-store.js';
+import { resolveStorage } from './storage/resolve.js';
+import type { StorageBundle } from './storage/ports.js';
+import type { KnowledgeConfig } from './config.js';
 import type {
   ProjectGraph,
   ProjectGraphMeta,
@@ -29,11 +31,6 @@ import type {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const KB_DIR = join(
-  process.env.ANVIL_HOME || process.env.FF_HOME || join(homedir(), '.anvil'),
-  'knowledge-base',
-);
 
 const PROJECT_GRAPH_FILE = 'PROJECT_GRAPH.json';
 const PROJECT_SUMMARY_FILE = 'PROJECT_SUMMARY.md';
@@ -428,6 +425,40 @@ export interface BuildProjectGraphOptions {
   model?: string;
   dryRun?: boolean;
   onProgress?: (message: string) => void;
+  /** Storage resolution — omit ⇒ fs defaults (today's behavior). */
+  config?: KnowledgeConfig;
+}
+
+/** Enumerate `<repo>/GRAPH_REPORT.md` across the project. fs fast-path scans
+ *  top-level dirs (a recursive blob list would descend into lancedb/); non-fs
+ *  backends use list() — a metadata query. */
+async function collectGraphReports(
+  storage: StorageBundle,
+): Promise<Array<{ repo: string; report: string }>> {
+  const graphReports: Array<{ repo: string; report: string }> = [];
+  const blobs = storage.blobs;
+  try {
+    if (blobs instanceof FsBlobStore) {
+      if (!existsSync(storage.basePath)) return graphReports;
+      const { readdirSync } = await import('node:fs');
+      for (const entry of readdirSync(storage.basePath)) {
+        try {
+          const report = await blobs.getText(`${entry}/GRAPH_REPORT.md`);
+          if (report !== null) graphReports.push({ repo: entry, report });
+        } catch { /* skip unreadable */ }
+      }
+      return graphReports;
+    }
+    for (const key of await blobs.list('')) {
+      const m = /^([^/]+)\/GRAPH_REPORT\.md$/.exec(key);
+      if (!m) continue;
+      try {
+        const report = await blobs.getText(key);
+        if (report !== null) graphReports.push({ repo: m[1], report });
+      } catch { /* skip unreadable */ }
+    }
+  } catch { /* KB location doesn't exist or isn't readable */ }
+  return graphReports;
 }
 
 /**
@@ -439,7 +470,9 @@ export async function buildProjectGraph(
   options?: BuildProjectGraphOptions,
 ): Promise<ProjectGraph> {
   const log = options?.onProgress ?? (() => {});
-  const projectDir = join(KB_DIR, project);
+  const storage = resolveStorage(project, options?.config);
+  const blobs = storage.blobs;
+  const projectDir = storage.basePath;
   const startTime = Date.now();
 
   // 1. Read factory.yaml
@@ -451,19 +484,7 @@ export async function buildProjectGraph(
 
   // 2. Collect per-repo graph reports
   log('Collecting per-repo graph reports...');
-  const graphReports: Array<{ repo: string; report: string }> = [];
-  if (existsSync(projectDir)) {
-    const { readdirSync, statSync } = await import('node:fs');
-    for (const entry of readdirSync(projectDir)) {
-      const reportPath = join(projectDir, entry, 'GRAPH_REPORT.md');
-      if (existsSync(reportPath)) {
-        try {
-          const report = readFileSync(reportPath, 'utf-8');
-          graphReports.push({ repo: entry, report });
-        } catch { /* skip unreadable */ }
-      }
-    }
-  }
+  const graphReports = await collectGraphReports(storage);
 
   if (graphReports.length === 0) {
     log('Warning: No per-repo graph reports found. Run "anvil index" or refresh KB first for better results.');
@@ -472,24 +493,22 @@ export async function buildProjectGraph(
   // 3. Collect cross-repo edges from project graph
   log('Reading cross-repo relationships...');
   const crossRepoEdges: Array<{ source: string; target: string; type: string; evidence: string }> = [];
-  const projectGraphPath = join(projectDir, 'system_graph_v2.json');
-  if (existsSync(projectGraphPath)) {
-    try {
-      const graphData = JSON.parse(readFileSync(projectGraphPath, 'utf-8'));
-      // graphology export format
-      const edges = graphData.edges ?? [];
-      for (const e of edges) {
-        if (e.attributes?.crossRepo) {
-          crossRepoEdges.push({
-            source: e.source,
-            target: e.target,
-            type: e.attributes.type ?? 'unknown',
-            evidence: e.attributes.evidence ?? '',
-          });
-        }
+  try {
+    // graphology export format; absent once only system_graph.sqlite is written.
+    const graphData = await blobs.getJson<{
+      edges?: Array<{ source: string; target: string; attributes?: { crossRepo?: boolean; type?: string; evidence?: string } }>;
+    }>('system_graph_v2.json');
+    for (const e of graphData?.edges ?? []) {
+      if (e.attributes?.crossRepo) {
+        crossRepoEdges.push({
+          source: e.source,
+          target: e.target,
+          type: e.attributes.type ?? 'unknown',
+          evidence: e.attributes.evidence ?? '',
+        });
       }
-    } catch { /* skip */ }
-  }
+    }
+  } catch { /* skip */ }
 
   // 4. Assemble prompt
   const userPrompt = assembleUserPrompt(factoryYaml, graphReports, crossRepoEdges);
@@ -576,11 +595,10 @@ export async function buildProjectGraph(
     keyFlows: Array.isArray(parsed.keyFlows) ? parsed.keyFlows : [],
   };
 
-  // 8. Save
-  mkdirSync(projectDir, { recursive: true });
-  writeFileSync(join(projectDir, PROJECT_GRAPH_FILE), JSON.stringify(graph, null, 2), 'utf-8');
+  // 8. Save (via the blob port; putJson pretty-prints = byte-identical to before)
+  await blobs.putJson(PROJECT_GRAPH_FILE, graph);
   const summary = renderProjectSummary(project, graph);
-  writeFileSync(join(projectDir, PROJECT_SUMMARY_FILE), summary, 'utf-8');
+  await blobs.putText(PROJECT_SUMMARY_FILE, summary);
   log(`Saved PROJECT_GRAPH.json and PROJECT_SUMMARY.md to ${projectDir}`);
 
   return graph;
@@ -590,28 +608,24 @@ export async function buildProjectGraph(
 // Load existing project graph
 // ---------------------------------------------------------------------------
 
-export function loadProjectGraph(project: string): ProjectGraph | null {
-  const path = join(KB_DIR, project, PROJECT_GRAPH_FILE);
-  if (!existsSync(path)) return null;
+export async function loadProjectGraph(project: string, config?: KnowledgeConfig): Promise<ProjectGraph | null> {
   try {
-    return JSON.parse(readFileSync(path, 'utf-8'));
+    return await resolveStorage(project, config).blobs.getJson<ProjectGraph>(PROJECT_GRAPH_FILE);
   } catch {
     return null;
   }
 }
 
-export function loadProjectSummary(project: string): string | null {
-  const path = join(KB_DIR, project, PROJECT_SUMMARY_FILE);
-  if (!existsSync(path)) return null;
+export async function loadProjectSummary(project: string, config?: KnowledgeConfig): Promise<string | null> {
   try {
-    return readFileSync(path, 'utf-8');
+    return await resolveStorage(project, config).blobs.getText(PROJECT_SUMMARY_FILE);
   } catch {
     return null;
   }
 }
 
-export function getProjectGraphStatus(project: string): ProjectGraphStatus {
-  const graph = loadProjectGraph(project);
+export async function getProjectGraphStatus(project: string, config?: KnowledgeConfig): Promise<ProjectGraphStatus> {
+  const graph = await loadProjectGraph(project, config);
   if (!graph) {
     return { exists: false, generatedAt: null, model: null, costUsd: null };
   }
@@ -627,28 +641,17 @@ export function getProjectGraphStatus(project: string): ProjectGraphStatus {
 // Cost estimation (no LLM call)
 // ---------------------------------------------------------------------------
 
-export function estimateProjectGraphCost(
+export async function estimateProjectGraphCost(
   project: string,
   factoryYamlPath: string,
   provider?: string,
-): { estimatedInputTokens: number; estimatedOutputTokens: number; estimatedCostUsd: number; model: string; provider: string } {
+  config?: KnowledgeConfig,
+): Promise<{ estimatedInputTokens: number; estimatedOutputTokens: number; estimatedCostUsd: number; model: string; provider: string }> {
   const factoryYaml = existsSync(factoryYamlPath)
     ? readFileSync(factoryYamlPath, 'utf-8')
     : '';
 
-  const graphReports: Array<{ repo: string; report: string }> = [];
-  const projectDir = join(KB_DIR, project);
-  if (existsSync(projectDir)) {
-    try {
-      const { readdirSync } = require('node:fs');
-      for (const entry of readdirSync(projectDir)) {
-        const reportPath = join(projectDir, entry, 'GRAPH_REPORT.md');
-        if (existsSync(reportPath)) {
-          graphReports.push({ repo: entry, report: readFileSync(reportPath, 'utf-8') });
-        }
-      }
-    } catch { /* skip */ }
-  }
+  const graphReports = await collectGraphReports(resolveStorage(project, config));
 
   const userPrompt = assembleUserPrompt(factoryYaml, graphReports, []);
   const inputTokens = Math.ceil((SYSTEM_PROMPT.length + userPrompt.length) / 4);

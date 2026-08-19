@@ -127,23 +127,23 @@ interface ServerContext {
 4. Pick transport:
    - `stdio` → `new StdioServerTransport()` + `server.connect`.
    - else → `startHttpTransport(opts)` with `createMcpServer` factory
-     producing one Server per session.
+     producing one Server per request.
 5. If `parseReindexInterval() > 0` → `setInterval(...).unref()` running
    `trackedIndex(..., { label: 'auto-reindex' })`.
 
-### 3.3 `createMcpServerInstance(ctx)` — per-session MCP wiring
+### 3.3 `createMcpServerInstance(ctx)` — per-request MCP wiring
 
 ```
 const server = new Server({ name: 'code-search-mcp', version: '0.1.0' },
                           { capabilities: { tools: {}, resources: {} } });
 allTools = [...registerSearchTools, ...registerGraphTools,
             ...registerProfileTools, ...registerIndexTools];
-server.setRequestHandler(ListToolsRequestSchema,  () => ({ tools: allTools }));
-server.setRequestHandler(CallToolRequestSchema,   handleSearchTool || handleGraphTool
-                                                  || handleProfileTool || handleIndexTool
-                                                  || { error: 'Unknown tool: ...' });
-server.setRequestHandler(ListResourcesRequestSchema, () => ({ resources }));
-server.setRequestHandler(ReadResourceRequestSchema,  handleResource);
+server.setRequestHandler('tools/list',     () => ({ tools: allTools }));
+server.setRequestHandler('tools/call',     handleSearchTool || handleGraphTool
+                                           || handleProfileTool || handleIndexTool
+                                           || { error: 'Unknown tool: ...' });
+server.setRequestHandler('resources/list', () => ({ resources }));
+server.setRequestHandler('resources/read', handleResource);
 ```
 
 ### 3.4 `trackedIndex(ctx, project, dirPath, opts)`
@@ -170,27 +170,21 @@ Parses `CODE_SEARCH_REINDEX_INTERVAL`:
 ## 4. HTTP transport (`src/transports/http-transport.ts`)
 
 `startHttpTransport(opts)` opens a `node:http` server listening on
-`config.port` / `config.host`. Per-session
-`StreamableHTTPServerTransport` with:
-
-- `MAX_SESSIONS = 100` cap.
-- `SESSION_TTL_MS = 30 * 60 * 1000` (30 min).
-- Cleanup `setInterval` every 5 min (drops stale sessions).
-- Each new session creates its own `mcpServer = await createMcpServer()`
-  → `transport.handleRequest(req, res)`. The transport allocates a
-  session id (returned in `mcp-session-id` response header).
+`config.port` / `config.host`. Serving is stateless: one
+`createMcpHandler` (SDK v2) instance serves every `/mcp` request —
+modern (2026-07-28) envelope traffic on a per-request micro-transport,
+2025-era clients via the stateless legacy fallback. Each exchange gets
+its own `mcpServer = await createMcpServer()`; no session ids, no TTL.
 
 Routes:
 
 | Method + path | Auth | Handler |
 |---|---|---|
-| `GET /health` | none | `getHealth()` + `activeSessions` count |
+| `GET /health` | none | `getHealth()` |
 | `GET /status` | none | `getStatus()` (live indexing telemetry) |
 | `POST /index` | yes when `authEnabled` | parses `{ path, project?, force? }` JSON, calls `onIndex(body)` |
-| `POST /mcp` (no `mcp-session-id`) | yes when `authEnabled` | new session: create transport + Server, route request |
-| `POST /mcp` (with `mcp-session-id`) | yes when `authEnabled` | route to existing session's transport, bump `lastActivity` |
-| `GET /mcp` | yes when `authEnabled` | SSE stream for existing session |
-| `DELETE /mcp` | yes when `authEnabled` | drop session |
+| `POST /mcp` | yes when `authEnabled` | stateless exchange via `createMcpHandler` (both eras) |
+| `GET /mcp` / `DELETE /mcp` | yes when `authEnabled` | 405 (legacy session verbs — no sessions exist) |
 | anything else | — | 404 |
 
 Every response carries an `X-Request-ID` header (8-char UUID slice).
@@ -423,7 +417,7 @@ packages/code-search-mcp/
     │   └── env-config.ts                    ← loadServerConfig + resolveLlmMode
     │
     ├── transports/
-    │   ├── http-transport.ts                ← Streamable HTTP + sessions
+    │   ├── http-transport.ts                ← Streamable HTTP (stateless)
     │   └── remote-proxy.ts                  ← stdio → /mcp forwarder
     │
     ├── middleware/

@@ -1,5 +1,6 @@
 import { rmSync } from 'node:fs';
 import type { CodeChunk, ScoredChunk } from '@esankhan3/anvil-knowledge-core';
+import type { VectorStorePort, IvfPqIndexConfig } from './storage/ports.js';
 
 /** A LanceDB store left 0-byte/truncated by a prior killed-mid-write (OOM /
  *  SIGKILL / ENOSPC). Surfaces as a lance IO / "Invalid range" / generic
@@ -17,14 +18,49 @@ function isCorruptVectorStore(err: unknown): boolean {
  *  index exists (ensureVectorIndex). */
 const VECTOR_NPROBES = Math.max(1, parseInt(process.env.CODE_SEARCH_VECTOR_NPROBES ?? '', 10) || 40);
 
-export class VectorStore {
+export class VectorStore implements VectorStorePort {
   private db: any; // lancedb.Connection
   private table: any; // lancedb.Table
   private dbPath: string;
+  private storageOptions?: Record<string, string>;
+  private cacheBudget?: { indexCacheBytes: number; metadataCacheBytes: number };
+  private indexConfig?: IvfPqIndexConfig;
   private initialized: boolean = false;
 
-  constructor(dbPath: string) {
+  /** `dbPath` is a local directory (default) or an object-store URI
+   *  (`s3://bucket/prefix`). `storageOptions` carries the LanceDB/object_store
+   *  S3 connection knobs (endpoint, region, path-style, …) for MinIO; omit for
+   *  local. Access key/secret are read from the environment by object_store.
+   *  `cacheBudget` (S3 deployments) bounds LanceDB's in-RAM index/metadata
+   *  Session caches so a memory-limited pod stays under its limit; omit ⇒
+   *  LanceDB defaults (≈6 GiB / 1 GiB). LanceDB has no on-disk fragment cache,
+   *  so this RAM Session is the only adapter-level caching lever (ADR §5.5).
+   *  `indexConfig` (ADR §5.5, `storage.vector.lancedb.index`) enables the IVF_PQ
+   *  index so an S3 query reads only probed partitions; omit ⇒ flat/exact scan. */
+  constructor(
+    dbPath: string,
+    storageOptions?: Record<string, string>,
+    cacheBudget?: { indexCacheBytes: number; metadataCacheBytes: number },
+    indexConfig?: IvfPqIndexConfig,
+  ) {
     this.dbPath = dbPath;
+    this.storageOptions = storageOptions;
+    this.cacheBudget = cacheBudget;
+    this.indexConfig = indexConfig;
+  }
+
+  /** True when dbPath is a local filesystem path (no `scheme://`). */
+  private get isLocal(): boolean {
+    return !/^[a-z0-9]+:\/\//i.test(this.dbPath);
+  }
+
+  /** Positional args for `lancedb.connect(uri, options?, session?)`. */
+  private connectArgs(
+    session?: any, // lancedb.Session — matches the `any` lancedb types used throughout
+  ): [string, { storageOptions: Record<string, string> }?, any?] {
+    const opts = this.storageOptions ? { storageOptions: this.storageOptions } : undefined;
+    if (session) return [this.dbPath, opts, session];
+    return opts ? [this.dbPath, opts] : [this.dbPath];
   }
 
   /** Initialize connection, create or open table.
@@ -42,7 +78,18 @@ export class VectorStore {
         '@lancedb/lancedb is not installed. Install it with: npm install @lancedb/lancedb',
       );
     }
-    this.db = await lancedb.connect(this.dbPath);
+    // Bounded in-RAM Session (S3 deployments) — index + metadata caches sized
+    // from storage.cache. Built only when a budget was resolved; otherwise
+    // connect() with no session uses LanceDB defaults (today's behavior). The
+    // `Session` export guards a binding too old to have it (native optional dep).
+    const session =
+      this.cacheBudget && lancedb.Session
+        ? new lancedb.Session(
+            BigInt(this.cacheBudget.indexCacheBytes),
+            BigInt(this.cacheBudget.metadataCacheBytes),
+          )
+        : undefined;
+    this.db = await lancedb.connect(...this.connectArgs(session));
     try {
       this.table = await this.db.openTable('chunks');
       // A 0-byte fragment from a killed-mid-write often opens fine but throws on
@@ -61,8 +108,13 @@ export class VectorStore {
           `[knowledge-core] vector store at ${this.dbPath} is corrupt (${msg.slice(0, 160)}); dropping and rebuilding from chunks.json.`,
         );
         this.table = undefined;
-        try { rmSync(this.dbPath, { recursive: true, force: true }); } catch { /* best effort */ }
-        this.db = await lancedb.connect(this.dbPath);
+        // Local stores only: drop the corrupt dir and recreate. An object-store
+        // URI (s3://) can't be rm'd here — the sole-writer daemon rebuilds it on
+        // its next full index.
+        if (this.isLocal) {
+          try { rmSync(this.dbPath, { recursive: true, force: true }); } catch { /* best effort */ }
+        }
+        this.db = await lancedb.connect(...this.connectArgs(session));
       }
       // else: table doesn't exist yet (first run) — created on first upsert.
     }
@@ -77,8 +129,14 @@ export class VectorStore {
     if (!this.table) return;
     try {
       const lancedb = await import('@lancedb/lancedb');
+      // withPosition: term positions enable PhraseQuery (multi-token literal
+      // matching). removeStopWords: the default drops 'to'/'if'/'in' etc.,
+      // which silently breaks phrases containing them — and stop words are
+      // meaningful tokens in code and error strings. The index is rebuilt
+      // every embed cycle, so this takes effect at the next reindex without
+      // a migration.
       await this.table.createIndex('contextualizedContent', {
-        config: lancedb.Index.fts(),
+        config: lancedb.Index.fts({ withPosition: true, removeStopWords: false }),
         replace: true,
       });
     } catch {
@@ -133,38 +191,64 @@ export class VectorStore {
   async optimizeIndexes(): Promise<void> {
     if (!this.table) return;
     try {
-      await this.table.optimize();
+      // Also prune old dataset versions: Lance is MVCC and optimize() alone
+      // keeps every version, so a 6h reindex cycle grows the bucket forever
+      // (measured: +50-100% of dataset size per cycle). Retention must exceed
+      // the readers' refresh window (retriever TTL / invalidate broadcast) so
+      // an in-flight reader never loses the version it has open.
+      const hours = Number(process.env.CODE_SEARCH_LANCE_RETENTION_HOURS) || 24;
+      await this.table.optimize({ cleanupOlderThan: new Date(Date.now() - hours * 3_600_000) });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[knowledge-core] index optimize skipped: ${msg.slice(0, 160)}`);
     }
   }
 
-  /** Build an IVF_FLAT index on the `vector` column so vector search reads only
-   *  the probed partitions instead of brute-force scanning every row — the fix
-   *  for the multi-second flat-scan latency at org scale. IVF_FLAT (not PQ) keeps
-   *  exact distances within each partition, so there's no quantization recall
-   *  loss, and the full vectors fit comfortably in the VM's RAM. Query-time
-   *  `nprobes` (VECTOR_NPROBES) trades recall vs partitions scanned.
+  /** Build the vector-column index so vector search reads only the probed
+   *  partitions instead of brute-force scanning every row — the fix for the
+   *  multi-second flat-scan latency at org scale.
    *
-   *  Write path only; idempotent (build-if-absent — a full rebuild recreates it,
+   *  Two shapes, one write-path entry point:
+   *  - Default (no `storage.vector.lancedb.index` config): **IVF_FLAT** — exact
+   *    distances within each partition, no quantization recall loss; the full
+   *    vectors fit local RAM. This is the local/VM production behavior.
+   *  - `indexConfig` set (S3/MinIO deployments, ADR §5.5): **IVF_PQ** with the
+   *    configured partitions/sub-vectors, so a query drags only probed,
+   *    quantized partitions across the network.
+   *
+   *  WRITE PATH ONLY — a reader must never build an index (sole-writer
+   *  invariant). Idempotent (build-if-absent — a full rebuild recreates it,
    *  incremental adds are folded by optimizeIndexes()). Below `minRows` a flat
    *  scan is already fast and IVF training is noise, so skip. Non-fatal: on
-   *  failure vector search falls back to the exact flat scan. */
+   *  failure (e.g. `numSubVectors` not dividing the embedding dimension) vector
+   *  search falls back to the exact flat scan — degraded speed, never
+   *  correctness — and the reason is logged. */
   async ensureVectorIndex(opts?: { minRows?: number }): Promise<void> {
     if (!this.table) return;
-    const minRows = opts?.minRows ?? 10_000;
+    const minRows = this.indexConfig?.minRows ?? opts?.minRows ?? 10_000;
     try {
       const count = await this.table.countRows();
       if (count < minRows) return;
       const existing: Array<{ columns?: string[] }> = await this.table.listIndices();
+      // Already built (the FTS index is on contextualizedContent, not vector) →
+      // leave it; appends are absorbed without a costly retrain.
       if (existing.some((i) => Array.isArray(i.columns) && i.columns.includes('vector'))) return;
       const lancedb = await import('@lancedb/lancedb');
-      await this.table.createIndex('vector', { config: lancedb.Index.ivfFlat() });
-      console.error(`[knowledge-core] built IVF_FLAT vector index on ${count} rows.`);
+      if (this.indexConfig) {
+        const ivfOpts: { numPartitions?: number; numSubVectors?: number } = {};
+        if (this.indexConfig.numPartitions) ivfOpts.numPartitions = this.indexConfig.numPartitions;
+        if (this.indexConfig.numSubVectors) ivfOpts.numSubVectors = this.indexConfig.numSubVectors;
+        await this.table.createIndex('vector', { config: lancedb.Index.ivfPq(ivfOpts) });
+        console.error(
+          `[knowledge-core] built IVF_PQ vector index on ${count} rows (${JSON.stringify(ivfOpts)}).`,
+        );
+      } else {
+        await this.table.createIndex('vector', { config: lancedb.Index.ivfFlat() });
+        console.error(`[knowledge-core] built IVF_FLAT vector index on ${count} rows.`);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[knowledge-core] vector index build skipped (flat scan still works): ${msg.slice(0, 160)}`);
+      console.error(`[knowledge-core] vector index build skipped (flat scan still works): ${msg.slice(0, 200)}`);
     }
   }
 
@@ -218,8 +302,15 @@ export class VectorStore {
   ): Promise<ScoredChunk[]> {
     if (!this.table) return [];
     // nprobes = IVF partitions scanned per query (no-op on a flat/un-indexed
-    // table). Higher = better recall, more work; tunable without a redeploy.
-    let query = this.table.search(queryEmbedding).limit(opts?.limit ?? 20).nprobes(VECTOR_NPROBES);
+    // table). Higher = better recall, more work. `indexConfig` (IVF_PQ / S3
+    // deployments) wins when set; otherwise the env-tunable VECTOR_NPROBES.
+    // refineFactor (IVF_PQ only) re-ranks the top nprobes·refine candidates
+    // with exact distance against the retained raw vectors (ADR §5.5).
+    let query = this.table
+      .search(queryEmbedding)
+      .limit(opts?.limit ?? 20)
+      .nprobes(this.indexConfig?.nprobes ?? VECTOR_NPROBES);
+    if (this.indexConfig?.refineFactor) query = query.refineFactor(this.indexConfig.refineFactor);
     if (opts?.filter) query = query.where(opts.filter);
     const results = await query.toArray();
     return results.map((r: any) => ({
@@ -227,6 +318,22 @@ export class VectorStore {
       score: r._distance != null ? 1 / (1 + r._distance) : 0.5,
       source: 'vector' as const,
     }));
+  }
+
+  /** Approximate (IVF_PQ, index-backed) nearest-neighbor ids — applies the
+   *  configured nprobes/refineFactor via vectorSearch. Used by the recall gate. */
+  async vectorSearchIds(queryEmbedding: number[], k: number): Promise<string[]> {
+    const results = await this.vectorSearch(queryEmbedding, { limit: k });
+    return results.map((s) => s.chunk.id);
+  }
+
+  /** EXACT nearest-neighbor ids via `bypassVectorIndex()` — forces a flat scan
+   *  on the same table, ignoring the IVF_PQ index. This is the ground-truth
+   *  baseline the P1d recall gate compares the approximate search against. */
+  async vectorSearchExactIds(queryEmbedding: number[], k: number): Promise<string[]> {
+    if (!this.table) return [];
+    const rows = await this.table.search(queryEmbedding).bypassVectorIndex().limit(k).toArray();
+    return rows.map((r: any) => r.id as string);
   }
 
   /** Full-text BM25 search (LanceDB built-in FTS) */
@@ -269,6 +376,65 @@ export class VectorStore {
         source: 'exact' as const,
       }));
     } catch {
+      return [];
+    }
+  }
+
+  /** Substring symbol lookup: chunks whose entityName CONTAINS the query,
+   *  case-insensitively — the Zoekt-style partial-identifier tier
+   *  (`SearchResponse` finds `CompanySearchResponse`). A projected ILIKE scan
+   *  over the short entityName column: measured ~50ms cold / ~3ms warm at
+   *  450k rows. Results ranked exact > prefix > infix, then shorter names
+   *  (tighter match) first. */
+  async searchByEntitySubstring(query: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
+    if (!this.table || query.length === 0) return [];
+    const esc = query.replace(/'/g, "''").replace(/([%_\\])/g, '\\$1');
+    const cond = `entityName ILIKE '%${esc}%'`;
+    const where = filter ? `(${cond}) AND (${filter})` : cond;
+    try {
+      // Over-fetch so the JS ranking below sees enough candidates to prefer
+      // exact/prefix matches over incidental infix hits.
+      const rows = await this.table.query().where(where).limit(limit * 4).toArray();
+      const q = query.toLowerCase();
+      const rank = (name: string): number => {
+        const n = name.replace(/\$\d+$/, '').toLowerCase();
+        if (n === q) return 0;
+        if (n.startsWith(q) || n.endsWith(q)) return 1;
+        return 2;
+      };
+      return rows
+        .map((r: any) => ({ row: r, r: rank(r.entityName ?? ''), len: (r.entityName ?? '').length }))
+        .sort((a: any, b: any) => a.r - b.r || a.len - b.len)
+        .slice(0, limit)
+        .map(({ row, r }: any) => ({
+          chunk: rowToChunk(row),
+          score: 1 - r * 0.2,
+          source: 'exact' as const,
+        }));
+    } catch {
+      return [];
+    }
+  }
+
+  /** Exact-phrase search over the code text (tantivy PhraseQuery) — multi-token
+   *  literals (error strings, exact statements) match as an adjacent phrase
+   *  instead of a bag of tokens. Requires the FTS index built withPosition;
+   *  until the next reindex provides that, this returns [] (non-fatal). */
+  async phraseSearch(queryText: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
+    if (!this.table) return [];
+    try {
+      const lancedb = await import('@lancedb/lancedb');
+      const pq = new (lancedb as any).PhraseQuery(queryText, 'contextualizedContent');
+      let q = this.table.query().fullTextSearch(pq).limit(limit);
+      if (filter) q = q.where(filter);
+      const results = await q.toArray();
+      return results.map((r: any) => ({
+        chunk: rowToChunk(r),
+        score: r._score ?? r._relevance_score ?? 0.5,
+        source: 'phrase' as const,
+      }));
+    } catch {
+      // PhraseQuery unavailable (old binding) or index lacks positions — no-op.
       return [];
     }
   }
@@ -448,6 +614,10 @@ export class VectorStore {
     }
   }
 }
+
+/** ADR §3 canonical name for the default LanceDB-backed `VectorStorePort`
+ *  adapter. Alias for now; a later phase renames the class outright. */
+export { VectorStore as LanceVectorStore };
 
 function rowToChunk(row: any): CodeChunk {
   return {
