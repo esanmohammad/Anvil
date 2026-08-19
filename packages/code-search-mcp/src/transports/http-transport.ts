@@ -82,7 +82,7 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         name: 'code-search-mcp',
-        version: '0.5.0',
+        version: '1.0.0',
         node: process.version,
         platform: process.platform,
       }));
@@ -114,7 +114,7 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
       const status = opts.getStatus?.() ?? {};
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        version: '0.5.0',
+        version: '1.0.0',
         uptime: Math.floor((Date.now() - startedAt) / 1000),
         ...status,
       }, null, 2));
