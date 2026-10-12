@@ -165,7 +165,10 @@ function extractEnvVars(repoPath: string): string[] {
 function extractEvents(repoPath: string): Record<string, string> {
   // Match patterns like: TOPIC = 'user.created', channel: 'orders', event: 'payment_completed'
   const eventPatterns = [
-    /(?:topic|TOPIC|channel|CHANNEL|event|EVENT)\s*[:=]\s*['"`]([a-zA-Z0-9._-]+)['"`]/g,
+    /(?:topic|TOPIC|channel|CHANNEL|event|EVENT|queue|Queue|QUEUE)\w*\s*[:=]\s*['"`]([a-zA-Z0-9._-]+)['"`]/g,
+    // Spring AMQP / RabbitMQ
+    /convertAndSend\s*\(\s*"([a-zA-Z0-9._-]+)"/g,
+    /@RabbitListener\s*\([^)]*queues\s*=\s*"([a-zA-Z0-9._-]+)"/g,
     /(?:subscribe|publish|emit|on)\s*\(\s*['"`]([a-zA-Z0-9._-]+)['"`]/g,
   ];
   const sourceFiles = walkFiles(repoPath, (f) => {
@@ -182,7 +185,8 @@ function extractEvents(repoPath: string): Record<string, string> {
       while ((match = pattern.exec(content)) !== null) {
         const eventName = match[1];
         // Filter out overly generic names
-        if (eventName.length > 3 && eventName.includes('.') && !(eventName in eventMap)) {
+        // Must contain a separator so bare words are rejected; dots, dashes and underscores all count
+        if (eventName.length > 3 && /^[a-z0-9]+(?:[._-][a-z0-9]+)+$/i.test(eventName) && !(eventName in eventMap)) {
           eventMap[eventName] = filePath;
         }
       }
@@ -196,16 +200,25 @@ function extractApiEndpoints(repoPath: string): { routes: Record<string, string>
   const routeDefPatterns = [
     /(?:app|router)\.(get|post|put|patch|delete)\s*\(\s*['"`](\/[a-zA-Z0-9/:._-]+)['"`]/g,
     /@(Get|Post|Put|Patch|Delete)\s*\(\s*['"`](\/[a-zA-Z0-9/:._-]+)['"`]/g,
+    // Go: r.Path("/x"), http.HandleFunc("/x", …), r.Handle("/x", …)
+    /\.(Path|HandleFunc|Handle)\s*\(\s*"(\/[a-zA-Z0-9/:._{}-]+)"/g,
+    // Spring MVC: @RequestMapping(value = "/x"), @GetMapping("/x"), …
+    /@(RequestMapping|GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping)\s*\((?:[^)]*?(?:value|path)\s*=\s*)?"(\/[a-zA-Z0-9/:._{}-]+)"/g,
   ];
   // HTTP client call patterns
   const httpCallPatterns = [
     /(?:axios|fetch|http|client)\.(get|post|put|patch|delete)\s*\(\s*[`'"](?:https?:\/\/[^/]*?)?(\/[a-zA-Z0-9/:._-]+)['"`]/g,
     /fetch\s*\(\s*[`'"](?:https?:\/\/[^/]*?)?(\/[a-zA-Z0-9/:._-]+)['"`]/g,
+    // Service-name URLs built by hand: "http://user/customers", `http://user%s/login`, `http://user${domain}/cards`
+    /["'`]https?:\/\/[a-z][a-z0-9-]*(?:%s|\$\{[^}]*\})?(\/[a-zA-Z0-9/:._-]+)["'`]/g,
+    // Java URI builders: new ServiceUri(new Hostname("payment"), …, "/paymentAuth")
+    /Hostname\s*\(\s*"[a-z][a-z0-9-]*"\s*\)[^;]*?"(\/[a-zA-Z0-9/:._{}-]+)"/g,
   ];
 
   const sourceFiles = walkFiles(repoPath, (f) => {
     const ext = extname(f);
-    return ['.ts', '.js'].includes(ext);
+    // Go and Java services define routes too (gorilla/mux, net/http, Spring MVC)
+    return ['.ts', '.js', '.go', '.java'].includes(ext);
   }, 3000);
 
   const routes: Record<string, string> = {};
@@ -219,7 +232,8 @@ function extractApiEndpoints(repoPath: string): { routes: Record<string, string>
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(content)) !== null) {
         // Normalize path: strip params to base pattern
-        const routePath = match[2].replace(/:[a-zA-Z]+/g, ':param');
+        // Patterns with a single capture group (e.g. bare fetch('/x')) put the path in match[1]
+        const routePath = (match[2] ?? match[1]).replace(/:[a-zA-Z]+/g, ':param');
         if (!(routePath in routes)) routes[routePath] = filePath;
       }
     }
@@ -228,7 +242,7 @@ function extractApiEndpoints(repoPath: string): { routes: Record<string, string>
       pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(content)) !== null) {
-        const clientPath = match[2].replace(/:[a-zA-Z]+/g, ':param');
+        const clientPath = (match[2] ?? match[1]).replace(/:[a-zA-Z]+/g, ':param');
         if (!(clientPath in clients)) clients[clientPath] = filePath;
       }
     }
@@ -278,7 +292,9 @@ function extractGrpc(repoPath: string): { defs: Record<string, string>; clients:
 
 function extractDbTables(repoPath: string): Record<string, string> {
   const sqlCreatePattern = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?(\w+)["`]?/gi;
-  const sqlQueryPattern = /(?:FROM|INTO|JOIN|UPDATE)\s+["`]?(\w+)["`]?/gi;
+  // Upper-case SQL keywords only: a case-insensitive scan turned every Python/JS
+  // `from x import` and `import y from 'z'` into a "shared table" named x / z.
+  const sqlQueryPattern = /\b(?:FROM|INTO|JOIN|UPDATE)\s+["`]?([a-z_][a-z0-9_]*)["`]?/g;
   const typeormPattern = /@Entity\s*\(\s*['"`](\w+)['"`]\s*\)/g;
   const gormPattern = /TableName\s*\(\s*\)\s*string\s*\{\s*return\s*["'](\w+)["']/g;
   const sequelizePattern = /sequelize\.define\s*\(\s*['"`](\w+)['"`]/g;
