@@ -44,7 +44,6 @@ import {
   emitToolResult,
   emitToolUse,
 } from './stream-format.js';
-import { registerAnthropicLlm } from './adk-anthropic-llm.js';
 import { UpstreamError, bodyLooksRetryable } from './upstream-error.js';
 import { createNullTurnRecorder } from './turn-recorder/index.js';
 
@@ -193,6 +192,17 @@ export class AdkAdapter implements ModelAdapter {
     const adk = await loadAdk();
 
     // Register Anthropic Llm exactly once per process — idempotent.
+    //
+    // Loaded lazily, AFTER `loadAdk()` succeeded: `adk-anthropic-llm.ts`
+    // has to import `@google/adk` statically (`AnthropicLlm extends
+    // BaseLlm` needs the base class at definition time). A static import
+    // here would hoist that into this module's load — and, via
+    // `index.ts`, into every consumer of agent-core — which turns the
+    // *optional* `@google/adk` dependency into a hard one. npm prunes the
+    // whole optional subtree on Node < 22 (transitive `engines` checks),
+    // so that static import crashed `code-search-mcp` on Node 20 with
+    // ERR_MODULE_NOT_FOUND before any adapter was even selected.
+    const { registerAnthropicLlm } = await import('./adk-anthropic-llm.js');
     registerAnthropicLlm();
 
     // Bridge `GOOGLE_API_KEY` → `GEMINI_API_KEY` for users who set the
