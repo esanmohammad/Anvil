@@ -168,6 +168,8 @@ export const metrics = {
   queryDuration: registry.register(new Histogram('code_search_query_duration_seconds', 'Query latency by mode.')),
   indexChunks: registry.register(new Gauge('code_search_index_chunks_total', 'Indexed chunks by repo.')),
   indexAge: registry.register(new Gauge('code_search_index_age_seconds', 'Seconds since last index by repo.')),
+  vectorIndexUnindexedRows: registry.register(new Gauge('code_search_vector_index_unindexed_rows', 'Rows not yet folded into the vector index (brute-force scanned) by project.')),
+  vectorIndexGrowthRatio: registry.register(new Gauge('code_search_vector_index_growth_ratio', 'Rows written since the vector index was last trained / rows it was trained on, by project (retrains at CODE_SEARCH_VECTOR_RETRAIN_RATIO).')),
   embeddingCalls: registry.register(new Counter('code_search_embeddings_calls_total', 'Embedding API calls by provider.')),
   llmCalls: registry.register(new Counter('code_search_llm_calls_total', 'LLM API calls by phase.')),
   errors: registry.register(new Counter('code_search_errors_total', 'Errors by kind.')),

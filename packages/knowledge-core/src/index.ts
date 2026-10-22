@@ -36,6 +36,7 @@ export * from './repo-profiler.js';
 export * from './service-mesh-inferrer.js';
 export * from './rag-evaluator.js';
 export * from './vector-recall.js';
+export * from './vector-index-maintenance.js';
 export * from './ast-graph-builder.js';
 // project-graph-builder.ts re-exports the class from project-graph-builder-core.ts,
 // so a single barrel entry covers both modules without duplicate-name conflicts.

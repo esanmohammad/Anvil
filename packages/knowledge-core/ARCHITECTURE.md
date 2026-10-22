@@ -299,8 +299,20 @@ API:
 | `deleteFileChunks(project, repo, filePaths)` | bulk file-level delete |
 | `getChunkIds(project)` | for incremental embed planning |
 | `getStats()` / `hasData()` | row count |
+| `ensureVectorIndex({ minRows, retrain })` | build the IVF vector index when absent (≥ `minRows`), or retrain it in place |
+| `vectorIndexState()` | row count + the vector index's indexed / unindexed rows |
+| `optimizeIndexes()` | fold appended rows into every index, compact, prune old versions |
 
 FTS index built on `contextualizedContent`.
+
+The vector index (IVF_FLAT, or IVF_PQ when `storage.vector.lancedb.index` is
+set) is managed by `vector-index-maintenance.ts` on the write path. It is built
+once the table reaches `minRows`, and `optimize()` folds appends into the
+existing centroids. The writer counts rows written since the last training and
+retrains in place (`createIndex(..., { replace: true })`) once that reaches
+`trainedRows × CODE_SEARCH_VECTOR_RETRAIN_RATIO` (default 1; 0 disables), when
+the configured index type changes, or once for an index with no training
+record. Training + health are recorded in `vector_index.json`.
 
 ## 11. Reranker (`src/reranker.ts`)
 
@@ -490,7 +502,10 @@ hallucination_count?, similarity?, overall }, costs, durations }`.
 5. Embed in batches: `batchSize = 10` for Ollama, `50` otherwise. Delay
    `50` ms / `100` ms between batches.
 6. `addChunks(embeddedChunks)`.
-7. Clear `deleted_files.json` (applied), then update each repo's
+7. Build missing scalar indexes, then `maintainVectorIndex` (build / due
+   retrain / optimize; writes `vector_index.json`). An embed run with nothing
+   new still runs this step and bumps the index generation.
+8. Clear `deleted_files.json` (applied), then update each repo's
    `index_meta.json` (`embeddingProvider`, `lastIndexedAt`).
 
 ### 19.3 `indexProject` = `buildKB` + `embedChunks`.
@@ -553,6 +568,7 @@ packages/knowledge-core/
     │
     ├── embedder.ts                        ← 6 providers + factory + auto
     ├── vector-store.ts                    ← LanceDB wrapper
+    ├── vector-index-maintenance.ts        ← vector-index build / retrain / health
     ├── reranker.ts                        ← 4 providers + factory
     ├── query-classifier.ts                ← classifyQuery
     ├── query-router.ts                    ← QueryRouter

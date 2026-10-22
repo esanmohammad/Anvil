@@ -1,6 +1,12 @@
 import { rmSync } from 'node:fs';
 import type { CodeChunk, ScoredChunk } from '@esankhan3/anvil-knowledge-core';
-import type { VectorStorePort, IvfPqIndexConfig } from './storage/ports.js';
+import type {
+  VectorStorePort,
+  IvfPqIndexConfig,
+  VectorIndexBuildResult,
+  VectorIndexState,
+  VectorIndexType,
+} from './storage/ports.js';
 
 /** A LanceDB store left 0-byte/truncated by a prior killed-mid-write (OOM /
  *  SIGKILL / ENOSPC). Surfaces as a lance IO / "Invalid range" / generic
@@ -151,8 +157,9 @@ export class VectorStore implements VectorStorePort {
    *  low-cardinality equality columns (repoName, project), `btree` for
    *  high-cardinality ones (filePath, entityName, id).
    *
-   *  Write path only; idempotent (build-if-absent — a full rebuild recreates the
-   *  table and rebuilds these; incremental adds are folded by {@link optimizeIndexes}).
+   *  Write path only; idempotent (build-if-absent — a new table, e.g. after a
+   *  corrupt-store heal, gets them on its first run; incremental adds are folded
+   *  by {@link optimizeIndexes}).
    *  Non-fatal: a missing index just means that query falls back to a scan, so a
    *  build failure (e.g. on an empty table) degrades performance, never correctness. */
   async ensureScalarIndexes(): Promise<void> {
@@ -217,39 +224,85 @@ export class VectorStore implements VectorStorePort {
    *    quantized partitions across the network.
    *
    *  WRITE PATH ONLY — a reader must never build an index (sole-writer
-   *  invariant). Idempotent (build-if-absent — a full rebuild recreates it,
-   *  incremental adds are folded by optimizeIndexes()). Below `minRows` a flat
-   *  scan is already fast and IVF training is noise, so skip. Non-fatal: on
+   *  invariant). Builds when absent; otherwise leaves the index alone unless
+   *  `retrain` is set, in which case it retrains in place (same name,
+   *  `replace: true` — one atomic commit, so readers pinned to the previous
+   *  version keep the old index). Appends between retrains are folded into the
+   *  existing centroids by optimizeIndexes(); when to retrain is decided by
+   *  vector-index-maintenance.ts. Below `minRows` a flat scan is already fast
+   *  and IVF training is noise, so a first build is skipped. Non-fatal: on
    *  failure (e.g. `numSubVectors` not dividing the embedding dimension) vector
-   *  search falls back to the exact flat scan — degraded speed, never
-   *  correctness — and the reason is logged. */
-  async ensureVectorIndex(opts?: { minRows?: number }): Promise<void> {
-    if (!this.table) return;
+   *  search keeps the previous index or the exact flat scan — degraded speed,
+   *  never correctness — and the reason is logged and returned. */
+  async ensureVectorIndex(opts?: { minRows?: number; retrain?: boolean }): Promise<VectorIndexBuildResult> {
+    if (!this.table) return { status: 'no-table' };
     const minRows = this.indexConfig?.minRows ?? opts?.minRows ?? 10_000;
     try {
       const count = await this.table.countRows();
-      if (count < minRows) return;
-      const existing: Array<{ columns?: string[] }> = await this.table.listIndices();
-      // Already built (the FTS index is on contextualizedContent, not vector) →
-      // leave it; appends are absorbed without a costly retrain.
-      if (existing.some((i) => Array.isArray(i.columns) && i.columns.includes('vector'))) return;
+      const existing = await this.vectorIndexConfig();
+      if (existing && !opts?.retrain) return { status: 'present' };
+      if (!existing && count < minRows) return { status: 'below-min' };
       const lancedb = await import('@lancedb/lancedb');
-      if (this.indexConfig) {
-        const ivfOpts: { numPartitions?: number; numSubVectors?: number } = {};
-        if (this.indexConfig.numPartitions) ivfOpts.numPartitions = this.indexConfig.numPartitions;
-        if (this.indexConfig.numSubVectors) ivfOpts.numSubVectors = this.indexConfig.numSubVectors;
-        await this.table.createIndex('vector', { config: lancedb.Index.ivfPq(ivfOpts) });
-        console.error(
-          `[knowledge-core] built IVF_PQ vector index on ${count} rows (${JSON.stringify(ivfOpts)}).`,
-        );
+      const indexType = this.desiredVectorIndexType();
+      // Explicit partition count (LanceDB's own default is √rows) so the value
+      // is known for health reporting.
+      const numPartitions = this.indexConfig?.numPartitions ?? Math.max(1, Math.round(Math.sqrt(count)));
+      let config;
+      if (indexType === 'IVF_PQ') {
+        const ivfOpts: { numPartitions: number; numSubVectors?: number } = { numPartitions };
+        if (this.indexConfig?.numSubVectors) ivfOpts.numSubVectors = this.indexConfig.numSubVectors;
+        config = lancedb.Index.ivfPq(ivfOpts);
       } else {
-        await this.table.createIndex('vector', { config: lancedb.Index.ivfFlat() });
-        console.error(`[knowledge-core] built IVF_FLAT vector index on ${count} rows.`);
+        config = lancedb.Index.ivfFlat({ numPartitions });
       }
+      const started = Date.now();
+      await this.table.createIndex('vector', {
+        config,
+        ...(existing ? { name: existing.name, replace: true } : {}),
+      });
+      const durationMs = Date.now() - started;
+      const status = existing ? 'retrained' : 'built';
+      console.error(
+        `[knowledge-core] ${status} ${indexType} vector index on ${count} rows (${numPartitions} partitions, ${durationMs}ms).`,
+      );
+      return { status, indexType, numPartitions, rows: count, durationMs };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[knowledge-core] vector index build skipped (flat scan still works): ${msg.slice(0, 200)}`);
+      return { status: 'failed', error: msg.slice(0, 500) };
     }
+  }
+
+  /** The index type a build would produce under the current config. */
+  desiredVectorIndexType(): VectorIndexType {
+    return this.indexConfig ? 'IVF_PQ' : 'IVF_FLAT';
+  }
+
+  /** The vector-column index entry from listIndices(), if any (the FTS index is
+   *  on contextualizedContent, scalar ones on their own columns). */
+  private async vectorIndexConfig(): Promise<{ name: string } | null> {
+    const existing: Array<{ name: string; columns?: string[] }> = await this.table.listIndices();
+    return existing.find((i) => Array.isArray(i.columns) && i.columns.includes('vector')) ?? null;
+  }
+
+  /** Live vector-index state: row count plus the index's indexed/unindexed
+   *  split (rows appended since the last optimize() are unindexed and served by
+   *  brute-force scan). Null when there is no table. */
+  async vectorIndexState(): Promise<VectorIndexState | null> {
+    if (!this.table) return null;
+    const rowCount: number = await this.table.countRows();
+    const existing = await this.vectorIndexConfig();
+    if (!existing) return { rowCount, index: null };
+    const stats = await this.table.indexStats(existing.name);
+    return {
+      rowCount,
+      index: {
+        name: existing.name,
+        indexType: stats?.indexType ?? 'unknown',
+        numIndexedRows: stats?.numIndexedRows ?? 0,
+        numUnindexedRows: stats?.numUnindexedRows ?? 0,
+      },
+    };
   }
 
   /** Insert or replace chunks with embeddings */

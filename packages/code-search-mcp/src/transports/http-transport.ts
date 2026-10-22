@@ -30,6 +30,8 @@ export interface HttpTransportOptions {
   getHealth?: () => Record<string, unknown>;
   /** Detailed indexing status for GET /status */
   getStatus?: () => Record<string, unknown>;
+  /** Refresh gauges that need async reads before GET /metrics renders. */
+  collectMetrics?: () => Promise<void>;
   /** Handler for POST /index — allows triggering indexing via REST */
   onIndex?: (body: { path: string; project?: string; force?: boolean }) => Promise<Record<string, unknown>>;
 }
@@ -104,6 +106,9 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
       const status = opts.getStatus?.() ?? {};
       const indexing = (status.indexing as { phase?: string; percent?: number } | undefined);
       metrics.indexAge.set(0, { phase: indexing?.phase ?? 'idle' });
+      try {
+        await opts.collectMetrics?.();
+      } catch { /* a failed collector must not fail the scrape */ }
       res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
       res.end(registry.render());
       return;

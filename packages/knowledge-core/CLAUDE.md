@@ -58,7 +58,15 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 - `HybridRetriever` (`src/retriever.ts`) — 4-phase: vector ⫽ BM25 → RRF
   fusion → AST tripartite expansion → cross-encoder rerank.
 - `VectorStore` (`src/vector-store.ts`) — LanceDB-backed; supports
-  vector + FTS search, file-level deletes, FTS index rebuild.
+  vector + FTS search, file-level deletes, FTS index rebuild, IVF vector
+  index build / in-place retrain (`ensureVectorIndex`), `vectorIndexState`.
+- `maintainVectorIndex` / `planVectorIndex` / `readVectorIndexHealth`
+  (`src/vector-index-maintenance.ts`) — write-path vector-index lifecycle:
+  build at `minRows`, retrain once rows written since the last training
+  reach `trainedRows × CODE_SEARCH_VECTOR_RETRAIN_RATIO` (default 1; 0
+  disables), on an index-type config change, or once for an index with no
+  training record; then `optimize()`. Records training + health
+  (unindexed rows) in `vector_index.json`, surfaced via `getStats().vectorIndex`.
 - `createEmbeddingProvider` (`src/embedder.ts`) — 6 providers:
   `codestral` / `voyage` / `openai` / `ollama` / `gemini-oauth` /
   `openai-compatible`, plus `auto`.
@@ -220,7 +228,10 @@ Deleted and changed files are read from `deleted_files.json` (written by
 `hash(filePath, startLine, endLine)`, so a changed file's unmoved chunks keep
 their ids and must be wiped first to be re-embedded. The list is cleared once
 an embed applies it; `buildKB` merges into a list not yet applied rather than
-overwriting it.
+overwriting it. Every embed run — including one with nothing new to embed —
+ends with `maintainVectorIndex` (build / due retrain / optimize); the
+nothing-new path then bumps the index generation because optimize prunes old
+dataset versions readers may still hold.
 
 ### Retrieval contract
 
@@ -246,6 +257,7 @@ overwriting it.
   PROJECT_GRAPH.json             # LLM-generated semantic graph
   PROJECT_SUMMARY.md             # human-readable companion
   lancedb/                       # vector store
+  vector_index.json              # vector-index training + health (writer-maintained)
   <repo>/
     profile.json                 # RepoProfile (cached by fingerprintHash)
     graph.json                   # per-repo AST graph

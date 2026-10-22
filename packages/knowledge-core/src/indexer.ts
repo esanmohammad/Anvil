@@ -6,6 +6,7 @@ import type { FileIndexEntry } from '@esankhan3/anvil-knowledge-core';
 import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 import { resolveStorage, invalidateGraphStores } from './storage/resolve.js';
 import type { BlobStorePort, StorageBundle } from './storage/ports.js';
+import { maintainVectorIndex, readVectorIndexHealth } from './vector-index-maintenance.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { correlateCrossRepoEdges } from './cross-repo-detector.js';
@@ -596,11 +597,15 @@ export class KnowledgeIndexer {
       await vectorStore.ensureFtsIndex();
       // Heal missing scalar + vector indexes too (a prior run could have aborted
       // before building them) so filtered search / graph expansion / vector search
-      // stay index-backed rather than full-scanning. The vector index shape
-      // (IVF_FLAT default / IVF_PQ when storage.vector.lancedb.index is set)
-      // resolves inside ensureVectorIndex.
+      // stay index-backed rather than full-scanning, and run the vector-index step
+      // (build / due retrain / optimize — a prior run may also have died before
+      // folding its appends in).
       await vectorStore.ensureScalarIndexes();
-      await vectorStore.ensureVectorIndex();
+      const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: 0 });
+      // optimize() prunes dataset versions past the retention window; readers
+      // only reopen on a generation bump, so signal them or a reader pinned to
+      // a pruned version would lose its files.
+      await bumpIndexGeneration(storage.blobs);
       report({ phase: 'done', message: 'All chunks already embedded', percent: 100, etaSeconds: 0 });
       return {
         project,
@@ -612,6 +617,7 @@ export class KnowledgeIndexer {
         crossRepoEdges: 0,
         lastIndexed: new Date().toISOString(),
         indexDurationMs: Date.now() - startTime,
+        ...(vectorIndex ? { vectorIndex } : {}),
       };
     }
 
@@ -724,12 +730,12 @@ export class KnowledgeIndexer {
     // + filtered search from full-table scans into indexed lookups; the vector
     // index (IVF_FLAT default, IVF_PQ when storage.vector.lancedb.index is set)
     // turns brute-force KNN into probed-partition reads — together the
-    // query-latency win at org scale. After a full rebuild the table was
-    // recreated, so this trains fresh centroids; incremental adds are folded in
-    // by optimizeIndexes.
+    // query-latency win at org scale. maintainVectorIndex builds it once the
+    // table is big enough, retrains it in place once the rows written since its
+    // last training reach the retrain ratio, and optimizes (folds this run's
+    // appends into every index, compacts, prunes).
     await vectorStore.ensureScalarIndexes();
-    await vectorStore.ensureVectorIndex();
-    await vectorStore.optimizeIndexes();
+    const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: stored });
     log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
     // The stale-file list is applied — clear it, or a later no-change cycle
     // (buildKB returns early without rewriting it) would wipe those files again
@@ -776,6 +782,7 @@ export class KnowledgeIndexer {
       crossRepoEdges: 0,
       lastIndexed: new Date().toISOString(),
       indexDurationMs: durationMs,
+      ...(vectorIndex ? { vectorIndex } : {}),
     };
   }
 
@@ -813,6 +820,8 @@ export class KnowledgeIndexer {
   async getStats(project: string, config?: KnowledgeConfig): Promise<IndexStats> {
     const storage = resolveStorage(project, config);
     const basePath = storage.basePath;
+    const vectorIndex = await readVectorIndexHealth(storage.blobs);
+    const withVectorIndex = (s: IndexStats): IndexStats => (vectorIndex ? { ...s, vectorIndex } : s);
 
     // Fast path: the writer's rolled-up stats — one small blob read instead of
     // a vector-store connect + a meta read per repo.
@@ -826,7 +835,7 @@ export class KnowledgeIndexer {
         lastIndexed: string;
       }>('index_stats.json');
       if (rollup) {
-        return {
+        return withVectorIndex({
           project,
           repos: rollup.repos,
           totalChunks: rollup.totalChunks,
@@ -836,7 +845,7 @@ export class KnowledgeIndexer {
           crossRepoEdges: rollup.crossRepoEdges,
           lastIndexed: rollup.lastIndexed,
           indexDurationMs: 0,
-        };
+        });
       }
     } catch { /* fall back to the walk */ }
 
@@ -860,7 +869,7 @@ export class KnowledgeIndexer {
       }
     } catch { /* ignore */ }
 
-    return {
+    return withVectorIndex({
       project,
       repos,
       totalChunks: stats?.rowCount ?? 0,
@@ -870,7 +879,7 @@ export class KnowledgeIndexer {
       crossRepoEdges: 0,
       lastIndexed,
       indexDurationMs: 0,
-    };
+    });
   }
 }
 

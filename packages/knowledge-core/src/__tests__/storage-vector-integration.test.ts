@@ -146,7 +146,7 @@ describe('resolveStorage().vectors — real LanceDB round-trip (P0b wiring)', ()
       const e1 = new Array(DIM).fill(0); e1[0] = 1;
       const e2 = new Array(DIM).fill(0); e2[1] = 1;
       await v.upsertChunks([chunk('a', 'r1', 'alpha', e1), chunk('b', 'r1', 'beta', e2)]);
-      await v.ensureVectorIndex(); // 2 rows < minRows 1000 → no-op
+      assert.equal((await v.ensureVectorIndex()).status, 'below-min'); // 2 rows < minRows 1000 → no-op
       assert.equal(hasVectorIndex(await lanceIndices(base)), false, 'no vector index below minRows');
     } finally {
       rmSync(base, { recursive: true, force: true });
@@ -180,11 +180,13 @@ describe('resolveStorage().vectors — real LanceDB round-trip (P0b wiring)', ()
       rows.push(chunk('NEEDLE', 'r1', 'the needle', needle));
       await v.upsertChunks(rows);
 
-      await v.ensureVectorIndex(); // 601 ≥ minRows 100 → builds
+      const built = await v.ensureVectorIndex(); // 601 ≥ minRows 100 → builds
+      assert.equal(built.status, 'built');
+      assert.equal(built.status === 'built' && built.numPartitions, 4, 'configured partitions used');
       assert.equal(hasVectorIndex(await lanceIndices(base)), true, 'IVF_PQ index built on vector column');
 
       // a second call is idempotent (index already present → no retrain, no throw)
-      await v.ensureVectorIndex();
+      assert.equal((await v.ensureVectorIndex()).status, 'present');
 
       const near = await v.vectorSearch(needle, { limit: 1 });
       assert.equal(near[0]?.chunk.id, 'NEEDLE');
