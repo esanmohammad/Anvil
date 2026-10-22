@@ -5,8 +5,24 @@
 import type { ServerContext } from '../server.js';
 import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import { KnowledgeIndexer } from '@esankhan3/anvil-knowledge-core';
+import type { VectorIndexHealth } from '@esankhan3/anvil-knowledge-core';
 
 const TOOL_NAMES = ['index_status'];
+
+/** One-line summary of the writer's vector-index record. */
+function describeVectorIndex(v: VectorIndexHealth | undefined): string {
+  if (!v) return 'none (flat scan — table below the index threshold or not yet indexed)';
+  const parts = [`${v.indexType ?? 'unknown'}, ${v.numPartitions ?? '?'} partitions`];
+  parts.push(
+    v.trainedRows
+      ? `trained on ${v.trainedRows.toLocaleString()} rows at ${v.trainedAt}, +${v.rowsAddedSinceTrain.toLocaleString()} since (${Math.round((v.rowsAddedSinceTrain / v.trainedRows) * 100)}%)`
+      : 'training untracked (retrains on the next writer run)',
+  );
+  parts.push(`${(v.numUnindexedRows ?? 0).toLocaleString()} unindexed rows`);
+  if (v.retrainStartedAt) parts.push(`retrain started ${v.retrainStartedAt} has not completed`);
+  if (v.lastError) parts.push(`last error: ${v.lastError}`);
+  return parts.join('; ');
+}
 
 export function registerIndexTools() {
   return [
@@ -40,6 +56,7 @@ export async function handleIndexTool(
         `- **Embedding provider:** ${stats.embeddingProvider}`,
         `- **Last indexed:** ${stats.lastIndexed || 'never'}`,
         `- **Repos:** ${stats.repos.length}`,
+        `- **Vector index:** ${describeVectorIndex(stats.vectorIndex)}`,
         '',
         '## Repos',
         ...stats.repos.map(r => `- ${r.name}: ${r.chunkCount} chunks`),

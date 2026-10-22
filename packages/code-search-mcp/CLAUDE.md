@@ -61,7 +61,9 @@ All implemented in `src/tools/`:
   from `<KB>/<repo>/profile.json` via `loadProfile` /
   `loadAllProfiles`.
 - **Index** (`index-tools.ts`) — `index_status`. Reads
-  `KnowledgeIndexer.getStats(project)`.
+  `KnowledgeIndexer.getStats(project)`, including the vector-index line
+  (type, partitions, training size + rows since, unindexed rows) from the
+  writer's `vector_index.json`.
 
 ### Resources
 
@@ -205,9 +207,15 @@ text body for `/metrics`. Pre-declared `metrics` namespace covers
 `code_search_queries_total`, `code_search_query_duration_seconds`,
 `code_search_index_chunks_total`, `code_search_index_age_seconds`,
 `code_search_embeddings_calls_total`, `code_search_llm_calls_total`,
-`code_search_errors_total`, `code_search_reranker_cache_hits_total`.
+`code_search_errors_total`, `code_search_reranker_cache_hits_total`,
+`code_search_vector_index_unindexed_rows`,
+`code_search_vector_index_growth_ratio`.
 `InProcessBackend.search` records `queriesTotal` / `queryDuration` /
-`errors`; other call sites are wiring points for future work.
+`errors`; the two vector-index gauges are refreshed per scrape by the
+`collectMetrics` hook `server.ts` passes to `startHttpTransport` (reads the
+writer's `vector_index.json` blob, since in cluster mode the HTTP workers
+aren't the writer; a failing collector never fails the scrape). Other call
+sites are wiring points for future work.
 
 `src/observability/logger.ts:Logger` — structured JSON logger
 (`{level, msg, ts, …}` per line) when `telemetry.structuredLogs=true`;

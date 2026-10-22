@@ -31,12 +31,31 @@ export interface IvfPqIndexConfig {
   refineFactor?: number;
 }
 
+export type VectorIndexType = 'IVF_FLAT' | 'IVF_PQ';
+
+/** Outcome of {@link VectorStorePort.ensureVectorIndex}. */
+export type VectorIndexBuildResult =
+  | { status: 'built' | 'retrained'; indexType: VectorIndexType; numPartitions: number; rows: number; durationMs: number }
+  | { status: 'present' | 'below-min' | 'no-table' }
+  | { status: 'failed'; error: string };
+
+/** Live vector-index state read from the table (`listIndices` + `indexStats`). */
+export interface VectorIndexState {
+  rowCount: number;
+  index: { name: string; indexType: string; numIndexedRows: number; numUnindexedRows: number } | null;
+}
+
 export interface VectorStorePort {
   init(opts?: { healCorrupt?: boolean }): Promise<void>;
   ensureFtsIndex(): Promise<void>;
-  /** (Re)build the vector index (IVF_FLAT default, IVF_PQ when
-   *  `storage.vector.lancedb.index` is configured) — write path only. */
-  ensureVectorIndex(opts?: { minRows?: number }): Promise<void>;
+  /** Build the vector index when absent, or retrain it in place when `retrain`
+   *  (IVF_FLAT default, IVF_PQ when `storage.vector.lancedb.index` is
+   *  configured) — write path only. */
+  ensureVectorIndex(opts?: { minRows?: number; retrain?: boolean }): Promise<VectorIndexBuildResult>;
+  /** The vector index's live state; null when there is no table. */
+  vectorIndexState(): Promise<VectorIndexState | null>;
+  /** The index type a build would produce under the current config. */
+  desiredVectorIndexType(): VectorIndexType;
   /** Build scalar (bitmap/btree) indexes on filterable columns — write path only. */
   ensureScalarIndexes(): Promise<void>;
   /** Fold newly-appended rows into existing indexes (post-incremental-embed). */

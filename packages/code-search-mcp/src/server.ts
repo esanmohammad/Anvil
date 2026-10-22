@@ -14,11 +14,12 @@ import { registerGraphTools, handleGraphTool } from './tools/graph.js';
 import { registerProfileTools, handleProfileTool } from './tools/profile.js';
 import { registerIndexTools, handleIndexTool } from './tools/index-tools';
 import { registerResources, handleResource } from './resources/resources';
-import { getBlobStore } from '@esankhan3/anvil-knowledge-core';
+import { getBlobStore, readVectorIndexHealth } from '@esankhan3/anvil-knowledge-core';
 import { indexFromPath, invalidateRetriever } from '@esankhan3/anvil-knowledge-core';
 import { loadServerConfig, type ServerConfig } from './core/env-config.js';
 import { toKnowledgeConfig } from './core/config.js';
 import { startHttpTransport } from './transports/http-transport.js';
+import { metrics } from './observability/metrics.js';
 
 // State shared across tools
 export interface IndexingState {
@@ -191,6 +192,16 @@ export async function startServer(
           elapsedMs: ctx.indexing.startedAt ? Date.now() - ctx.indexing.startedAt : null,
         },
       }),
+      // From the writer's blob record, not process state: in cluster mode the
+      // workers serving HTTP are not the writer.
+      collectMetrics: async () => {
+        const blobs = getBlobStore(ctx.projectName, toKnowledgeConfig(loadServerConfig().__unified));
+        const health = await readVectorIndexHealth(blobs);
+        if (!health) return;
+        const labels = { project: ctx.projectName };
+        metrics.vectorIndexUnindexedRows.set(health.numUnindexedRows ?? 0, labels);
+        if (health.trainedRows) metrics.vectorIndexGrowthRatio.set(health.rowsAddedSinceTrain / health.trainedRows, labels);
+      },
       onIndex: (body) =>
         isReadOnlyWorker ? forwardIndexToPrimary(body) : runAdminIndex(ctx, body),
     });

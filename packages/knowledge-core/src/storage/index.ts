@@ -9,6 +9,9 @@ export type {
   GraphStorePort,
   StorageBundle,
   IvfPqIndexConfig,
+  VectorIndexType,
+  VectorIndexBuildResult,
+  VectorIndexState,
 } from './ports.js';
 export { FsBlobStore } from './fs-blob-store.js';
 export { MongoBlobStore, closeMongoClients } from './mongo-blob-store.js';

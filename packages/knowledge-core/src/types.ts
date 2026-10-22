@@ -86,6 +86,31 @@ export interface IndexStats {
   crossRepoEdges: number;
   lastIndexed: string;
   indexDurationMs: number;
+  /** Vector-index training + health record (`vector_index.json`); absent until
+   *  the table is big enough to index. */
+  vectorIndex?: VectorIndexHealth;
+}
+
+/** Writer-maintained record of the IVF vector index: what it was last trained
+ *  on, how much has been written since (the retrain trigger), and its health at
+ *  the end of the last writer run. Persisted as `vector_index.json`. */
+export interface VectorIndexHealth {
+  /** Index type as LanceDB reports it (IVF_FLAT / IVF_PQ). */
+  indexType?: string;
+  numPartitions?: number;
+  /** Rows the index was last trained on. Absent ⇒ training untracked (index
+   *  built before it was recorded) — the next writer run retrains. */
+  trainedRows?: number;
+  trainedAt?: string;
+  /** Rows written since the last training (growth + churn). */
+  rowsAddedSinceTrain: number;
+  /** Set when a retrain starts, cleared when one completes. */
+  retrainStartedAt?: string;
+  numIndexedRows?: number;
+  /** Rows not yet folded into the index (served by brute-force scan). */
+  numUnindexedRows?: number;
+  checkedAt: string;
+  lastError?: string;
 }
 
 // Embedding provider interface
