@@ -482,13 +482,16 @@ hallucination_count?, similarity?, overall }, costs, durations }`.
 
 1. Load `chunks.json`.
 2. Open `VectorStore` at `<basePath>/lancedb`.
-3. Diff against existing chunk IDs → `newChunks`.
-4. Read `deleted_files.json` → `deleteFileChunks` per repo.
+3. Read `deleted_files.json` (deleted + changed files) → `deleteFileChunks`
+   per repo. This runs before the id diff: chunk ids are
+   `hash(filePath, startLine, endLine)`, so a changed file's unmoved chunks
+   keep their ids and would otherwise be skipped as already embedded.
+4. Diff against existing chunk IDs → `newChunks`.
 5. Embed in batches: `batchSize = 10` for Ollama, `50` otherwise. Delay
    `50` ms / `100` ms between batches.
 6. `addChunks(embeddedChunks)`.
-7. Update each repo's `index_meta.json` (`embeddingProvider`,
-   `lastIndexedAt`).
+7. Clear `deleted_files.json` (applied), then update each repo's
+   `index_meta.json` (`embeddingProvider`, `lastIndexedAt`).
 
 ### 19.3 `indexProject` = `buildKB` + `embedChunks`.
 
