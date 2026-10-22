@@ -215,8 +215,12 @@ else full re-chunk + full graph rebuild. Per-file metadata lives in
 
 `embedChunks` is independently incremental: it diffs `chunks.json`
 against existing chunk IDs in LanceDB and only embeds the new ones.
-Deleted files are read from `deleted_files.json` (written by `buildKB`)
-and removed from the store.
+Deleted and changed files are read from `deleted_files.json` (written by
+`buildKB`) and their rows removed **before** the id diff — chunk ids are
+`hash(filePath, startLine, endLine)`, so a changed file's unmoved chunks keep
+their ids and must be wiped first to be re-embedded. The list is cleared once
+an embed applies it; `buildKB` merges into a list not yet applied rather than
+overwriting it.
 
 ### Retrieval contract
 

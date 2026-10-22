@@ -446,6 +446,12 @@ export class KnowledgeIndexer {
         allStaleFiles.push({ repoName: repo.name, filePath: f });
       }
     }
+    // Keep entries a previous embed hasn't applied yet (it failed or never ran):
+    // overwriting would drop those files' pending wipes.
+    const listed = new Set(allStaleFiles.map((f) => `${f.repoName}\0${f.filePath}`));
+    for (const f of await this.getDeletedFiles(storage.blobs)) {
+      if (!listed.has(`${f.repoName}\0${f.filePath}`)) allStaleFiles.push(f);
+    }
     await storage.blobs.putText('deleted_files.json', JSON.stringify(allStaleFiles));
 
     // 12. Save per-repo metadata
@@ -529,6 +535,26 @@ export class KnowledgeIndexer {
     const vectorStore = storage.vectors;
     await vectorStore.init({ healCorrupt: true });
 
+    // Wipe the rows of changed/deleted files (listed by buildKB) BEFORE taking
+    // the id snapshot below: chunk ids are hash(filePath, startLine, endLine),
+    // so a changed file's unmoved chunks keep their ids — wiped after the
+    // snapshot they would be skipped as "already embedded" and lost. Wiped
+    // first, the file is re-embedded whole from chunks.json.
+    const deletedFiles = await this.getDeletedFiles(storage.blobs);
+    if (deletedFiles.length > 0) {
+      // Group by repo for efficient deletion (file path matching, not chunk ids)
+      const byRepo = new Map<string, string[]>();
+      for (const d of deletedFiles) {
+        const list = byRepo.get(d.repoName) ?? [];
+        list.push(d.filePath);
+        byRepo.set(d.repoName, list);
+      }
+      for (const [repoName, filePaths] of byRepo) {
+        log(`Removing stale chunks for ${filePaths.length} changed/deleted files from ${repoName}...`);
+        await vectorStore.deleteFileChunks(project, repoName, filePaths);
+      }
+    }
+
     // Which chunks are already embedded (id-set diff). Bounded: holds only the
     // id strings, never the chunk bodies.
     const existingIds = new Set<string>();
@@ -539,8 +565,6 @@ export class KnowledgeIndexer {
         for (const id of existingChunks) existingIds.add(id);
       }
     } catch { /* first run — no existing data */ }
-
-    const deletedFiles = await this.getDeletedFiles(storage.blobs);
 
     // Pass 1 — stream chunks.json to tally totals + how many need embedding,
     // WITHOUT ever holding all chunks in memory. At org scale (~810k chunks,
@@ -589,21 +613,6 @@ export class KnowledgeIndexer {
         lastIndexed: new Date().toISOString(),
         indexDurationMs: Date.now() - startTime,
       };
-    }
-
-    // Delete chunks for files that were removed — use file path matching, not chunk IDs
-    if (deletedFiles.length > 0) {
-      // Group by repo for efficient deletion
-      const byRepo = new Map<string, string[]>();
-      for (const d of deletedFiles) {
-        const list = byRepo.get(d.repoName) ?? [];
-        list.push(d.filePath);
-        byRepo.set(d.repoName, list);
-      }
-      for (const [repoName, filePaths] of byRepo) {
-        log(`Removing stale chunks for ${filePaths.length} changed/deleted files from ${repoName}...`);
-        await vectorStore.deleteFileChunks(project, repoName, filePaths);
-      }
     }
 
     // Embed only new/changed chunks.
@@ -722,6 +731,10 @@ export class KnowledgeIndexer {
     await vectorStore.ensureVectorIndex();
     await vectorStore.optimizeIndexes();
     log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
+    // The stale-file list is applied — clear it, or a later no-change cycle
+    // (buildKB returns early without rewriting it) would wipe those files again
+    // with nothing left to re-embed them.
+    if (deletedFiles.length > 0) await storage.blobs.putText('deleted_files.json', '[]');
 
     // Update metadata (repoNames was computed during pass 1).
     for (const repoName of repoNames) {

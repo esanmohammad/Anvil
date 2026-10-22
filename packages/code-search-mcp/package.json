@@ -1,6 +1,6 @@
 {
   "name": "@esankhan3/code-search-mcp",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "MCP server for multi-repo code search \u2014 GitHub org or local path, zero config",
   "type": "module",
   "license": "MIT",
