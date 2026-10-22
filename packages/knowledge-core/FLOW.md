@@ -34,11 +34,12 @@ buildKB(project, repos, config, opts):
   ├─ basePath = getKnowledgeBasePath(project)
   │     └─ CODE_SEARCH_DATA_DIR > ANVIL_HOME/knowledge-base > ~/.anvil/...
   │
-  ├─ Step 1 — SHA-based skip check
+  ├─ Step 1 — SHA + working-tree skip check
   │     for repo in repos:
-  │       sha = getRepoSha(repo.path)              ← git rev-parse HEAD
+  │       sha = getRepoSha(repo.path)              ← git rev-parse HEAD (ls-remote for cloneUrl)
   │       meta = readRepoIndexMeta(<basePath>/<repo>/index_meta.json)
-  │       if !force && meta.lastIndexedSha === sha: skip
+  │       tree = getWorkingTreeState(repo.path)    ← uncommitted edits (local checkouts)
+  │       if !force && meta.lastIndexedSha === sha && tree === meta.workingTree: skip
   │       else add to reposToIndex
   │
   ├─ Step 2 — LLM repo profiling (skipped if !isLlmAvailable())
@@ -52,9 +53,10 @@ buildKB(project, repos, config, opts):
   │
   ├─ Step 3 — Chunk repos
   │     for repo in reposToIndex:
-  │       diff = meta?.lastIndexedSha
-  │              ? getAllChanges(repo.path, meta.lastIndexedSha)
-  │              : null
+  │       diff = !meta?.lastIndexedSha ? null
+  │              : HEAD === meta.lastIndexedSha
+  │                ? diffWorkingTreeStates(meta.workingTree, tree)   ← edits since last index
+  │                : getAllChanges(repo.path, meta.lastIndexedSha)   ← + indexed edits no longer dirty
   │       useIncremental = diff && !diff.fallbackToFull && (added+modified+deleted) > 0
   │       result = useIncremental
   │              ? chunkChangedFiles(repo, name, project, cfg, diff)
@@ -113,7 +115,7 @@ buildKB(project, repos, config, opts):
   └─ Step 12 — Per-repo metadata
         for repo in reposToIndex:
           write <basePath>/<repo>/index_meta.json {
-            lastIndexedSha, lastIndexedAt, chunkCount,
+            lastIndexedSha, workingTree, lastIndexedAt, chunkCount,
             embeddingProvider: 'pending', files: fileIndex
           }
 

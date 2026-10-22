@@ -15,7 +15,14 @@ import { join } from 'node:path';
 import { chunkRepo, chunkChangedFiles } from './chunker.js';
 import { buildAstGraph, incrementalGraphUpdate, generateGraphReport } from './ast-graph-builder.js';
 import { detectWorkspace } from './workspace-detector.js';
-import { getAllChanges, getChangedFilesList, getDeletedFilesList } from './git-diff.js';
+import {
+  getAllChanges,
+  getChangedFilesList,
+  getDeletedFilesList,
+  getWorkingTreeState,
+  diffWorkingTreeStates,
+} from './git-diff.js';
+import type { WorkingTreeState } from './git-diff.js';
 import { createChunkWriter } from './chunks-io.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { resolveStorage } from './storage/resolve.js';
@@ -35,6 +42,9 @@ export interface RepoIndexMeta {
   /** Serializable workspace packages (WorkspaceMap holds Maps, which don't
    *  survive JSON) — rehydrated for cross-repo correlation on skipped repos. */
   workspacePackages?: WorkspacePackage[];
+  /** Uncommitted state indexed alongside `lastIndexedSha` (local checkouts):
+   *  path → content hash of every file differing from HEAD. */
+  workingTree?: WorkingTreeState;
 }
 
 export function getRepoSha(repoPath: string): string | null {
@@ -112,6 +122,8 @@ export interface RepoResult {
   changedFiles: string[];
   deletedFiles: string[];
   chunkCount: number;
+  /** Working-tree state this run indexed (recorded in index_meta.json). */
+  workingTree: WorkingTreeState;
 }
 
 /** Chunk + build the AST graph for one repo. Writes a chunk shard + graph.json
@@ -147,7 +159,27 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     : new FsBlobStore(basePath);
 
   const meta = force ? null : await readRepoIndexMeta(basePath, repoName, blobs);
-  const diff = force ? null : (meta?.lastIndexedSha ? getAllChanges(repoPath, meta.lastIndexedSha) : null);
+  // Uncommitted edits count too (local checkouts; a fresh clone has none).
+  // At an unchanged HEAD, diff the working tree against the state indexed last
+  // time — an edit already indexed isn't re-chunked (and re-embedded) every
+  // run, and one since reverted is re-chunked back to its committed content.
+  // Across new commits, also re-process indexed edits that are no longer dirty.
+  const workingTree = job.cloneUrl ? {} : getWorkingTreeState(repoPath);
+  let diff = null;
+  if (meta?.lastIndexedSha) {
+    const indexedTree = meta.workingTree ?? {};
+    if (getRepoSha(repoPath) === meta.lastIndexedSha) {
+      diff = diffWorkingTreeStates(repoPath, indexedTree, workingTree);
+    } else {
+      diff = getAllChanges(repoPath, meta.lastIndexedSha);
+      if (!diff.fallbackToFull) {
+        const listed = new Set([...diff.added, ...diff.modified, ...diff.deleted]);
+        const settled = diffWorkingTreeStates(repoPath, indexedTree, {});
+        diff.modified.push(...settled.modified.filter((f) => !listed.has(f) && !(f in workingTree)));
+        diff.deleted.push(...settled.deleted.filter((f) => !listed.has(f) && !(f in workingTree)));
+      }
+    }
+  }
   const useIncremental =
     !!diff && !diff.fallbackToFull && diff.added.length + diff.modified.length + diff.deleted.length > 0;
 
@@ -233,5 +265,6 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     changedFiles,
     deletedFiles,
     chunkCount,
+    workingTree,
   };
 }

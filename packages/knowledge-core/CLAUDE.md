@@ -216,8 +216,14 @@ plus a correlate strategy (join over the persisted signals) inside
 ### Incremental indexing path
 
 `buildKB` consults `index_meta.json` for each repo. If `lastIndexedSha`
-matches `git rev-parse HEAD` → skip. Else `getAllChanges(repo, prevSha)`
-→ if non-fallback + non-empty → `chunkChangedFiles` + `incrementalGraphUpdate`;
+matches `git rev-parse HEAD` **and** (local checkouts) the uncommitted
+working-tree state matches the `workingTree` snapshot indexed last time
+(`getWorkingTreeState`: path → content hash of every file differing from
+HEAD) → skip. Else, at an unchanged HEAD the change set is
+`diffWorkingTreeStates(indexed, current)` (new/changed edits, plus reverted
+ones re-chunked back to HEAD); after new commits it is
+`getAllChanges(repo, prevSha)` plus indexed edits no longer dirty → if
+non-fallback + non-empty → `chunkChangedFiles` + `incrementalGraphUpdate`;
 else full re-chunk + full graph rebuild. Per-file metadata lives in
 `fileIndex` inside `index_meta.json`.
 
@@ -262,7 +268,7 @@ dataset versions readers may still hold.
     profile.json                 # RepoProfile (cached by fingerprintHash)
     graph.json                   # per-repo AST graph
     GRAPH_REPORT.md              # quality report
-    index_meta.json              # { lastIndexedSha, lastIndexedAt, files, chunkCount, embeddingProvider }
+    index_meta.json              # { lastIndexedSha, workingTree, lastIndexedAt, files, chunkCount, embeddingProvider }
 ```
 
 ## Things that don't exist (intentionally)

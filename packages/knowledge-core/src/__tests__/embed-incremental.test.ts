@@ -175,4 +175,47 @@ describe('embedChunks — incremental runs keep every chunk', () => {
       assert.equal(after.total, before.total);
     });
   });
+
+  it('tracks uncommitted edits: indexed once, not re-embedded while unchanged, reverted cleanly', async (t) => {
+    await withFixture(t, async ({ repo, project, config, rows }) => {
+      await indexFromPath(project, repo, { config });
+      const before = await rows();
+
+      // Saved but not committed — what the daemon's file watcher reacts to.
+      appendFileSync(join(repo, 'a.ts'), fn('omega'));
+      await indexFromPath(project, repo, { config });
+      const edited = await rows();
+      assert.equal(edited.a, before.a + 1, 'the new uncommitted function is indexed');
+      assert.equal(edited.total, before.total + 1);
+
+      // Same dirty state on the next run: nothing to redo.
+      const callsBefore = embedCalls;
+      await indexFromPath(project, repo, { config });
+      assert.equal(embedCalls, callsBefore, 'an unchanged uncommitted edit is not re-embedded');
+      assert.deepEqual(await rows(), edited);
+
+      // Reverting the edit restores the committed content in the index.
+      git(repo, 'checkout', '--', 'a.ts');
+      await indexFromPath(project, repo, { config });
+      assert.deepEqual(await rows(), before, 'reverted edit leaves the index as committed');
+
+      // An uncommitted delete drops the file; restoring it brings it back.
+      rmSync(join(repo, 'b.ts'));
+      await indexFromPath(project, repo, { config });
+      assert.equal((await rows()).b, 0, 'uncommitted delete removes the file');
+      git(repo, 'checkout', '--', 'b.ts');
+      await indexFromPath(project, repo, { config });
+      assert.deepEqual(await rows(), before, 'restored file is indexed again');
+
+      // An indexed edit reverted while HEAD moves on (a commit to another file):
+      // the reverted file must still go back to its committed content.
+      appendFileSync(join(repo, 'a.ts'), fn('omega'));
+      await indexFromPath(project, repo, { config });
+      assert.equal((await rows()).a, before.a + 1);
+      git(repo, 'checkout', '--', 'a.ts');
+      touch(repo, 'b.ts');
+      await indexFromPath(project, repo, { config });
+      assert.deepEqual(await rows(), before, 'reverted edit is restored across a new commit');
+    });
+  });
 });

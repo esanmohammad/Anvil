@@ -10,6 +10,8 @@ import { maintainVectorIndex, readVectorIndexHealth } from './vector-index-maint
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { correlateCrossRepoEdges } from './cross-repo-detector.js';
+import { getWorkingTreeState, sameWorkingTreeState } from './git-diff.js';
+import type { WorkingTreeState } from './git-diff.js';
 import type { CrossRepoSignals } from './cross-repo-detector.js';
 import { HybridRetriever } from './retriever.js';
 import { loadKnowledgeConfig, getKnowledgeBasePath } from '@esankhan3/anvil-knowledge-core';
@@ -158,7 +160,12 @@ export class KnowledgeIndexer {
       // Remote repos: compare the ls-remote HEAD sha — unchanged repos never clone.
       const currentSha = repo.cloneUrl ? getRemoteSha(repo.cloneUrl) : getRepoSha(repo.path);
       const meta = await readRepoIndexMeta(basePath, repo.name, storage.blobs);
-      if (meta && currentSha && meta.lastIndexedSha === currentSha) {
+      // Unchanged = same HEAD AND (local checkouts) the same uncommitted edits
+      // as last indexed — saved-but-uncommitted work must still be picked up.
+      const treeUnchanged = repo.cloneUrl
+        ? true
+        : sameWorkingTreeState(meta?.workingTree ?? {}, getWorkingTreeState(repo.path));
+      if (meta && currentSha && meta.lastIndexedSha === currentSha && treeUnchanged) {
         // A skipped repo is served entirely from its stored artifacts (graph +
         // cross-repo signals) — no clone, no AST re-parse. An index written
         // before signals existed must be re-indexed once to backfill them.
@@ -218,7 +225,7 @@ export class KnowledgeIndexer {
     // metadata, so the main thread never accumulates the whole corpus (bounded
     // memory). Concurrency is adaptive; a worker failure falls back to in-thread.
     const repoStats: Array<{ name: string; chunkCount: number; language: string }> = [];
-    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry>; sha: string | null; shardComplete: boolean }>();
+    const repoChunkResults = new Map<string, { changedFiles: string[]; deletedFiles: string[]; fileIndex: Record<string, FileIndexEntry>; sha: string | null; shardComplete: boolean; workingTree: WorkingTreeState }>();
     const workspaceMaps = new Map<string, WorkspaceMap>();
     const shardPaths: string[] = [];
     // System graph: stream per-repo nodes/edges straight to SQLite as repos
@@ -267,7 +274,7 @@ export class KnowledgeIndexer {
         if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
         repoStats.push({ name: res.repoName, chunkCount: res.chunkCount, language: res.language });
         if (res.chunked) {
-          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {}, sha: res.sha, shardComplete: res.shardComplete });
+          repoChunkResults.set(res.repoName, { changedFiles: res.changedFiles, deletedFiles: res.deletedFiles, fileIndex: res.fileIndex ?? {}, sha: res.sha, shardComplete: res.shardComplete, workingTree: res.workingTree });
           if (res.shardPath) shardPaths.push(res.shardPath);
         }
         processed++;
@@ -470,6 +477,7 @@ export class KnowledgeIndexer {
           chunkCount: totalChunkCount,
           embeddingProvider: 'pending',
           files: result?.fileIndex,
+          workingTree: result?.workingTree,
           // Serializable form (WorkspaceMap holds Maps) — rehydrated when this
           // repo is later skipped, for cross-repo workspace-dep correlation.
           workspacePackages: workspaceMaps.get(repo.name)?.packages,

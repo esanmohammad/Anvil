@@ -1,5 +1,7 @@
 import { execSync } from 'node:child_process';
-import { extname } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { extname, join } from 'node:path';
 
 export interface GitDiff {
   added: string[];
@@ -164,4 +166,51 @@ export function getChangedFilesList(diff: GitDiff): string[] {
 /** Convenience: get all files that need removal from index */
 export function getDeletedFilesList(diff: GitDiff): string[] {
   return [...diff.deleted];
+}
+
+/** Path → content hash ('deleted' when gone) of every file whose working-tree
+ *  content differs from HEAD (staged, unstaged, untracked). Empty when clean.
+ *  Recorded per repo at index time so a later run can tell an uncommitted edit
+ *  it already indexed from a new or reverted one at the same HEAD. */
+export type WorkingTreeState = Record<string, string>;
+
+export function getWorkingTreeState(repoPath: string): WorkingTreeState {
+  const changes = getUncommittedChanges(repoPath);
+  const state: WorkingTreeState = {};
+  const present = [...changes.added, ...changes.modified, ...changes.renamed.map((r) => r.to)];
+  const gone = [...changes.deleted, ...changes.renamed.map((r) => r.from)];
+  for (const rel of gone) state[rel] = 'deleted';
+  for (const rel of present) {
+    try {
+      const full = join(repoPath, rel);
+      state[rel] = existsSync(full) ? createHash('sha256').update(readFileSync(full)).digest('hex') : 'deleted';
+    } catch {
+      state[rel] = 'unreadable';
+    }
+  }
+  return state;
+}
+
+export function sameWorkingTreeState(a: WorkingTreeState, b: WorkingTreeState): boolean {
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every((k) => a[k] === b[k]);
+}
+
+/** Files to re-process when HEAD is unchanged but the working tree moved since
+ *  the last index: every path whose state differs between the two snapshots.
+ *  A path that left the snapshot was reverted (back at its HEAD content) or
+ *  removed; either way it is re-chunked from disk or dropped. */
+export function diffWorkingTreeStates(
+  repoPath: string,
+  indexed: WorkingTreeState,
+  current: WorkingTreeState,
+): GitDiff {
+  const modified: string[] = [];
+  const deleted: string[] = [];
+  for (const rel of new Set([...Object.keys(indexed), ...Object.keys(current)])) {
+    if (indexed[rel] === current[rel]) continue;
+    if (existsSync(join(repoPath, rel))) modified.push(rel);
+    else deleted.push(rel);
+  }
+  return { added: [], modified, deleted, renamed: [], fallbackToFull: false };
 }
