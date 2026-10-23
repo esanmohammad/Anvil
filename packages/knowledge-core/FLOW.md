@@ -1,4 +1,4 @@
-# `@anvil/knowledge-core` — Flows
+# `@esankhan3/anvil-knowledge-core` — Flows
 
 Sequence-style descriptions of the core paths through the package. Every
 arrow + box maps to actual symbols in `src/`. See `ARCHITECTURE.md` for
@@ -18,7 +18,7 @@ indexFromPath(project, dir, opts)              ← src/indexer.ts
         │
         └─ indexer.buildKB(project, repos, DEFAULT_CONFIG, opts)
               │
-              ▼ (12 steps below)
+              ▼ (11 steps below)
 
 embedFromPath(project, opts)
   └─ indexer.embedChunks(project, DEFAULT_CONFIG, opts)
@@ -26,7 +26,7 @@ embedFromPath(project, opts)
         ▼ (described in §3 below)
 ```
 
-## 2. `KnowledgeIndexer.buildKB(...)` — 12 steps
+## 2. `KnowledgeIndexer.buildKB(...)` — 11 steps
 
 ```
 buildKB(project, repos, config, opts):
@@ -58,61 +58,63 @@ buildKB(project, repos, config, opts):
   │                ? diffWorkingTreeStates(meta.workingTree, tree)   ← edits since last index
   │                : getAllChanges(repo.path, meta.lastIndexedSha)   ← + indexed edits no longer dirty
   │       useIncremental = diff && !diff.fallbackToFull && (added+modified+deleted) > 0
-  │       result = useIncremental
-  │              ? chunkChangedFiles(repo, name, project, cfg, diff)
-  │              : chunkRepo(repo, name, project, cfg, meta?.files)
-  │       allChunks.push(...result.chunks)
+  │       useIncremental
+  │         ? chunkChangedFiles(repo, name, project, cfg, diff, write)
+  │         : chunkRepo(repo, name, project, cfg, meta?.files, write)
+  │       write → <repo>/chunks.shard.ndjson (local scratch, streamed)
   │
-  ├─ Step 4 — Structural dedup
-  │     dedup = deduplicateByStructure(allChunks)
+  │     Steps 3, 5 and 6 run together per repo (repo-pipeline.ts:processCheckout)
+  │     in an adaptive worker pool, in-thread on fallback. Each repo:
+  │       workspaceMap = detectWorkspace(repo.path)    ← Step 5
+  │       chunk to the shard (above)
+  │       graph = Step 6 (below); write graph.json + GRAPH_REPORT.md
+  │       write <repo>/signals.json = extractCrossRepoSignals(repo.path)
+  │     As each repo finishes, the main thread streams its graph into
+  │     system_graph.sqlite (graphWriter.addRepoGraph — nodes namespaced
+  │     <repo>::<id>). Skipped repos are served from their stored graph.json.
+  │
+  ├─ Step 4 — Structural dedup (streamed)
+  │     dedupShardsToChunks(shards) → <basePath>/chunks.json
   │           ├─ computeStructuralHash per chunk (strip comments,
   │           │  collapse whitespace, normalize idents, sha256)
   │           └─ keep one per hash bucket
   │
-  ├─ Step 5 — Workspace detection
-  │     for repo in repos:
-  │       workspaceMaps[repo.name] = detectWorkspace(repo.path)
-  │             └─ run every ManifestDescriptor (one per ecosystem)
+  ├─ Step 5 — Workspace detection (in the per-repo worker)
+  │     detectWorkspace(repo.path)
+  │           └─ run every ManifestDescriptor (one per ecosystem)
   │
-  ├─ Step 6 — AST graphs
-  │     graphBuilder = new ProjectGraphBuilder(); await init()
-  │     for repo in repos:
-  │       diff = repoDiffs.get(repo.name)
-  │       if diff non-fallback && existsSync(graph.json):
-  │         graph = await incrementalGraphUpdate(existingGraph,
-  │                       changedFiles, deletedFiles, repo.path, { workspaceMap })
-  │       else:
-  │         graph = await buildAstGraph(repo.path, { workspaceMap })
-  │             └─ 6 phases: ws nodes, entity extraction, import resolution,
-  │                          type refs, call disambiguation, inheritance, contains
-  │       graphBuilder.addRepoGraph(repo.name, graph)   ← namespace nodes as <repo>::<id>
-  │       write graph.json + GRAPH_REPORT.md
+  ├─ Step 6 — AST graph (in the per-repo worker)
+  │     if useIncremental && graph.json exists:
+  │       graph = await incrementalGraphUpdate(existingGraph,
+  │                     changedFiles, deletedFiles, repo.path, { workspaceMap })
+  │     else:
+  │       graph = await buildAstGraph(repo.path, { workspaceMap })
+  │           └─ 6 phases: ws nodes, entity extraction, import resolution,
+  │                        type refs, call disambiguation, inheritance, contains
   │
   ├─ Step 7 — Cross-repo edges (when repos.length > 1 or workspaces present)
-  │     edges = correlateCrossRepoEdges(signalsFromBlobs, workspaceMaps)
-  │           └─ 14 strategies (kafka, http, grpc, db, env vars, npm/workspace deps,
-  │              k8s, docker-compose, proto, redis, s3, shared types, shared constants)
-  │     graphBuilder.addCrossRepoEdges(edges)
+  │     edges = correlateCrossRepoEdges(<repo>/signals.json for every repo, workspaceMaps)
+  │           └─ 14 strategies (npm/workspace deps, shared types, env vars, shared
+  │              events/topics, HTTP routes, gRPC services, DB schemas, Redis keys,
+  │              S3 buckets, OpenAPI contracts, docker-compose + k8s refs → `http`,
+  │              shared constants)
+  │     graphWriter.addCrossRepoEdges(edges)
   │
   ├─ Step 8 — LLM service mesh (skipped if !isLlmAvailable())
   │     profiles = loadAllProfiles(project)
-  │     meshEdges = await inferServiceMesh(profiles, opts)
-  │           ├─ Phase A: deterministic match (consumes ↔ exposes)
-  │           │            via normalizeIdentifier (lowercase, separators, version strip)
-  │           └─ Phase B: LLM gap-fill for orphans
-  │     graphBuilder.addCrossRepoEdges(meshEdges)
+  │     meshEdges = await inferServiceMesh(profiles, opts)   ← see §6
+  │     graphWriter.addCrossRepoEdges(meshEdges)
   │
-  ├─ Step 9 — Community detection
-  │     graphBuilder.detectCommunities()             ← Louvain
+  ├─ Step 9 — Persist the system graph
+  │     graphWriter.finalize()                       ← backfill degrees, close
+  │     upload system_graph.sqlite when the blob backend is remote
+  │     (no SQLite driver: an in-memory ProjectGraphBuilder collects steps 3–8
+  │      instead, runs Louvain, and writes system_graph_v2.json)
   │
-  ├─ Step 10 — Save project graph
-  │     write <basePath>/system_graph_v2.json (graphBuilder.exportJson())
+  ├─ Step 10 — Save deleted files
+  │     write <basePath>/deleted_files.json   ← merged into a list not yet applied
   │
-  ├─ Step 11 — Save chunks + deleted files
-  │     write <basePath>/chunks.json (uniqueChunks)
-  │     write <basePath>/deleted_files.json
-  │
-  └─ Step 12 — Per-repo metadata
+  └─ Step 11 — Per-repo metadata
         for repo in reposToIndex:
           write <basePath>/<repo>/index_meta.json {
             lastIndexedSha, workingTree, lastIndexedAt, chunkCount,
@@ -183,50 +185,59 @@ retriever.retrieve(query, opts):                ← src/retriever.ts
   │
   ├─ classification = classifyQuery(query)        ← src/query-classifier.ts
   │     identifier|path|error-code|natural-language|mixed → adaptive weights
+  │     (vector + bm25 used; the graph weight is unused)
   │
   ├─ filterRepos = opts.repoFilter ?? opts.repos
-  │      ?? (queryRouter ? await queryRouter.route(query).repos : undefined)
+  │      ?? (CODE_SEARCH_AUTO_ROUTE=1 && queryRouter
+  │            ? queryRouter.route(query) when strategy 'filtered'
+  │            : none — search all repos)
   │  filter = `repoName IN (...)` SQL fragment
   │
-  ├─ Phase 1 — parallel retrieval (each fetches 50)
-  │     queryEmbedding = useVector
-  │       ? (cache hit ? cached : await embedder.embedSingle(query); cache.set)
-  │       : null
-  │     [vec, bm25] = await Promise.all([
-  │       useVector ? store.vectorSearch(emb, { limit:50, filter }) : []
-  │       useBm25   ? store.fullTextSearch(query, 50)               : []
+  ├─ Phase 1 — parallel retrieval
+  │     [vec, bm25, exact, phrase] = await Promise.all([
+  │       useVector ? store.vectorSearch(emb, { limit:50, filter })  : []
+  │                   └─ emb: query-embedding cache, else embedder.embedSingle
+  │       useBm25   ? store.fullTextSearch(query, 50, filter)        : []
+  │       bare identifier && mode !== 'vector'
+  │         ? (≥3 chars ? store.searchByEntitySubstring(q, 20, filter)
+  │                     : store.searchByEntityName([q], 20, filter)) : []
+  │       multi-token && ≥8 chars && mode !== 'vector'
+  │         ? store.phraseSearch(q, 20, filter)                       : []
   │     ])
   │
-  ├─ if mode === 'vector' or 'bm25':
-  │       packWithinBudget(results, maxTokens, maxChunks); return
+  ├─ if mode === 'vector': pack(diversifyByFile(vec)); return
+  │  if mode === 'bm25':   pack(diversifyByFile(dedupe([...exact, ...phrase, ...bm25]))); return
   │
-  ├─ Phase 2 — RRF fusion (with adaptive or default weights)
+  ├─ Phase 2 — weighted RRF fusion
   │     wV = adaptiveWeights.vector ?? config.hybridWeights.vector
   │     wB = adaptiveWeights.bm25   ?? config.hybridWeights.bm25
-  │     fused = reciprocalRankFusion([vec, bm25], [wV, wB])
-  │             score(doc) = Σ_stream weight / (k + rank)
+  │     fused = reciprocalRankFusion([vec, bm25, exact, phrase], [wV, wB, 1, 1], k)
+  │             score(doc) = Σ_stream weight / (k + rank);  k = CODE_SEARCH_RRF_K ?? 10
+  │     fused = boostExactSymbol(fused)        ← exact entityName matches pinned first
+  │     fusedPool = diversifyByFile(dedupeExactContent(fused)).slice(0, 15)
+  │                 └─ ≤ CODE_SEARCH_MAX_PER_FILE (default 2) chunks per file
   │
-  ├─ Phase 3 — AST tripartite expansion (skipped if !useGraph || !graph)
+  ├─ Phase 3 — AST expansion
+  │     runs only if useGraph && graphStore && (reranker || fusedPool.length < maxChunks)
   │     seedNodeIds = resolveFusedSeeds(fused, 5)
   │           ├─ pick top fused chunks, one per file (diversify)
   │           └─ resolve <repo>::<file>::<entity> → graph node id
   │     expandedIds = tripartiteExpand(seedNodeIds)
-  │           ├─ outgoing edges (deps) with confidence ≥ 0.7
-  │           ├─ incoming edges (dependents) with confidence ≥ 0.7
-  │           └─ exclude 'contains' relation
+  │           ├─ graphStore.neighborsOf(seed, 'both') — one hop, both directions,
+  │           │  confidence ≥ 0.7, excluding 'contains'
+  │           └─ drop module / package nodes
   │     astChunks = await store.getChunksByEntity(parsedLookups)
   │
   ├─ Phase 4 — Cross-encoder rerank
-  │     candidatePool = dedupeById([...fused.slice(0,15), ...astChunks])
+  │     candidatePool = diversifyByFile(dedupe([...fusedPool, ...astChunks]))
   │     if reranker && candidatePool.length > 1:
   │       try ranked = await reranker.rerank(query, docs, maxChunks)
   │       finalChunks = ranked.map(...)
   │       catch:    finalChunks = candidatePool   ← fall back to RRF order
-  │     else finalChunks = candidatePool
+  │     else finalChunks = candidatePool           ← AST chunks sit after the pool
   │
   └─ selected = packWithinBudget(finalChunks, maxTokens, maxChunks)
-     graphContext = useGraph ? graph.exportForPrompt(2000) : ''
-     return { chunks: selected, graphContext, totalTokens, query }
+     return { chunks: selected, graphContext: '', totalTokens, query }
 ```
 
 ## 5. Repo profiling — `profileProject(project, repos, opts)`
@@ -266,28 +277,32 @@ returns RepoProfile[]
 ```
 inferServiceMesh(profiles, opts):                  ← src/service-mesh-inferrer.ts
   │
-  ├─ Phase A — deterministic matching
-  │     for consumer in profiles:
-  │       for endpoint in consumer.consumes:
-  │         normalizedC = normalizeIdentifier(endpoint.identifier)
-  │              lowercase + collapse separators + strip version + normalize path params
-  │         for producer in profiles - consumer:
-  │           for produced in producer.exposes:
-  │             if normalizedC === normalizeIdentifier(produced.identifier)
-  │                && type-compatible (kafka-producer ↔ kafka-consumer, etc.):
-  │                emit CrossRepoEdge {
-  │                  sourceRepo: consumer.name,
-  │                  targetRepo: producer.name,
-  │                  edgeType: type-derived,
-  │                  evidence: identifier,
-  │                  confidence: 0.9
-  │                }
+  ├─ Phase A — deterministic matching, per MATCH_RULE
+  │     rules (edgeType / baseConfidence / threshold): kafka 0.95/0.8, http 0.85/0.6,
+  │       grpc 0.95/0.8, database 0.8/0.8, redis 0.75/0.7, s3 0.8/0.8
+  │     for repoA, repoB in profiles (A ≠ B; A < B for database/redis/s3):
+  │       for exposed in repoA.exposes of the rule's producer type:
+  │         for consumed in repoB.consumes of the consumer type
+  │                         (+ repoB.exposes for database/redis/s3 — shared resources):
+  │           similarity = identifierSimilarity(exposed, consumed)
+  │                 └─ normalizeIdentifier: lowercase + collapse separators +
+  │                    strip version + normalize path params; exact match = 1.0
+  │           if similarity ≥ threshold:
+  │             emit CrossRepoEdge {
+  │               sourceRepo: repoA.name,        ← the exposing repo
+  │               targetRepo: repoB.name,
+  │               edgeType: rule.edgeType,
+  │               evidence: "<A> exposes … matched with <B> … (similarity: …)",
+  │               confidence: baseConfidence × similarity
+  │             }
   │
   ├─ Phase B — LLM gap-fill for orphans
-  │     orphans = profiles.filter(p => no edges touch it)
+  │     orphans = profiles with no Phase A edge
   │     if orphans.length > 0:
-  │       runLLM(buildOrphanPrompt(profiles, orphans), GAPFILL_SYSTEM)
-  │       parse JSON → CrossRepoEdge[] (edgeType: 'llm-inferred', confidence: 0.5)
+  │       runLLM(orphans + their domain neighbours, SYSTEM_PROMPT)
+  │       keep inferred edges with confidence ≥ 0.6 between known, distinct repos
+  │       edgeType = http|kafka|grpc|database|redis|s3 when the LLM names one,
+  │                  else 'llm-inferred'
   │
   └─ return [...phaseAEdges, ...phaseBEdges]
 ```
@@ -297,27 +312,30 @@ inferServiceMesh(profiles, opts):                  ← src/service-mesh-inferrer
 ```
 detectCrossRepoEdges(repos, workspaceMaps?)        ← src/cross-repo-detector.ts
   │
-  └─ unionAll(detectors):
-       sharedTypes        → walkFiles per repo for type defs, match across
-       kafkaTopics        → KafkaJS / sarama / spring patterns
-       httpEndpoints      → routes per repo, match against fetch/axios calls
-       grpcServices       → .proto files + service registrations
-       databaseTables     → migrations + ORM models
-       envVars            → process.env / os.Getenv references
-       npmDeps            → package.json dependencies
-       workspaceDeps      → from workspaceMaps
-       workspaceImports   → static imports resolved through workspace aliases
-       sharedConstants    → exact string match across repos for known patterns
-       redis              → redis client config + key prefixes
-       s3                 → bucket names
-       proto              → shared proto file imports
-       dockerCompose      → service references
-       k8sService         → service.yaml manifests
+  ├─ signals = extractCrossRepoSignals(repo.path) per repo
+  │     one bounded tree scan (walkFiles(dir, predicate, maxFiles=5000)) into a
+  │     JSON-serializable CrossRepoSignals bundle. buildKB runs this half in the
+  │     per-repo worker and persists it as <repo>/signals.json.
+  │
+  └─ correlateCrossRepoEdges(signals, workspaceMaps) — 14 join strategies:
+       shared-npm-deps      → npm-dep
+       shared-types         → shared-type
+       env-var-correlation  → env-var
+       event-schemas        → event-schema   (shared event / topic names)
+       api-endpoints        → http           (routes ↔ HTTP clients)
+       workspace-deps       → workspace-dep
+       grpc-services        → grpc
+       database-schemas     → database
+       redis-key-patterns   → redis
+       s3-buckets           → s3
+       openapi-schemas      → api-contract
+       docker-compose-links → http
+       k8s-service-refs     → http
+       shared-constants     → shared-constant
 
-each detector → CrossRepoEdge { sourceRepo, sourceNode, targetRepo, targetNode,
+each strategy → CrossRepoEdge { sourceRepo, sourceNode, targetRepo, targetNode,
                                  edgeType, evidence, confidence }
-
-walkFiles(dir, predicate, maxFiles=5000) bounds the per-detector work.
+A failing strategy is skipped; the others still run.
 ```
 
 ## 8. AST graph construction — `buildAstGraph(repoPath, opts)`
@@ -354,7 +372,8 @@ buildAstGraph(repoPath, { workspaceMap? })          ← src/ast-graph-builder.ts
   ├─ Phase 6: Package → file 'contains' edges
   │
   └─ return GraphifyOutput { nodes, links }
-       each edge carries 'confidence' (0..1) for weighted retrieval BFS
+       each edge carries 'confidence' (0..1); retrieval expansion and
+       trace_path follow only edges with confidence ≥ 0.7 (a flat filter)
 
 incrementalGraphUpdate(existingGraph, changedFiles, deletedFiles, repoPath, opts):
   ├─ drop nodes whose file is in deletedFiles or changedFiles
@@ -367,11 +386,12 @@ incrementalGraphUpdate(existingGraph, changedFiles, deletedFiles, repoPath, opts
 
 ```
 buildProjectGraph(project, opts):                   ← src/project-graph-builder.ts
-  │
+  │                                                    (run by the CLI `graph` command)
   ├─ context = assemble:
   │     factory.yaml summary
   │     <repo>/GRAPH_REPORT.md per repo
   │     cross-repo edges from system_graph_v2.json
+  │       (written only on the no-SQLite fallback — empty on the SQLite path)
   │
   ├─ result = await runLLM(promptFromContext, PROJECT_GRAPH_SYSTEM)
   │             ↑ shims to @anvil/agent-core
@@ -463,7 +483,7 @@ createEmbeddingProvider(config):
 
 createReranker(provider):
   switch provider:
-    'ollama'                → OllamaReranker (qwen3:0.6b @ localhost:11434)
+    'ollama'                → OllamaReranker (qwen2.5-coder:7b @ localhost:11434)
     'cohere'                → CohereReranker
     'voyage'                → VoyageReranker
     'openai-compatible'|'custom' → OpenAICompatibleReranker

@@ -58,7 +58,7 @@ compiles today.
                  ┌───────────────────────────────┐
                  │ <KB>/<project>/               │
                  │   lancedb/                    │
-                 │   system_graph_v2.json        │
+                 │   system_graph.sqlite         │
                  │   <repo>/graph.json           │
                  │   <repo>/profile.json         │
                  │   <repo>/index_meta.json      │
@@ -120,8 +120,10 @@ interface ServerContext {
 
 1. `loadServerConfig()` — pull every `CODE_SEARCH_*` env var.
 2. Log resolved LLM mode (`disabled` / `api → ...` / `cli → ...`).
-3. `await autoIndex(ctx)` — if `<KB>/lancedb` + `system_graph_v2.json`
-   exist → `ctx.indexReady = true`. Else if `directoryPath` set →
+3. `await autoIndex(ctx)` — if the writer's `index_stats.json` shows a
+   finished embed (`embeddingProvider !== 'pending'`), or the legacy local
+   layout exists (`lancedb` + `system_graph.sqlite` or
+   `system_graph_v2.json`) → `ctx.indexReady = true`. Else if `directoryPath` set →
    `trackedIndex(ctx, ..., { label: 'auto-index' })`. Else log "tools
    will return empty results."
 4. Pick transport:
@@ -182,6 +184,10 @@ Routes:
 |---|---|---|
 | `GET /health` | none | `getHealth()` |
 | `GET /status` | none | `getStatus()` (live indexing telemetry) |
+| `GET /version` | none | name, version, node, platform |
+| `GET /ready` | none | 200 once `indexReady`, else 503 |
+| `GET /metrics` | none | awaits `collectMetrics()`, renders the Prometheus registry |
+| `GET /admin/api/status` | none | `getStatus()` + version + uptime |
 | `POST /index` | yes when `authEnabled` | parses `{ path, project?, force? }` JSON, calls `onIndex(body)` |
 | `POST /mcp` | yes when `authEnabled` | stateless exchange via `createMcpHandler` (both eras) |
 | `GET /mcp` / `DELETE /mcp` | yes when `authEnabled` | 405 (legacy session verbs — no sessions exist) |
@@ -271,28 +277,31 @@ chunks, and returns the source for that entity.
 
 ### 7.2 Graph (`tools/graph.ts`)
 
-Reads JSON files directly from `<KB>/<project>/`. A shared
-`resolveEntityNodes(nodes, name, repo?, fuzzy?)` resolves a symbol name to
-node keys — exact by default (`label === name` or key endsWith `::name`),
-substring only when `fuzzy:true`.
+The system-graph tools query knowledge-core's `GraphStore`
+(`getGraphStore` → `system_graph.sqlite`, JSON fallback for older
+indexes) by slice, never loading the whole graph. `store.resolveNodes(name,
+repo?, fuzzy?)` resolves a symbol name to node keys — exact by default
+(`label === name` or key endsWith `::name`), substring only when
+`fuzzy:true`. Edge types other than `contains` are not distinguished, so
+"callers" include importers, type-referencers and inheritors.
 
 | Tool | Reads | What it computes |
 |---|---|---|
 | `get_repo_graph` | `<repo>/graph.json` | summary + first 50 entities |
-| `get_cross_repo_edges` | `system_graph_v2.json` | filter to `src.repo !== tgt.repo`, optional `repo` filter on either end |
-| `find_callers` | `system_graph_v2.json` | `resolveEntityNodes` → incoming non-`contains` edges → unique sources (top 30) |
-| `find_dependencies` | `system_graph_v2.json` | same but outgoing → unique targets |
-| `impact_analysis` | `system_graph_v2.json` | nodes whose key contains `<repo>::<file>::` (precise `::<entity>` suffix); incoming edges from outside the file → dependents + affected repo set |
-| `trace_path` | `system_graph_v2.json` | confidence-weighted BFS (skips `contains`, `confidence≥0.7`); shortest path to `to`, else the reachable tree (≤`maxDepth`, cap 50) |
-| `search_graph` | `system_graph_v2.json` | filter nodes by name (regex/substring) / type / file / repo; rank by non-`contains` degree; top `limit` |
+| `get_cross_repo_edges` | `GraphStore` | `crossRepoEdges(repo?, 50)` — edges whose source and target repos differ, optional `repo` on either end |
+| `find_callers` | `GraphStore` | `resolveNodes` → sources of incoming non-`contains` edges (top 30) |
+| `find_dependencies` | `GraphStore` | same but outgoing → unique targets |
+| `impact_analysis` | `GraphStore` | `nodesInFiles(repo, [file], entity?)` → `dependents` (incoming edges from outside the scope) + affected repo set |
+| `trace_path` | `GraphStore` | BFS over `neighborsOf` (non-`contains`, `confidence ≥ 0.7`, unweighted); shortest path to `to`, else the reachable tree (≤`maxDepth`, cap 50) |
+| `search_graph` | `GraphStore` | filter nodes by name (SQL `LIKE` substring) / type / file / repo; rank by non-`contains` degree; top `limit` |
 | `find_dead_code` | `<repo>/graph.json` | entity nodes (function/method/class/…) with zero non-`contains` in-degree |
-| `detect_changes` | git + `system_graph_v2.json` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)` → changed files → entities in those files → outside dependents |
-| `get_architecture` | `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` / profiles | renders project graph; degrades to profiles, then to a "no data" hint |
+| `detect_changes` | git + `GraphStore` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)` → changed files → `nodesInFiles` → `dependents` |
+| `get_architecture` | `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` / profiles | renders the CLI-generated project graph; degrades to profiles, then to a "no data" hint |
 
 Node id convention: `<repo>::<filePath>::<entity>` (matches AST graph
 builder's namespacing). `get_architecture` reads `PROJECT_GRAPH.json` /
-`PROJECT_SUMMARY.md` via `getKnowledgeBasePath` (honors
-`CODE_SEARCH_DATA_DIR`), not knowledge-core's `ANVIL_HOME`-based loaders.
+`PROJECT_SUMMARY.md` through the project's blob store (`getBlobStore`),
+not knowledge-core's `ANVIL_HOME`-based loaders.
 
 ### 7.3 Profile (`tools/profile.ts`)
 
@@ -315,7 +324,7 @@ profiles exist (renders `(not yet profiled)` list).
 | URI | Source |
 |---|---|
 | `code-search://repos` | `loadAllProfiles(project)` JSON |
-| `code-search://system-graph` | `<KB>/system_graph_v2.json` |
+| `code-search://system-graph` | `GraphStore` — bounded overview (top nodes by degree, cross-repo edges, totals) |
 | `code-search://repo/{name}/profile` | dynamic; `loadProfile(project, name)` JSON |
 | `code-search://repo/{name}/graph` | dynamic; `<KB>/<repo>/graph.json` |
 
@@ -407,14 +416,22 @@ packages/code-search-mcp/
 ├── README.md
 ├── CLAUDE.md
 ├── ARCHITECTURE.md
-├── FLOW.md
 ├── build.mjs                                ← esbuild bundle script
 └── src/
-    ├── index.ts                             ← CLI entry + mode dispatch
+    ├── index.ts                             ← code-search-mcp entry + mode dispatch
     ├── server.ts                            ← startServer + ServerContext + autoIndex + trackedIndex
     │
     ├── core/
-    │   └── env-config.ts                    ← loadServerConfig + resolveLlmMode
+    │   ├── config.ts                        ← unified CodeSearchConfig resolver
+    │   └── env-config.ts                    ← loadServerConfig (back-compat shim) + resolveLlmMode
+    │
+    ├── backends/                            ← SearchBackend: in-process + daemon client
+    ├── daemon/                              ← code-search-daemon: watcher + UDS JSON-RPC
+    ├── cli/
+    │   └── index.ts                         ← code-search subcommands
+    ├── observability/                       ← Prometheus metrics + structured logger
+    ├── projects/
+    │   └── registry.ts                      ← multi-project registry + quotas
     │
     ├── transports/
     │   ├── http-transport.ts                ← Streamable HTTP (stateless)
@@ -425,7 +442,7 @@ packages/code-search-mcp/
     │
     ├── tools/
     │   ├── search.ts                        ← search_code / _semantic / _exact
-    │   ├── graph.ts                         ← 5 graph tools
+    │   ├── graph.ts                         ← 10 graph tools
     │   ├── profile.ts                       ← list_repos / get_repo_profile
     │   └── index-tools.ts                   ← index_status
     │
@@ -441,20 +458,21 @@ packages/code-search-mcp/
 
 From `package.json`:
 
-- `@modelcontextprotocol/sdk` (^1.29.0) — MCP `Server`,
-  `StdioServerTransport`, `StreamableHTTPServerTransport`, request
-  schemas.
-- `@anvil/knowledge-core` (workspace) — chunking, retrieval, indexing,
-  repo profiling, project graph. All tools and resources delegate
-  here.
-- `@anvil/agent-core` (workspace, transitive via knowledge-core) — LLM
-  runner shim used during repo profiling and service mesh inference.
+- `@modelcontextprotocol/server` + `@modelcontextprotocol/node` (^2.0.0) —
+  MCP SDK v2 (`createMcpHandler` for stateless HTTP, stdio transport).
+- `@esankhan3/anvil-knowledge-core` — chunking, retrieval, indexing,
+  repo profiling, graph store. All tools and resources delegate here.
+- `@esankhan3/anvil-agent-core` — LLM runner shim used during repo
+  profiling and service mesh inference.
+- `@lancedb/lancedb-*` native bindings as `optionalDependencies`.
 
-Build: `node build.mjs` produces a single bundled `dist/index.js` (bin
-target). No `tsc` for shipping; `tsc -b --watch` in dev only.
+Build: `node build.mjs` bundles three bin targets — `dist/index.js`,
+`dist/cli/index.js`, `dist/daemon/index.js`. No `tsc` for shipping;
+`tsc -b --watch` in dev only.
 
 ## 13. Tests
 
-No `__tests__/` directory — the package is glue code. Behavioral
-coverage lives in `@anvil/knowledge-core`'s tests (chunker,
-query-classifier, retriever defaults, structural hasher).
+`src/__tests__/` (`node --test` on the built `dist/__tests__/`): config
+resolver, daemon RPC, graph tools, stateless HTTP, `/metrics` endpoint,
+observability, project registry. Retrieval and indexing behaviour is
+covered by `@esankhan3/anvil-knowledge-core`'s tests.

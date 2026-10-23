@@ -53,8 +53,13 @@ All implemented in `src/tools/`:
   (multi-hop call-chain BFS), `search_graph` (structural query by
   name/type/file, ranked by degree), `find_dead_code` (zero-caller
   entities), `detect_changes` (git diff → affected entities + dependents),
-  `get_architecture` (project overview). Read directly from
-  `<KB>/system_graph_v2.json` and `<KB>/<repo>/graph.json`. Symbol
+  `get_architecture` (project overview). The system-graph tools query
+  knowledge-core's `GraphStore` (`getGraphStore` → `system_graph.sqlite`,
+  JSON fallback for older indexes); `get_repo_graph` and `find_dead_code`
+  read `<KB>/<repo>/graph.json`; `get_architecture` reads
+  `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` (CLI-generated) and falls back
+  to profiles. Traversal is untyped beyond skipping `contains` edges, so
+  `find_callers` also returns importers and type-referencers. Symbol
   resolution is exact by default via `resolveEntityNodes` (`fuzzy:true`
   for substring).
 - **Profiles** (`profile.ts`) — `list_repos`, `get_repo_profile`. Read
@@ -72,7 +77,7 @@ All implemented in `src/tools/`:
 - `code-search://repos` — JSON of all profiles.
 - `code-search://system-graph` — bounded overview of the merged graph
   (top nodes by degree + cross-repo edges + totals), served from
-  `system_graph.sqlite` via `openSystemGraphStore`. Not a full dump —
+  `system_graph.sqlite` via `getGraphStore`. Not a full dump —
   that would reintroduce the org-scale OOM; use the graph tools for
   traversal.
 - `code-search://repo/{name}/profile` — single repo profile (dynamic).
@@ -88,7 +93,8 @@ All implemented in `src/tools/`:
   `node:http` server; `/mcp` is served statelessly by one SDK-v2
   `createMcpHandler` (modern 2026-07-28 era + per-request legacy
   fallback; GET/DELETE answer 405). Routes: `/health`, `/status`,
-  `/index`, `/mcp`.
+  `/version`, `/ready`, `/metrics`, `/admin/api/status`, `POST /index`,
+  `/mcp`.
 - `src/middleware/auth.ts:createAuthMiddleware(config)` — `none` /
   `api-key` / `jwt` (HS256). In-memory rate limiter (sliding 1 min
   window) keyed by identity subject.
@@ -250,6 +256,11 @@ node --test packages/code-search-mcp/dist/__tests__/*.test.js
 Tests at `src/__tests__/`:
 - `config-resolver.test.ts` — P3 precedence, secret redaction.
 - `daemon-rpc.test.ts` — P4 UDS JSON-RPC roundtrip (skipped on win32).
+- `graph-tools.test.ts` — `trace_path`, `find_callers`, `find_dead_code`,
+  `get_architecture`, `get_code_snippet`.
+- `http-stateless.test.ts` — stateless `/mcp` serving (no session affinity).
+- `metrics-endpoint.test.ts` — `/metrics` awaits `collectMetrics`, renders
+  when it throws.
 - `observability.test.ts` — P7 Counter/Gauge/Histogram + Logger.
 - `projects.test.ts` — P8 registry, scope auth, quota window.
 
@@ -357,5 +368,3 @@ Parsed by `parseReindexInterval()`. Skips when
 
 - `ARCHITECTURE.md` — module map, mode dispatch, HTTP routes, tool
   surface.
-- `FLOW.md` — sequence diagrams: remote-proxy startup, serve-mode
-  startup, search call, graph call, admin index, auto-reindex.

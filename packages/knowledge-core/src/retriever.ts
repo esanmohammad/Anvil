@@ -2,10 +2,11 @@
  * Gold Standard Hybrid Retriever — 4-phase pipeline from
  * "Scalable Code Search Architectures" (2026).
  *
- * Phase 1: Vector ⫽ BM25 (parallel retrieval)
- * Phase 2: RRF fusion → single ranked list
- * Phase 3: AST tripartite expansion from top fused seeds → direct chunk lookup
- * Phase 4: Cross-encoder reranking via Ollama (or Cohere/Voyage)
+ * Phase 1: Vector ⫽ BM25 ⫽ literal tiers (entityName, exact phrase) in parallel
+ * Phase 2: weighted RRF fusion → single ranked list
+ * Phase 3: AST expansion from top fused seeds → direct chunk lookup (only when
+ *          a reranker is configured or the fused pool can't fill maxChunks)
+ * Phase 4: Cross-encoder reranking when a reranker is configured
  */
 
 import type { ScoredChunk, RetrievalResult, EmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
