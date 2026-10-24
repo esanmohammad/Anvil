@@ -20,7 +20,8 @@ running indexer).
 
 ### Four operating modes (`code-search-mcp` argv)
 
-`src/index.ts` parses argv and dispatches:
+`src/index.ts` splits config flags off with `parseCliFlags` (unknown
+flag → exit 2), then dispatches on order-independent mode flags:
 
 - **`--print-config`** — prints the resolved `CodeSearchConfig` as JSON
   to stdout (secrets redacted) and exits. Honors every layer of the
@@ -34,8 +35,9 @@ running indexer).
 - **Local mode** — `--local <path>` or `--local github:org/pattern`.
   Discovers repos under a path (or clones a GitHub org), builds the
   index, then serves over stdio.
-- **Serve mode** — `--serve [--port] [--auth] [--transport]`. Starts an
-  HTTP server (Streamable HTTP, default; SSE optional) with `/mcp` +
+- **Serve mode** — `--serve [path] [--port] [--auth]` (any order with
+  `--local <path>`; project defaults to `default`). Starts an HTTP
+  server (Streamable HTTP only — `--transport sse` exits 2) with `/mcp` +
   `/health` + `/ready` + `/version` + `/status` + `/metrics` +
   `/admin/api/status` + `POST /index` endpoints.
 
@@ -95,25 +97,43 @@ All implemented in `src/tools/`:
 - `code-search://repo/{name}/profile` — single repo profile (dynamic).
 - `code-search://repo/{name}/graph` — single repo graph (dynamic).
 
+The two dynamic URIs are advertised by `registerResourceTemplates()` on
+`resources/templates/list`.
+
 ### Server core
 
-- `src/server.ts:startServer(projectName, dirPath?)` — wires tools +
-  resources, calls `autoIndex` if no index found, picks transport
-  (stdio or HTTP), schedules optional reindex via
-  `CODE_SEARCH_REINDEX_INTERVAL`.
+- `src/server.ts:startServer(projectName, dirPath?, { force? })` — wires
+  tools + resources. stdio: `autoIndex` (build if no index), then
+  connect. HTTP: `startHttpTransport` first (port bound, `/ready` 503),
+  then `autoIndex`. Schedules the reindex from
+  `indexing.reindexIntervalMs` (env / YAML / CLI). The server process is
+  itself the writer for its project and searches in-process; it never
+  routes to a `code-search-daemon` (only the CLI's `pickBackend` does).
+- Cluster mode (`CODE_SEARCH_WORKERS` > 1, HTTP only) — `node:cluster`
+  primary + N workers sharing the port. The primary never serves HTTP;
+  it is the sole writer (startup index, scheduled reindex, `POST /index`
+  forwarded by workers over IPC) and broadcasts a retriever invalidate
+  after each index. Workers mirror its indexing state (`csm:state`, so
+  `/status` / `/ready` / `/admin/api/status` agree on every worker) and
+  ask it for rate-limit / quota decisions (`csm:rate`, one window per
+  server). See `ARCHITECTURE.md` §3.2.1.
 - `src/transports/http-transport.ts:startHttpTransport(opts)` —
   `node:http` server; `/mcp` is served statelessly by one SDK-v2
   `createMcpHandler` (modern 2026-07-28 era + per-request legacy
   fallback; GET/DELETE answer 405). Routes: `/health`, `/status`,
   `/version`, `/ready`, `/metrics`, `/admin/api/status`, `POST /index`,
-  `/mcp`.
-- `src/middleware/auth.ts:createAuthMiddleware(config)` — `none` /
-  `api-key` / `jwt` (HS256). In-memory rate limiter (sliding 1 min
-  window) keyed by identity subject.
+  `/mcp`. `/mcp` runs `authorize(identity)` (the P8 entry, below) after
+  authentication.
+- `src/middleware/auth.ts:createAuthMiddleware(config, { rateLimiter })` —
+  `none` / `api-key` / `jwt` (HS256; `exp` required, `nbf` honoured;
+  throws at creation for jwt without a secret). Rate limit: sliding 1 min
+  window per identity subject (`middleware/rate-limit.ts:SlidingWindow`),
+  API-key subject = hash of the full key, 429 + `Retry-After`.
 - `src/transports/remote-proxy.ts:startRemoteProxy(config)` — stdio
-  MCP server that proxies to a remote `/mcp` endpoint over HTTP.
-  Captures `mcp-session-id` header for session continuity. Parses
-  `text/event-stream` responses.
+  MCP server that proxies to a remote (stateless) `/mcp` endpoint over
+  HTTP, one POST per call. Parses `text/event-stream` replies event by
+  event and picks the message whose id matches; HTTP / JSON-RPC failures
+  reach the client as JSON-RPC errors.
 
 ### Sources
 
@@ -144,18 +164,29 @@ Public functions:
   reads the canonical names and doesn't emit `[anvil-llm] DEPRECATED`
   noise. Only writes when canonical is unset, so explicit `ANVIL_*`
   always wins.
-- `parseCliFlags(argv)` → `{ patch: DeepPartial<CodeSearchConfig>, rest }`.
-  Reserved-flag set (`--local`, `--remote`, `--serve`, `--workspace`, …)
-  is forwarded to the caller via `rest`.
+- `parseCliFlags(argv)` → `{ patch: DeepPartial<CodeSearchConfig>, rest,
+  unknown }`. Reserved-flag set (`--local`, `--remote`, `--serve`,
+  `--workspace`, …) is forwarded to the caller via `rest`; `--port` /
+  `--host` / `--transport` / `--auth` map to `server.*` / `auth.mode`;
+  flags naming no config leaf land in `unknown` and every caller exits 2.
+- `exportDataDir(cfg)` — sets `CODE_SEARCH_DATA_DIR` (knowledge-core's
+  only data-dir input) so `storage.dataDir` from YAML / CLI moves the KB.
+  The default `storage.dataDir` is knowledge-core's own fallback
+  (`~/.anvil/knowledge-base`). Every entry point calls it.
+- `parseReindexInterval(raw)` — `0`/`none`, `<n>m`, `<n>h` or ≥ 60000 ms;
+  anything else → the resolver warns once and uses 0.
 - `toKnowledgeConfig(cfg)` → strict `KnowledgeConfig`. Used by `server.ts`
   + `cli/index.ts` to thread the resolved struct into
   `indexFromPath(..., { config })` and `getRetriever(project, config)`.
-- `printConfig(cfg)` + `redactSecrets(value)` — for `--print-config`.
+- `printConfig(cfg)` + `redactSecrets(value)` — for `--print-config`:
+  secret-named keys at any depth, OTEL header values, URI credentials.
 
-`src/core/env-config.ts:loadServerConfig()` is now a **back-compat shim**
-over `resolveCodeSearchConfig()`. Returns the legacy flat `ServerConfig`
-shape (for `auth.ts`, `http-transport.ts`, etc.) plus `__unified: CodeSearchConfig`.
-Cached; use `resetServerConfig()` in tests. The shim still bridges
+`src/core/env-config.ts:loadServerConfig({ cli?, workspaceDir? })` is a
+**back-compat shim** over `resolveCodeSearchConfig()`. Returns the legacy
+flat `ServerConfig` shape (for `auth.ts`, `http-transport.ts`, etc.) plus
+`__unified: CodeSearchConfig`. Cached — `src/index.ts` makes the first
+call with the CLI patch; use `resetServerConfig()` in tests. `llmMode`
+mirrors agent-core: an explicit `cli` / `api` / `none` wins. The shim still bridges
 `EMBEDDING_API_KEY` → provider-specific env vars (`MISTRAL_API_KEY`,
 `OPENAI_API_KEY`, `VOYAGE_API_KEY`) and `RERANKER_API_KEY` →
 `COHERE_API_KEY` / `VOYAGE_API_KEY` for one release cycle.
@@ -171,12 +202,15 @@ implementations:
   "just call getRetriever()" path. Threads an explicit `KnowledgeConfig`
   so issue #6 stays fixed regardless of instantiator. Records
   `metrics.queriesTotal` / `queryDuration` / `errors` (P7) on every call.
+  `forceIndex` / `invalidate` call knowledge-core's `invalidateRetriever`
+  so the next search sees the new index.
 - `DaemonBackend` (`daemon-client.ts`) — UDS JSON-RPC 2.0 client. One
   socket connection per call (server keeps state). `ping()` returns
   true for a live daemon within ~250ms.
 
 `pickBackend(cfg)` returns daemon if the socket exists AND `preferDaemon`
 AND `ping()` succeeds; otherwise falls through to `InProcessBackend`.
+Only the CLI (`query`) calls it — the MCP server doesn't.
 `daemonSocketPath(dataDir, project)` resolves to UDS on POSIX
 (`<dataDir>/daemon/<project>.sock`) or named pipe on Windows.
 
@@ -184,12 +218,16 @@ AND `ping()` succeeds; otherwise falls through to `InProcessBackend`.
 
 `src/daemon/index.ts` is the long-lived indexer process. Boot:
 
-1. Resolve unified config (with `workspaceDir` overlay).
-2. Build/refresh the index for `--workspace <path>`.
-3. Start the file watcher (debounced batches).
-4. Start the UDS JSON-RPC server (the same protocol `DaemonBackend`
-   speaks).
-5. Write `<dataDir>/daemon/<project>.pid`; trap SIGINT/SIGTERM.
+1. Resolve unified config (with `workspaceDir` overlay); project =
+   basename of the resolved `--workspace` path.
+2. Refuse to start when a daemon already answers on
+   `<dataDir>/daemon/<project>.sock`; remove a stale socket.
+3. Start the UDS JSON-RPC server (binding the socket is the daemon's
+   claim on the project) and write `<dataDir>/daemon/<project>.pid`.
+4. Build/refresh the index, then start the file watcher. Every index run
+   (initial, watcher batch, `index.force`) goes through one serial queue;
+   one run per watcher batch.
+5. SIGINT/SIGTERM: remove only its own socket and pid file, exit.
 
 `src/daemon/watcher.ts:Watcher` — zero-dep `fs.watch` with `recursive:
 true` on darwin/win32; per-directory walk on linux. Coalesces fs events
@@ -199,64 +237,76 @@ into debounced batches (default `indexing.debounceMs=500`). Honors
 `src/daemon/rpc-server.ts:RpcServer` — JSON-RPC 2.0 method set:
 `search.code` / `index.status` / `index.force` / `index.invalidate` /
 `health`. Strict 1.0 contract — both client and server must bump
-together when adding methods.
+together when adding methods. Dispatches own handler names only;
+notifications (no `id`) get no reply; a batch gets one `-32600`.
 
 ### Standalone CLI (P5)
 
 `src/cli/index.ts` — subcommand router for the `code-search` bin.
-Subcommands:
-- `code-search index [path] [--force]` — one-shot index of a directory.
+Each subcommand parses its own flags + positionals in any order; unknown
+flags and invalid values exit 2; project names go through
+`core/project-name.ts:validateProjectName`. Subcommands:
+- `code-search index [path] [--force] [--project p]` — one-shot index of
+  a directory.
 - `code-search query <text> [--mode hybrid|vector|bm25] [--top-k N]
-  [--repo r1 --repo r2] [--format text|json|jsonl] [--project p]`.
-  Picks daemon when alive, else in-process.
-- `code-search status [--project p]` — JSON status: chunks, repos,
-  embedding provider, last-indexed-at, daemon socket + liveness.
-- `code-search reset [--project p]` — `rm -rf` the project's KB dir.
-- `code-search daemon …` — forwards to `code-search-daemon`.
-- `code-search serve …` / `code-search mcp …` — forward to the original
-  `dist/index.js` entry in serve / mcp mode.
+  [--repo r1 --repo r2] [--format text|json|jsonl] [--project p]
+  [--no-daemon]`. Picks daemon when it answers a ping, else in-process.
+- `code-search status [--project p]` — JSON status: dataDir, kbPath,
+  indexed, chunks, repos, embedding provider, last-indexed-at, daemon
+  socket + liveness (ping). Never creates dirs for an unindexed project.
+- `code-search reset [--project p]` — `rm -rf <dataDir>/<project>` only.
+- `code-search daemon …` — runs `code-search-daemon` as a child,
+  forwarding SIGINT/SIGTERM/SIGHUP and exiting with its status.
+- `code-search serve …` / `code-search mcp …` — run the original
+  `dist/index.js` entry in-process in serve mode / stdio local mode
+  (`mcp --remote URL` = proxy).
 - `code-search --print-config` — shared with `code-search-mcp`.
 
 ### Observability (P7)
 
 `src/observability/metrics.ts` — zero-dep Prometheus-format collectors:
 `Counter`, `Gauge`, `Histogram`. Process-wide `registry` renders the
-text body for `/metrics`. Pre-declared `metrics` namespace covers
+text body for `/metrics`. Pre-declared `metrics` namespace:
 `code_search_queries_total`, `code_search_query_duration_seconds`,
-`code_search_index_chunks_total`, `code_search_index_age_seconds`,
-`code_search_embeddings_calls_total`, `code_search_llm_calls_total`,
-`code_search_errors_total`, `code_search_reranker_cache_hits_total`,
-`code_search_vector_index_unindexed_rows`,
+`code_search_errors_total`, `code_search_index_age_seconds`,
+`code_search_index_chunks_total`, `code_search_vector_index_unindexed_rows`,
 `code_search_vector_index_growth_ratio`.
 `InProcessBackend.search` and the MCP search tools (`tools/search.ts`)
-record `queriesTotal` / `queryDuration` / `errors`; the two vector-index
-gauges are refreshed per scrape by the `collectMetrics` hook `server.ts`
-passes to `startHttpTransport` (reads the
-writer's `vector_index.json` blob, since in cluster mode the HTTP workers
-aren't the writer; a failing collector never fails the scrape). Other call
-sites are wiring points for future work.
+record `queriesTotal` / `queryDuration` / `errors`. The four index gauges
+are owned by `server.ts:collectIndexMetrics`, the `collectMetrics` hook
+passed to `startHttpTransport`: per scrape it clears them and re-reads the
+writer's blobs (`index_stats.json`, `vector_index.json` — in cluster mode
+the HTTP workers aren't the writer); index age = seconds since the last
+successful index. A failing collector never fails the scrape.
 
 `src/observability/logger.ts:Logger` — structured JSON logger
-(`{level, msg, ts, …}` per line) when `telemetry.structuredLogs=true`;
-falls back to passthrough text mode for the existing stderr-scrape
-pattern. `configureLogger(opts)` swaps the process-wide instance.
+(`{level, msg, ts, component, …}` per line) when
+`telemetry.structuredLogs=true`; otherwise passthrough text
+(`[component] msg`, the historical stderr format). The server, daemon
+and CLI log through `getComponentLogger(component)` after
+`configureLogger` applies the resolved config; lines knowledge-core
+prints itself are not wrapped.
 
 ### Multi-project / multi-tenant (P8)
 
 `src/projects/registry.ts` — file-backed `ProjectRegistry` over
 `<dataDir>/projects/<name>/project.yaml`. Each entry carries
-`{workspaceDir, repos, scopes, quotas, config}`. Quotas:
-`maxQueriesPerMinute` (sliding window per (identity, project)),
-`maxEmbeddingCostUsd`, `maxLlmCostUsd`.
+`{workspaceDir, repos, scopes, quotas, config}`.
 
 - `projectAccessAllowed(project, identityScopes)` — public when
   `project.scopes=[]`, scope-match otherwise, `*` is admin override.
-- `checkProjectQuota(project, identity)` — sliding 1-min bucket keyed by
-  `(identity, project)`; `maxQueriesPerMinute=0` disables.
+- `checkProjectQuota(project, identity)` / `projectQuotaKey` — sliding
+  1-min window keyed by `(identity, project)`;
+  `maxQueriesPerMinute=0` disables.
 
-Daemon-side wiring (multi-project mode where one daemon serves N
-projects) is the next implementation step; the registry + accessors are
-ready.
+Enforced: the HTTP server loads the registry at boot and, when the served
+project has an entry, gates every `/mcp` request on its scopes (403) and
+query quota (429 + `Retry-After`) — `server.ts:createProjectAuthorizer`.
+API keys are admin (`*`); a JWT's scopes are its `scope` claim (none →
+no scopes). Not enforced anywhere: `repos`, `maxEmbeddingCostUsd`,
+`maxLlmCostUsd`; a `config:` block isn't read (`ProjectEntry.config` is
+the workspace's `.code-search.yaml` layer). The daemon and CLI don't
+consult the registry.
 
 ## Build + test
 
@@ -268,7 +318,11 @@ node --test packages/code-search-mcp/dist/__tests__/*.test.js
 
 Tests at `src/__tests__/`:
 - `config-resolver.test.ts` — P3 precedence, secret redaction.
+- `config-cli.test.ts` — CLI flag parsing (aliases, unknown flags),
+  redaction, reindex intervals, LLM mode, project names.
 - `daemon-rpc.test.ts` — P4 UDS JSON-RPC roundtrip (skipped on win32).
+- `daemon-rpc-protocol.test.ts` — own-property dispatch, notifications,
+  batch, socket ownership on stop.
 - `graph-tools.test.ts` — `trace_path`, `find_callers`, `find_dead_code`,
   `get_architecture`, `get_code_snippet` over the JSON system graph.
 - `graph-tools-store.test.ts` — graph tools over the SQLite system graph:
@@ -278,10 +332,19 @@ Tests at `src/__tests__/`:
 - `tool-inputs.test.ts` — argument validation (`isError`), descriptors vs
   behaviour, `search_exact` without an embedder, search metrics, hints.
 - `http-stateless.test.ts` — stateless `/mcp` serving (no session affinity).
+- `http-auth.test.ts` — JWT claims, jwt-without-secret, sliding window,
+  per-key limits + `Retry-After`, `/admin/api/status` auth, P8 scopes +
+  quota on `/mcp` (spawns the server).
 - `metrics-endpoint.test.ts` — `/metrics` awaits `collectMetrics`, renders
   when it throws.
+- `metrics-collect.test.ts` — `collectIndexMetrics` gauges.
 - `observability.test.ts` — P7 Counter/Gauge/Histogram + Logger.
 - `projects.test.ts` — P8 registry, scope auth, quota window.
+- End-to-end (spawn the built binaries against a git fixture + a fake
+  OpenAI-compatible embedder, helpers in `_harness.ts`, ports
+  47380–47399): `server-cli-args.test.ts`, `server-lifecycle.test.ts`,
+  `http-index.test.ts` (POST /index + cluster mode), `remote-proxy.test.ts`,
+  `daemon-runtime.test.ts`.
 
 Build output: bundled `dist/` with three bin entries:
 - `dist/index.js` → `code-search-mcp`
@@ -315,11 +378,14 @@ Every comment must be true of the code **as it currently stands**. When a change
 
 ### Auth on admin endpoints
 
-`POST /index` and `/mcp` both go through `authenticate(req, res)` when
-`config.authEnabled === true`. `/health` and `/status` are always
-public (read-only). The `/index` handler also goes through `onIndex`
-in `server.ts`, which gates against concurrent indexing via
-`ctx.indexing.status === 'indexing'`.
+`POST /index`, `/admin/api/status` and `/mcp` go through
+`authenticate(req, res)` when `config.authEnabled === true`. `/health`,
+`/status`, `/ready`, `/version` and `/metrics` are always public. The
+`/index` handler (`server.ts:runAdminIndex`, via `onIndex`) re-indexes
+the served project only (another `project` → 400), 409s while an index
+runs (`ctx.indexing.status === 'indexing'`), and throws `HttpError` for
+the status to answer with; the transport caps the body at 64 KiB (413)
+and 400s invalid JSON / a missing `path`.
 
 ### Status tracking
 
@@ -335,8 +401,10 @@ History capped at 50 entries (FIFO). Available via `GET /status`.
 
 ### Auto-reindex schedule
 
-`CODE_SEARCH_REINDEX_INTERVAL` accepts `30m` / `1h` / `6h` / `0` (off).
-Parsed by `parseReindexInterval()`. Skips when
+`indexing.reindexIntervalMs` (`CODE_SEARCH_REINDEX_INTERVAL` /
+YAML / `--indexing.reindex-interval-ms`) accepts `30m` / `1h` / `6h` /
+`0` (off) or ms ≥ 60000; anything else is reported invalid and disables
+it. Normalised by `core/config.ts:parseReindexInterval()`. Skips when
 `indexing.status === 'indexing'` to prevent overlap. Uses
 `setInterval(..).unref()` so the timer doesn't keep the process alive.
 
@@ -345,7 +413,10 @@ Parsed by `parseReindexInterval()`. Skips when
 - Default `host` is `127.0.0.1` when `authMode === 'none'`, else
   `0.0.0.0`. Public binding without auth logs a stderr warning.
 - API keys compared via `timingSafeEqual` (`safeCompare`).
-- JWT: HS256 only, signature + `exp` + `iss` validated.
+- JWT: HS256 only, signature + `iss` + required `exp` + `nbf` validated;
+  no secret in jwt mode → the server refuses to start.
+- `--print-config` redacts every credential it can recognise (secret-named
+  keys, OTEL headers, URI userinfo).
 
 ## Things that don't exist (intentionally)
 
@@ -353,8 +424,9 @@ Parsed by `parseReindexInterval()`. Skips when
   mesh inference) goes through `@anvil/knowledge-core`'s
   `claude-runner.ts` shim → `@anvil/agent-core`'s single-shot.
 - No session state at all — every `/mcp` request is an independent
-  stateless exchange (SDK v2 / spec 2026-07-28). Remote-proxy clients
-  re-init on first request.
+  stateless exchange (SDK v2 / spec 2026-07-28). The remote proxy keeps
+  no session either.
+- No SSE transport.
 - No web framework — `http-transport.ts` is hand-rolled `node:http`
   with a single dispatch function so zero-runtime-dep stays a goal.
 - No chokidar / native file-watcher dep — the daemon uses Node's

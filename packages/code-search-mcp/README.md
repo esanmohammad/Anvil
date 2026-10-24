@@ -55,23 +55,38 @@ job — none of them need a separate install.
 code-search index .                                  # index current dir
 code-search query "where do we verify JWTs"          # hybrid by default
 code-search query "createPet" --mode bm25 --top-k 5  # exact-identifier mode
+code-search query --project petshop --format json "adopt pet"  # flags in any order
 code-search status --project petshop                 # JSON report
 code-search reset --project petshop                  # drop the index
 code-search --print-config                           # resolved config (redacted)
 ```
 Every `CodeSearchConfig` leaf is settable as `--<dotted-path>` —
 e.g. `--embedding.provider codestral`, `--retrieval.max-chunks 12`,
-`--no-indexing.auto-index`.
+`--no-indexing.auto-index`. An unknown flag (or an invalid `--mode` /
+`--format` / `--top-k`) exits with status 2 instead of being ignored.
+`query`, `status` and `--print-config` read the cwd's
+`.code-search.yaml`; `index <path>` reads the one in `<path>`.
+`status` reports where the KB lives (`dataDir`, `kbPath`), whether the
+project is indexed, and whether a daemon answers on its socket.
+`reset` only removes `<dataDir>/<project>` and rejects project names that
+aren't a single path segment (or are the reserved `daemon` / `projects`).
 
 ### Daemon mode (long-running indexer)
 ```sh
 code-search-daemon --workspace /path/to/repos
+code-search daemon --workspace .        # same, via the CLI wrapper
 ```
 Builds the index once, then watches the workspace and debounce-
-reindexes on file events. Listens on a UDS socket at
-`<dataDir>/daemon/<project>.sock` (named pipe on Windows). The CLI
-and MCP server automatically prefer the daemon when it's alive,
-falling back to in-process when it isn't.
+reindexes on file events (one index run per batch; results are fresh as
+soon as a run finishes). The project is named after the workspace
+directory. Listens on a UDS socket at `<dataDir>/daemon/<project>.sock`
+(named pipe on Windows) and writes `<project>.pid` next to it; a second
+daemon for the same project refuses to start, and a stopped daemon
+removes only its own socket + pid file. `code-search query` prefers the
+daemon when it answers a ping (`--no-daemon` to skip it), falling back
+to in-process when it doesn't. The MCP server (`--local` / `--serve`)
+does **not** use the daemon — it indexes and searches in-process, so
+don't run both on the same project.
 
 ### MCP — three modes (`code-search-mcp` argv)
 
@@ -96,13 +111,20 @@ your embedder + reranker are local (Ollama).
 
 **Serve**
 ```sh
-code-search-mcp --serve --port 4000 --auth api-key
+code-search-mcp --serve /path/to/repos --port 4000 --auth api-key
 ```
-Boots an HTTP server (Streamable HTTP transport, SSE optional)
-with `/mcp`, `/health`, `/ready`, `/version`, `/status`,
+Boots an HTTP server (Streamable HTTP on `/mcp`; there is no SSE
+transport) with `/health`, `/ready`, `/version`, `/status`,
 `/metrics` (Prometheus), `/admin/api/status`, and an admin
-`POST /index`. Use this to host one index for a whole team — every
-dev points their client at the same URL.
+`POST /index`. The port is bound before the startup index runs, so
+probes answer from the start (`/ready` is 503 until the index is
+servable). `--serve <path>`, `--serve --local <path>` and
+`--local <path> --serve` are equivalent; the project is `default`
+unless `--project` says otherwise. Use this to host one index for a
+whole team — every dev points their client at the same URL.
+
+`code-search mcp [path]` is the stdio local mode over the cwd (or
+`path`); `code-search mcp --remote URL` is the remote proxy.
 
 ---
 
@@ -198,16 +220,17 @@ no scrape config or APM agent required.
 | Endpoint | Returns |
 |---|---|
 | `GET /health` | Liveness ping with project + uptime |
-| `GET /ready` | `200` only after first index completes |
-| `GET /version` | Package + Node + platform |
+| `GET /ready` | `200` once the index is servable, `503` before (incl. during the startup index) |
+| `GET /version` | Package version + Node + platform |
 | `GET /status` | Current indexing phase + last-success history |
-| `GET /metrics` | Prometheus text format (queries, latency histogram, chunks, embedding/LLM calls, errors) |
-| `GET /admin/api/status` | JSON status dashboard for the admin UI |
+| `GET /metrics` | Prometheus text format: queries, latency histogram, errors, seconds since the last successful index, chunks per repo, vector-index health |
+| `GET /admin/api/status` | JSON status dashboard for the admin UI (requires auth when auth is on) |
 
 Set `CODE_SEARCH_STRUCTURED_LOGS=1` for one-JSON-line-per-event
-stderr logs, and `CODE_SEARCH_TELEMETRY_RECORD_QUERIES=1` to opt
-into recording query text in spans (off by default — queries are
-PII-shaped).
+stderr logs from the server, daemon and CLI (lines knowledge-core
+prints itself stay plain), and `CODE_SEARCH_TELEMETRY_RECORD_QUERIES=1`
+to opt into recording query text in spans (off by default — queries
+are PII-shaped).
 
 ---
 
@@ -223,9 +246,15 @@ quotas:
   max_embedding_cost_usd: 5
 ```
 
-`ProjectRegistry` reads them at boot. `projectAccessAllowed`
-gates by scope (`*` is admin). `checkProjectQuota` enforces a
-sliding 1-minute window per `(identity, project)`.
+The HTTP server reads the entry of the project it serves once at
+boot and enforces it on every `/mcp` request: the caller's scopes
+must match `scopes` (`*` is admin; API keys are admin; a JWT's
+scopes come from its `scope` claim) or it gets 403, and
+`max_queries_per_minute` caps requests per `(identity, project)` in
+a sliding 1-minute window (429 + `Retry-After`). Not enforced:
+`repos`, `max_embedding_cost_usd` / `max_llm_cost_usd`, and any
+`config:` block (per-project config comes from the workspace's
+`.code-search.yaml`).
 
 ---
 
@@ -233,19 +262,25 @@ sliding 1-minute window per `(identity, project)`.
 
 ### Auth, three flavors
 `none` (local-only, default 127.0.0.1 binding), `api-key`
-(`Authorization: Bearer ...`, timing-safe compare), `jwt` (HS256,
-signature + `exp` + `iss` validated). Public binding without auth
-logs a warning, because that's what should happen.
+(`Authorization: Bearer ...`, timing-safe compare), `jwt` (HS256;
+signature, `iss`, a required `exp` and, when present, `nbf`
+validated; the server refuses to start in `jwt` mode without
+`CODE_SEARCH_AUTH_JWT_SECRET`). Public binding without auth logs a
+warning, because that's what should happen.
 
 ### Rate limiting
-In-memory sliding 1-minute window keyed by identity subject. Tune
-per-deployment.
+`CODE_SEARCH_RATE_LIMIT_PER_MINUTE` (default 100) requests per
+identity in a sliding 1-minute window (each API key counts on its
+own); 429 responses carry `Retry-After`. In cluster mode the limit
+applies to the whole server, not per worker.
 
 ### Auto-reindex
-`CODE_SEARCH_REINDEX_INTERVAL=30m` (or `1h`, `6h`, `0` to disable)
-runs an incremental re-index in the background. Skips itself if a
-manual index is already running. The timer is `unref`'d so it
-doesn't keep the process alive.
+`CODE_SEARCH_REINDEX_INTERVAL=30m` (or `1h`, `6h`, `0` to disable;
+also `indexing.reindex_interval_ms` in YAML or
+`--indexing.reindex-interval-ms`) runs an incremental re-index in
+the background. Anything else (e.g. `90s`) is reported as invalid and
+disables it. Skips itself if a manual index is already running. The
+timer is `unref`'d so it doesn't keep the process alive.
 
 ### Status tracking
 Every index call lands in a 50-entry FIFO history with start
@@ -259,9 +294,21 @@ instance: modern (2026-07-28) clients negotiate via
 per-request legacy fallback. No session map, no TTL.
 
 ### Admin index endpoint
-`POST /index` with `{ project, dirPath?, opts? }` triggers a
-fresh index. Gated against concurrent runs. Auth-required when
-auth is on.
+`POST /index` with `{ "path": "/repos", "force"?: true }` (re)indexes
+the served project from `path`, which then becomes its directory for
+scheduled reindexes. `project`, if given, must be the served project
+(a server never switches projects — 400 otherwise). Invalid JSON or a
+missing `path` → 400, a body over 64 KiB → 413, an index already
+running → 409. Auth-required when auth is on. The response reports
+chunks, repos and cross-repo edges.
+
+### Cluster mode
+`CODE_SEARCH_WORKERS=N` (2–16) forks N HTTP workers sharing the port.
+The primary is the only writer (startup index, `POST /index` forwarded
+over IPC, scheduled reindex) and pushes its indexing state to the
+workers, so `/status`, `/ready` and `/admin/api/status` look the same
+on every worker; rate limits and quotas are counted once for the whole
+server.
 
 ---
 
@@ -291,7 +338,8 @@ auth is on.
                     └────────────┬────────────┘
                                  │ on disk
                                  ▼
-                    ~/.anvil/knowledge-base/<project>/
+                    <dataDir>/<project>/
+                    (default ~/.anvil/knowledge-base/)
 ```
 
 Three different fronts, one knowledge stack:
@@ -321,16 +369,21 @@ Single resolver in `src/core/config.ts`. Five precedence layers
 5. CLI flags via `--<dotted-path>` (e.g. `--embedding.provider codestral`)
 
 Run `code-search --print-config` or `code-search-mcp --print-config`
-any time to see the resolved struct (secrets redacted).
+any time to see the resolved struct (secrets redacted — including
+passwords in URIs and OTEL header values). `--port`, `--host`,
+`--transport` and `--auth` are shorthands for `server.port`,
+`server.host`, `server.transport` and `auth.mode`.
 
 | Var (`CODE_SEARCH_*`) | Effect |
 |---|---|
 | `SERVER` | Remote URL (proxy mode) |
 | `API_KEY` | API key for proxy or serve modes |
-| `DATA_DIR` | Override the index storage root |
+| `DATA_DIR` | Index storage root (default `~/.anvil/knowledge-base`; also `storage.data_dir` / `--storage.data-dir`). Daemon sockets live under `<dataDir>/daemon/` |
 | `PORT` / `HOST` / `TRANSPORT` | HTTP server bind |
 | `AUTH_MODE` / `AUTH_API_KEYS` / `AUTH_JWT_SECRET` | Server auth |
-| `REINDEX_INTERVAL` | `30m` / `1h` / `6h` / `0` |
+| `REINDEX_INTERVAL` | `30m` / `1h` / `6h` / `0`; invalid → disabled |
+| `RATE_LIMIT_PER_MINUTE` | Per-identity request limit (sliding window) |
+| `WORKERS` | `>1` → cluster mode |
 | `EMBEDDING_PROVIDER` | `auto` / `codestral` / `voyage` / `openai` / `ollama` / `openai-compatible` / `custom` / `gemini-oauth` |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | Model + dims |
 | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` | Credentials |
@@ -339,8 +392,8 @@ any time to see the resolved struct (secrets redacted).
 | `RERANKER_MODEL` / `RERANKER_API_KEY` / `RERANKER_BASE_URL` | Reranker config |
 | `RETRIEVAL_MAX_CHUNKS` / `RETRIEVAL_MAX_TOKENS` | Retrieval tuning |
 | `AUTO_INDEX` | `false` to disable startup auto-index |
-| `DAEMON_DISABLED` / `DAEMON_AUTO_SPAWN` | Daemon backend control |
-| `LLM_MODE` / `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | Profiling + service-mesh LLM. Pre-promoted to `ANVIL_LLM_*` so the agent-core integration is silent. |
+| `DAEMON_DISABLED` | `code-search query` never uses a daemon |
+| `LLM_MODE` / `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | Profiling + service-mesh LLM (`LLM_MODE` defaults to `none`). Pre-promoted to `ANVIL_LLM_*` so the agent-core integration is silent. |
 | `INDEXING_DEBOUNCE_MS` / `CHUNKING_MAX_TOKENS` | Indexer knobs |
 | `METRICS_ENABLED` / `STRUCTURED_LOGS` / `TELEMETRY_RECORD_QUERIES` | Observability |
 
@@ -388,8 +441,8 @@ proxies (cluster workers) are free.
 
 **Security defaults that don't bite.** Default bind is `127.0.0.1`
 when auth is `none`. API keys compared timing-safe. JWT
-signature + exp + iss validated. Public binding without auth
-logs a warning instead of pretending it's fine.
+signature + exp (required) + nbf + iss validated. Public binding
+without auth logs a warning instead of pretending it's fine.
 
 ---
 

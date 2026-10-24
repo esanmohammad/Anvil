@@ -27,10 +27,9 @@ compiles today.
        ┌──────────────┐  ┌──────────────────────────────────────┐
        │ remote-proxy │  │ server.ts:startServer                │
        │ (stdio loop  │  │   loadServerConfig                   │
-       │  forwards to │  │   autoIndex(ctx)                     │
-       │  /mcp)       │  │   transport === 'stdio'              │
-       └──────────────┘  │     ? StdioServerTransport           │
-                         │     : startHttpTransport(opts)       │
+       │  forwards to │  │   stdio: autoIndex → connect         │
+       │  /mcp)       │  │   HTTP:  startHttpTransport (bind)   │
+       └──────────────┘  │          → autoIndex                 │
                          │   schedule auto-reindex              │
                          └──────────────────────────────────────┘
                                             │
@@ -67,36 +66,44 @@ compiles today.
 
 ## 2. Three operating modes (`src/index.ts`)
 
-The single binary `code-search-mcp` parses argv into `mode: 'remote' |
-'local' | 'serve'`:
+The single binary `code-search-mcp` first runs `parseCliFlags(argv)`
+(`core/config.ts`), which splits off every config flag — `--<dotted.path>
+<value>` plus the `--port` / `--host` / `--transport` / `--auth` shorthands
+for `server.port` / `server.host` / `server.transport` / `auth.mode` — and
+reports flags that name no config leaf (exit 2). The remaining mode flags are
+order-independent and pick `mode: 'remote' | 'local' | 'serve'`:
 
 | Mode | When | What it spawns |
 |---|---|---|
 | `remote` (default) | `code-search-mcp` (no flags) or `--remote URL` or any `http(s)://...` bare arg | `startRemoteProxy({ serverUrl, apiKey })` — stdio MCP server forwarding to a remote `/mcp` |
-| `local` | `--local <path>` or `--local github:org[/pattern]` | Discovers/clones repos → `startServer(project, dirPath)` over stdio |
-| `serve` | `--serve` (with `--port`/`--auth`/`--transport`) | `startServer(project, src?)` with HTTP transport |
+| `local` | `--local [path\|github:org[/pattern]]` (or a bare path) | Discovers/clones repos → `startServer(project, dirPath)` over stdio. Project defaults to the source's basename; `--local --project p` with no path serves an existing index |
+| `serve` | `--serve [path]`, in any order with `--local <path>` | `startServer(project, dirPath)` over Streamable HTTP. Project defaults to `"default"` |
 
-CLI flags (parsed by argv loop):
+Mode flags:
 
 ```
---remote <url>          Remote server URL (also accepts bare URL arg)
---local [path|github:..] Local source
---serve                 HTTP server mode
+--remote <url>           Remote server URL (also accepts bare URL arg)
+--local [path|github:..] Local source (stdio unless --serve)
+--serve [path]           HTTP server mode (Streamable HTTP on /mcp)
 --api-key <key>
---project <name>
---token <token>         GitHub token
---force                 Force full re-index
---port <port>
---transport <stdio|sse|streamable-http>
---auth <none|api-key|jwt>
+--project <name>         Validated: one path segment, not daemon/projects
+--token <token>          GitHub token
+--force                  Re-index at startup even if an index exists
+--print-config           Print the resolved config (redacted) and exit
 --help / -h
 ```
+
+There is no SSE transport: `--transport sse` / `CODE_SEARCH_TRANSPORT=sse`
+exit 2 with an error. The config layers are resolved once
+(`loadServerConfig({ cli, workspaceDir })`, workspace layer = the source
+path or the cwd), `exportDataDir` hands `storage.dataDir` to knowledge-core,
+and `configureLogger` applies `telemetry.structuredLogs`.
 
 Remote mode env fallback: `CODE_SEARCH_SERVER` /
 `CODE_SEARCH_REMOTE_URL`, `CODE_SEARCH_API_KEY` /
 `CODE_SEARCH_AUTH_API_KEY`.
 
-GitHub source: `--local github:<org>[/<pattern>]` clones to
+GitHub source: `github:<org>[/<pattern>]` clones to
 `~/.code-search/<org>/` via `cloneOrUpdateOrg` (gh CLI preferred,
 GitHub API fallback).
 
@@ -116,27 +123,57 @@ interface ServerContext {
 }
 ```
 
-### 3.2 `startServer(projectName, directoryPath)`
+### 3.2 `startServer(projectName, directoryPath, { force? })`
 
-1. `loadServerConfig()` — pull every `CODE_SEARCH_*` env var.
-2. Log resolved LLM mode (`disabled` / `api → ...` / `cli → ...`).
-3. `await autoIndex(ctx)` — if the writer's `index_stats.json` shows a
+The server process is the index writer for the project it serves and
+searches in-process — it never routes to a running `code-search-daemon`
+(only the CLI's `pickBackend` does). Don't run a daemon and a server on the
+same project + data dir.
+
+1. `loadServerConfig()` — the cached resolved config.
+2. Log resolved LLM mode (`disabled` / `api → ...` / `cli → ...`), which
+   honours an explicit `llm.mode` (incl. `none`) the way agent-core does.
+3. `autoIndex(ctx)` — if the writer's `index_stats.json` shows a
    finished embed (`embeddingProvider !== 'pending'`), or the legacy local
    layout exists (`lancedb` + `system_graph.sqlite` or
-   `system_graph_v2.json`) → `ctx.indexReady = true`. Else if `directoryPath` set →
-   `trackedIndex(ctx, ..., { label: 'auto-index' })`. Else log "tools
-   will return empty results."
-4. Pick transport:
-   - `stdio` → `new StdioServerTransport()` + `server.connect`.
-   - else → `startHttpTransport(opts)` with `createMcpServer` factory
-     producing one Server per request.
-5. If `parseReindexInterval() > 0` → `setInterval(...).unref()` running
-   `trackedIndex(..., { label: 'auto-reindex' })`.
+   `system_graph_v2.json`) → `ctx.indexReady = true` (unless `force`).
+   Else if `directoryPath` set → `trackedIndex(ctx, ..., { label:
+   'auto-index' })`. Else log "tools will return empty results."
+   - stdio → `autoIndex`, then `StdioServerTransport` + `server.connect`.
+   - HTTP → `startHttpTransport(opts)` first, then `autoIndex`: `/health`
+     answers and `/ready` is 503 while the startup index runs.
+4. `indexing.reindexIntervalMs > 0` (any config layer) →
+   `setInterval(...).unref()` running `trackedIndex(..., { label:
+   'auto-reindex' })`, skipped while an index runs.
+
+`collectIndexMetrics(project, config, lastSuccess)` refreshes the index
+gauges per `/metrics` scrape (see §4).
+
+### 3.2.1 Cluster mode (`CODE_SEARCH_WORKERS`)
+
+`CODE_SEARCH_WORKERS=N` (2–16) with an HTTP transport turns the process
+into a `node:cluster` primary that forks N workers sharing the listen port.
+
+- **Workers** serve HTTP only and never write: `POST /index` is forwarded
+  to the primary over IPC (`csm:index` → `csm:index-result`, HTTP status
+  preserved). Their `ctx.indexing` / `indexReady` / `directoryPath` mirror
+  the primary's (`csm:state`, pushed every 250 ms when changed and on
+  worker start), so `/status`, `/ready` and `/admin/api/status` report the
+  writer's indexing from any worker. Rate-limit and quota checks go to the
+  primary (`csm:rate`), so a limit applies to the whole server, not per
+  worker (fallback to the worker's own window if the primary doesn't answer
+  in 2 s).
+- **The primary** never serves HTTP. It forks the workers, then runs the
+  startup `autoIndex`, the reindex schedule and forwarded index requests as
+  the sole writer, and broadcasts `csm:invalidate` after each successful
+  index so workers drop their cached retrievers. It respawns workers that
+  die and forwards SIGINT/SIGTERM to them; a worker whose primary is gone
+  exits.
 
 ### 3.3 `createMcpServerInstance(ctx)` — per-request MCP wiring
 
 ```
-const server = new Server({ name: 'code-search-mcp', version: '0.1.0' },
+const server = new Server({ name: 'code-search-mcp', version: PACKAGE_VERSION },
                           { capabilities: { tools: {}, resources: {} } });
 allTools = [...registerSearchTools, ...registerGraphTools,
             ...registerProfileTools, ...registerIndexTools];
@@ -145,6 +182,7 @@ server.setRequestHandler('tools/call',     handleSearchTool || handleGraphTool
                                            || handleProfileTool || handleIndexTool
                                            || { error: 'Unknown tool: ...' });
 server.setRequestHandler('resources/list', () => ({ resources }));
+server.setRequestHandler('resources/templates/list', () => ({ resourceTemplates }));
 server.setRequestHandler('resources/read', handleResource);
 ```
 
@@ -159,15 +197,18 @@ Wraps `indexFromPath` (knowledge-core) with status accounting:
 - On error: `error`, push `error`, rethrow.
 - `pushHistory` keeps the last 50 entries (FIFO).
 
-### 3.5 `parseReindexInterval()`
+### 3.5 Reindex interval (`core/config.ts:parseReindexInterval`)
 
-Parses `CODE_SEARCH_REINDEX_INTERVAL`:
+`indexing.reindexIntervalMs` from any layer (`CODE_SEARCH_REINDEX_INTERVAL`,
+YAML `indexing.reindex_interval_ms`, `--indexing.reindex-interval-ms`) is
+normalised by the resolver, so `--print-config` shows what the server runs:
 
 | Value | Result |
 |---|---|
 | unset / `0` / `none` | `0` (disabled) |
-| `30m` / `1h` / `6h` (or any `\d+(m\|h)`) | converted to ms |
-| anything else | `0` + stderr warning |
+| `30m` / `1h` / `6h` (any `\d+(m\|h)`) | converted to ms |
+| a number of ms ≥ 60000 | as is |
+| anything else (`90s`, `abc`, < 1 minute) | `0` + one stderr warning ("invalid reindex interval") |
 
 ## 4. HTTP transport (`src/transports/http-transport.ts`)
 
@@ -177,6 +218,8 @@ Parses `CODE_SEARCH_REINDEX_INTERVAL`:
 modern (2026-07-28) envelope traffic on a per-request micro-transport,
 2025-era clients via the stateless legacy fallback. Each exchange gets
 its own `mcpServer = await createMcpServer()`; no session ids, no TTL.
+The port is bound before `startHttpTransport` resolves; a listen error
+(e.g. `EADDRINUSE`) rejects it.
 
 Routes:
 
@@ -184,40 +227,71 @@ Routes:
 |---|---|---|
 | `GET /health` | none | `getHealth()` |
 | `GET /status` | none | `getStatus()` (live indexing telemetry) |
-| `GET /version` | none | name, version, node, platform |
+| `GET /version` | none | name, version (package.json), node, platform |
 | `GET /ready` | none | 200 once `indexReady`, else 503 |
 | `GET /metrics` | none | awaits `collectMetrics()`, renders the Prometheus registry |
-| `GET /admin/api/status` | none | `getStatus()` + version + uptime |
-| `POST /index` | yes when `authEnabled` | parses `{ path, project?, force? }` JSON, calls `onIndex(body)` |
-| `POST /mcp` | yes when `authEnabled` | stateless exchange via `createMcpHandler` (both eras) |
+| `GET /admin/api/status` | yes when `authEnabled` | `getStatus()` + version + uptime |
+| `POST /index` | yes when `authEnabled` | body ≤ 64 KiB (else 413) parsed as `{ path, project?, force? }` (invalid JSON / no `path` → 400), then `onIndex(body)`; an `HttpError` thrown by it sets the status |
+| `POST /mcp` | yes when `authEnabled`, then `authorize(identity)` | stateless exchange via `createMcpHandler` (both eras) |
 | `GET /mcp` / `DELETE /mcp` | yes when `authEnabled` | 405 (legacy session verbs — no sessions exist) |
 | anything else | — | 404 |
 
 Every response carries an `X-Request-ID` header (8-char UUID slice).
 
+`POST /index` (`server.ts:runAdminIndex`) re-indexes the served project
+only: `project` defaults to it, a different `project` → 400 (the server
+never switches projects); a missing `path` dir → 400; an index already
+running → 409. On success `path` becomes the project's directory for
+scheduled reindexes, and the response's `crossRepoEdges` is read from the
+stats rollup (the embed stage's own result doesn't carry it).
+
+`authorize` (`server.ts:createProjectAuthorizer`) applies the P8 registry
+entry of the served project, if `<dataDir>/projects/<project>/project.yaml`
+exists (read once at boot): identity scopes must match the project's
+`scopes` (`projectAccessAllowed`, else 403) and requests per `(identity,
+project)` are capped at `quotas.max_queries_per_minute` (sliding window,
+429 + `Retry-After`). The entry's `repos`, cost ceilings and any `config:`
+block are not enforced.
+
+`/metrics` gauges (`server.ts:collectIndexMetrics`, run per scrape from
+the writer's blobs, so cluster workers report the writer's index):
+`code_search_index_age_seconds{project}` (seconds since the last
+successful index — the newer of the stats rollup's `lastIndexed` and this
+process's own last success), `code_search_index_chunks_total{project,repo}`,
+and the two `code_search_vector_index_*` gauges. The collector clears these
+gauges each scrape, so a vanished blob drops its series.
+
 ## 5. Auth middleware (`src/middleware/auth.ts`)
 
 ```
-createAuthMiddleware(config) → authenticate(req, res): AuthIdentity | null
+createAuthMiddleware(config, { rateLimiter? }) → async authenticate(req, res): AuthIdentity | null
 ```
+
+Creating it throws for `jwt` mode without `authJwtSecret`, so the server
+refuses to start (clear error) instead of answering 500.
 
 Branches on `config.authMode`:
 
 - `'none'` → returns `{ mode: 'anonymous', subject: 'anonymous',
-  scopes: ['*'] }` immediately.
+  scopes: ['*'] }` immediately (no rate limit).
 - Missing `Authorization: Bearer ...` header → 401.
 - `'api-key'` → `safeCompare` (timing-safe `timingSafeEqual`) against
-  every entry in `config.authApiKeys`. Subject = `key:<first 8 chars>...`.
+  every entry in `config.authApiKeys`. Subject = `key:<sha256(key)[0:16]>`
+  (distinct per full key; the key itself is never logged). Scopes `['*']`.
 - `'jwt'` → `verifyJwt(token, secret, issuer)`:
-  - HS256 only.
-  - Verifies signature with `createHmac` + `timingSafeEqual`.
-  - Checks `exp` (unix seconds).
-  - Checks `iss` against `config.authJwtIssuer`.
-  - Returns `{ sub, scope? }` on success.
+  - HS256 only; signature via `createHmac` + `timingSafeEqual`.
+  - `exp` required (a token without it is refused) and must be in the future.
+  - `nbf`, when present, must not be in the future.
+  - `iss` must equal `config.authJwtIssuer`.
+  - Scopes = the space-separated `scope` claim; no claim → no scopes.
 
-Rate limiter: in-memory `Map<subject, { count, resetAt }>`, sliding 1
-min window, `config.rateLimitPerMinute` cap. Stale buckets cleaned
-every 5 min.
+Rate limit (`middleware/rate-limit.ts`): a sliding window — a request is
+admitted when fewer than `config.rateLimitPerMinute` requests of the same
+subject were admitted in the preceding 60 s (timestamp log per key, no
+fixed-window boundary burst). 429 responses carry `Retry-After` (seconds
+until the oldest admitted request leaves the window). The same
+`SlidingWindow` backs the P8 per-(identity, project) quota. In cluster mode
+the limiter is the primary's (§3.2.1), so limits are per server.
 
 ## 6. Remote proxy (`src/transports/remote-proxy.ts`)
 
@@ -226,27 +300,25 @@ every 5 min.
 1. `RemoteConnection` instance pinned to `serverUrl` + `apiKey`.
 2. `await remote.health()` — best-effort warm-up; logs warning on
    failure but starts anyway.
-3. `await remote.initialize()` — sends MCP `initialize` JSON-RPC.
-4. Creates a local stdio MCP `Server` and wires four handlers:
-
-| Local handler | Remote method |
-|---|---|
-| `ListToolsRequestSchema` | `tools/list` |
-| `CallToolRequestSchema` | `tools/call` (`{ name, arguments }`) |
-| `ListResourcesRequestSchema` | `resources/list` |
-| `ReadResourceRequestSchema` | `resources/read` |
-
+3. `await remote.initialize()` — an MCP `initialize` round trip used as a
+   startup credentials / reachability check (logged; nothing is retried).
+4. Creates a local stdio MCP `Server` forwarding `tools/list`,
+   `tools/call` (`{ name, arguments }`), `resources/list`,
+   `resources/templates/list`, `resources/read`.
 5. `await server.connect(new StdioServerTransport())`.
 
-`RemoteConnection.request(method, params, id?)`:
+`RemoteConnection.request(method, params)`:
 
-- `POST <serverUrl>/mcp` with JSON-RPC body.
+- `POST <serverUrl>/mcp` with a JSON-RPC body (fresh id per request).
+  The remote is stateless — no session header is sent or kept.
 - Headers: `Content-Type`, `Accept: application/json,
-  text/event-stream`, `Authorization: Bearer <apiKey>` (if set),
-  `mcp-session-id: <captured>` (if set).
-- Captures `mcp-session-id` from response headers for sticky sessions.
-- Parses both `application/json` and `text/event-stream` responses
-  (extracts JSON from `data: ...` lines).
+  text/event-stream`, `Authorization: Bearer <apiKey>` (if set).
+- `text/event-stream` bodies are parsed event by event (`data:` lines of
+  an event joined) and the message whose `id` matches the request is the
+  reply — notifications and other ids are skipped.
+- An HTTP error, an unreachable remote, a missing reply, or a JSON-RPC
+  `error` reply throws `ProtocolError`, which the local server returns to
+  the client as a JSON-RPC error (codes of remote errors are kept).
 
 ## 7. Tools (`src/tools/`)
 
@@ -350,9 +422,10 @@ profiles exist (renders `(not yet profiled)` list).
 | `code-search://repo/{name}/profile` | dynamic; `loadProfile(project, name)` JSON |
 | `code-search://repo/{name}/graph` | dynamic; `<KB>/<repo>/graph.json` |
 
-`registerResources(ctx)` lists only the two static URIs; dynamic ones
-are matched via regex inside `handleResource(uri, ctx)`. Unknown URIs
-return `text/plain "Unknown resource: <uri>"`.
+`registerResources(ctx)` lists the two static URIs (`resources/list`);
+`registerResourceTemplates()` advertises the two dynamic ones
+(`resources/templates/list`), which `handleResource(uri, ctx)` matches by
+regex. Unknown URIs return `text/plain "Unknown resource: <uri>"`.
 
 ## 9. Sources (`src/sources/`)
 
@@ -381,19 +454,33 @@ facade.)
 - Returns `{ name, path, language }[]` shape compatible with
   `discoverRepos`.
 
-## 10. Environment config (`src/core/env-config.ts`)
+## 10. Config (`src/core/config.ts`, `src/core/env-config.ts`)
 
-`loadServerConfig()` returns the full `ServerConfig`, cached in a
-module-level `_config`. `resetServerConfig()` clears for tests.
+`resolveCodeSearchConfig({ cli?, workspaceDir?, configPath? })` merges
+`DEFAULTS` → `~/.code-search/config.yaml` → `<workspaceDir>/.code-search.yaml`
+→ `CODE_SEARCH_*` env → CLI patch, then: binds `0.0.0.0` when auth is on
+and no layer set a host, normalises the reindex interval (§3.5), makes
+`storage.dataDir` absolute, and bridges `CODE_SEARCH_LLM_*` → `ANVIL_LLM_*`.
+`exportDataDir(cfg)` sets `CODE_SEARCH_DATA_DIR` for knowledge-core (its
+only data-dir input); the default `storage.dataDir` is knowledge-core's own
+fallback (`$ANVIL_HOME/knowledge-base`, else `~/.anvil/knowledge-base`).
+`printConfig` redacts secret-named keys (password / secret / token /
+authorization / api key / credential, any depth), every OTEL header value,
+and credentials inside URIs (`scheme://user:***@`).
 
-`CODE_SEARCH_*` env var surface (via `env(key)` helper):
+`loadServerConfig({ cli?, workspaceDir? })` (back-compat shim) returns the
+flat `ServerConfig` + `__unified`, cached in a module-level `_config` (the
+first caller, `src/index.ts`, passes the CLI patch); `resetServerConfig()`
+clears it for tests.
+
+`CODE_SEARCH_*` env var surface:
 
 | Variable | Default | Notes |
 |---|---|---|
 | `PORT` | `3100` | parsed int |
 | `HOST` | `127.0.0.1` if auth=none else `0.0.0.0` | |
-| `TRANSPORT` | `stdio` | `stdio` / `sse` / `streamable-http` |
-| `DATA_DIR` | `''` | passes through to knowledge-core's `getKnowledgeBasePath` |
+| `TRANSPORT` | `stdio` | `stdio` / `streamable-http` (`--serve` forces the latter; `sse` is an error) |
+| `DATA_DIR` | `~/.anvil/knowledge-base` | KB root; daemon sockets / pid files and the P8 registry live under it too |
 | `EMBEDDING_PROVIDER` | `auto` | |
 | `EMBEDDING_MODEL` | — | |
 | `EMBEDDING_DIMENSIONS` | `1024` | |
@@ -405,22 +492,27 @@ module-level `_config`. `resetServerConfig()` clears for tests.
 | `GITHUB_TOKEN` | falls back to `process.env.GITHUB_TOKEN` | |
 | `AUTH_MODE` | `none` | |
 | `AUTH_API_KEYS` | `''` | comma-separated, trimmed |
-| `AUTH_JWT_SECRET` | — | required for `jwt` mode |
+| `AUTH_JWT_SECRET` | — | required for `jwt` mode (startup fails without it) |
 | `AUTH_JWT_ISSUER` | `code-search-mcp` | |
-| `RATE_LIMIT_PER_MINUTE` | `100` | |
-| `LLM_MODE` | auto-resolved | see `resolveLlmMode` |
+| `RATE_LIMIT_PER_MINUTE` | `100` | per identity, sliding window, per server |
+| `REINDEX_INTERVAL` | `0` | see §3.5 |
+| `STRUCTURED_LOGS` | off | JSON log lines from server, daemon and CLI |
+| `DAEMON_DISABLED` | off | CLI `query` never uses a daemon |
+| `LLM_MODE` | `none` | `cli` / `api` / `none` |
 | `LLM_PROVIDER` | `anthropic` | |
 | `LLM_MODEL` | `sonnet` | |
 | `LLM_API_KEY` | falls back to `ANTHROPIC_API_KEY` | |
 | `LLM_BASE_URL` | — | |
 | `CLAUDE_BIN` | `claude` | |
+| `WORKERS` | `1` | >1 → cluster mode (§3.2.1) |
 
-`resolveLlmMode(explicit, apiKey)`:
+`resolveLlmMode(explicit, apiKey)` mirrors agent-core's single-shot (what
+indexing actually uses), with `explicit` = `ANVIL_LLM_MODE` (bridged from
+`llm.mode`):
 
-1. Explicit `'cli'`/`'api'`/`'none'` wins (with API-key sanity check).
-2. `apiKey` set → `'api'`.
-3. `which <claudeBin>` succeeds → `'cli'`.
-4. Else `'none'` (LLM features disabled, indexing still works).
+1. Explicit `'cli'`/`'api'`/`'none'` wins (`api` without a key → `none`).
+2. Otherwise (an unrecognised value): `apiKey` set → `'api'`; `which
+   <claudeBin>` succeeds → `'cli'`; else `'none'`.
 
 API-key bridging at load time:
 
@@ -428,6 +520,40 @@ API-key bridging at load time:
   `OPENAI_API_KEY` / `VOYAGE_API_KEY` (only if not already set).
 - `RERANKER_API_KEY` + provider → `COHERE_API_KEY` / `VOYAGE_API_KEY`.
 - `OLLAMA_HOST` set on `process.env` for downstream consumers.
+
+### 10.1 Daemon + CLI (`src/daemon/`, `src/cli/`, `src/backends/`)
+
+`code-search-daemon --workspace <path>` — project = basename of the
+resolved path (validated like every project name: one path segment, not
+`daemon` / `projects`). Boot: resolve config (workspace layer included) →
+refuse to start if a daemon already answers `health` on
+`<dataDir>/daemon/<project>.sock` (a stale socket is removed) → bind the
+RPC socket (its claim on the project) → write `<project>.pid` → initial
+index → start the watcher. All index runs (initial, watcher batch,
+`index.force`) go through one serial queue; a batch that arrives while a
+watcher run is queued folds into it (one run per batch). `InProcessBackend`
+calls knowledge-core's `invalidateRetriever` after every index run and
+after `index.invalidate`, so the next search sees the new state. On
+SIGINT/SIGTERM it removes only its own socket (inode check; it leaves the
+handle open rather than unlink a path another daemon took over) and its pid
+file (if it still holds its pid).
+
+`RpcServer` dispatches only the handlers' own method names; requests
+without an `id` are notifications (run, never answered); a batch array gets
+one `-32600` error.
+
+`code-search` (`cli/index.ts`) parses each subcommand's own flags and
+positionals in any order (`query --project ws "text"`); unknown flags,
+invalid `--format` / `--top-k` / `--mode` exit 2. `query` / `status` resolve
+the workspace layer from the cwd, `index` from its path. `query` uses the
+daemon when `pickBackend` gets a ping (`--no-daemon` / `daemon.disabled`
+skip it); `status` reports `daemonAlive` from a ping and never touches a
+project that has no index (`indexed: false`, nothing created); `reset`
+deletes only `<dataDir>/<project>` for a valid project name. `code-search
+daemon` runs the daemon as a child and forwards SIGINT/SIGTERM/SIGHUP to
+it, exiting with its status; `serve` / `mcp` run `src/index.ts` in-process
+(`mcp` = `--local`, i.e. stdio over the cwd or a path; `mcp --remote URL`
+is the proxy).
 
 ## 11. File layout
 
@@ -445,7 +571,9 @@ packages/code-search-mcp/
     │
     ├── core/
     │   ├── config.ts                        ← unified CodeSearchConfig resolver
-    │   └── env-config.ts                    ← loadServerConfig (back-compat shim) + resolveLlmMode
+    │   ├── env-config.ts                    ← loadServerConfig (back-compat shim) + resolveLlmMode
+    │   ├── project-name.ts                  ← validateProjectName
+    │   └── version.ts                       ← PACKAGE_VERSION (from package.json)
     │
     ├── backends/                            ← SearchBackend: in-process + daemon client
     ├── daemon/                              ← code-search-daemon: watcher + UDS JSON-RPC
@@ -460,7 +588,8 @@ packages/code-search-mcp/
     │   └── remote-proxy.ts                  ← stdio → /mcp forwarder
     │
     ├── middleware/
-    │   └── auth.ts                          ← none/api-key/jwt + rate limit
+    │   ├── auth.ts                          ← none/api-key/jwt + rate limit
+    │   └── rate-limit.ts                    ← SlidingWindow + RateLimiter
     │
     ├── tools/
     │   ├── search.ts                        ← search_code / _semantic / _exact / get_code_snippet
@@ -496,7 +625,12 @@ Build: `node build.mjs` bundles three bin targets — `dist/index.js`,
 ## 13. Tests
 
 `src/__tests__/` (`node --test` on the built `dist/__tests__/`): config
-resolver, daemon RPC, graph tools (JSON and SQLite system graph), tool
-input validation / descriptors / search metrics, stateless HTTP,
-`/metrics` endpoint, observability, project registry. Retrieval and indexing behaviour is
-covered by `@esankhan3/anvil-knowledge-core`'s tests.
+resolver + CLI flag parsing, daemon RPC (wire + protocol edges), graph
+tools (JSON and SQLite system graph), tool input validation / descriptors /
+search metrics, stateless HTTP, `/metrics` endpoint + index collector,
+observability, project registry, HTTP auth, plus end-to-end tests that
+spawn the built binaries against a git fixture and a fake
+OpenAI-compatible embedder (`_harness.ts`): argv handling, server
+lifecycle, `POST /index` + cluster mode, remote proxy, daemon runtime.
+Retrieval and indexing behaviour is covered by
+`@esankhan3/anvil-knowledge-core`'s tests.
