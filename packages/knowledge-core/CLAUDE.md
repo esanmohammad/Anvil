@@ -130,8 +130,16 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   build at `minRows`, retrain once rows written since the last training
   reach `trainedRows × CODE_SEARCH_VECTOR_RETRAIN_RATIO` (default 1; 0
   disables), on an index-type config change, or once for an index with no
-  training record; then `optimize()`. Records training + health
-  (unindexed rows) in `vector_index.json`, surfaced via `getStats().vectorIndex`.
+  training record; then `optimize()`. After a (re)training — or once, for
+  an index never calibrated — it calibrates `nprobes`: the fewest IVF probes
+  whose recall@10 vs an exact scan reaches 0.95 on ~100 query-like probes
+  the embed run samples (entity names, the names split into words, comment
+  lines — short texts embed away from code chunks, so in-distribution
+  probes would under-probe; `calibrateNprobes` in `vector-recall.ts`).
+  Records training + health (unindexed rows, calibrated `nprobes`) in
+  `vector_index.json`, surfaced via `getStats().vectorIndex`; `getRetriever`
+  applies the calibrated `nprobes` (`setCalibratedNprobes`) unless the index
+  config or `CODE_SEARCH_VECTOR_NPROBES` sets one (default 40 when none).
 - `createEmbeddingProvider` (`src/embedder.ts`) — 6 providers:
   `codestral` / `voyage` / `openai` / `ollama` / `gemini-oauth` /
   `openai-compatible`, plus `auto`.

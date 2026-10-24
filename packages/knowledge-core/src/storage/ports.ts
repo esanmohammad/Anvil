@@ -68,7 +68,9 @@ export interface VectorStorePort {
   phraseSearch(queryText: string, limit?: number, filter?: string): Promise<ScoredChunk[]>;
   upsertChunks(chunks: Array<CodeChunk & { embedding: number[] }>): Promise<void>;
   addChunks(chunks: Array<CodeChunk & { embedding: number[] }>, opts?: { skipIndex?: boolean }): Promise<void>;
-  vectorSearch(queryEmbedding: number[], opts?: { limit?: number; filter?: string }): Promise<ScoredChunk[]>;
+  vectorSearch(queryEmbedding: number[], opts?: { limit?: number; filter?: string; nprobes?: number }): Promise<ScoredChunk[]>;
+  /** Use the writer-calibrated probe count (vector_index.json) for queries. */
+  setCalibratedNprobes(nprobes: number | undefined): void;
   fullTextSearch(queryText: string, limit?: number, filter?: string): Promise<ScoredChunk[]>;
   getByIds(ids: string[]): Promise<CodeChunk[]>;
   getChunksByEntity(

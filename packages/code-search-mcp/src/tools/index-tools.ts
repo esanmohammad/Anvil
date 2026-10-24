@@ -20,6 +20,9 @@ function describeVectorIndex(v: VectorIndexHealth | undefined): string {
       : 'training untracked (retrains on the next writer run)',
   );
   parts.push(`${(v.numUnindexedRows ?? 0).toLocaleString()} unindexed rows`);
+  if (v.nprobes) {
+    parts.push(`${v.nprobes} probes per query (recall@10 ${v.calibratedRecall?.toFixed(3)} on ${v.calibrationQueries} query-like probes)`);
+  }
   if (v.retrainStartedAt) parts.push(`retrain started ${v.retrainStartedAt} has not completed`);
   if (v.lastError) parts.push(`last error: ${v.lastError}`);
   return parts.join('; ');

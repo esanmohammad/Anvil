@@ -17,6 +17,8 @@
 
 import type { VectorIndexHealth } from './types.js';
 import type { BlobStorePort, VectorIndexState, VectorIndexType, VectorStorePort } from './storage/ports.js';
+import { calibrateNprobes } from './vector-recall.js';
+import type { RecallProbe } from './vector-recall.js';
 
 export const VECTOR_INDEX_KEY = 'vector_index.json';
 
@@ -24,6 +26,9 @@ export const VECTOR_INDEX_KEY = 'vector_index.json';
  *  failure) is not retried for this long, so a retrain that can't fit doesn't
  *  take down every writer run. */
 const RETRAIN_BACKOFF_MS = 24 * 3_600_000;
+
+/** Mean recall@10 (vs an exact scan) the calibrated probe count must reach. */
+const TARGET_RECALL = 0.95;
 
 export type VectorIndexAction = 'ensure' | 'retrain' | 'backoff' | 'none';
 
@@ -82,7 +87,9 @@ export async function readVectorIndexHealth(blobs: BlobStorePort): Promise<Vecto
 /**
  * Run the vector-index step of a writer cycle: build / retrain as planned,
  * optimize (fold appends, compact, prune), then record training + health.
- * `rowsWritten` = rows added to the table this run. Non-fatal throughout —
+ * `rowsWritten` = rows added to the table this run. `probes` supplies
+ * query-like embeddings to calibrate nprobes against whenever the index was
+ * (re)trained this run or has never been calibrated. Non-fatal throughout —
  * failures are logged and recorded in `lastError`; a failed retrain keeps the
  * old index and the counter. Returns the record, or null when there is no
  * vector index (no table, or below minRows).
@@ -90,7 +97,13 @@ export async function readVectorIndexHealth(blobs: BlobStorePort): Promise<Vecto
 export async function maintainVectorIndex(
   vectors: VectorStorePort,
   blobs: BlobStorePort,
-  opts: { rowsWritten: number; log?: (msg: string) => void; ratio?: number; minRows?: number },
+  opts: {
+    rowsWritten: number;
+    log?: (msg: string) => void;
+    ratio?: number;
+    minRows?: number;
+    probes?: () => Promise<number[][]>;
+  },
 ): Promise<VectorIndexHealth | null> {
   const log = opts.log ?? ((msg: string) => console.error(`[knowledge-core] ${msg}`));
   const save = async (record: VectorIndexHealth): Promise<void> => {
@@ -166,6 +179,26 @@ export async function maintainVectorIndex(
     numUnindexedRows: after.index.numUnindexedRows,
     checkedAt: new Date().toISOString(),
   });
+
+  // Calibrate after optimize, so every row is indexed and the probes see the
+  // partitions readers will search.
+  const trained = record.trainedAt !== meta?.trainedAt;
+  const probeStore = vectors as unknown as Partial<RecallProbe>;
+  if (opts.probes && (trained || record.nprobes == null) && probeStore.vectorSearchIds && probeStore.vectorSearchExactIds) {
+    try {
+      const queries = await opts.probes();
+      if (queries.length > 0) {
+        const started = Date.now();
+        const c = await calibrateNprobes(probeStore as RecallProbe, queries, {
+          k: 10, target: TARGET_RECALL, maxNprobes: record.numPartitions ?? Math.max(1, Math.round(Math.sqrt(after.rowCount))),
+        });
+        Object.assign(record, { nprobes: c.nprobes, calibratedRecall: c.recall, calibrationQueries: queries.length });
+        outcome = `${outcome ? `${outcome}; ` : ''}nprobes=${c.nprobes} (recall@10 ${c.recall.toFixed(3)} on ${queries.length} probes, ${Date.now() - started}ms)`;
+      }
+    } catch (err) {
+      record.lastError = `nprobes calibration failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
   await save(record);
 
   const since = record.trainedRows
