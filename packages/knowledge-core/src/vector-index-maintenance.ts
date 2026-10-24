@@ -99,6 +99,8 @@ export async function maintainVectorIndex(
   blobs: BlobStorePort,
   opts: {
     rowsWritten: number;
+    /** Rows deleted this run (> 0: the table changed even with nothing written). */
+    rowsDeleted?: number;
     log?: (msg: string) => void;
     ratio?: number;
     minRows?: number;
@@ -155,8 +157,13 @@ export async function maintainVectorIndex(
   }
 
   // Fold appends into every index + compact + prune — even with no vector
-  // index yet (FTS/scalar indexes and fragments need it too).
-  await vectors.optimizeIndexes();
+  // index yet (FTS/scalar indexes and fragments need it too). optimize()
+  // rewrites every index whether or not anything changed (several GB at 1M
+  // rows, kept for the retention window), so a run that wrote, deleted and
+  // trained nothing, and left no row unindexed, skips it.
+  const trained = record.trainedAt !== meta?.trainedAt;
+  const idle = opts.rowsWritten === 0 && !opts.rowsDeleted && !trained && !(await vectors.hasUnindexedRows());
+  if (!idle) await vectors.optimizeIndexes();
 
   const after = await readState();
   if (!after) {
@@ -182,7 +189,6 @@ export async function maintainVectorIndex(
 
   // Calibrate after optimize, so every row is indexed and the probes see the
   // partitions readers will search.
-  const trained = record.trainedAt !== meta?.trainedAt;
   const probeStore = vectors as unknown as Partial<RecallProbe>;
   if (opts.probes && (trained || record.nprobes == null) && probeStore.vectorSearchIds && probeStore.vectorSearchExactIds) {
     try {

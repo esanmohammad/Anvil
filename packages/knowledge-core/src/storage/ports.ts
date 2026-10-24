@@ -60,6 +60,8 @@ export interface VectorStorePort {
   ensureScalarIndexes(): Promise<void>;
   /** Fold newly-appended rows into existing indexes (post-incremental-embed). */
   optimizeIndexes(): Promise<void>;
+  /** Whether any index has rows appended since it was last folded in. */
+  hasUnindexedRows(): Promise<boolean>;
   /** Exact-symbol lookup by entityName (indexed equality) — the literal tier. */
   searchByEntityName(names: string[], limit?: number, filter?: string): Promise<ScoredChunk[]>;
   /** Substring symbol lookup (Zoekt-style partial-identifier tier). */
