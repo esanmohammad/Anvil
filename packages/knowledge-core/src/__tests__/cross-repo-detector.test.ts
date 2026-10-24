@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { correlateCrossRepoEdges, detectCrossRepoEdges, extractCrossRepoSignals } from '../cross-repo-detector.js';
 import type { CrossRepoSignals } from '../cross-repo-detector.js';
+import type { CrossRepoEdge, WorkspaceMap, WorkspacePackage } from '../types.js';
 
 let root: string;
 const repo = (name: string) => ({ name, path: join(root, name), language: 'mixed' });
@@ -213,5 +214,181 @@ describe('correlateCrossRepoEdges — env vars', () => {
     );
     const env = correlateCrossRepoEdges(signals).filter((e) => e.edgeType === 'env-var').map((e) => e.evidence);
     assert.deepEqual(env, ['Shared env var: LEDGER_DB_URL']);
+  });
+});
+
+const fmt = (e: CrossRepoEdge) =>
+  `${e.edgeType} ${e.confidence} ${e.sourceRepo}::${e.sourceNode} -> ${e.targetRepo}::${e.targetNode} | ${e.evidence}`;
+
+describe('correlateCrossRepoEdges — golden edge set', () => {
+  it('emits exactly these edges across all 14 strategies', () => {
+    // Map order decides the direction of symmetric edges (earlier repo = source).
+    const signals = new Map(Object.entries<CrossRepoSignals>({
+      billing: {
+        npmDeps: ['@org/logger', '@org/billing-sdk', '@org/logger'],
+        types: { Invoice: 'src/types.ts', Money: 'src/money.ts' },
+        envVars: ['BILLING_DB_URL', 'NODE_ENV', 'SENTRY_DSN', 'BILLING_DB_URL'],
+        events: { 'invoice.created': 'src/events.ts' },
+        apiRoutes: { '/api/invoices/:param': 'src/server.ts', '/health': 'src/server.ts' },
+        apiClients: { '/health': 'src/self-check.ts' },
+        grpcDefs: { Ledger: 'proto/ledger.proto' },
+        dbTables: { invoices: 'db/schema.sql', customers: 'db/schema.sql' },
+        redisPrefixes: { 'billing:invoice': 'src/cache.ts' },
+        buckets: { 'invoice-pdfs': 'src/pdf.ts' },
+        apiSpecPaths: { '/api/invoices/:param': 'openapi.yaml', '/api/invoices': 'openapi.yaml' },
+        constants: { 'billing.invoice.v1': { name: 'INVOICE_SCHEMA', filePath: 'src/schema.ts' } },
+      },
+      'billing-ui': {
+        npmDeps: ['@org/logger', '@org/ui-kit'],
+        types: { Invoice: 'src/api.ts' },
+        envVars: ['BILLING_URL', 'SENTRY_DSN', 'NODE_ENV'],
+        apiClients: { '/api/invoices/:param': 'src/client.ts', '/api/invoices/:param/lines': 'src/client.ts', '/carts': 'src/cart.ts' },
+        httpCalls: { '/api/invoices/:param': 'src/client.ts', '/api/invoices': 'src/list.ts' },
+        constants: { 'billing.invoice.v1': { name: 'SCHEMA_ID', filePath: 'src/const.ts' } },
+        composeRefs: [
+          { file: 'docker-compose.yml', service: 'billing', evidence: 'Docker Compose depends_on: billing' },
+          { file: 'docker-compose.yml', service: 'billing-ui', evidence: 'Docker Compose depends_on: billing-ui' },
+          { file: 'docker-compose.yml', service: 'postgres', evidence: 'Docker Compose depends_on: postgres' },
+        ],
+      },
+      'billing-worker': {
+        envVars: ['BILLING_DB_URL', 'SENTRY_DSN', 'PORT'],
+        events: { 'invoice.created': 'jobs/consume.go', 'invoice.paid': 'jobs/consume.go' },
+        grpcClients: { Ledger: 'main.go' },
+        dbTables: { invoices: 'internal/repo.go' },
+        redisPrefixes: { 'billing:invoice': 'internal/cache.go' },
+        buckets: { 'invoice-pdfs': 'jobs/export.py' },
+        k8sRefs: [
+          { file: 'k8s/deploy.yaml', service: 'billing', evidence: 'K8s service DNS: billing.prod.svc' },
+          { file: 'k8s/deploy.yaml', service: 'ledger', evidence: 'K8s env service ref: ledger' },
+        ],
+      },
+      'mta-ledger': {
+        npmDeps: ['@org/logger'],
+        envVars: ['SENTRY_DSN', 'AUDIT_URL'],
+        events: { 'invoice.paid': 'src/consumer.ts' },
+        grpcDefs: { Ledger: 'proto/ledger.proto' },
+        grpcClients: { Ledger: 'src/self.ts' },
+        dbTables: { ledger_entries: 'db/001.sql', customers: 'db/002.sql' },
+      },
+      gateway: {
+        envVars: ['SENTRY_DSN', 'AUDIT_URL'],
+        apiRoutes: { '/carts': 'src/routes.ts' },
+        apiClients: { '/health': 'src/probe.ts', '/api/invoices/:param': 'src/proxy.ts' },
+        httpCalls: { '/api/invoices': 'src/proxy.ts' },
+        constants: {
+          'billing.invoice.v1': { name: 'INV', filePath: 'src/c.ts' },
+          'https://auth.example.com': { name: 'AUTH_URL', filePath: 'src/c.ts' },
+        },
+        composeRefs: [{ file: 'deploy/compose.yaml', service: 'mta_ledger', evidence: 'Docker Compose link: mta_ledger' }],
+      },
+      auth: {
+        envVars: ['SENTRY_DSN', 'AUDIT_URL'],
+        types: { Money: 'src/money.ts' },
+        apiSpecPaths: { '/api/invoices': 'specs/openapi.json' },
+        constants: { 'https://auth.example.com': { name: 'ISSUER', filePath: 'src/config.ts' } },
+      },
+      web: { npmDeps: ['@org/ui-kit'], envVars: ['SENTRY_DSN'] },
+    }));
+    const pkg = (name: string, dependencies: string[]): WorkspacePackage =>
+      ({ name, path: '', relativePath: `packages/${name.split('/')[1]}`, ecosystem: 'npm', manifestFile: 'package.json', dependencies });
+    const wsMap = (packages: WorkspacePackage[]): WorkspaceMap =>
+      ({ repoPath: '', packages, nameToPackage: new Map(packages.map((p) => [p.name, p])), pathAliases: new Map() });
+    const workspaceMaps = new Map<string, WorkspaceMap>([
+      ['billing', wsMap([pkg('@billing/api', ['@billing/core', 'lodash']), pkg('@billing/core', ['@billing/core']), pkg('@billing/cli', ['@billing/api', '@billing/core'])])],
+      ['web', wsMap([pkg('@web/app', ['@web/app'])])],
+    ]);
+
+    assert.deepEqual(correlateCrossRepoEdges(signals, workspaceMaps).map(fmt).sort(), [
+      'api-contract 0.9 billing-ui::src/client.ts::/api/invoices/:param -> billing::openapi.yaml::/api/invoices/:param | OpenAPI endpoint: /api/invoices/:param',
+      'api-contract 0.9 billing-ui::src/list.ts::/api/invoices -> auth::specs/openapi.json::/api/invoices | OpenAPI endpoint: /api/invoices',
+      'api-contract 0.9 billing-ui::src/list.ts::/api/invoices -> billing::openapi.yaml::/api/invoices | OpenAPI endpoint: /api/invoices',
+      'api-contract 0.9 gateway::src/proxy.ts::/api/invoices -> auth::specs/openapi.json::/api/invoices | OpenAPI endpoint: /api/invoices',
+      'api-contract 0.9 gateway::src/proxy.ts::/api/invoices -> billing::openapi.yaml::/api/invoices | OpenAPI endpoint: /api/invoices',
+      'database 0.85 billing::db/schema.sql::customers -> mta-ledger::db/002.sql::customers | Shared table: customers',
+      'database 0.85 billing::db/schema.sql::invoices -> billing-worker::internal/repo.go::invoices | Shared table: invoices',
+      'env-var 0.6 billing::env::BILLING_DB_URL -> billing-worker::env::BILLING_DB_URL | Shared env var: BILLING_DB_URL',
+      'env-var 0.6 gateway::env::AUDIT_URL -> auth::env::AUDIT_URL | Shared env var: AUDIT_URL',
+      'env-var 0.6 mta-ledger::env::AUDIT_URL -> auth::env::AUDIT_URL | Shared env var: AUDIT_URL',
+      'env-var 0.6 mta-ledger::env::AUDIT_URL -> gateway::env::AUDIT_URL | Shared env var: AUDIT_URL',
+      'event-schema 0.85 billing-worker::jobs/consume.go::invoice.paid -> mta-ledger::src/consumer.ts::invoice.paid | Shared event/topic: invoice.paid',
+      'event-schema 0.85 billing::src/events.ts::invoice.created -> billing-worker::jobs/consume.go::invoice.created | Shared event/topic: invoice.created',
+      'grpc 0.9 billing-worker::main.go::LedgerClient -> billing::proto/ledger.proto::Ledger | gRPC service: Ledger',
+      'grpc 0.9 billing-worker::main.go::LedgerClient -> mta-ledger::proto/ledger.proto::Ledger | gRPC service: Ledger',
+      'grpc 0.9 mta-ledger::src/self.ts::LedgerClient -> billing::proto/ledger.proto::Ledger | gRPC service: Ledger',
+      'http 0.8 billing-ui::src/cart.ts::/carts -> gateway::src/routes.ts::/carts | API endpoint: /carts',
+      'http 0.8 billing-ui::src/client.ts::/api/invoices/:param -> billing::src/server.ts::/api/invoices/:param | API endpoint: /api/invoices/:param',
+      'http 0.8 billing-worker::k8s/deploy.yaml::k8s-env -> mta-ledger::k8s-service::ledger | K8s env service ref: ledger',
+      'http 0.8 billing-worker::k8s/deploy.yaml::k8s-ref -> billing::k8s-service::billing | K8s service DNS: billing.prod.svc',
+      'http 0.8 gateway::src/probe.ts::/health -> billing::src/server.ts::/health | API endpoint: /health',
+      'http 0.8 gateway::src/proxy.ts::/api/invoices/:param -> billing::src/server.ts::/api/invoices/:param | API endpoint: /api/invoices/:param',
+      'http 0.85 billing-ui::docker-compose.yml::compose -> billing::service::billing | Docker Compose depends_on: billing',
+      'http 0.85 gateway::deploy/compose.yaml::compose -> mta-ledger::service::mta_ledger | Docker Compose link: mta_ledger',
+      'npm-dep 0.7 billing-ui::package.json::@org/logger -> mta-ledger::package.json::@org/logger | Shared scoped dependency: @org/logger',
+      'npm-dep 0.7 billing-ui::package.json::@org/ui-kit -> web::package.json::@org/ui-kit | Shared scoped dependency: @org/ui-kit',
+      'npm-dep 0.7 billing::package.json::@org/logger -> billing-ui::package.json::@org/logger | Shared scoped dependency: @org/logger',
+      'npm-dep 0.7 billing::package.json::@org/logger -> mta-ledger::package.json::@org/logger | Shared scoped dependency: @org/logger',
+      'redis 0.75 billing::src/cache.ts::redis:billing:invoice -> billing-worker::internal/cache.go::redis:billing:invoice | Shared Redis key prefix: billing:invoice',
+      's3 0.8 billing::src/pdf.ts::s3:invoice-pdfs -> billing-worker::jobs/export.py::s3:invoice-pdfs | Shared bucket: invoice-pdfs',
+      'shared-constant 0.7 billing-ui::src/const.ts::SCHEMA_ID -> gateway::src/c.ts::INV | Shared constant value: "billing.invoice.v1" (SCHEMA_ID / INV)',
+      'shared-constant 0.7 billing::src/schema.ts::INVOICE_SCHEMA -> billing-ui::src/const.ts::SCHEMA_ID | Shared constant value: "billing.invoice.v1" (INVOICE_SCHEMA / SCHEMA_ID)',
+      'shared-constant 0.7 billing::src/schema.ts::INVOICE_SCHEMA -> gateway::src/c.ts::INV | Shared constant value: "billing.invoice.v1" (INVOICE_SCHEMA / INV)',
+      'shared-constant 0.7 gateway::src/c.ts::AUTH_URL -> auth::src/config.ts::ISSUER | Shared constant value: "https://auth.example.com" (AUTH_URL / ISSUER)',
+      'shared-type 0.9 billing::src/money.ts::Money -> auth::src/money.ts::Money | Shared type: Money',
+      'shared-type 0.9 billing::src/types.ts::Invoice -> billing-ui::src/api.ts::Invoice | Shared type: Invoice',
+      'workspace-dep 1 billing::pkg::@billing/api -> billing::pkg::@billing/core | @billing/api depends on @billing/core (package.json)',
+      'workspace-dep 1 billing::pkg::@billing/cli -> billing::pkg::@billing/api | @billing/cli depends on @billing/api (package.json)',
+      'workspace-dep 1 billing::pkg::@billing/cli -> billing::pkg::@billing/core | @billing/cli depends on @billing/core (package.json)',
+    ]);
+  });
+});
+
+describe('correlateCrossRepoEdges — scale', () => {
+  it('joins 3000 repos in time linear in signals + edges, not repo pairs', () => {
+    // Every repo holds 10 keys of its own per field plus one it shares with its
+    // neighbour, and calls the next repo: ~470k signals, 27k edges. Comparing
+    // repo pairs would take ~700M key lookups here (minutes); the hash join
+    // takes well under a second.
+    const N = 3000;
+    const own = (field: string, i: number) => Array.from({ length: 10 }, (_, k) => `${field}-${i}-${k}`);
+    const keyed = (field: string, i: number, extra: string) =>
+      Object.fromEntries([...own(field, i), extra].map((k) => [k, `src/${field}.ts`]));
+    const pair = (field: string, i: number) => keyed(field, i, `${field}-pair-${i >> 1}`);
+    const next = (i: number) => (i + 1) % N;
+    const signals = new Map<string, CrossRepoSignals>(Array.from({ length: N }, (_, i) => [`svc-${i}`, {
+      npmDeps: [...own('@org/npm', i), `@org/npm-pair-${i >> 1}`],
+      envVars: [...own('ENV', i), `ENV_PAIR_${i >> 1}`],
+      types: pair('type', i),
+      events: pair('event', i),
+      dbTables: pair('table', i),
+      redisPrefixes: pair('redis', i),
+      buckets: pair('bucket', i),
+      constants: Object.fromEntries([...own('v/const', i), `v/const-pair-${i >> 1}`].map((v) => [v, { name: 'C', filePath: 'src/c.ts' }])),
+      apiRoutes: keyed('/route', i, `/route/${i}`),
+      apiClients: keyed('/call', i, `/route/${next(i)}`),
+      grpcDefs: keyed('Svc', i, `Svc${i}`),
+      grpcClients: keyed('Cli', i, `Svc${next(i)}`),
+      apiSpecPaths: keyed('/spec', i, `/spec/${i}`),
+      httpCalls: keyed('/fetch', i, `/spec/${next(i)}`),
+      composeRefs: [{ file: 'docker-compose.yml', service: `svc-${next(i)}`, evidence: 'compose' }],
+      k8sRefs: [{ file: 'k8s/app.yaml', service: `svc-${next(i)}`, evidence: 'K8s service DNS' }],
+    }]));
+
+    const start = performance.now();
+    const edges = correlateCrossRepoEdges(signals);
+    const ms = performance.now() - start;
+
+    // 8 symmetric strategies × N/2 pairs + 5 directional strategies × N calls.
+    assert.equal(edges.length, 8 * (N / 2) + 5 * N);
+    assert.ok(ms < 5000, `correlating ${N} repos took ${ms.toFixed(0)} ms`);
+  });
+
+  it('keeps every edge of a strategy too large to spread into one call', () => {
+    // 600 repos sharing one type: 179,700 edges, past V8's ~120k argument limit.
+    const N = 600;
+    const signals = new Map<string, CrossRepoSignals>(
+      Array.from({ length: N }, (_, i) => [`svc-${i}`, { types: { Tenant: 'src/tenant.ts' } }]),
+    );
+    assert.equal(correlateCrossRepoEdges(signals).length, (N * (N - 1)) / 2);
   });
 });

@@ -585,7 +585,14 @@ endpoints share the code graph's file keys); `buildKB` runs it in the worker
 and persists it as `<repo>/signals.json`. `correlateCrossRepoEdges(signals,
 workspaceMaps)` runs the 14 join strategies over those bundles and emits
 typed `CrossRepoEdge` rows, so partial cycles correlate stored signals
-without re-scanning unchanged repos.
+without re-scanning unchanged repos. Each strategy joins on the shared value
+(package, type, env var, topic, route path, service, table, key prefix,
+bucket, constant): symmetric ones index each value's holders as the repos are
+visited and pair a repo with the earlier holders (`joinPairwise`, earlier repo
+= source), directional ones index the clients by value and look each provided
+value up once (`joinProviderConsumer`), compose / k8s refs resolve through a
+repo-name map. Cost is O(signals + edges), not O(repos²); the edges themselves
+are still pairwise when many repos share a value.
 
 `detectSemanticEdges(...)` (`src/semantic-edge-detector.ts`) — LLM-inferred
 edges between repos. Exported only; `buildKB` doesn't call it.
