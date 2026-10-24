@@ -10,7 +10,8 @@
  */
 
 import { mkdirSync, rmSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { exec, execSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { chunkRepo, chunkChangedFiles, CHUNK_ID_VERSION } from './chunker.js';
 import { buildAstGraph, incrementalGraphUpdate, generateGraphReport } from './ast-graph-builder.js';
@@ -55,9 +56,20 @@ export interface RepoIndexMeta {
   chunkIdVersion?: number;
 }
 
+const execAsync = promisify(exec);
+
 export function getRepoSha(repoPath: string): string | null {
   try {
     return execSync('git rev-parse HEAD', { cwd: repoPath, stdio: 'pipe', encoding: 'utf-8', timeout: 5000 }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/** {@link getRepoSha} without blocking the event loop. */
+export async function getRepoShaAsync(repoPath: string): Promise<string | null> {
+  try {
+    return (await execAsync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf-8', timeout: 5000 })).stdout.trim();
   } catch {
     return null;
   }
@@ -72,6 +84,17 @@ export function getRemoteSha(cloneUrl: string): string | null {
       stdio: 'pipe', encoding: 'utf-8', timeout: 30_000,
     });
     const sha = out.split(/\s/)[0]?.trim();
+    return sha && /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+/** {@link getRemoteSha} without blocking the event loop. */
+export async function getRemoteShaAsync(cloneUrl: string): Promise<string | null> {
+  try {
+    const { stdout } = await execAsync(`git ls-remote ${JSON.stringify(cloneUrl)} HEAD`, { encoding: 'utf-8', timeout: 30_000 });
+    const sha = stdout.split(/\s/)[0]?.trim();
     return sha && /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   } catch {
     return null;

@@ -1,4 +1,5 @@
-import { execSync } from 'node:child_process';
+import { exec, execSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
@@ -106,28 +107,40 @@ export function getCommittedChanges(repoPath: string, sinceCommit: string): GitD
   }
 }
 
+/** The listings an uncommitted-changes check combines: staged, unstaged, untracked. */
+const UNCOMMITTED_CMDS = [
+  'git diff --name-status --cached',
+  'git diff --name-status',
+  'git ls-files --others --exclude-standard',
+];
+
+function uncommittedFromOutputs([staged, unstaged, untracked]: string[]): GitDiff {
+  const untrackedFiles = untracked ? untracked.split('\n').filter(f => f && isSourceFile(f)) : [];
+  return mergeDiffs(parseNameStatus(staged), parseNameStatus(unstaged), untrackedFiles);
+}
+
 /**
  * Get uncommitted changes (staged + unstaged + untracked).
  */
 export function getUncommittedChanges(repoPath: string): GitDiff {
   try {
-    const staged = execSync('git diff --name-status --cached', {
+    return uncommittedFromOutputs(UNCOMMITTED_CMDS.map((cmd) => execSync(cmd, {
       cwd: repoPath, encoding: 'utf-8', timeout: 5_000, stdio: ['pipe', 'pipe', 'pipe']
-    }).trim();
+    }).trim()));
+  } catch {
+    return { added: [], modified: [], deleted: [], renamed: [], fallbackToFull: false };
+  }
+}
 
-    const unstaged = execSync('git diff --name-status', {
-      cwd: repoPath, encoding: 'utf-8', timeout: 5_000, stdio: ['pipe', 'pipe', 'pipe']
-    }).trim();
+const execAsync = promisify(exec);
 
-    const untracked = execSync('git ls-files --others --exclude-standard', {
-      cwd: repoPath, encoding: 'utf-8', timeout: 5_000, stdio: ['pipe', 'pipe', 'pipe']
-    }).trim();
-
-    const stagedDiff = parseNameStatus(staged);
-    const unstagedDiff = parseNameStatus(unstaged);
-    const untrackedFiles = untracked ? untracked.split('\n').filter(f => f && isSourceFile(f)) : [];
-
-    return mergeDiffs(stagedDiff, unstagedDiff, untrackedFiles);
+/** {@link getUncommittedChanges} without blocking the event loop, so many
+ *  repos can be checked at once. */
+export async function getUncommittedChangesAsync(repoPath: string): Promise<GitDiff> {
+  try {
+    const outputs = await Promise.all(UNCOMMITTED_CMDS.map(async (cmd) =>
+      (await execAsync(cmd, { cwd: repoPath, encoding: 'utf-8', timeout: 5_000 })).stdout.trim()));
+    return uncommittedFromOutputs(outputs);
   } catch {
     return { added: [], modified: [], deleted: [], renamed: [], fallbackToFull: false };
   }
@@ -168,7 +181,15 @@ export function getDeletedFilesList(diff: GitDiff): string[] {
 export type WorkingTreeState = Record<string, string>;
 
 export function getWorkingTreeState(repoPath: string): WorkingTreeState {
-  const changes = getUncommittedChanges(repoPath);
+  return workingTreeStateOf(repoPath, getUncommittedChanges(repoPath));
+}
+
+/** {@link getWorkingTreeState} without blocking the event loop. */
+export async function getWorkingTreeStateAsync(repoPath: string): Promise<WorkingTreeState> {
+  return workingTreeStateOf(repoPath, await getUncommittedChangesAsync(repoPath));
+}
+
+function workingTreeStateOf(repoPath: string, changes: GitDiff): WorkingTreeState {
   const state: WorkingTreeState = {};
   const present = [...changes.added, ...changes.modified, ...changes.renamed.map((r) => r.to)];
   const gone = [...changes.deleted, ...changes.renamed.map((r) => r.from)];

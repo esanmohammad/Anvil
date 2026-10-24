@@ -12,7 +12,7 @@ import { cosineSimilarity } from './query-router.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { correlateCrossRepoEdges, CROSS_REPO_SIGNALS_VERSION } from './cross-repo-detector.js';
-import { getWorkingTreeState, sameWorkingTreeState } from './git-diff.js';
+import { getWorkingTreeStateAsync, sameWorkingTreeState } from './git-diff.js';
 import type { WorkingTreeState } from './git-diff.js';
 import type { CrossRepoSignals } from './cross-repo-detector.js';
 import { HybridRetriever } from './retriever.js';
@@ -26,7 +26,7 @@ import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { iterateChunksFile } from './chunks-io.js';
 import { writeSystemGraphSqlite, createSystemGraphSqliteWriter } from './graph-store.js';
 import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
-import { processRepoPipeline, getRepoSha, getRemoteSha, readRepoIndexMeta } from './repo-pipeline.js';
+import { processRepoPipeline, getRepoSha, getRepoShaAsync, getRemoteShaAsync, readRepoIndexMeta } from './repo-pipeline.js';
 import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
 
 // ---------------------------------------------------------------------------
@@ -141,43 +141,54 @@ export class KnowledgeIndexer {
     const skippedRepos: string[] = [];
     const skippedMeta = new Map<string, RepoIndexMeta>();
 
-    for (const repo of repos) {
-      if (opts?.force) {
-        reposToIndex.push(repo);
-        continue;
-      }
+    // Is each repo unchanged since the last index? A check is a few git
+    // processes (~0.2 s for the working-tree listings on a large checkout), so
+    // checks run concurrently — sequentially they cost ~0.2 s × repos on every
+    // cycle, a minute at a few hundred repos, even when nothing changed.
+    const checkRepo = async (repo: (typeof repos)[number]): Promise<{ meta: RepoIndexMeta; sha: string; hasArtifacts: boolean } | null> => {
       // Remote repos: compare the ls-remote HEAD sha — unchanged repos never clone.
-      const currentSha = repo.cloneUrl ? getRemoteSha(repo.cloneUrl) : getRepoSha(repo.path);
-      const meta = await readRepoIndexMeta(basePath, repo.name, storage.blobs);
+      const [currentSha, meta] = await Promise.all([
+        repo.cloneUrl ? getRemoteShaAsync(repo.cloneUrl) : getRepoShaAsync(repo.path),
+        readRepoIndexMeta(basePath, repo.name, storage.blobs),
+      ]);
+      if (!meta || !currentSha || meta.lastIndexedSha !== currentSha) return null;
       // Unchanged = same HEAD AND (local checkouts) the same uncommitted edits
       // as last indexed — saved-but-uncommitted work must still be picked up.
-      const treeUnchanged = repo.cloneUrl
-        ? true
-        : sameWorkingTreeState(meta?.workingTree ?? {}, getWorkingTreeState(repo.path));
-      if (meta && currentSha && meta.lastIndexedSha === currentSha && treeUnchanged) {
-        // A skipped repo is served entirely from its stored artifacts (graph +
-        // cross-repo signals + chunks carried forward) — no clone, no AST
-        // re-parse. An index whose signals are missing or in an older format,
-        // or whose chunks use an older id scheme, must be re-indexed once.
-        const signals = await storage.blobs
-          .getJson<CrossRepoSignals>(`${repo.name}/signals.json`)
-          .catch(() => null);
-        const hasArtifacts =
-          meta.chunkIdVersion === CHUNK_ID_VERSION &&
-          (await storage.blobs.exists(`${repo.name}/graph.json`)) &&
-          signals?.version === CROSS_REPO_SIGNALS_VERSION;
-        if (hasArtifacts) {
-          skippedRepos.push(repo.name);
-          skippedMeta.set(repo.name, meta);
-          log(`Skipping ${repo.name} — unchanged (${currentSha.slice(0, 7)})`);
-        } else {
-          reposToIndex.push(repo);
-          log(`Re-indexing ${repo.name} — unchanged but stored graph/signals missing or outdated (pre-upgrade index)`);
-        }
+      if (!repo.cloneUrl && !sameWorkingTreeState(meta.workingTree ?? {}, await getWorkingTreeStateAsync(repo.path))) {
+        return null;
+      }
+      // A skipped repo is served entirely from its stored artifacts (graph +
+      // cross-repo signals + chunks carried forward) — no clone, no AST
+      // re-parse. An index whose signals are missing or in an older format,
+      // or whose chunks use an older id scheme, must be re-indexed once.
+      const signals = await storage.blobs
+        .getJson<CrossRepoSignals>(`${repo.name}/signals.json`)
+        .catch(() => null);
+      const hasArtifacts =
+        meta.chunkIdVersion === CHUNK_ID_VERSION &&
+        (await storage.blobs.exists(`${repo.name}/graph.json`)) &&
+        signals?.version === CROSS_REPO_SIGNALS_VERSION;
+      return { meta, sha: currentSha, hasArtifacts };
+    };
+    const checks = opts?.force
+      ? repos.map(() => null)
+      : await runReposPooled(repos, {
+          concurrency: resolveIndexConcurrency(repos.length),
+          workerUrl: null,
+          inThread: checkRepo,
+          toMessage: () => null,
+        });
+    repos.forEach((repo, i) => {
+      const check = checks[i];
+      if (check?.hasArtifacts) {
+        skippedRepos.push(repo.name);
+        skippedMeta.set(repo.name, check.meta);
+        log(`Skipping ${repo.name} — unchanged (${check.sha.slice(0, 7)})`);
       } else {
         reposToIndex.push(repo);
+        if (check) log(`Re-indexing ${repo.name} — unchanged but stored graph/signals missing or outdated (pre-upgrade index)`);
       }
-    }
+    });
 
     // Repos the last cycle indexed that are no longer in the workspace: their
     // chunks drop out of chunks.json below (embedChunks then sweeps their rows)
