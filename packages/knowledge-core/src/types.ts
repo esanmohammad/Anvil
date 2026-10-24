@@ -1,6 +1,6 @@
 // Code chunk — atomic unit of knowledge
 export interface CodeChunk {
-  id: string;                    // deterministic: sha256(filePath + startLine + endLine)
+  id: string;                    // deterministic: sha256(repoName, filePath, startLine, endLine)
   filePath: string;              // relative to repo root
   repoName: string;
   project: string;

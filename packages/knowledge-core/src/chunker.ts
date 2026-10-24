@@ -181,9 +181,15 @@ function patternsForLanguage(lang: string): BoundaryPattern[] {
   }
 }
 
-function chunkId(filePath: string, startLine: number, endLine: number): string {
+/** Bump when chunk ids change scheme: buildKB re-chunks (never skips or carries
+ *  forward) a repo whose index_meta records another version. 2 = repo-scoped ids. */
+export const CHUNK_ID_VERSION = 2;
+
+/** Ids are unique per project: the same path + line range in two repos must
+ *  not collide, and fields are separated so (a.ts, 1, 23) ≠ (a.ts, 12, 3). */
+function chunkId(repoName: string, filePath: string, startLine: number, endLine: number): string {
   return createHash('sha256')
-    .update(`${filePath}${startLine}${endLine}`)
+    .update(`${repoName}\0${filePath}\0${startLine}\0${endLine}`)
     .digest('hex')
     .slice(0, 16);
 }
@@ -336,7 +342,7 @@ function chunkFile(
   ) => {
     const ctxContent = `${contextPrefix}\n${content}`;
     const tokens = Math.ceil(ctxContent.length / 4);
-    const id = chunkId(relPath, startLine, endLine);
+    const id = chunkId(repoName, relPath, startLine, endLine);
     chunks.push({
       id,
       filePath: relPath,
@@ -504,6 +510,10 @@ export async function chunkRepo(
 /**
  * Chunk only the files that git diff identified as changed.
  * Much faster than chunkRepo() which iterates ALL files.
+ *
+ * The returned `fileIndex` covers the whole repo: `cachedFiles` (the previous
+ * index) minus the diffed paths, plus the re-chunked ones — so it stays the
+ * complete file list a later full re-chunk diffs against.
  */
 export async function chunkChangedFiles(
   repoPath: string,
@@ -512,10 +522,12 @@ export async function chunkChangedFiles(
   config: { maxTokens: number },
   diff: { added: string[]; modified: string[]; deleted: string[] },
   onChunk?: (chunk: CodeChunk) => void,
+  cachedFiles?: Record<string, FileIndexEntry>,
 ): Promise<ChunkResult> {
   const allChunks: CodeChunk[] = [];
   const changedFiles: string[] = [];
-  const fileIndex: Record<string, FileIndexEntry> = {};
+  const fileIndex: Record<string, FileIndexEntry> = { ...cachedFiles };
+  for (const relPath of [...diff.added, ...diff.modified, ...diff.deleted]) delete fileIndex[relPath];
 
   // Only chunk added + modified files
   for (const relPath of [...diff.added, ...diff.modified]) {

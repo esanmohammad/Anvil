@@ -12,7 +12,7 @@
 import { mkdirSync, rmSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
-import { chunkRepo, chunkChangedFiles } from './chunker.js';
+import { chunkRepo, chunkChangedFiles, CHUNK_ID_VERSION } from './chunker.js';
 import { buildAstGraph, incrementalGraphUpdate, generateGraphReport } from './ast-graph-builder.js';
 import { detectWorkspace } from './workspace-detector.js';
 import {
@@ -45,6 +45,9 @@ export interface RepoIndexMeta {
   /** Uncommitted state indexed alongside `lastIndexedSha` (local checkouts):
    *  path → content hash of every file differing from HEAD. */
   workingTree?: WorkingTreeState;
+  /** Chunk-id scheme the repo's chunks were written with ({@link CHUNK_ID_VERSION});
+   *  absent before v2. Any other value → the repo is re-chunked from scratch. */
+  chunkIdVersion?: number;
 }
 
 export function getRepoSha(repoPath: string): string | null {
@@ -158,7 +161,10 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     ? resolveStorage(project, { storage: job.storage } as KnowledgeConfig).blobs
     : new FsBlobStore(basePath);
 
-  const meta = force ? null : await readRepoIndexMeta(basePath, repoName, blobs);
+  // Chunks written under another id scheme can't be diffed or carried forward:
+  // treat that repo like a first index (full re-chunk, no file cache).
+  const stored = force ? null : await readRepoIndexMeta(basePath, repoName, blobs);
+  const meta = stored?.chunkIdVersion === CHUNK_ID_VERSION ? stored : null;
   // Uncommitted edits count too (local checkouts; a fresh clone has none).
   // At an unchanged HEAD, diff the working tree against the state indexed last
   // time — an edit already indexed isn't re-chunked (and re-embedded) every
@@ -206,7 +212,7 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
     let result: Awaited<ReturnType<typeof chunkRepo>>;
     try {
       result = useIncremental
-        ? await chunkChangedFiles(repoPath, repoName, project, chunking, diff!, writer.write)
+        ? await chunkChangedFiles(repoPath, repoName, project, chunking, diff!, writer.write, meta?.files)
         : await chunkRepo(repoPath, repoName, project, chunking, meta?.files ?? undefined, writer.write);
     } finally {
       writer.close();
