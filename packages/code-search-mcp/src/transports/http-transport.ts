@@ -14,13 +14,42 @@ import { randomUUID } from 'node:crypto';
 import { createMcpHandler, type Server } from '@modelcontextprotocol/server';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import type { ServerConfig } from '../core/env-config.js';
+import { PACKAGE_VERSION } from '../core/version.js';
 import { createAuthMiddleware, type AuthIdentity } from '../middleware/auth.js';
-import { registry, metrics } from '../observability/metrics.js';
+import type { RateLimiter } from '../middleware/rate-limit.js';
+import { registry } from '../observability/metrics.js';
+import { getComponentLogger } from '../observability/logger.js';
+
+const log = getComponentLogger('code-search-mcp');
 
 /** Factory that creates a fresh, fully-wired MCP Server instance */
 export type McpServerFactory = () => Promise<{
   server: Server;
 }>;
+
+/** An error whose HTTP status the transport should answer with. */
+export class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+/** `ok: false` carries the HTTP status + error to answer with. */
+export interface AuthzDecision {
+  ok: boolean;
+  status?: number;
+  error?: string;
+  retryAfterSec?: number;
+}
+
+export interface IndexRequestBody {
+  path: string;
+  project?: string;
+  force?: boolean;
+}
+
+/** POST /index bodies are tiny JSON objects; anything bigger is refused. */
+const MAX_INDEX_BODY_BYTES = 64 * 1024;
 
 export interface HttpTransportOptions {
   config: ServerConfig;
@@ -32,13 +61,53 @@ export interface HttpTransportOptions {
   getStatus?: () => Record<string, unknown>;
   /** Refresh gauges that need async reads before GET /metrics renders. */
   collectMetrics?: () => Promise<void>;
-  /** Handler for POST /index — allows triggering indexing via REST */
-  onIndex?: (body: { path: string; project?: string; force?: boolean }) => Promise<Record<string, unknown>>;
+  /** Handler for POST /index — allows triggering indexing via REST. Throw an
+   *  HttpError to answer with its status. */
+  onIndex?: (body: IndexRequestBody) => Promise<Record<string, unknown>>;
+  /** Per-request authorization of an authenticated identity on /mcp
+   *  (project scopes + query quota). */
+  authorize?: (identity: AuthIdentity) => Promise<AuthzDecision>;
+  /** Rate limiter behind the auth middleware (default: this process's window). */
+  rateLimiter?: RateLimiter;
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+  res.end(JSON.stringify(body));
+}
+
+/** Read a request body up to `limit` bytes; null when it was larger (413 sent). */
+function readBody(req: IncomingMessage, res: ServerResponse, limit: number): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    if (Number(req.headers['content-length'] ?? 0) > limit) {
+      sendJson(res, 413, { error: `Request body exceeds ${limit} bytes` }, { Connection: 'close' });
+      req.resume();
+      resolve(null);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let tooLarge = false;
+    req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return;
+      size += chunk.length;
+      if (size > limit) {
+        tooLarge = true;
+        sendJson(res, 413, { error: `Request body exceeds ${limit} bytes` }, { Connection: 'close' });
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => { if (!tooLarge) resolve(Buffer.concat(chunks).toString('utf-8')); });
+    req.on('error', reject);
+  });
 }
 
 export async function startHttpTransport(opts: HttpTransportOptions): Promise<NodeHttpServer> {
   const { config, createMcpServer, onReady, getHealth } = opts;
-  const authenticate = createAuthMiddleware(config);
+  // Throws for an unusable auth config (jwt without a secret) — before listen.
+  const authenticate = createAuthMiddleware(config, { rateLimiter: opts.rateLimiter });
 
   // P7 — uptime for /admin/api/status.
   const startedAt = Date.now();
@@ -48,7 +117,7 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
   // fallback (fresh instance per exchange). GET/DELETE (legacy session verbs)
   // are answered 405 by the handler itself.
   const mcpHandler = createMcpHandler(async () => (await createMcpServer()).server, {
-    onerror: (err) => console.error(`[code-search-mcp] MCP handler error: ${err.message}`),
+    onerror: (err) => log.error(`MCP handler error: ${err.message}`),
   });
   const handleMcp = toNodeHandler(mcpHandler);
 
@@ -63,11 +132,7 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
     // ── Health check (no auth) ──────────────────────────────────────
     if (path === '/health' && req.method === 'GET') {
       const health = getHealth?.() ?? {};
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: 'ok',
-        ...health,
-      }));
+      sendJson(res, 200, { status: 'ok', ...health });
       return;
     }
 
@@ -81,13 +146,12 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
 
     // ── Version (P7) ────────────────────────────────────────────────
     if (path === '/version' && req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
+      sendJson(res, 200, {
         name: 'code-search-mcp',
-        version: '1.0.0',
+        version: PACKAGE_VERSION,
         node: process.version,
         platform: process.platform,
-      }));
+      });
       return;
     }
 
@@ -95,17 +159,12 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
     if (path === '/ready' && req.method === 'GET') {
       const health = getHealth?.() ?? {};
       const ready = health.indexReady === true;
-      res.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ready, ...health }));
+      sendJson(res, ready ? 200 : 503, { ready, ...health });
       return;
     }
 
     // ── Prometheus metrics (P7) ────────────────────────────────────
     if (path === '/metrics' && req.method === 'GET') {
-      // Update gauges with current state.
-      const status = opts.getStatus?.() ?? {};
-      const indexing = (status.indexing as { phase?: string; percent?: number } | undefined);
-      metrics.indexAge.set(0, { phase: indexing?.phase ?? 'idle' });
       try {
         await opts.collectMetrics?.();
       } catch { /* a failed collector must not fail the scrape */ }
@@ -114,61 +173,63 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
       return;
     }
 
-    // ── Admin JSON status (P7) ─────────────────────────────────────
+    // ── Admin JSON status (P7) — exposes paths + history, so authed ──
     if (path === '/admin/api/status' && req.method === 'GET') {
+      if (config.authEnabled && !(await authenticate(req, res))) return;
       const status = opts.getStatus?.() ?? {};
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        version: '1.0.0',
+        version: PACKAGE_VERSION,
         uptime: Math.floor((Date.now() - startedAt) / 1000),
         ...status,
       }, null, 2));
       return;
     }
 
-    // ── Admin: Index a new path (POST /index) ─────────────────────
+    // ── Admin: Index a path (POST /index) ─────────────────────────
     if (path === '/index' && req.method === 'POST') {
-      // Auth required even if MCP auth is disabled — this is an admin endpoint
-      if (config.authEnabled) {
-        const identity = authenticate(req, res);
-        if (!identity) return;
-      }
+      if (config.authEnabled && !(await authenticate(req, res))) return;
 
-      let body = '';
-      req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
-      req.on('end', async () => {
-        try {
-          const parsed = JSON.parse(body) as { path: string; project?: string; force?: boolean };
-          if (!parsed.path) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: '`path` is required' }));
-            return;
-          }
-          if (!opts.onIndex) {
-            res.writeHead(501, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Indexing handler not configured' }));
-            return;
-          }
-          const result = await opts.onIndex(parsed);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(result));
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: msg }));
-          }
-        }
-      });
+      const raw = await readBody(req, res, MAX_INDEX_BODY_BYTES);
+      if (raw === null) return;
+      let body: IndexRequestBody;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        sendJson(res, 400, { error: 'Body must be a JSON object: {"path": "...", "project"?: "...", "force"?: true}' });
+        return;
+      }
+      if (typeof body !== 'object' || body === null || typeof body.path !== 'string' || !body.path) {
+        sendJson(res, 400, { error: '`path` is required' });
+        return;
+      }
+      if (!opts.onIndex) {
+        sendJson(res, 501, { error: 'Indexing handler not configured' });
+        return;
+      }
+      try {
+        sendJson(res, 200, await opts.onIndex(body));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const status = err instanceof HttpError ? err.status : 500;
+        if (!res.headersSent) sendJson(res, status, { error: msg });
+      }
       return;
     }
 
     // ── MCP endpoint ────────────────────────────────────────────────
     if (path === '/mcp') {
-      // Auth check
-      if (config.authEnabled) {
-        const identity = authenticate(req, res);
-        if (!identity) return;
+      const identity = config.authEnabled
+        ? await authenticate(req, res)
+        : { mode: 'anonymous' as const, subject: 'anonymous', scopes: ['*'] };
+      if (!identity) return;
+      if (opts.authorize) {
+        const decision = await opts.authorize(identity);
+        if (!decision.ok) {
+          sendJson(res, decision.status ?? 403, { error: decision.error },
+            decision.retryAfterSec ? { 'Retry-After': String(decision.retryAfterSec) } : {});
+          return;
+        }
       }
 
       await handleMcp(req, res);
@@ -176,12 +237,13 @@ export async function startHttpTransport(opts: HttpTransportOptions): Promise<No
     }
 
     // ── 404 ─────────────────────────────────────────────────────────
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
+    sendJson(res, 404, { error: 'Not found' });
   });
 
-  return new Promise<NodeHttpServer>((resolve) => {
+  return new Promise<NodeHttpServer>((resolve, reject) => {
+    httpServer.once('error', reject);
     httpServer.listen(config.port, config.host, () => {
+      httpServer.off('error', reject);
       const url = `http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port}`;
       onReady?.(url);
       resolve(httpServer);

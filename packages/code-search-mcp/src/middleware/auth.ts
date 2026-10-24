@@ -7,9 +7,10 @@
  *   - No auth (passthrough)
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ServerConfig } from '../core/env-config.js';
+import { localRateLimiter, type RateLimiter } from './rate-limit.js';
 
 export interface AuthIdentity {
   mode: 'api-key' | 'jwt' | 'anonymous';
@@ -17,34 +18,9 @@ export interface AuthIdentity {
   scopes: string[];
 }
 
-// ── Rate limiter (in-memory sliding window) ─────────────────────────────
-
-const rateBuckets = new Map<string, { count: number; resetAt: number }>();
-
-function checkRateLimit(identity: string, maxPerMinute: number): boolean {
-  const now = Date.now();
-  const bucket = rateBuckets.get(identity);
-
-  if (!bucket || now > bucket.resetAt) {
-    rateBuckets.set(identity, { count: 1, resetAt: now + 60_000 });
-    return true;
-  }
-
-  if (bucket.count >= maxPerMinute) return false;
-  bucket.count++;
-  return true;
-}
-
-// Clean up stale buckets every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, bucket] of rateBuckets) {
-    if (now > bucket.resetAt) rateBuckets.delete(key);
-  }
-}, 300_000).unref();
-
 // ── JWT verification (HS256) ────────────────────────────────────────────
 
+/** Valid claims, or null. `exp` is required; `nbf`, when present, is honoured. */
 function verifyJwt(
   token: string,
   secret: string,
@@ -68,9 +44,11 @@ function verifyJwt(
     }
 
     const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    const now = Math.floor(Date.now() / 1000);
 
-    // Check expiry
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
+    // A token that never expires is a permanent credential — refuse it.
+    if (typeof payload.exp !== 'number' || payload.exp <= now) return null;
+    if (payload.nbf !== undefined && (typeof payload.nbf !== 'number' || payload.nbf > now)) return null;
 
     // Check issuer
     if (issuer && payload.iss !== issuer) return null;
@@ -90,84 +68,70 @@ function safeCompare(a: string, b: string): boolean {
   return timingSafeEqual(bufA, bufB);
 }
 
+/** Stable, non-reversible subject for an API key (keys sharing a prefix get
+ *  distinct rate buckets; the key itself is never logged or exposed). */
+function apiKeySubject(key: string): string {
+  return `key:${createHash('sha256').update(key).digest('hex').slice(0, 16)}`;
+}
+
 // ── Main auth function ──────────────────────────────────────────────────
 
-export function createAuthMiddleware(config: ServerConfig) {
-  return function authenticate(
+/**
+ * Build the per-request authenticator. Throws at creation when the mode
+ * can't work (jwt without a secret) so the server refuses to start instead
+ * of answering every request with a 500. Rate limiting is a sliding window
+ * per identity subject (`rateLimiter` — the cluster primary's window when
+ * running as a worker).
+ */
+export function createAuthMiddleware(config: ServerConfig, opts: { rateLimiter?: RateLimiter } = {}) {
+  if (config.authMode === 'jwt' && !config.authJwtSecret) {
+    throw new Error('Auth mode "jwt" needs a signing secret: set CODE_SEARCH_AUTH_JWT_SECRET (or auth.jwt_secret in config).');
+  }
+  const rateLimiter = opts.rateLimiter ?? localRateLimiter;
+
+  const reject = (res: ServerResponse, status: number, error: string, headers: Record<string, string> = {}): null => {
+    res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+    res.end(JSON.stringify({ error }));
+    return null;
+  };
+
+  return async function authenticate(
     req: IncomingMessage,
     res: ServerResponse,
-  ): AuthIdentity | null {
+  ): Promise<AuthIdentity | null> {
     // No auth mode — allow everything
     if (config.authMode === 'none') {
       return { mode: 'anonymous', subject: 'anonymous', scopes: ['*'] };
     }
 
     const authHeader = req.headers.authorization;
-    if (!authHeader?.startsWith('Bearer ')) {
-      res.writeHead(401, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing Authorization header' }));
-      return null;
-    }
+    if (!authHeader?.startsWith('Bearer ')) return reject(res, 401, 'Missing Authorization header');
 
     const token = authHeader.slice(7);
+    let identity: AuthIdentity;
 
-    // API Key mode
     if (config.authMode === 'api-key') {
       const matched = config.authApiKeys.some((key) => safeCompare(token, key));
-      if (!matched) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid API key' }));
-        return null;
-      }
-
-      const identity: AuthIdentity = {
-        mode: 'api-key',
-        subject: `key:${token.slice(0, 8)}...`,
-        scopes: ['*'],
-      };
-
-      // Rate limit check
-      if (!checkRateLimit(identity.subject, config.rateLimitPerMinute)) {
-        res.writeHead(429, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
-        return null;
-      }
-
-      return identity;
-    }
-
-    // JWT mode
-    if (config.authMode === 'jwt') {
-      if (!config.authJwtSecret) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'JWT secret not configured' }));
-        return null;
-      }
-
-      const claims = verifyJwt(token, config.authJwtSecret, config.authJwtIssuer);
-      if (!claims) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid or expired JWT' }));
-        return null;
-      }
-
-      const identity: AuthIdentity = {
+      if (!matched) return reject(res, 401, 'Invalid API key');
+      identity = { mode: 'api-key', subject: apiKeySubject(token), scopes: ['*'] };
+    } else if (config.authMode === 'jwt') {
+      const claims = verifyJwt(token, config.authJwtSecret!, config.authJwtIssuer);
+      if (!claims) return reject(res, 401, 'Invalid or expired JWT');
+      // No `scope` claim → no scopes (least privilege): such a token reaches
+      // only projects that require none. API keys are admin (`*`).
+      identity = {
         mode: 'jwt',
         subject: claims.sub,
-        scopes: claims.scope ? claims.scope.split(' ') : ['*'],
+        scopes: claims.scope ? claims.scope.split(' ').filter(Boolean) : [],
       };
-
-      if (!checkRateLimit(identity.subject, config.rateLimitPerMinute)) {
-        res.writeHead(429, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Rate limit exceeded' }));
-        return null;
-      }
-
-      return identity;
+    } else {
+      return reject(res, 500, `Unknown auth mode: ${config.authMode}`);
     }
 
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: `Unknown auth mode: ${config.authMode}` }));
-    return null;
+    const decision = await rateLimiter(`auth:${identity.subject}`, config.rateLimitPerMinute);
+    if (!decision.ok) {
+      return reject(res, 429, 'Rate limit exceeded', { 'Retry-After': String(decision.retryAfterSec) });
+    }
+    return identity;
   };
 }

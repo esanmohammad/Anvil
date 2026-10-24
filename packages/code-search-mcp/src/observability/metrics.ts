@@ -1,10 +1,10 @@
 /**
  * Minimal Prometheus metrics surface (P7).
  *
- * Zero-dep registry that produces the text-format `/metrics` body. Counter
- * + Histogram are enough to cover query rate, latency, embedding/LLM
- * spend, and error counts as documented in CODE-SEARCH-MCP-STANDALONE-PLAN
- * §3.8. The dashboard or prom-scraper can consume the output directly.
+ * Zero-dep registry that produces the text-format `/metrics` body: query
+ * rate + latency + errors (counters / histogram) and index gauges refreshed
+ * at scrape time. The dashboard or prom-scraper can consume the output
+ * directly.
  */
 
 export type LabelValues = Record<string, string | number>;
@@ -64,6 +64,11 @@ export class Gauge {
 
   set(value: number, labels?: LabelValues): void {
     this.buckets.set(labelKey(labels), { labels, value });
+  }
+
+  /** Drop every series (a collector that owns the gauge starts each scrape empty). */
+  clear(): void {
+    this.buckets.clear();
   }
 
   render(): string {
@@ -166,12 +171,9 @@ export const registry = new Registry();
 export const metrics = {
   queriesTotal: registry.register(new Counter('code_search_queries_total', 'Total search queries by mode + repo.')),
   queryDuration: registry.register(new Histogram('code_search_query_duration_seconds', 'Query latency by mode.')),
-  indexChunks: registry.register(new Gauge('code_search_index_chunks_total', 'Indexed chunks by repo.')),
-  indexAge: registry.register(new Gauge('code_search_index_age_seconds', 'Seconds since last index by repo.')),
+  indexChunks: registry.register(new Gauge('code_search_index_chunks_total', 'Indexed chunks by project + repo.')),
+  indexAge: registry.register(new Gauge('code_search_index_age_seconds', 'Seconds since the last successful index, by project.')),
   vectorIndexUnindexedRows: registry.register(new Gauge('code_search_vector_index_unindexed_rows', 'Rows not yet folded into the vector index (brute-force scanned) by project.')),
   vectorIndexGrowthRatio: registry.register(new Gauge('code_search_vector_index_growth_ratio', 'Rows written since the vector index was last trained / rows it was trained on, by project (retrains at CODE_SEARCH_VECTOR_RETRAIN_RATIO).')),
-  embeddingCalls: registry.register(new Counter('code_search_embeddings_calls_total', 'Embedding API calls by provider.')),
-  llmCalls: registry.register(new Counter('code_search_llm_calls_total', 'LLM API calls by phase.')),
   errors: registry.register(new Counter('code_search_errors_total', 'Errors by kind.')),
-  rerankerCacheHits: registry.register(new Counter('code_search_reranker_cache_hits_total', 'Rerank cache lookups by outcome.')),
 };

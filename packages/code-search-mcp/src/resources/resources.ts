@@ -25,6 +25,24 @@ export function registerResources(ctx: ServerContext) {
   ];
 }
 
+/** The dynamic per-repo resources, advertised via resources/templates/list. */
+export function registerResourceTemplates() {
+  return [
+    {
+      uriTemplate: 'code-search://repo/{name}/profile',
+      name: 'Repo Profile',
+      description: 'Profile of one repo (see code-search://repos for names)',
+      mimeType: 'application/json',
+    },
+    {
+      uriTemplate: 'code-search://repo/{name}/graph',
+      name: 'Repo Graph',
+      description: 'Code graph (nodes + links) of one repo',
+      mimeType: 'application/json',
+    },
+  ];
+}
+
 export async function handleResource(
   uri: string,
   ctx: ServerContext,
