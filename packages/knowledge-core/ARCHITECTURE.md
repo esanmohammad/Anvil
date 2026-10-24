@@ -330,7 +330,11 @@ API:
 | `vectorIndexState()` | row count + the vector index's indexed / unindexed rows |
 | `optimizeIndexes()` | fold appended rows into every index, compact, prune old versions |
 
-FTS index built on `contextualizedContent`.
+FTS index on `contextualizedContent` (`contextualizedContent_idx`, with
+positions, stop words kept). The write path builds it once; `optimize()` folds
+later appends in, and until then they are still found by term search (not by
+phrase search). The index name stands for its config: a config change ships
+with a new name, and `ensureFtsIndex` builds the new index then drops the old.
 
 The vector index (IVF_FLAT, or IVF_PQ when `storage.vector.lancedb.index` is
 set) is managed by `vector-index-maintenance.ts` on the write path. It is built
@@ -605,7 +609,10 @@ Steps:
    (10 for Ollama, else 128) with `CODE_SEARCH_EMBEDDING_CONCURRENCY`
    in flight (Ollama 1, else 8), streamed — no inter-batch delay; 429s
    back off inside the embedder.
-6. `addChunks(embeddedChunks)`; rebuild FTS.
+6. `addChunks` the embedded rows in appends of 4,096 (one LanceDB commit
+   each, so commits don't scale with chunks / batch size); then
+   `ensureFtsIndex`, which builds the full-text index only when it is missing
+   or under an older config's name.
 7. Build missing scalar indexes, then `maintainVectorIndex` (build / due
    retrain / optimize; writes `vector_index.json`). An embed run with nothing
    new still runs this step and bumps the index generation.

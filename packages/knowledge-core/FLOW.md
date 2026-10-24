@@ -175,10 +175,13 @@ embedChunks(project, config, opts):
   │  concurrency = ollama ? 1 : CODE_SEARCH_EMBEDDING_CONCURRENCY ?? 8
   │
   ├─ stream chunks.json again; new chunks → batches, `concurrency` in flight,
-  │  each batch embedded then store.addChunks(batch); progress + ETA
-  │  (no inter-batch delay — 429s back off inside the embedder)
+  │  each batch embedded into a buffer that store.addChunks appends once it
+  │  holds 4,096 rows (and at the end) — one LanceDB commit per append;
+  │  progress + ETA (no inter-batch delay — 429s back off inside the embedder)
   │
-  ├─ ensureFtsIndex (when anything new) + ensureScalarIndexes + maintainVectorIndex(rowsWritten)
+  ├─ ensureFtsIndex (when anything new; builds only if missing / older config)
+  │  + ensureScalarIndexes + maintainVectorIndex(rowsWritten) — its optimize()
+  │  folds this run's appends into the existing indexes
   ├─ clear deleted_files.json
   └─ for repoName in repoNames:
        update index_meta.json { embeddingProvider, embeddingModel,
