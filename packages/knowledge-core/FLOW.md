@@ -405,8 +405,8 @@ buildProjectGraph(project, opts):                   ← src/project-graph-builde
   ├─ context = assemble:
   │     factory.yaml summary
   │     <repo>/GRAPH_REPORT.md per repo
-  │     cross-repo edges from system_graph_v2.json
-  │       (written only on the no-SQLite fallback — empty on the SQLite path)
+  │     cross-repo edges (+ evidence, first 30) from the system graph store
+  │       (storage.graph(): system_graph.sqlite, else system_graph_v2.json)
   │
   ├─ result = await runLLM(promptFromContext, PROJECT_GRAPH_SYSTEM)
   │             ↑ shims to @anvil/agent-core

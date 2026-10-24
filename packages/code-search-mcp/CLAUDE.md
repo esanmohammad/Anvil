@@ -45,9 +45,11 @@ All implemented in `src/tools/`:
 
 - **Search** (`search.ts`) — `search_code` (hybrid),
   `search_semantic` (vector-only), `search_exact` (BM25) all call
-  `getRetriever(project).retrieve(query, opts)`. `get_code_snippet`
-  fetches one entity's source from `chunks.json` directly (embedder-
-  independent — works in BM25-only mode).
+  `getRetriever(project).retrieve(query, opts)` and record the query
+  metrics. `search_exact` skips the `ctx.indexReady` gate (BM25 needs no
+  embedder). `get_code_snippet` fetches one entity's source from the
+  vector store, else `chunks.json` (embedder-independent — works in
+  BM25-only mode).
 - **Graph** (`graph.ts`) — `get_repo_graph`, `get_cross_repo_edges`,
   `find_callers`, `find_dependencies`, `impact_analysis`, `trace_path`
   (multi-hop call-chain BFS), `search_graph` (structural query by
@@ -58,10 +60,16 @@ All implemented in `src/tools/`:
   JSON fallback for older indexes); `get_repo_graph` and `find_dead_code`
   read `<KB>/<repo>/graph.json`; `get_architecture` reads
   `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` (CLI-generated) and falls back
-  to profiles. Traversal is untyped beyond skipping `contains` edges, so
-  `find_callers` also returns importers and type-referencers. Symbol
-  resolution is exact by default via `resolveEntityNodes` (`fuzzy:true`
-  for substring).
+  to profiles. `find_callers` / `find_dependencies` / `trace_path` follow
+  `calls` edges by default; `relations` (`imports`, `uses`, `type-ref`,
+  `inherits`, `all`) lists the others, grouped by relation. Symbol
+  resolution is exact by default via `store.resolveNodes` (full
+  `repo::file::entity` id, label, or `::name` suffix — case-sensitive;
+  `fuzzy:true` = case-insensitive substring of symbol names).
+  `impact_analysis` follows dependents up to `depth` hops; it and
+  `detect_changes` mark cross-repo endpoints of the file as
+  `[file-level]`. `detect_changes` maps `git diff -U0` hunks onto entity
+  line ranges derived from declaration lines at the base commit.
 - **Profiles** (`profile.ts`) — `list_repos`, `get_repo_profile`. Read
   from `<KB>/<repo>/profile.json` via `loadProfile` /
   `loadAllProfiles`.
@@ -69,6 +77,9 @@ All implemented in `src/tools/`:
   `KnowledgeIndexer.getStats(project)`, including the vector-index line
   (type, partitions, training size + rows since, unindexed rows) from the
   writer's `vector_index.json`.
+- Every handler validates its arguments against its own `inputSchema`
+  (`tools/validate.ts:validateArgs`); bad input and thrown errors return
+  `isError: true`.
 
 ### Resources
 
@@ -216,9 +227,9 @@ text body for `/metrics`. Pre-declared `metrics` namespace covers
 `code_search_errors_total`, `code_search_reranker_cache_hits_total`,
 `code_search_vector_index_unindexed_rows`,
 `code_search_vector_index_growth_ratio`.
-`InProcessBackend.search` records `queriesTotal` / `queryDuration` /
-`errors`; the two vector-index gauges are refreshed per scrape by the
-`collectMetrics` hook `server.ts` passes to `startHttpTransport` (reads the
+`InProcessBackend.search` and the MCP search tools (`tools/search.ts`)
+record `queriesTotal` / `queryDuration` / `errors`; the two vector-index
+gauges are refreshed per scrape by the `collectMetrics` hook `server.ts` passes to `startHttpTransport` (reads the
 writer's `vector_index.json` blob, since in cluster mode the HTTP workers
 aren't the writer; a failing collector never fails the scrape). Other call
 sites are wiring points for future work.
@@ -257,7 +268,13 @@ Tests at `src/__tests__/`:
 - `config-resolver.test.ts` — P3 precedence, secret redaction.
 - `daemon-rpc.test.ts` — P4 UDS JSON-RPC roundtrip (skipped on win32).
 - `graph-tools.test.ts` — `trace_path`, `find_callers`, `find_dead_code`,
-  `get_architecture`, `get_code_snippet`.
+  `get_architecture`, `get_code_snippet` over the JSON system graph.
+- `graph-tools-store.test.ts` — graph tools over the SQLite system graph:
+  evidence, workspace edges, symmetric / multi-hop / file-level impact,
+  symbol resolution, relations, `search_graph` regex, `get_repo_graph`
+  edges, hunk-precise and deleted-file `detect_changes`, `find_dead_code`.
+- `tool-inputs.test.ts` — argument validation (`isError`), descriptors vs
+  behaviour, `search_exact` without an embedder, search metrics, hints.
 - `http-stateless.test.ts` — stateless `/mcp` serving (no session affinity).
 - `metrics-endpoint.test.ts` — `/metrics` awaits `collectMetrics`, renders
   when it throws.
@@ -286,9 +303,10 @@ Every comment must be true of the code **as it currently stands**. When a change
 
 1. Add a `register<X>Tools()` exporter that returns an MCP tool
    descriptor `{ name, description, inputSchema }[]`.
-2. Add a `handle<X>Tool(name, args, ctx)` that returns
-   `{ content: [{ type: 'text', text }] } | null` (null = "not my
-   tool, try the next handler").
+2. Add a `handle<X>Tool(name, args, ctx)` that returns a `ToolResult`
+   (`toolText` / `toolError` from `tools/validate.ts`) or null (= "not
+   my tool, try the next handler"). Run `validateArgs(inputSchema, args)`
+   first so the descriptor is the contract.
 3. Wire both into `src/server.ts:createMcpServerInstance` —
    `allTools.push` for listing and a sequential `if` chain for
    dispatch.

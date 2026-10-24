@@ -41,8 +41,12 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   cross-repo edges into `system_graph.sqlite` (better-sqlite3, else
   `node:sqlite`); `GraphStore` serves slice queries (callers, dependencies,
   dependents, cross-repo edges, neighbors) to the retriever's graph expansion
-  and the MCP graph tools. Edges keep `type` + `confidence`; cross-repo
-  `evidence` is not stored.
+  and the MCP graph tools. Edges keep `type`, `confidence` and (cross-repo)
+  `evidence`. Exact name resolution is case-sensitive and wildcard-free and
+  accepts a full `repo::file::entity` id; `dependents` treats
+  `SYMMETRIC_EDGE_TYPES` (shared topic / table / key / bucket / type /
+  constant / env var / npm dep) as two-way; `crossRepoEdges` includes
+  same-repo `workspace-dep` edges.
 - `ProjectGraphBuilder` (`src/project-graph-builder-core.ts`) — in-memory
   `graphology` directed multi-graph with Louvain communities; namespaces
   nodes as `<repo>::<id>`. `buildKB` uses it only when no SQLite driver
@@ -51,7 +55,8 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   `getProjectGraphStatus` / `estimateProjectGraphCost`
   (`src/project-graph-builder.ts`) — LLM-powered semantic project graph,
   built only by the CLI `graph` command. Its cross-repo edge input comes
-  from `system_graph_v2.json`, which the SQLite path doesn't write.
+  from the system graph store (`system_graph.sqlite`, or the JSON
+  fallback).
 - `detectCrossRepoEdges` (`src/cross-repo-detector.ts`) — 14 strategies,
   split into `extractCrossRepoSignals(repoPath)` (per-repo tree scan, runs in
   the worker while the clone exists, persisted as `<repo>/signals.json`) +

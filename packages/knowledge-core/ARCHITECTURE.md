@@ -459,8 +459,25 @@ repo's nodes/edges plus the cross-repo edges as `buildKB` goes, and
 `GraphStore` (`openSystemGraphStore` / `getGraphStore`) serves slice
 queries to the retriever and the MCP graph tools. Tables: `nodes(key,
 repo, file, label, type, degree, attrs)` and `edges(source, target, type,
-confidence, source_repo, target_repo)` — cross-repo `evidence` is not
-stored.
+confidence, source_repo, target_repo, evidence)` — `evidence` (the
+route / topic / table / package a cross-repo edge was matched on) is NULL
+for AST edges; files written before the column existed are still read
+(`NULL AS evidence`) until the next index rebuilds them.
+
+Query semantics (both the SQLite store and the JSON fallback):
+`resolveNodes` is exact by default — full key, `label`, or a `::name` key
+suffix, case-sensitive and wildcard-free; `fuzzy` = case-insensitive
+substring of symbol labels (`module` / `external` nodes skipped).
+`callers` / `dependencies` / `neighborsOf` take an edge-type filter
+(omitted = every type but `contains`); `callers` / `dependencies` return
+`{ key, type }`. `crossRepoEdges` returns edges between repos plus
+same-repo `workspace-dep` edges. `dependents` follows edges into the set
+and, for `SYMMETRIC_EDGE_TYPES` (`event-schema`, `database`, `redis`, `s3`,
+`shared-type`, `shared-constant`, `env-var`, `npm-dep` — one stored edge
+per pair, in arbitrary order), edges out of it too, returned flipped so
+`source` is the dependent. `searchNodes` `name` is a case-insensitive
+regex over symbol labels (a `regexp` SQL user function; JS filtering on a
+driver without user functions); an invalid pattern throws.
 
 `ProjectGraphBuilder` — `graphology` directed multi-graph, used by
 `buildKB` only when no SQLite driver loads. Lazy-loads `graphology` +
@@ -473,9 +490,9 @@ Methods: `addRepoGraph(name, graphJson)` (namespaces nodes as
 `buildProjectGraph(project, opts)` — LLM-driven, run by the CLI `graph`
 command: assembles factory.yaml + per-repo graph reports + cross-repo
 edges → single LLM call → `ProjectGraph` written to `PROJECT_GRAPH.json` +
-`PROJECT_SUMMARY.md` under the knowledge-base dir. Cross-repo edges are
-read from `system_graph_v2.json`, so on the SQLite path the prompt gets
-none.
+`PROJECT_SUMMARY.md` under the knowledge-base dir. Cross-repo edges (with
+their evidence, first 30) come from the system graph store
+(`storage.graph()` — `system_graph.sqlite`, or the JSON fallback).
 
 `loadProjectGraph` / `loadProjectSummary` / `getProjectGraphStatus` /
 `estimateProjectGraphCost` — read-side helpers.
