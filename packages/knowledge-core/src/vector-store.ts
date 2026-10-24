@@ -24,10 +24,46 @@ function isCorruptVectorStore(err: unknown): boolean {
  *  index exists (ensureVectorIndex). */
 const VECTOR_NPROBES = Math.max(1, parseInt(process.env.CODE_SEARCH_VECTOR_NPROBES ?? '', 10) || 40);
 
-/** Name of the full-text index. It stands for the FTS config in
- *  ensureFtsIndex: change the config → change the name, and the next write
- *  cycle builds the new index and drops the old one. */
-const FTS_INDEX_NAME = 'contextualizedContent_idx';
+/** Insert a space at camelCase / PascalCase / acronym boundaries
+ *  (`parseHTTPResponse` → `parse HTTP Response`) so identifier parts become
+ *  BM25 terms. snake_case needs nothing: `_` already breaks tokens. */
+export function splitIdentifiers(text: string): string {
+  return text.replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2');
+}
+
+/** Words with no case boundary inside: lowercase, ALL_CAPS, Capitalized. */
+const PLAIN_WORD = /\b(?:[a-z0-9_]+|[A-Z0-9_]+|[A-Z][a-z0-9_]+)\b/g;
+
+/** The parts of a text's compound identifiers only (`return
+ *  verifyExpectedBacklogCount(q)` → `verify Expected Backlog Count`). The
+ *  contentSplit column holds this rather than the whole split text, so a
+ *  plain word counts once — in contextualizedContent — not once per column. */
+export function identifierParts(text: string): string {
+  return splitIdentifiers(text.replace(PLAIN_WORD, ' ').replace(/[^A-Za-z0-9_]+/g, ' '));
+}
+
+/** Columns derived from others, with the SQL that fills them in for rows
+ *  written before the column existed (ensureColumns). Each SQL must match the
+ *  JS that addChunks uses for new rows (`(?-u:\b)` = JS's ASCII `\b`). */
+const DERIVED_COLUMNS = [
+  {
+    name: 'contentSplit',
+    valueSql:
+      "regexp_replace(regexp_replace(regexp_replace(regexp_replace(contextualizedContent, " +
+      "'(?-u:\\b)(?:[a-z0-9_]+|[A-Z0-9_]+|[A-Z][a-z0-9_]+)(?-u:\\b)', ' ', 'g'), '[^A-Za-z0-9_]+', ' ', 'g'), " +
+      "'([a-z0-9])([A-Z])', '${1} ${2}', 'g'), '([A-Z]+)([A-Z][a-z])', '${1} ${2}', 'g')",
+  },
+];
+
+/** Full-text indexes. Each name stands for its config in ensureFtsIndex:
+ *  change a config → change its name, and the next write cycle builds the new
+ *  index and drops the old one. */
+const FTS_INDEXES = [
+  // Positions enable PhraseQuery (multi-token literal matching).
+  { column: 'contextualizedContent', name: 'contextualizedContent_idx', withPosition: true },
+  // Compound-identifier parts for term search; phrases stay on the original column.
+  { column: 'contentSplit', name: 'contentSplit_idx', withPosition: false },
+];
 
 export class VectorStore implements VectorStorePort {
   private db: any; // lancedb.Connection
@@ -37,6 +73,10 @@ export class VectorStore implements VectorStorePort {
   private cacheBudget?: { indexCacheBytes: number; metadataCacheBytes: number };
   private indexConfig?: IvfPqIndexConfig;
   private initialized: boolean = false;
+  private columnsEnsured = false;
+  /** Whether the table has the identifier-split FTS index (absent on tables
+   *  no upgraded writer has touched yet); resolved on first search. */
+  private splitFts?: Promise<boolean>;
 
   /** `dbPath` is a local directory (default) or an object-store URI
    *  (`s3://bucket/prefix`). `storageOptions` carries the LanceDB/object_store
@@ -132,33 +172,50 @@ export class VectorStore implements VectorStorePort {
     this.initialized = true;
   }
 
-  /** Build the full-text index on contextualizedContent if it is missing or
-   *  was built with an older config. An existing current index is left alone:
-   *  rows appended since are still searched (unindexed rows are scanned) and
-   *  optimizeIndexes() folds them in, so a cycle's cost tracks what changed,
-   *  not the corpus size. Write path only. */
+  /** Build each full-text index (FTS_INDEXES) that is missing or was built
+   *  with an older config, after adding any derived column the table lacks.
+   *  An existing current index is left alone: rows appended since are still
+   *  searched (unindexed rows are scanned) and optimizeIndexes() folds them
+   *  in, so a cycle's cost tracks what changed, not the corpus size. Write
+   *  path only. */
   async ensureFtsIndex(): Promise<void> {
     if (!this.table) return;
-    try {
-      const indexes: Array<{ name: string; indexType: string; columns: string[] }> = await this.table.listIndices();
-      const fts = indexes.filter((i) => i.indexType === 'FTS' && i.columns.includes('contextualizedContent'));
-      if (fts.some((i) => i.name === FTS_INDEX_NAME)) return;
-      const lancedb = await import('@lancedb/lancedb');
-      // withPosition: term positions enable PhraseQuery (multi-token literal
-      // matching). removeStopWords: the default drops 'to'/'if'/'in' etc.,
-      // which silently breaks phrases containing them — and stop words are
-      // meaningful tokens in code and error strings.
-      await this.table.createIndex('contextualizedContent', {
-        config: lancedb.Index.fts({ withPosition: true, removeStopWords: false }),
-        name: FTS_INDEX_NAME,
-        replace: true,
-      });
-      // Indexes built under another name carry an older config. Drop them
-      // only after the current one exists, so search never lacks an index.
-      for (const old of fts) await this.table.dropIndex(old.name);
-    } catch {
-      // Index creation can fail on empty tables or unsupported configs — non-fatal
+    await this.ensureColumns();
+    const lancedb = await import('@lancedb/lancedb');
+    for (const spec of FTS_INDEXES) {
+      try {
+        const indexes: Array<{ name: string; indexType: string; columns: string[] }> = await this.table.listIndices();
+        const fts = indexes.filter((i) => i.indexType === 'FTS' && i.columns.includes(spec.column));
+        if (fts.some((i) => i.name === spec.name)) continue;
+        // removeStopWords: the default drops 'to'/'if'/'in' etc., which
+        // silently breaks phrases containing them — and stop words are
+        // meaningful tokens in code and error strings.
+        await this.table.createIndex(spec.column, {
+          config: lancedb.Index.fts({ withPosition: spec.withPosition, removeStopWords: false }),
+          name: spec.name,
+          replace: true,
+        });
+        // Indexes built under another name carry an older config. Drop them
+        // only after the current one exists, so search never lacks an index.
+        for (const old of fts) await this.table.dropIndex(old.name);
+      } catch {
+        // Index creation can fail on empty tables or unsupported configs — non-fatal
+      }
     }
+  }
+
+  /** Add the DERIVED_COLUMNS an older writer's table lacks, computed in SQL
+   *  from existing columns — a column add writes only the new column's files,
+   *  never rewrites rows. Must run before this writer's first add (rows carry
+   *  every column), so addChunks / upsertChunks / ensureFtsIndex call it.
+   *  Write path only. */
+  private async ensureColumns(): Promise<void> {
+    if (!this.table || this.columnsEnsured) return;
+    const schema = await this.table.schema();
+    const have = new Set(schema.fields.map((f: { name: string }) => f.name));
+    const missing = DERIVED_COLUMNS.filter((c) => !have.has(c.name));
+    if (missing.length > 0) await this.table.addColumns(missing);
+    this.columnsEnsured = true;
   }
 
   /** Build scalar indexes on every column that `.filter()` / `.where()` touches,
@@ -324,6 +381,7 @@ export class VectorStore implements VectorStorePort {
       vector: c.embedding, // LanceDB uses 'vector' field for embeddings
       content: c.content,
       contextualizedContent: c.contextualizedContent,
+      contentSplit: identifierParts(c.contextualizedContent),
       contextPrefix: c.contextPrefix,
       filePath: c.filePath,
       repoName: c.repoName,
@@ -340,6 +398,7 @@ export class VectorStore implements VectorStorePort {
     if (!this.table) {
       this.table = await this.db.createTable('chunks', rows, { mode: 'overwrite' });
     } else {
+      await this.ensureColumns();
       // Replace rows with the given ids, keep everything else.
       await this.deleteChunksByIds(rows.map((r) => r.id));
       await this.table.add(rows);
@@ -395,7 +454,25 @@ export class VectorStore implements VectorStorePort {
   async fullTextSearch(queryText: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
     if (!this.table) return [];
     try {
-      let q = this.table.search(queryText, 'fts', 'contextualizedContent').limit(limit);
+      let q;
+      // Words containing '_' are already split into terms on the original
+      // column; sending them to the split column too would count them again
+      // for camelCase spellings of the same words (TRIGGER_TO_WEB_TYPE vs
+      // triggerToWebType) and outrank the definition.
+      const splitQuery = splitIdentifiers(queryText.replace(/[A-Za-z0-9]*_[A-Za-z0-9_]*/g, ' '));
+      if (/[A-Za-z0-9]/.test(splitQuery) && (await this.hasSplitFts())) {
+        // Original tokens on the original column, identifier parts on the
+        // split column; a row's score is the sum. An exact identifier keeps
+        // its rare full token, and "expected backlog count" also reaches
+        // `verifyExpectedBacklogCount`.
+        const { BooleanQuery, MatchQuery, Occur } = await import('@lancedb/lancedb');
+        q = this.table.query().fullTextSearch(new BooleanQuery([
+          [Occur.Should, new MatchQuery(queryText, 'contextualizedContent')],
+          [Occur.Should, new MatchQuery(splitQuery, 'contentSplit')],
+        ])).limit(limit);
+      } else {
+        q = this.table.search(queryText, 'fts', 'contextualizedContent').limit(limit);
+      }
       // Apply the same repo filter as vectorSearch — without it, BM25 results
       // leak across repos even when the caller scoped to specific repos.
       if (filter) q = q.where(filter);
@@ -412,6 +489,14 @@ export class VectorStore implements VectorStorePort {
       // FTS index may not exist
       return [];
     }
+  }
+
+  private hasSplitFts(): Promise<boolean> {
+    this.splitFts ??= (async () => {
+      const indexes: Array<{ name: string }> = await this.table.listIndices();
+      return indexes.some((i) => i.name === 'contentSplit_idx');
+    })().catch(() => false);
+    return this.splitFts;
   }
 
   /** Exact-symbol lookup: chunks whose entityName equals one of `names`.
@@ -650,6 +735,7 @@ export class VectorStore implements VectorStorePort {
       vector: c.embedding,
       content: c.content,
       contextualizedContent: c.contextualizedContent,
+      contentSplit: identifierParts(c.contextualizedContent),
       contextPrefix: c.contextPrefix,
       filePath: c.filePath,
       repoName: c.repoName,
@@ -666,6 +752,7 @@ export class VectorStore implements VectorStorePort {
     if (!this.table) {
       this.table = await this.db.createTable('chunks', rows, { mode: 'overwrite' });
     } else {
+      await this.ensureColumns();
       await this.table.add(rows);
     }
     if (!opts?.skipIndex) {
