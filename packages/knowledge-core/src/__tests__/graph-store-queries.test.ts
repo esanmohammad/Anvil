@@ -7,8 +7,10 @@
  * types count as dependents from both sides; same-repo workspace-dep edges are
  * listed with the cross-repo edges; exact name resolution is case-sensitive,
  * wildcard-free and accepts a full `repo::file::entity` id; fuzzy and regex
- * name matching look at symbol names, not file paths; relation-typed
- * callers / dependencies / neighbours.
+ * name matching look at symbol names, not file paths; fuzzy matching keeps
+ * insertion order up to its limit, matches terms under FUZZY_MIN_CHARS
+ * exactly, reads the trigram index (a file without it scans, same answers);
+ * relation-typed callers / dependencies / neighbours.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -19,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import {
   createSystemGraphSqliteWriter,
+  FUZZY_MIN_CHARS,
   openSystemGraphStore,
   ProjectGraphBuilder,
   SYMMETRIC_EDGE_TYPES,
@@ -57,7 +60,10 @@ const ORDERS: GraphifyOutput = {
 };
 
 const WEB: GraphifyOutput = {
-  nodes: [{ id: 'src/api/orders.ts::fetchOrder', label: 'fetchOrder', type: 'function', file: 'src/api/orders.ts' }],
+  nodes: [
+    { id: 'src/api/orders.ts::fetchOrder', label: 'fetchOrder', type: 'function', file: 'src/api/orders.ts' },
+    { id: 'src/api/orders.ts::db', label: 'db', type: 'const', file: 'src/api/orders.ts' },
+  ],
   links: [],
 };
 
@@ -184,6 +190,20 @@ for (const [kind, build] of [['sqlite', buildSqlite], ['json', buildJson]] as co
       assert.deepEqual(store.resolveNodes('%', undefined, true), []);
     });
 
+    it('fuzzy keeps insertion order and stops at the limit; terms under FUZZY_MIN_CHARS match exactly', () => {
+      assert.deepEqual(keys(store.resolveNodes('ORDER', undefined, true)), [
+        'orders::src/models.ts::Order', 'orders::src/server.ts::getOrderById', 'orders::src/server.ts::getXorder',
+        'orders::src/server.ts::get_order', 'web::src/api/orders.ts::fetchOrder',
+      ]);
+      assert.deepEqual(store.resolveNodes('ORDER', undefined, true, 3).map((r) => r.key), [
+        'orders::src/server.ts::getOrderById', 'orders::src/server.ts::get_order', 'orders::src/server.ts::getXorder',
+      ]);
+      assert.equal(FUZZY_MIN_CHARS, 3);
+      assert.deepEqual(keys(store.resolveNodes('db', undefined, true)), ['web::src/api/orders.ts::db']);
+      assert.deepEqual(store.resolveNodes('Or', undefined, true), []);
+      assert.deepEqual(store.resolveNodes('DB', undefined, true), []);
+    });
+
     it('callers / dependencies / neighbours filter by relation and report it', () => {
       const stepThree = ['orders::src/pipeline/stepThree.ts::stepThree'];
       assert.deepEqual(store.callers(stepThree, 10, ['calls']), [{ key: 'orders::src/pipeline/chainA.ts::startPipeline', type: 'calls' }]);
@@ -238,6 +258,72 @@ describe('SqliteGraphStore — exact name resolution is index-backed', () => {
         const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...Array((sql.match(/\?/g) ?? []).length).fill(null)) as Array<{ detail: string }>;
         assert.ok(!plan.some((r) => /^SCAN nodes/.test(r.detail)), `${sql}\n${plan.map((r) => r.detail).join('\n')}`);
       }
+    } finally { db.close(); }
+  });
+});
+
+describe('SqliteGraphStore — fuzzy name matching is index-backed', () => {
+  it('reads the trigram index and never scans the nodes table, with or without a repo', async () => {
+    const dir = join(root, 'fuzzy-plan');
+    const store = await buildSqlite(dir);
+    const Database = (await import('better-sqlite3')).default;
+    const proto = Database.prototype as any; // record the SQL the store prepares
+    const prepare = proto.prepare;
+    const sqls: string[] = [];
+    proto.prepare = function (this: unknown, sql: string) {
+      if (/FROM nodes/.test(sql)) sqls.push(sql);
+      return prepare.call(this, sql);
+    };
+    try {
+      store.resolveNodes('order', undefined, true);
+      store.resolveNodes('order', 'orders', true, 10);
+      store.searchNodes({ name: 'order' }, 10); // a plain-literal name: count + rows
+    } finally {
+      proto.prepare = prepare;
+      store.close();
+    }
+    assert.equal(sqls.length, 4);
+    const db = new Database(join(dir, 'system_graph.sqlite'), { readonly: true });
+    db.function('regexp', (_src: unknown, _value: unknown) => 0); // the store registers it on its own connection
+    try {
+      for (const sql of sqls) {
+        const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...Array((sql.match(/\?/g) ?? []).length).fill(null)) as Array<{ detail: string }>)
+          .map((r) => r.detail);
+        assert.ok(plan.some((d) => /^SCAN \w+ VIRTUAL TABLE INDEX \d+:M/.test(d)), `${sql}\n${plan.join('\n')}`);
+        assert.ok(!plan.some((d) => /^SCAN (nodes|n)(\s|$)/.test(d)), `${sql}\n${plan.join('\n')}`);
+      }
+    } finally { db.close(); }
+  });
+
+  it('a file written before the index answers the same by scanning, and is never altered', async () => {
+    const dir = join(root, 'fuzzy-new');
+    const oldDir = join(root, 'fuzzy-old');
+    const store = await buildSqlite(dir);
+    (await buildSqlite(oldDir)).close();
+    const Database = (await import('better-sqlite3')).default;
+    const oldPath = join(oldDir, 'system_graph.sqlite');
+    const raw = new Database(oldPath);
+    raw.exec('DROP TABLE nodes_fts');
+    raw.close();
+    const oldStore = await openSystemGraphStore(oldDir);
+    assert.ok(oldStore);
+    try {
+      for (const term of ['order', 'ORDER', 'Pipeline', 'three', 'tal', '%', '_order', 'get_', 'm/a', 'or"d', 'a*:', '(r)', 'ÖRDER', 'xyz', 'getOrderById']) {
+        for (const repo of [undefined, 'orders']) {
+          assert.deepEqual(store.resolveNodes(term, repo, true), oldStore.resolveNodes(term, repo, true), `${term} in ${repo}`);
+          assert.deepEqual(store.resolveNodes(term, repo, true, 2), oldStore.resolveNodes(term, repo, true, 2), `${term} in ${repo}, limit 2`);
+        }
+        const a = store.searchNodes({ name: term }, 50);
+        const b = oldStore.searchNodes({ name: term }, 50);
+        assert.deepEqual({ total: a.total, keys: keys(a.rows) }, { total: b.total, keys: keys(b.rows) }, term);
+      }
+    } finally {
+      store.close();
+      oldStore.close();
+    }
+    const db = new Database(oldPath, { readonly: true });
+    try {
+      assert.equal((db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'nodes_fts%'").get() as { c: number }).c, 0);
     } finally { db.close(); }
   });
 });

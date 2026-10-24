@@ -68,7 +68,11 @@ All implemented in `src/tools/`:
   `inherits`, `all`) lists the others, grouped by relation. Symbol
   resolution is exact by default via `store.resolveNodes` (full
   `repo::file::entity` id, label, or `::name` suffix — case-sensitive,
-  index-backed; `fuzzy:true` = case-insensitive substring of symbol names).
+  index-backed; `fuzzy:true` = case-insensitive substring of symbol names,
+  read from knowledge-core's trigram index). `graph.ts:resolveKeys` caps a
+  fuzzy name at `FUZZY_MATCH_CAP` (200) start nodes and says "matched more
+  than 200 symbols — be more specific" when it cuts; a fuzzy term under 3
+  characters (`FUZZY_MIN_CHARS`) is matched exactly, with a note.
   `impact_analysis` follows dependents up to `depth` hops; it and
   `detect_changes` mark cross-repo endpoints of the file as
   `[file-level]`. `detect_changes` maps `git diff -U0` hunks onto entity
@@ -341,7 +345,8 @@ Tests at `src/__tests__/`:
 - `graph-traversal.test.ts` — `trace_path` shortest paths vs a plain BFS on
   seeded random graphs (direction, relations, confidence, maxDepth); node
   cap + wall-clock budget on a 63k-node fan-out graph (`trace_path`,
-  `impact_analysis` lower-bound counts and cut-off hops).
+  `impact_analysis` lower-bound counts and cut-off hops); the fuzzy match cap
+  and its note, short fuzzy terms matched exactly.
 - `tool-inputs.test.ts` — argument validation (`isError`), descriptors vs
   behaviour, `search_exact` without an embedder, search metrics, hints.
 - `http-stateless.test.ts` — stateless `/mcp` serving (no session affinity).

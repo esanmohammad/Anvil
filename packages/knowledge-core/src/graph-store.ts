@@ -38,13 +38,20 @@ export const SYMMETRIC_EDGE_TYPES: ReadonlySet<string> = new Set([
  *  skip them unless the caller asks for the type explicitly. */
 const NON_SYMBOL_TYPES = ['module', 'external'];
 
+/** Fuzzy terms shorter than this (in characters) match exactly: the trigram
+ *  index can't serve them, and a 1–2 character substring matches a large
+ *  share of all symbols. */
+export const FUZZY_MIN_CHARS = 3;
+
 /**
  * Query surface the system-graph tools need. Implemented over SQLite and
  * (fallback) over the legacy JSON export.
  *
  * Name resolution (`resolveNodes`): exact by default — a node's full key, its
  * label, or a `::`-suffix of its key (`file::entity`), case-sensitive;
- * `fuzzy` = case-insensitive substring of symbol labels. `types` filters by
+ * `fuzzy` = case-insensitive substring of symbol labels (a term under
+ * {@link FUZZY_MIN_CHARS} characters matches exactly instead). At most `limit`
+ * matches (default 5000), in insertion order. `types` filters by
  * edge type (`calls`, `imports`, `uses`, `type-ref`, `inherits`, cross-repo
  * types); omitted = every edge type except `contains`. `crossRepoEdges` also
  * returns same-repo `workspace-dep` edges. `dependents` follows edges into the
@@ -56,7 +63,7 @@ const NON_SYMBOL_TYPES = ['module', 'external'];
  * labels; an invalid one throws.
  */
 export interface GraphStore {
-  resolveNodes(name: string, repo?: string, fuzzy?: boolean): Array<{ key: string; label: string }>;
+  resolveNodes(name: string, repo?: string, fuzzy?: boolean, limit?: number): Array<{ key: string; label: string }>;
   callers(targetKeys: string[], limit: number, types?: string[]): TypedNeighbor[];
   dependencies(sourceKeys: string[], limit: number, types?: string[]): TypedNeighbor[];
   crossRepoEdges(repo: string | undefined, limit: number): { edges: GraphEdge[]; total: number };
@@ -151,6 +158,17 @@ const keyTail = (key: string): string => {
 };
 const INSERT_NODE = 'INSERT OR REPLACE INTO nodes(key,key_tail,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?,?)';
 
+/** Trigram FTS5 index over node labels (rowid = nodes.rowid; contentless, so
+ *  it stores only the index) for fuzzy name matching. Skipped when the
+ *  driver's SQLite has no FTS5 or trigram tokenizer (SQLite < 3.34): readers
+ *  then scan. */
+function indexLabels(db: SqliteDb): void {
+  try {
+    db.exec("CREATE VIRTUAL TABLE nodes_fts USING fts5(name, content='', columnsize=0, tokenize='trigram')");
+  } catch { return; }
+  db.exec('INSERT INTO nodes_fts(rowid, name) SELECT rowid, label FROM nodes');
+}
+
 /** Stream the in-memory graph into a fresh sqlite db. Returns false if no
  *  driver is available (caller falls back to the JSON write). */
 export async function writeSystemGraphSqlite(basePath: string, graph: GraphIterable): Promise<boolean> {
@@ -197,6 +215,7 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
       );
     });
     db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)').run('nodeCount', String(nodeCount));
+    indexLabels(db);
     db.exec('COMMIT');
   } catch (err) {
     db.exec('ROLLBACK');
@@ -229,7 +248,7 @@ export interface SystemGraphSqliteWriter {
   addRepoGraph(repoName: string, graph: RepoGraphInput): void;
   /** Insert cross-repo edges + synthetic endpoints (mirrors addCrossRepoEdges). */
   addCrossRepoEdges(edges: CrossEdgeInput[]): void;
-  /** Backfill node degrees, write meta, close. */
+  /** Backfill node degrees, write meta, build the label index, close. */
   finalize(): { nodeCount: number; edgeCount: number };
 }
 
@@ -304,6 +323,7 @@ export async function createSystemGraphSqliteWriter(basePath: string): Promise<S
       try {
         for (const [key, deg] of degree) updDegree.run(deg, key);
         db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)').run('nodeCount', String(nodeKeys.size));
+        indexLabels(db);
         db.exec('COMMIT');
       } catch (e) { db.exec('ROLLBACK'); db.close(); throw e; }
       db.close();
@@ -328,6 +348,13 @@ const neighborFilter = (types?: string[]): string =>
   `(confidence IS NULL OR confidence >= 0.7) AND (type IS NULL OR type <> 'contains')${types?.length ? ` AND type IN (${placeholders(types.length)})` : ''}`;
 /** Escape LIKE's wildcards for `ESCAPE '\'`. */
 const likeEscape = (s: string): string => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+/** `s` as one FTS5 phrase: over the trigram index, the labels containing it (case-insensitive). */
+const ftsPhrase = (s: string): string => `"${s.replace(/"/g, '""')}"`;
+/** A searchNodes name the trigram index can serve: long enough, and free of
+ *  regex syntax, so a case-insensitive substring; printable ASCII only, where
+ *  the index's case folding and the regex's agree. */
+const isLiteralName = (s: string): boolean =>
+  s.length >= FUZZY_MIN_CHARS && /^[\x20-\x7e]+$/.test(s) && !/[\\^$.|?*+()[\]{}]/.test(s);
 
 /** Compile a caller-supplied name filter (case-insensitive). */
 function nameRegex(pattern: string): RegExp {
@@ -348,12 +375,25 @@ class SqliteGraphStore implements GraphStore {
   /** Files written before it existed have no `nodes.key_tail`: exact resolution scans them. */
   private readonly hasKeyTail: boolean;
   private readonly hasRegexp: boolean;
+  /** Files written before it existed have no `nodes_fts`, and a driver without
+   *  FTS5 / trigram can't read it: fuzzy matching scans those (bounded by its limit). */
+  private readonly hasFts: boolean;
 
   constructor(private db: SqliteDb) {
     const cols = db.prepare('PRAGMA table_info(edges)').all().map((c) => c.name as string);
     this.evidenceCol = cols.includes('evidence') ? 'evidence' : 'NULL AS evidence';
     this.hasKeyTail = db.prepare('PRAGMA table_info(nodes)').all().some((c) => c.name === 'key_tail');
     this.hasRegexp = this.registerRegexp();
+    this.hasFts = this.canReadFts();
+  }
+
+  private canReadFts(): boolean {
+    try {
+      this.db.prepare('SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?');
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private registerRegexp(): boolean {
@@ -370,13 +410,32 @@ class SqliteGraphStore implements GraphStore {
     }
   }
 
-  resolveNodes(name: string, repo?: string, fuzzy = false): Array<{ key: string; label: string }> {
+  resolveNodes(name: string, repo?: string, fuzzy = false, limit = 5000): Array<{ key: string; label: string }> {
     const params: unknown[] = [];
     let where: string;
     let repoCol = 'repo';
-    if (fuzzy) {
+    let from = 'nodes';
+    let order = 'rowid';
+    if (fuzzy && [...name].length >= FUZZY_MIN_CHARS) {
       where = `label LIKE '%' || ? || '%' ESCAPE '\\' AND type NOT IN (${placeholders(NON_SYMBOL_TYPES.length)})`;
       params.push(likeEscape(name), ...NON_SYMBOL_TYPES);
+      if (this.hasFts) {
+        // The index yields the candidates in rowid order, so LIMIT stops the
+        // read; the LIKE above keeps the scan's exact semantics.
+        from = 'nodes_fts JOIN nodes ON nodes.rowid = nodes_fts.rowid';
+        where = `nodes_fts MATCH ? AND ${where}`;
+        params.unshift(ftsPhrase(name));
+        if (repo) {
+          // Read only from the repo's first node to its last symbol. The writer
+          // inserts a repo's nodes together and cross-repo endpoints after every
+          // repo, so this range holds little but the repo.
+          where += ' AND nodes_fts.rowid BETWEEN (SELECT min(rowid) FROM nodes WHERE repo = ?)'
+            + ` AND (SELECT rowid FROM nodes WHERE repo = ? AND type NOT IN (${placeholders(NON_SYMBOL_TYPES.length)}) ORDER BY rowid DESC LIMIT 1)`;
+          params.push(repo, repo, ...NON_SYMBOL_TYPES);
+        }
+        order = 'nodes_fts.rowid';
+        repoCol = '+repo'; // `+`: filter only — keeps the planner on the index
+      }
     } else if (this.hasKeyTail) {
       // `=` / substr compare bytes: case-sensitive and wildcard-free. Every OR
       // arm has an index (key, label, key_tail); key_tail narrows the suffix
@@ -390,7 +449,7 @@ class SqliteGraphStore implements GraphStore {
     }
     if (repo) { where += ` AND ${repoCol} = ?`; params.push(repo); }
     // rowid = insertion order, the order a scan returns (callers may take the first match).
-    return this.db.prepare(`SELECT key, label FROM nodes WHERE ${where} ORDER BY rowid LIMIT 5000`).all(...params)
+    return this.db.prepare(`SELECT key, label FROM ${from} WHERE ${where} ORDER BY ${order} LIMIT ?`).all(...params, limit)
       .map((r) => ({ key: r.key as string, label: (r.label as string) || labelFromKey(r.key) }));
   }
 
@@ -537,6 +596,11 @@ class SqliteGraphStore implements GraphStore {
     if (f.type) { cond.push('type = ?'); p.push(f.type); }
     else if (re) { cond.push(`type NOT IN (${placeholders(NON_SYMBOL_TYPES.length)})`); p.push(...NON_SYMBOL_TYPES); }
     if (f.file) { cond.push("file LIKE '%' || ? || '%' ESCAPE '\\'"); p.push(likeEscape(f.file)); }
+    if (re && this.hasFts && isLiteralName(f.name!)) {
+      // A plain substring: the index narrows the rows the regex checks.
+      cond.push('rowid IN (SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?)');
+      p.push(ftsPhrase(f.name!));
+    }
     if (re && this.hasRegexp) { cond.push('regexp(?, label)'); p.push(f.name); }
     const where = cond.join(' AND ');
     const toRow = (r: any): GraphNodeRow => ({ key: r.key as string, label: (r.label as string) || labelFromKey(r.key), type: (r.type as string) || '?', file: (r.file as string) || fileOf(r.key), degree: (r.degree as number) ?? 0 });
@@ -575,13 +639,13 @@ class JsonGraphStore implements GraphStore {
     return out;
   }
 
-  resolveNodes(name: string, repo?: string, fuzzy = false): Array<{ key: string; label: string }> {
+  resolveNodes(name: string, repo?: string, fuzzy = false, limit = 5000): Array<{ key: string; label: string }> {
     const inRepo = (k: string) => !repo || k.startsWith(repo + '::');
     const lc = name.toLowerCase();
-    return this.nodes.filter((n) => inRepo(n.key) && (fuzzy
+    return this.nodes.filter((n) => inRepo(n.key) && (fuzzy && [...name].length >= FUZZY_MIN_CHARS
       ? !NON_SYMBOL_TYPES.includes(n.attributes?.type ?? '') && this.label(n).toLowerCase().includes(lc)
       : (n.key === name || this.label(n) === name || n.key.endsWith('::' + name)))
-    ).map((n) => ({ key: n.key, label: this.label(n) }));
+    ).slice(0, limit).map((n) => ({ key: n.key, label: this.label(n) }));
   }
   private typedEndpoints(keys: string[], side: 'callers' | 'deps', limit: number, types?: string[]): TypedNeighbor[] {
     const set = new Set(keys);

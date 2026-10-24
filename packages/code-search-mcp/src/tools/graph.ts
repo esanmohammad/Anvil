@@ -24,6 +24,7 @@ import {
   loadProfile,
   getAllChanges,
   getChangedFilesList,
+  FUZZY_MIN_CHARS,
   SYMMETRIC_EDGE_TYPES,
 } from '@esankhan3/anvil-knowledge-core';
 import { resolvedKnowledgeConfig } from '../core/env-config.js';
@@ -156,6 +157,23 @@ function reachable(
     frontier = next;
   }
   return out;
+}
+
+// A broad fuzzy term ("get") matches a large share of an org graph's symbols,
+// and every match is a start node. FUZZY_MATCH_CAP bounds them — and so the
+// traversal and the answer — and the answer says when it cut the matches.
+const FUZZY_MATCH_CAP = 200;
+
+/** Node keys `name` resolves to — fuzzy: at most FUZZY_MATCH_CAP, in the
+ *  store's order — and a note when the cap cut the matches or a term too short
+ *  for fuzzy matching was matched exactly. */
+function resolveKeys(store: GraphStore, name: string, repo: string | undefined, fuzzy: boolean): { keys: string[]; note: string } {
+  if (!fuzzy) return { keys: store.resolveNodes(name, repo).map((m) => m.key), note: '' };
+  const keys = store.resolveNodes(name, repo, true, FUZZY_MATCH_CAP + 1).map((m) => m.key);
+  const notes: string[] = [];
+  if ([...name].length < FUZZY_MIN_CHARS) notes.push(`_Fuzzy matching needs at least ${FUZZY_MIN_CHARS} characters — "${name}" was matched exactly._`);
+  if (keys.length > FUZZY_MATCH_CAP) notes.push(`_"${name}" matched more than ${FUZZY_MATCH_CAP} symbols — be more specific; using the first ${FUZZY_MATCH_CAP}._`);
+  return { keys: keys.slice(0, FUZZY_MATCH_CAP), note: notes.map((n) => `\n\n${n}`).join('') };
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +364,7 @@ export function registerGraphTools() {
         properties: {
           function: { type: 'string', minLength: 1, description: 'Symbol name or qualified id (repo::file::entity)' },
           repo: { type: 'string', minLength: 1, description: 'Limit resolution to this repo (optional)' },
-          fuzzy: { type: 'boolean', description: 'Case-insensitive substring match on symbol names instead of exact (default false)' },
+          fuzzy: { type: 'boolean', description: 'Case-insensitive substring match on symbol names instead of exact (default false). Needs 3+ characters (a shorter term matches exactly); uses the first 200 matches.' },
           relations: relationsProp('callers'),
         },
         required: ['function'],
@@ -360,7 +378,7 @@ export function registerGraphTools() {
         properties: {
           function: { type: 'string', minLength: 1, description: 'Symbol name or qualified id (repo::file::entity)' },
           repo: { type: 'string', minLength: 1, description: 'Limit resolution to this repo (optional)' },
-          fuzzy: { type: 'boolean', description: 'Case-insensitive substring match on symbol names instead of exact (default false)' },
+          fuzzy: { type: 'boolean', description: 'Case-insensitive substring match on symbol names instead of exact (default false). Needs 3+ characters (a shorter term matches exactly); uses the first 200 matches.' },
           relations: relationsProp('dependencies'),
         },
         required: ['function'],
@@ -391,7 +409,7 @@ export function registerGraphTools() {
           repo: { type: 'string', minLength: 1, description: 'Limit resolution to this repo (optional)' },
           direction: { type: 'string', enum: ['callees', 'callers', 'both'], description: 'Traverse callees (what it calls), callers (who calls it), or both. Default callees.' },
           maxDepth: { type: 'integer', minimum: 1, maximum: 10, description: 'Max hops to traverse (default 4, max 10)' },
-          fuzzy: { type: 'boolean', description: 'Case-insensitive substring match on symbol names instead of exact (default false)' },
+          fuzzy: { type: 'boolean', description: 'Case-insensitive substring match on symbol names instead of exact (default false). Needs 3+ characters (a shorter term matches exactly); uses the first 200 matches.' },
           relations: relationsProp('the traversal'),
         },
         required: ['from'],
@@ -533,11 +551,10 @@ export async function handleGraphTool(
       const repoFilter = args.repo as string | undefined;
       const fuzzy = args.fuzzy === true;
       const types = edgeTypes(args);
-      const matched = store.resolveNodes(funcName, repoFilter, fuzzy);
-      if (matched.length === 0) {
-        return text(`No entity found matching "${funcName}"${repoFilter ? ` in ${repoFilter}` : ''}.${fuzzy ? '' : ' Try fuzzy:true for substring matching.'}`);
+      const { keys, note } = resolveKeys(store, funcName, repoFilter, fuzzy);
+      if (keys.length === 0) {
+        return text(`No entity found matching "${funcName}"${repoFilter ? ` in ${repoFilter}` : ''}.${fuzzy ? '' : ' Try fuzzy:true for substring matching.'}${note}`);
       }
-      const keys = matched.map((m) => m.key);
       const fetch = (t?: string[]) => (name === 'find_callers' ? store.callers(keys, 30, t) : store.dependencies(keys, 30, t));
       const found = fetch(types);
       const noun = name === 'find_callers' ? 'callers' : 'dependencies';
@@ -550,7 +567,7 @@ export async function handleGraphTool(
         const hint = other.size
           ? `\n\nOther relations: ${[...other].map(([t, n]) => `${t} ${n}`).join(', ')} — pass relations: ${JSON.stringify([...other.keys()])} to list them.`
           : '';
-        return text(`${title}\n\nMatched ${matched.length} entit${matched.length === 1 ? 'y' : 'ies'}, but no ${noun} via ${relLabel}.${hint}`);
+        return text(`${title}\n\nMatched ${keys.length} entit${keys.length === 1 ? 'y' : 'ies'}, but no ${noun} via ${relLabel}.${hint}${note}`);
       }
       const byType = new Map<string, string[]>();
       for (const f of found) {
@@ -558,7 +575,7 @@ export async function handleGraphTool(
         byType.get(f.type)!.push(f.key);
       }
       const sections = [...byType].map(([t, ks]) => `## ${t} (${ks.length})\n${ks.map((k) => `- \`${k}\``).join('\n')}`).join('\n\n');
-      return text(`${title}\n\n${found.length} found (${relLabel}):\n\n${sections}`);
+      return text(`${title}\n\n${found.length} found (${relLabel}):\n\n${sections}${note}`);
     }
 
     if (name === 'impact_analysis') {
@@ -616,30 +633,31 @@ export async function handleGraphTool(
       const direction = (args.direction as GraphDirection | undefined) ?? 'callees';
       const maxDepth = (args.maxDepth as number | undefined) ?? 4;
 
-      const fromKeys = store.resolveNodes(from, repo, fuzzy).map((m) => m.key);
-      if (fromKeys.length === 0) return text(`No entity found matching "${from}".${fuzzy ? '' : ' Try fuzzy:true.'}`);
+      const { keys: fromKeys, note: fromNote } = resolveKeys(store, from, repo, fuzzy);
+      if (fromKeys.length === 0) return text(`No entity found matching "${from}".${fuzzy ? '' : ' Try fuzzy:true.'}${fromNote}`);
       const types = edgeTypes(args);
       const budget = new TraversalBudget();
 
       if (to) {
-        const toKeys = store.resolveNodes(to, repo, fuzzy).map((m) => m.key);
-        if (toKeys.length === 0) return text(`No entity found matching target "${to}".${fuzzy ? '' : ' Try fuzzy:true.'}`);
+        const { keys: toKeys, note: toNote } = resolveKeys(store, to, repo, fuzzy);
+        if (toKeys.length === 0) return text(`No entity found matching target "${to}".${fuzzy ? '' : ' Try fuzzy:true.'}${toNote}`);
+        const notes = fromNote + toNote;
         const { path, depth } = shortestPath(store, fromKeys, toKeys, maxDepth, direction, types, budget);
         if (!path && budget.exhausted) {
-          return text(`No path from "${from}" to "${to}" found within the traversal budget (explored ${budget.explored} nodes, depth ${depth} of ${maxDepth}, direction: ${direction}) — narrow the search (repo, exact names, relations) or lower maxDepth.`);
+          return text(`No path from "${from}" to "${to}" found within the traversal budget (explored ${budget.explored} nodes, depth ${depth} of ${maxDepth}, direction: ${direction}) — narrow the search (repo, exact names, relations) or lower maxDepth.${notes}`);
         }
-        if (!path) return text(`No path from "${from}" to "${to}" within ${maxDepth} hops (direction: ${direction}).`);
+        if (!path) return text(`No path from "${from}" to "${to}" within ${maxDepth} hops (direction: ${direction}).${notes}`);
         const labelOf = store.labelsOf(path);
         const arrow = direction === 'callers' ? ' ← ' : ' → ';
         const rendered = path.map((k) => labelOf.get(k) ?? k).join(arrow);
-        return text(`# Path (${path.length - 1} hops)\n\n${rendered}\n\n${path.map((k) => `- \`${k}\``).join('\n')}`);
+        return text(`# Path (${path.length - 1} hops)\n\n${rendered}\n\n${path.map((k) => `- \`${k}\``).join('\n')}${notes}`);
       }
 
       const nodes = reachable(store, fromKeys, maxDepth, direction, types, budget);
       const stopped = budget.exhausted
         ? `\n\n_Stopped early at the traversal budget (explored ${budget.explored} nodes) — narrow the search or lower maxDepth._`
         : '';
-      if (nodes.length === 0) return text(`No ${direction} reachable from "${from}" within ${maxDepth} hops.${stopped}`);
+      if (nodes.length === 0) return text(`No ${direction} reachable from "${from}" within ${maxDepth} hops.${stopped}${fromNote}`);
       const labelOf = store.labelsOf(nodes.map((n) => n.key));
       const byDepth = new Map<number, string[]>();
       for (const { key, depth } of nodes) {
@@ -648,7 +666,7 @@ export async function handleGraphTool(
       }
       const sections = [...byDepth.entries()].sort((a, b) => a[0] - b[0])
         .map(([d, ks]) => `## Depth ${d}\n${ks.map((k) => `- ${k}`).join('\n')}`).join('\n\n');
-      return text(`# Reachable from "${from}" (${direction}, ≤${maxDepth} hops)\n\n${nodes.length} nodes:\n\n${sections}${stopped}`);
+      return text(`# Reachable from "${from}" (${direction}, ≤${maxDepth} hops)\n\n${nodes.length} nodes:\n\n${sections}${stopped}${fromNote}`);
     }
 
     if (name === 'find_dead_code') {
