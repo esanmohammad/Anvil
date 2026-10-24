@@ -634,11 +634,11 @@ export class KnowledgeIndexer {
     const repoNames = [...repoChunkCounts.keys()];
 
     if (newChunkCount === 0 && deletedFiles.length === 0) {
-      // All vectors already present, so DON'T re-embed. But still (re)build the
-      // full-text (BM25) index over the existing rows: a prior run that wrote
-      // vectors then aborted before the post-loop FTS build (e.g. killed/aborted
-      // mid-run) leaves BM25 permanently degraded, and this "nothing new" path is
-      // the only one a re-run reaches. Cheap relative to embedding; idempotent.
+      // All vectors already present, so DON'T re-embed. But build the full-text
+      // (BM25) index if it is missing: a prior run that wrote vectors then
+      // aborted before the post-loop FTS build leaves none, and this "nothing
+      // new" path is the only one a re-run reaches. An existing index is kept;
+      // maintainVectorIndex's optimize() folds in rows it doesn't cover yet.
       log('All chunks already embedded — ensuring full-text index is built (no re-embed).');
       await vectorStore.ensureFtsIndex();
       // Heal missing scalar + vector indexes too (a prior run could have aborted
@@ -687,22 +687,38 @@ export class KnowledgeIndexer {
     log(`Embedding ${newChunkCount} new chunks with ${embedder.name} (${totalChunks - newChunkCount} cached, batch ${batchSize} × concurrency ${concurrency})...`);
 
     // Stream chunks.json a second time and embed only the new ones, in batches.
-    // Up to `concurrency` batches are in flight at once; each is written to
-    // LanceDB the instant its embeddings return (writes serialized via
-    // writeChain — LanceDB's add must not run concurrently on one table).
-    // Crucially we NEVER materialize the full chunk set nor a pre-sliced
-    // `batches[][]`: the producer reads one chunk at a time, fills a batch,
-    // dispatches it, then blocks until an in-flight slot frees. Memory stays
-    // bounded to the id-set + ~concurrency batches regardless of corpus size.
-    // The run stays resumable: new chunks are diffed against ids already in the
-    // store, so a crash loses only the few in-flight batches and a re-run
-    // continues from there. FTS is built once after the loop (skipIndex defers
-    // the per-batch rebuild).
+    // Up to `concurrency` batches are in flight at once. Embedded rows go into
+    // a buffer that is appended to LanceDB once it holds WRITE_ROWS rows (and
+    // once more at the end): every append is a LanceDB commit — a new version
+    // plus a data file — so appending per embedding batch would make commits,
+    // files and version-cleanup work scale with chunks / batchSize. Appends are
+    // serialized via writeChain (LanceDB's add must not run concurrently on
+    // one table). Crucially we NEVER materialize the full chunk set nor a
+    // pre-sliced `batches[][]`: the producer reads one chunk at a time, fills a
+    // batch, dispatches it, then blocks until an in-flight slot frees. Memory
+    // stays bounded to the id-set + ~concurrency batches + one write buffer
+    // regardless of corpus size. The run stays resumable: new chunks are
+    // diffed against ids already in the store, so a crash loses at most the
+    // unwritten buffer and a re-run continues from there. FTS is checked once
+    // after the loop (skipIndex).
+    const WRITE_ROWS = 4096;
     const totalBatches = Math.max(1, Math.ceil(newChunkCount / batchSize));
     let batchesDone = 0;
+    let embedded = 0;
     let stored = 0;
     const embedStartTime = Date.now();
     let writeChain: Promise<void> = Promise.resolve();
+    let pending: Array<CodeChunk & { embedding: number[] }> = [];
+    // Append the buffered rows after any earlier append; resolves once written.
+    const flush = (): Promise<void> => {
+      const rows = pending;
+      pending = [];
+      if (rows.length === 0) return writeChain;
+      return (writeChain = writeChain.then(async () => {
+        await vectorStore.addChunks(rows, { skipIndex: true });
+        stored += rows.length;
+      }));
+    };
 
     // When any batch fails, signal the producer + siblings to stop and surface
     // the error after all in-flight batches settle — otherwise a failed batch
@@ -717,16 +733,12 @@ export class KnowledgeIndexer {
         if (aborted) return;
         try {
           const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
-          const batchRows = batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] }));
-          // Serialize the LanceDB write by chaining onto the previous one, and
-          // await only the promise we just appended.
-          const myWrite = (writeChain = writeChain.then(() =>
-            vectorStore.addChunks(batchRows, { skipIndex: true }),
-          ));
-          await myWrite;
           if (aborted) return;
-          stored += batchRows.length;
+          pending.push(...batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] })));
+          embedded += batchChunks.length;
           batchesDone++;
+          if (pending.length >= WRITE_ROWS) await flush();
+          if (aborted) return;
 
           const elapsed = Date.now() - embedStartTime;
           const msPerBatch = elapsed / batchesDone;
@@ -735,13 +747,13 @@ export class KnowledgeIndexer {
 
           report({
             phase: 'embedding',
-            message: `Embedding: ${stored}/${newChunkCount} new (~${etaSeconds}s remaining)`,
+            message: `Embedding: ${embedded}/${newChunkCount} new (~${etaSeconds}s remaining)`,
             percent, etaSeconds,
-            chunksTotal: newChunkCount, chunksProcessed: stored,
+            chunksTotal: newChunkCount, chunksProcessed: embedded,
           });
 
           if (batchesDone % 10 === 0 || batchesDone === totalBatches) {
-            log(`  Embedded ${stored}/${newChunkCount} (ETA: ${formatEta(etaSeconds)})`);
+            log(`  Embedded ${embedded}/${newChunkCount} (ETA: ${formatEta(etaSeconds)})`);
           }
         } catch (err) {
           aborted = err; // stop producer + siblings; rethrown after all settle
@@ -765,9 +777,13 @@ export class KnowledgeIndexer {
     }
     if (batch.length > 0 && !aborted) dispatch(batch);
     await Promise.all(inFlight);
+    if (!aborted) {
+      try { await flush(); } catch (err) { aborted = err; }
+    }
     if (aborted) throw aborted; // no zombies left running; fail the run cleanly
 
-    // Build the full-text + scalar indexes once, after all batches are inserted.
+    // Build the full-text + scalar indexes if missing, after all batches are
+    // inserted; existing ones are kept and optimize() below folds the appends in.
     report({ phase: 'storing', message: 'Building search indexes...', percent: 92, etaSeconds: -1 });
     if (newChunkCount > 0) {
       await vectorStore.ensureFtsIndex();

@@ -24,6 +24,11 @@ function isCorruptVectorStore(err: unknown): boolean {
  *  index exists (ensureVectorIndex). */
 const VECTOR_NPROBES = Math.max(1, parseInt(process.env.CODE_SEARCH_VECTOR_NPROBES ?? '', 10) || 40);
 
+/** Name of the full-text index. It stands for the FTS config in
+ *  ensureFtsIndex: change the config → change the name, and the next write
+ *  cycle builds the new index and drops the old one. */
+const FTS_INDEX_NAME = 'contextualizedContent_idx';
+
 export class VectorStore implements VectorStorePort {
   private db: any; // lancedb.Connection
   private table: any; // lancedb.Table
@@ -127,24 +132,30 @@ export class VectorStore implements VectorStorePort {
     this.initialized = true;
   }
 
-  /** Create or rebuild the full-text search index on contextualizedContent */
-  /** (Re)build the full-text index. Public so a streamed batch insert can
-   *  defer it to a single call after the final batch instead of paying the
-   *  rebuild on every addChunks. */
+  /** Build the full-text index on contextualizedContent if it is missing or
+   *  was built with an older config. An existing current index is left alone:
+   *  rows appended since are still searched (unindexed rows are scanned) and
+   *  optimizeIndexes() folds them in, so a cycle's cost tracks what changed,
+   *  not the corpus size. Write path only. */
   async ensureFtsIndex(): Promise<void> {
     if (!this.table) return;
     try {
+      const indexes: Array<{ name: string; indexType: string; columns: string[] }> = await this.table.listIndices();
+      const fts = indexes.filter((i) => i.indexType === 'FTS' && i.columns.includes('contextualizedContent'));
+      if (fts.some((i) => i.name === FTS_INDEX_NAME)) return;
       const lancedb = await import('@lancedb/lancedb');
       // withPosition: term positions enable PhraseQuery (multi-token literal
       // matching). removeStopWords: the default drops 'to'/'if'/'in' etc.,
       // which silently breaks phrases containing them — and stop words are
-      // meaningful tokens in code and error strings. The index is rebuilt
-      // every embed cycle, so this takes effect at the next reindex without
-      // a migration.
+      // meaningful tokens in code and error strings.
       await this.table.createIndex('contextualizedContent', {
         config: lancedb.Index.fts({ withPosition: true, removeStopWords: false }),
+        name: FTS_INDEX_NAME,
         replace: true,
       });
+      // Indexes built under another name carry an older config. Drop them
+      // only after the current one exists, so search never lacks an index.
+      for (const old of fts) await this.table.dropIndex(old.name);
     } catch {
       // Index creation can fail on empty tables or unsupported configs — non-fatal
     }
@@ -333,7 +344,6 @@ export class VectorStore implements VectorStorePort {
       await this.deleteChunksByIds(rows.map((r) => r.id));
       await this.table.add(rows);
     }
-    // Rebuild FTS index after data changes
     await this.ensureFtsIndex();
   }
 
@@ -631,8 +641,8 @@ export class VectorStore implements VectorStorePort {
   }
 
   /** Add chunks without deleting existing project data (for incremental updates).
-   *  Pass { skipIndex: true } to defer the FTS rebuild; the caller must then
-   *  call ensureFtsIndex() once after the final batch. */
+   *  Pass { skipIndex: true } to skip the ensureFtsIndex() check; the caller
+   *  must then call it once after the final batch. */
   async addChunks(chunks: Array<CodeChunk & { embedding: number[] }>, opts?: { skipIndex?: boolean }): Promise<void> {
     if (chunks.length === 0) return;
     const rows = chunks.map((c) => ({
@@ -658,8 +668,6 @@ export class VectorStore implements VectorStorePort {
     } else {
       await this.table.add(rows);
     }
-    // Rebuild FTS index after data changes — unless the caller is streaming
-    // batches and will call ensureFtsIndex() once at the end.
     if (!opts?.skipIndex) {
       await this.ensureFtsIndex();
     }

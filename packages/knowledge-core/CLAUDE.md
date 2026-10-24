@@ -98,8 +98,10 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   configured or the fused pool can't fill `maxChunks`; its chunks are
   appended after the fused pool.
 - `VectorStore` (`src/vector-store.ts`) — LanceDB-backed; supports
-  vector + FTS search, file-level deletes, FTS index rebuild, IVF vector
-  index build / in-place retrain (`ensureVectorIndex`), `vectorIndexState`.
+  vector + FTS search, file-level deletes, FTS index build when missing or
+  under an older config's name (`ensureFtsIndex`; `optimize()` keeps it
+  current), IVF vector index build / in-place retrain (`ensureVectorIndex`),
+  `vectorIndexState`.
 - `maintainVectorIndex` / `planVectorIndex` / `readVectorIndexHealth`
   (`src/vector-index-maintenance.ts`) — write-path vector-index lifecycle:
   build at `minRows`, retrain once rows written since the last training
