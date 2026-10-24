@@ -1,4 +1,5 @@
 import { rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import type { CodeChunk, ScoredChunk } from '@esankhan3/anvil-knowledge-core';
 import type {
   VectorStorePort,
@@ -42,10 +43,17 @@ export function identifierParts(text: string): string {
   return splitIdentifiers(text.replace(PLAIN_WORD, ' ').replace(/[^A-Za-z0-9_]+/g, ' '));
 }
 
+/** SHA-256 (hex) of the text a chunk is embedded from — the key embedding
+ *  reuse looks vectors up by. */
+export function contentHash(contextualizedContent: string): string {
+  return createHash('sha256').update(contextualizedContent).digest('hex');
+}
+
 /** Columns derived from others, with the SQL that fills them in for rows
  *  written before the column existed (ensureColumns). Each SQL must match the
  *  JS that addChunks uses for new rows (`(?-u:\b)` = JS's ASCII `\b`). */
 const DERIVED_COLUMNS = [
+  { name: 'contentHash', valueSql: "encode(sha256(contextualizedContent), 'hex')" },
   {
     name: 'contentSplit',
     valueSql:
@@ -223,7 +231,8 @@ export class VectorStore implements VectorStorePort {
    *  table scans — the dominant per-query cost at org scale (a 383k-row scan of
    *  text-heavy rows, repeated per graph-expansion batch). `bitmap` for
    *  low-cardinality equality columns (repoName, project), `btree` for
-   *  high-cardinality ones (filePath, entityName, id).
+   *  high-cardinality ones (filePath, entityName, id, and contentHash for the
+   *  writer's embedding-reuse lookups).
    *
    *  Write path only; idempotent (build-if-absent — a new table, e.g. after a
    *  corrupt-store heal, gets them on its first run; incremental adds are folded
@@ -238,8 +247,10 @@ export class VectorStore implements VectorStorePort {
       { col: 'filePath', kind: 'btree' },
       { col: 'entityName', kind: 'btree' },
       { col: 'id', kind: 'btree' },
+      { col: 'contentHash', kind: 'btree' },
     ];
     try {
+      await this.ensureColumns();
       const existing: Array<{ columns?: string[] }> = await this.table.listIndices();
       const indexed = new Set(existing.flatMap((i) => i.columns ?? []));
       const lancedb = await import('@lancedb/lancedb');
@@ -382,6 +393,7 @@ export class VectorStore implements VectorStorePort {
       content: c.content,
       contextualizedContent: c.contextualizedContent,
       contentSplit: identifierParts(c.contextualizedContent),
+      contentHash: contentHash(c.contextualizedContent),
       contextPrefix: c.contextPrefix,
       filePath: c.filePath,
       repoName: c.repoName,
@@ -713,15 +725,56 @@ export class VectorStore implements VectorStorePort {
   /** Delete chunks for specific files within a repo (for incremental re-indexing) */
   async deleteFileChunks(project: string, repoName: string, filePaths: string[]): Promise<void> {
     if (!this.table || filePaths.length === 0) return;
-    const escapedProject = project.replace(/'/g, "''");
-    const escapedRepo = repoName.replace(/'/g, "''");
-    const fileFilter = filePaths.map((f) => `'${f.replace(/'/g, "''")}'`).join(', ');
     try {
-      await this.table.delete(
-        `project = '${escapedProject}' AND repoName = '${escapedRepo}' AND filePath IN (${fileFilter})`,
-      );
+      await this.table.delete(fileRowsFilter(project, repoName, filePaths));
     } catch {
       /* ok if empty */
+    }
+  }
+
+  /** (id, contentHash) of every row of the given files. Write path only. */
+  async getFileRowHashes(project: string, repoName: string, filePaths: string[]): Promise<Array<{ id: string; contentHash: string }>> {
+    if (!this.table || filePaths.length === 0) return [];
+    await this.ensureColumns();
+    const rows = await this.table.query()
+      .where(fileRowsFilter(project, repoName, filePaths))
+      .select(['id', 'contentHash'])
+      .toArray();
+    return rows.map((r: any) => ({ id: r.id, contentHash: r.contentHash }));
+  }
+
+  /** A vector for each of `hashes` that some row's contentHash equals — the
+   *  embedding of that exact text, for reuse instead of a provider call.
+   *  BTREE-indexed (ensureScalarIndexes). Write path only. */
+  async getVectorsByContentHash(hashes: string[]): Promise<Map<string, number[]>> {
+    const found = new Map<string, number[]>();
+    if (!this.table || hashes.length === 0) return found;
+    await this.ensureColumns();
+    const batchSize = 1000;
+    for (let i = 0; i < hashes.length; i += batchSize) {
+      const batch = hashes.slice(i, i + batchSize).filter((h) => /^[0-9a-f]{64}$/.test(h));
+      if (batch.length === 0) continue;
+      const rows = await this.table.query()
+        .where(`contentHash IN (${batch.map((h) => `'${h}'`).join(', ')})`)
+        .select(['contentHash', 'vector'])
+        .toArray();
+      for (const r of rows) if (!found.has(r.contentHash)) found.set(r.contentHash, Array.from(r.vector as ArrayLike<number>));
+    }
+    return found;
+  }
+
+  /** Delete exactly these rows — each matched on id AND contentHash, so a new
+   *  row that took over an id (chunk ids are position-keyed) survives. */
+  async deleteRows(rows: Array<{ id: string; contentHash: string }>): Promise<void> {
+    if (!this.table || rows.length === 0) return;
+    const esc = (s: string) => s.replace(/'/g, "''");
+    // Each pair is two conditions; Lance rejects a filter with more than 500.
+    const batchSize = 200;
+    for (let i = 0; i < rows.length; i += batchSize) {
+      const filter = rows.slice(i, i + batchSize)
+        .map((r) => `(id = '${esc(r.id)}' AND contentHash = '${esc(r.contentHash)}')`)
+        .join(' OR ');
+      await this.table.delete(filter);
     }
   }
 
@@ -736,6 +789,7 @@ export class VectorStore implements VectorStorePort {
       content: c.content,
       contextualizedContent: c.contextualizedContent,
       contentSplit: identifierParts(c.contextualizedContent),
+      contentHash: contentHash(c.contextualizedContent),
       contextPrefix: c.contextPrefix,
       filePath: c.filePath,
       repoName: c.repoName,
@@ -764,6 +818,13 @@ export class VectorStore implements VectorStorePort {
 /** ADR §3 canonical name for the default LanceDB-backed `VectorStorePort`
  *  adapter. Alias for now; a later phase renames the class outright. */
 export { VectorStore as LanceVectorStore };
+
+/** Predicate for every row of the given files of one repo. */
+function fileRowsFilter(project: string, repoName: string, filePaths: string[]): string {
+  const esc = (s: string) => s.replace(/'/g, "''");
+  const files = filePaths.map((f) => `'${esc(f)}'`).join(', ');
+  return `project = '${esc(project)}' AND repoName = '${esc(repoName)}' AND filePath IN (${files})`;
+}
 
 function rowToChunk(row: any): CodeChunk {
   return {

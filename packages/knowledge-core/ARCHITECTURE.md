@@ -345,6 +345,9 @@ API:
 | `getChunksByFile(repoName, filePath)` | all chunks for a file |
 | `deleteChunksByIds(ids)` | targeted delete |
 | `deleteFileChunks(project, repo, filePaths)` | bulk file-level delete |
+| `getFileRowHashes(project, repo, filePaths)` | `(id, contentHash)` of those files' rows |
+| `getVectorsByContentHash(hashes)` | a stored vector per content hash found (embedding reuse) |
+| `deleteRows(rows)` | delete exact `(id, contentHash)` rows |
 | `getChunkIds(project)` | for incremental embed planning |
 | `getStats()` / `hasData()` | row count |
 | `ensureVectorIndex({ minRows, retrain })` | build the IVF vector index when absent (≥ `minRows`), or retrain it in place |
@@ -652,18 +655,23 @@ Steps:
 ### 19.2 `KnowledgeIndexer.embedChunks(project, config, opts?)`
 
 1. Open `VectorStore` at `<basePath>/lancedb` (`healCorrupt`).
-2. Read `deleted_files.json` (deleted + changed files) → `deleteFileChunks`
-   per repo. This runs before the id diff: chunk ids are position-keyed, so
-   a changed file's unmoved chunks keep their ids and would otherwise be
-   skipped as already embedded.
-3. Snapshot existing chunk ids; stream `chunks.json` (NDJSON) to count
-   totals and new ids.
-4. Sweep rows whose ids `chunks.json` no longer lists (skipped when it is
-   empty).
+2. Read `deleted_files.json` (deleted + changed files) →
+   `getFileRowHashes` per repo: the stale rows' `(id, contentHash)`. Chunk
+   ids are position-keyed, so a changed file's new chunks can take those
+   ids; the diff below treats them as not embedded.
+3. Snapshot existing chunk ids (minus stale ids); stream `chunks.json`
+   (NDJSON) to count totals and new ids. A stale row whose id and text both
+   come back is kept.
+4. Plan the sweep: stale rows left (deleted by exact `(id, contentHash)`)
+   and rows whose ids `chunks.json` no longer lists (none when it is
+   empty). Both are deleted after step 5, so their vectors can be reused.
 5. Embed the new chunks: batches of `CODE_SEARCH_EMBEDDING_BATCH_SIZE`
    (10 for Ollama, else 128) with `CODE_SEARCH_EMBEDDING_CONCURRENCY`
    in flight (Ollama 1, else 8), streamed — no inter-batch delay; 429s
-   back off inside the embedder.
+   back off inside the embedder. Each batch first looks up its texts'
+   `contentHash` (BTREE) and reuses stored vectors; the first batch with
+   hits embeds one of them and compares (cosine > 0.99), so vectors from a
+   different provider / model / dimensions are never reused. Then the sweep.
 6. `addChunks` the embedded rows in appends of 4,096 (one LanceDB commit
    each, so commits don't scale with chunks / batch size); then
    `ensureFtsIndex`, which builds the full-text index only when it is missing
