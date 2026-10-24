@@ -108,7 +108,7 @@ dev points their client at the same URL.
 
 ## Tool surface
 
-Eleven tools across four categories. Every one of them maps to a
+Seventeen tools across four categories. Every one of them maps to a
 function in `@anvil/knowledge-core` — you're getting the same
 retrieval pipeline that powers the Anvil dashboard.
 
@@ -117,22 +117,27 @@ retrieval pipeline that powers the Anvil dashboard.
 |---|---|
 | `search_code` | Hybrid retrieval — vector + BM25 + graph + rerank |
 | `search_semantic` | Vector-only (paraphrases, intent) |
-| `search_exact` | BM25-only (identifiers, error codes) |
+| `search_exact` | BM25, led by exact symbol-name / phrase hits (identifiers, error codes); works without the embedder |
 | `get_code_snippet` | Fetch the source for one entity by qualified name (cheaper than reading the file) |
 
 ### Graph
 | Tool | What it does |
 |---|---|
-| `get_repo_graph` | Single-repo AST graph |
-| `get_cross_repo_edges` | Inter-repo edges (Kafka, HTTP, gRPC, shared types, …) |
-| `find_callers` | Who calls this function (exact by default; `fuzzy:true` for substring) |
-| `find_dependencies` | What this function calls |
-| `impact_analysis` | What breaks if this changes |
-| `trace_path` | Multi-hop call chain — shortest path between two functions, or the reachable call tree |
-| `search_graph` | Structural query — filter entities by name/type/file, ranked by connectivity |
-| `find_dead_code` | Entities with no callers (heuristic) |
-| `detect_changes` | Map a git diff to affected entities + their dependents |
+| `get_repo_graph` | Single-repo AST graph — entities and edges (`limit` caps each list) |
+| `get_cross_repo_edges` | Inter-repo edges (HTTP, gRPC, topics, tables, shared types, …), each with its evidence; same-repo workspace-package deps in their own section |
+| `find_callers` | Who calls this symbol — `calls` edges only by default; `relations` adds imports / uses / type-ref / inherits, listed per relation |
+| `find_dependencies` | What this symbol calls (same `relations` option) |
+| `impact_analysis` | What breaks if a file or entity changes — dependents up to `depth` hops (default 2, max 5), cross-repo included |
+| `trace_path` | Multi-hop call chain — shortest path (unweighted BFS) between two symbols, or what is reachable; `calls` edges by default |
+| `search_graph` | Structural query — filter nodes by name (regex over symbol names), type, file, repo; ranked by connectivity |
+| `find_dead_code` | Entities with no incoming edge and no other mention in their file (heuristic) |
+| `detect_changes` | Map a git diff to the entities whose lines changed (whole file for added / deleted files) + their dependents |
 | `get_architecture` | Project overview — repo roles, key flows, connections |
+
+Symbol arguments take a name (exact, case-sensitive) or a full
+`repo::file::entity` id; `fuzzy: true` matches a case-insensitive
+substring of symbol names. Every tool validates its arguments against
+its input schema — a bad argument returns `isError: true` and the reason.
 
 ### Profiles
 | Tool | What it does |
@@ -143,7 +148,7 @@ retrieval pipeline that powers the Anvil dashboard.
 ### Index
 | Tool | What it does |
 |---|---|
-| `index_status` | Last indexed SHA, chunk count, embedding provider |
+| `index_status` | Chunk count, embedding provider, last indexed time, vector-index health, chunks per repo |
 
 Plus four MCP resources via `code-search://`:
 `repos`, `system-graph`, `repo/{name}/profile`, `repo/{name}/graph`.
@@ -178,8 +183,10 @@ exist between web and api?
 Fourteen cross-repo edge strategies cover shared types, Kafka,
 HTTP, gRPC, databases, env vars, npm/workspace deps, k8s,
 docker-compose, proto, Redis, S3, and shared constants. Plus an
-LLM-inferred semantic edge layer. `find_callers` works *across
-repos*. So does `impact_analysis`.
+LLM-inferred semantic edge layer. `get_cross_repo_edges`,
+`impact_analysis` and `detect_changes` work *across repos* (shared
+topics, tables and the like count as dependencies both ways);
+`find_callers` and `trace_path` do too with `relations: ["all"]`.
 
 ---
 

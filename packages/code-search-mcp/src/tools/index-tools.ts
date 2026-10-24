@@ -1,11 +1,12 @@
 /**
- * Index management tools — status, reindex, and dynamic index_path.
+ * Index tools — index_status.
  */
 
 import type { ServerContext } from '../server.js';
 import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import { KnowledgeIndexer } from '@esankhan3/anvil-knowledge-core';
 import type { VectorIndexHealth } from '@esankhan3/anvil-knowledge-core';
+import { toolError, type ToolResult } from './validate.js';
 
 const TOOL_NAMES = ['index_status'];
 
@@ -28,7 +29,7 @@ export function registerIndexTools() {
   return [
     {
       name: 'index_status',
-      description: 'Get current index stats — chunk count, embedding provider, repos indexed, last indexed time.',
+      description: 'Get current index stats — chunk count, embedding provider, last indexed time, vector-index health, and chunks per repo.',
       inputSchema: {
         type: 'object' as const,
         properties: {},
@@ -41,7 +42,7 @@ export async function handleIndexTool(
   name: string,
   args: Record<string, unknown>,
   ctx: ServerContext,
-): Promise<{ content: Array<{ type: string; text: string }> } | null> {
+): Promise<ToolResult | null> {
   if (!TOOL_NAMES.includes(name)) return null;
 
   try {
@@ -68,6 +69,6 @@ export async function handleIndexTool(
     return null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: 'text', text: `Index tool error: ${msg}` }] };
+    return toolError(`Index tool error: ${msg}`);
   }
 }

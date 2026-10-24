@@ -254,6 +254,13 @@ Pattern per file: `register<X>Tools()` + `handle<X>Tool(name, args,
 ctx) → result | null`. The `null` return = "not my tool", lets the
 server.ts dispatcher try the next handler.
 
+Every handler first runs `validateArgs(inputSchema, args)`
+(`tools/validate.ts`) against the tool's own descriptor — required args,
+types, enums, integer `minimum` / `maximum`, `minLength` (non-blank
+strings) — so the advertised schema and the accepted input can't drift.
+A bad argument, or any thrown error, returns `isError: true` with the
+reason (`toolError`).
+
 ### 7.1 Search (`tools/search.ts`)
 
 | Tool | Mode passed to retriever |
@@ -262,43 +269,58 @@ server.ts dispatcher try the next handler.
 | `search_semantic` | `'vector'` (single-source) |
 | `search_exact` | `'bm25'` (single-source) |
 
-The three search tools:
+The three search tools (`query`, `maxResults` ≥ 1, `repos` — an array,
+one name, or a comma-separated string, coerced to a list; one naming no
+repo is an error):
 
-1. Guard on `ctx.indexReady`.
+1. Guard on `ctx.indexReady` — except `search_exact`: BM25 needs no
+   embedder, so it serves whatever the index holds.
 2. `retriever = await getRetriever(ctx.projectName)` (knowledge-core).
-3. `retriever.retrieve(query, { maxChunks: maxResults || 10,
-   repoFilter: repos, mode })`.
+3. `retriever.retrieve(query, { maxChunks: maxResults ?? 10,
+   maxTokens: maxResults × 4000, repoFilter: repos, mode })`.
 4. Format chunks as markdown with score, source, language fence.
+5. Record `metrics.queriesTotal{mode, outcome}`, `queryDuration{mode}`
+   and, on failure, `errors{kind: 'search'}` — the same labels
+   `InProcessBackend` uses (`mode` = `hybrid` / `vector` / `bm25`).
 
-`get_code_snippet` is the exception — it reads `chunks.json` directly
-(no retriever, no embedder), so it works in BM25-only / lite mode. Parses
-`id="repo::file::entity"` (or `repo`/`file`/`entity` fields), matches
-chunks, and returns the source for that entity.
+`get_code_snippet` is the exception — it never embeds, so it works in
+BM25-only / lite mode. Parses `id="repo::file::entity"` (or
+`repo`/`file`/`entity` fields), looks the entity up in the vector store
+(indexed lookup), falls back to streaming `chunks.json`, and returns the
+source for that entity.
 
 ### 7.2 Graph (`tools/graph.ts`)
 
 The system-graph tools query knowledge-core's `GraphStore`
 (`getGraphStore` → `system_graph.sqlite`, JSON fallback for older
 indexes) by slice, never loading the whole graph. `store.resolveNodes(name,
-repo?, fuzzy?)` resolves a symbol name to node keys — exact by default
-(`label === name` or key endsWith `::name`), substring only when
-`fuzzy:true`. Edge types other than `contains` are not distinguished, so
-"callers" include importers, type-referencers and inheritors.
+repo?, fuzzy?)` resolves a symbol to node keys — exact by default (full key,
+`label`, or a `::name` key suffix; case-sensitive, no wildcards), so a full
+`repo::file::entity` id works; `fuzzy:true` = case-insensitive substring of
+symbol labels (files and cross-repo endpoints skipped). Traversal tools take
+`relations` (`calls` default; `imports`, `uses`, `type-ref`, `inherits`,
+`all`) and pass the edge types to the store, so imports, type references
+and inheritance are never reported as calls.
 
 | Tool | Reads | What it computes |
 |---|---|---|
-| `get_repo_graph` | `<repo>/graph.json` | summary + first 50 entities |
-| `get_cross_repo_edges` | `GraphStore` | `crossRepoEdges(repo?, 50)` — edges whose source and target repos differ, optional `repo` on either end |
-| `find_callers` | `GraphStore` | `resolveNodes` → sources of incoming non-`contains` edges (top 30) |
-| `find_dependencies` | `GraphStore` | same but outgoing → unique targets |
-| `impact_analysis` | `GraphStore` | `nodesInFiles(repo, [file], entity?)` → `dependents` (incoming edges from outside the scope) + affected repo set |
-| `trace_path` | `GraphStore` | BFS over `neighborsOf` (non-`contains`, `confidence ≥ 0.7`, unweighted); shortest path to `to`, else the reachable tree (≤`maxDepth`, cap 50) |
-| `search_graph` | `GraphStore` | filter nodes by name (SQL `LIKE` substring) / type / file / repo; rank by non-`contains` degree; top `limit` |
-| `find_dead_code` | `<repo>/graph.json` | entity nodes (function/method/class/…) with zero non-`contains` in-degree |
-| `detect_changes` | git + `GraphStore` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)` → changed files → `nodesInFiles` → `dependents` |
+| `get_repo_graph` | `<repo>/graph.json` | node / edge counts (edges by type) + first `limit` entities and non-`contains` edges; unknown repo → `isError` |
+| `get_cross_repo_edges` | `GraphStore` | `crossRepoEdges(repo?, 50)` — edges between repos plus same-repo `workspace-dep` edges (own section), each with its `evidence`; shared-resource types shown `↔` |
+| `find_callers` | `GraphStore` | `resolveNodes` → `callers(keys, 30, types)` grouped by relation; when none, names the other relations present |
+| `find_dependencies` | `GraphStore` | same, `dependencies(keys, 30, types)` |
+| `impact_analysis` | `GraphStore` | scope = `nodesInFiles(repo, [file], entity?)` (`entity` may be a full id) → `dependents` hop by hop up to `depth` (default 2, max 5); with `entity`, the file's `external` (cross-repo endpoint) nodes join the scope and their dependents are marked `[file-level]`; no nodes for the file → `isError` |
+| `trace_path` | `GraphStore` | BFS over `neighborsOf(key, direction, types)` (`confidence ≥ 0.7`, unweighted); shortest path (≥ 1 hop) to `to`, else the reachable tree (≤`maxDepth` ≤ 10, cap 50) |
+| `search_graph` | `GraphStore` | `searchNodes`: name = case-insensitive regex over symbol labels (invalid → `isError`), type / file / repo filters; rank by non-`contains` degree; top `limit` |
+| `find_dead_code` | `<repo>/graph.json` + indexed chunk text | entity nodes (function/method/class/…) with zero non-`contains` in-degree whose name doesn't occur again in their own file (vector store `getChunksByFile`, else `chunks.json`) |
+| `detect_changes` | git + `GraphStore` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)`; added / deleted files → every node; modified files → entities whose range at the base overlaps a `git diff -U0` old-side hunk (ranges run from each entity's declaration line in `git show base:file` to the next declaration; an entity whose declaration isn't found is kept) + module node when a hunk falls outside every range + the file's endpoints (`[file-level]`) → one hop of `dependents` |
 | `get_architecture` | `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` / profiles | renders the CLI-generated project graph; degrades to profiles, then to a "no data" hint |
 
-Node id convention: `<repo>::<filePath>::<entity>` (matches AST graph
+`dependents` follows edges into the scope plus shared-resource cross-repo
+edges (`SYMMETRIC_EDGE_TYPES`: topics, tables, Redis keys, buckets, shared
+types / constants / env vars / npm deps) out of it, so both sides of a
+shared topic see each other.
+
+Node id convention: `<repo>::<filePath>::<entity>`, class members `<repo>::<filePath>::<Class>.<member>` (matches AST graph
 builder's namespacing). `get_architecture` reads `PROJECT_GRAPH.json` /
 `PROJECT_SUMMARY.md` through the project's blob store (`getBlobStore`),
 not knowledge-core's `ANVIL_HOME`-based loaders.
@@ -441,10 +463,11 @@ packages/code-search-mcp/
     │   └── auth.ts                          ← none/api-key/jwt + rate limit
     │
     ├── tools/
-    │   ├── search.ts                        ← search_code / _semantic / _exact
+    │   ├── search.ts                        ← search_code / _semantic / _exact / get_code_snippet
     │   ├── graph.ts                         ← 10 graph tools
     │   ├── profile.ts                       ← list_repos / get_repo_profile
-    │   └── index-tools.ts                   ← index_status
+    │   ├── index-tools.ts                   ← index_status
+    │   └── validate.ts                      ← validateArgs + toolText / toolError
     │
     ├── resources/
     │   └── resources.ts                     ← static + dynamic URIs
@@ -473,6 +496,7 @@ Build: `node build.mjs` bundles three bin targets — `dist/index.js`,
 ## 13. Tests
 
 `src/__tests__/` (`node --test` on the built `dist/__tests__/`): config
-resolver, daemon RPC, graph tools, stateless HTTP, `/metrics` endpoint,
-observability, project registry. Retrieval and indexing behaviour is
+resolver, daemon RPC, graph tools (JSON and SQLite system graph), tool
+input validation / descriptors / search metrics, stateless HTTP,
+`/metrics` endpoint, observability, project registry. Retrieval and indexing behaviour is
 covered by `@esankhan3/anvil-knowledge-core`'s tests.

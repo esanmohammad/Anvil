@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execSync } from 'node:child_process';
@@ -61,6 +61,8 @@ const REPO_GRAPH = {
 
 const CHUNKS = [
   { id: 'c1', repoName: 'app', filePath: 'a.ts', entityName: 'handleRequest', startLine: 1, endLine: 3, content: 'function handleRequest() { return 1; }', language: 'typescript' },
+  { id: 'c2', repoName: 'app', filePath: 'ui.ts', entityName: 'render', parentEntity: 'Board', startLine: 2, endLine: 2, content: 'render() { return "board"; }', language: 'typescript' },
+  { id: 'c3', repoName: 'app', filePath: 'ui.ts', entityName: 'render', parentEntity: 'Card', startLine: 5, endLine: 5, content: 'render() { return "card"; }', language: 'typescript' },
 ];
 
 const PROJECT_GRAPH = {
@@ -157,6 +159,12 @@ describe('get_code_snippet', () => {
     assert.match(text(r), /function handleRequest/);
   });
 
+  it('resolves a class-qualified method id to that class\'s method', async () => {
+    const t = text(await handleSearchTool('get_code_snippet', { id: 'app::ui.ts::Card.render' }, ctx()));
+    assert.match(t, /"card"/);
+    assert.doesNotMatch(t, /"board"/);
+  });
+
   it('reports when nothing matches', async () => {
     const r = await handleSearchTool('get_code_snippet', { id: 'app::a.ts::nope' }, ctx());
     assert.match(text(r), /No snippet found/);
@@ -210,12 +218,12 @@ describe('detect_changes', () => {
       git('config user.name test');
       git('config commit.gpgsign false');
       writeFileSync(join(repoDir, 'a.ts'), 'export function handleRequest() {}\n');
-      writeFileSync(join(repoDir, 'b.ts'), 'export function dbQuery() {}\n');
+      writeFileSync(join(repoDir, 'b.ts'), 'export function dbQuery() {\n  return 1;\n}\n');
       git('add -A');
       git('commit -q -m init');
       baseSha = execSync('git rev-parse HEAD', { cwd: repoDir }).toString().trim();
-      // uncommitted change to b.ts (where dbQuery lives in the fixture graph)
-      appendFileSync(join(repoDir, 'b.ts'), '// touched\n');
+      // uncommitted change inside dbQuery's body (b.ts in the fixture graph)
+      writeFileSync(join(repoDir, 'b.ts'), 'export function dbQuery() {\n  return 2;\n}\n');
     } catch {
       rmSync(ws, { recursive: true, force: true });
       return; // git unavailable — skip

@@ -508,9 +508,13 @@ export class VectorStore implements VectorStorePort {
     const esc = (s: string) => s.replace(/'/g, "''");
     const conditions = lookups.map((l) => {
       const base = `repoName = '${esc(l.repoName)}' AND filePath = '${esc(l.filePath)}'`;
-      return l.entityName
-        ? `(${base} AND entityName = '${esc(l.entityName)}')`
-        : `(${base})`;
+      if (!l.entityName) return `(${base})`;
+      // `Class.member` (graph node ids) → that class's member chunk.
+      const dot = l.entityName.lastIndexOf('.');
+      const member = dot > 0
+        ? ` OR (entityName = '${esc(l.entityName.slice(dot + 1))}' AND parentEntity = '${esc(l.entityName.slice(0, dot))}')`
+        : '';
+      return `(${base} AND (entityName = '${esc(l.entityName)}'${member}))`;
     });
     try {
       // Split into batches (avoid overly long filter strings) and run them
