@@ -404,8 +404,9 @@ Pipeline (4 phases):
 1. **Phase 1** — in parallel: `vectorSearch(50)`, `fullTextSearch(50)`,
    and two literal tiers — `searchByEntitySubstring` /
    `searchByEntityName` (20) for a bare identifier, `phraseSearch` (20)
-   for a multi-token query of ≥ 8 chars. Query embedding cached LRU-128,
-   10 min TTL. `'vector'` / `'bm25'` modes return here (`'bm25'` puts the
+   for a multi-token query of ≥ 8 chars. Query embedding cached LRU-4096
+   (a hit refreshes recency), 10 min TTL, keyed by the embedder's name /
+   model / dimensions plus the query. `'vector'` / `'bm25'` modes return here (`'bm25'` puts the
    literal hits first).
 2. **Phase 2** — weighted RRF (`k = CODE_SEARCH_RRF_K`, default 10):
    vector + BM25 with weights from `classifyQuery` (falls back to
@@ -416,8 +417,9 @@ Pipeline (4 phases):
 3. **Phase 3** — AST expansion (`+graph` modes), only when a reranker is
    configured or the pool can't fill `maxChunks`: pick 5 diversified seeds
    (one per file), take their one-hop neighbours in both directions
-   (non-`contains` edges with confidence ≥ 0.7, module/package nodes
-   dropped), fetch chunks via `getChunksByEntity`. Expanded chunks are
+   (non-`contains` edges with confidence ≥ 0.7, at most 100 rows per seed
+   via `neighborEdges`, module/package nodes dropped), fetch chunks via
+   `getChunksByEntity`. Expanded chunks are
    appended after the pool.
 4. **Phase 4** — Cross-encoder rerank over the pool + AST candidates
    when a reranker is configured. Reranker failure → fall back to RRF
@@ -462,24 +464,33 @@ The merged system graph normally lives in `system_graph.sqlite`
 repo's nodes/edges plus the cross-repo edges as `buildKB` goes, and
 `GraphStore` (`openSystemGraphStore` / `getGraphStore`) serves slice
 queries to the retriever and the MCP graph tools. Tables: `nodes(key,
-repo, file, label, type, degree, attrs)` and `edges(source, target, type,
-confidence, source_repo, target_repo, evidence)` — `evidence` (the
-route / topic / table / package a cross-repo edge was matched on) is NULL
-for AST edges; files written before the column existed are still read
-(`NULL AS evidence`) until the next index rebuilds them.
+key_tail, repo, file, label, type, degree, attrs)` and `edges(source,
+target, type, confidence, source_repo, target_repo, evidence)` —
+`evidence` (the route / topic / table / package a cross-repo edge was
+matched on) is NULL for AST edges; `key_tail` is the key's text after its
+last `::` (indexed). Files written before either column existed are still
+read (`NULL AS evidence`; exact resolution by scan) until the next index
+rebuilds them.
 
 Query semantics (both the SQLite store and the JSON fallback):
 `resolveNodes` is exact by default — full key, `label`, or a `::name` key
-suffix, case-sensitive and wildcard-free; `fuzzy` = case-insensitive
-substring of symbol labels (`module` / `external` nodes skipped).
-`callers` / `dependencies` / `neighborsOf` take an edge-type filter
-(omitted = every type but `contains`); `callers` / `dependencies` return
-`{ key, type }`. `crossRepoEdges` returns edges between repos plus
-same-repo `workspace-dep` edges. `dependents` follows edges into the set
-and, for `SYMMETRIC_EDGE_TYPES` (`event-schema`, `database`, `redis`, `s3`,
-`shared-type`, `shared-constant`, `env-var`, `npm-dep` — one stored edge
-per pair, in arbitrary order), edges out of it too, returned flipped so
-`source` is the dependent. `searchNodes` `name` is a case-insensitive
+suffix, case-sensitive and wildcard-free, matches in insertion order; on
+SQLite every arm is an index lookup (primary key, `label`, `key_tail` —
+a key ending in `::name` has the same tail as `::name`); `fuzzy` =
+case-insensitive substring of symbol labels (`module` / `external` nodes
+skipped), a scan.
+`callers` / `dependencies` / `neighborsOf` / `neighborEdges` take an
+edge-type filter (omitted = every type but `contains`); `callers` /
+`dependencies` return `{ key, type }`. `neighborEdges(keys, direction,
+types, limit)` is `neighborsOf` for a whole frontier — `[key, neighbour]`
+pairs, one query per 400 keys, at most `limit` rows. `crossRepoEdges`
+returns edges between repos plus same-repo `workspace-dep` edges.
+`dependents` follows edges into the set and, for `SYMMETRIC_EDGE_TYPES`
+(`event-schema`, `database`, `redis`, `s3`, `shared-type`,
+`shared-constant`, `env-var`, `npm-dep` — one stored edge per pair, in
+arbitrary order), edges out of it too, returned flipped so `source` is the
+dependent; with `maxRows` it stops after that many edges (`truncated`).
+`searchNodes` `name` is a case-insensitive
 regex over symbol labels (a `regexp` SQL user function; JS filtering on a
 driver without user functions); an invalid pattern throws.
 

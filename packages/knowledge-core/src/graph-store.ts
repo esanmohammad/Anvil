@@ -49,8 +49,11 @@ const NON_SYMBOL_TYPES = ['module', 'external'];
  * types); omitted = every edge type except `contains`. `crossRepoEdges` also
  * returns same-repo `workspace-dep` edges. `dependents` follows edges into the
  * set, plus {@link SYMMETRIC_EDGE_TYPES} edges out of it (returned flipped, so
- * `source` is always the dependent). `searchNodes` `name` is a case-insensitive
- * regex over symbol labels; an invalid one throws.
+ * `source` is always the dependent); with `maxRows` it stops after that many
+ * edges, and `truncated` says the count stopped there. `neighborEdges` is
+ * `neighborsOf` for many keys at once — `[key, neighbour]` pairs, at most
+ * `limit`. `searchNodes` `name` is a case-insensitive regex over symbol
+ * labels; an invalid one throws.
  */
 export interface GraphStore {
   resolveNodes(name: string, repo?: string, fuzzy?: boolean): Array<{ key: string; label: string }>;
@@ -58,8 +61,9 @@ export interface GraphStore {
   dependencies(sourceKeys: string[], limit: number, types?: string[]): TypedNeighbor[];
   crossRepoEdges(repo: string | undefined, limit: number): { edges: GraphEdge[]; total: number };
   nodesInFiles(repo: string, files: string[], entity?: string): string[];
-  dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] };
+  dependents(nodeKeys: string[], limit: number, maxRows?: number): { edges: GraphEdge[]; total: number; repos: string[]; truncated: boolean };
   neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[];
+  neighborEdges(keys: string[], direction: GraphDirection, types: string[] | undefined, limit: number): Array<[string, string]>;
   labelsOf(keys: string[]): Map<string, string>;
   nodeTypes(keys: string[]): Map<string, string>;
   searchNodes(
@@ -116,13 +120,16 @@ function loadDriver(): Promise<Opener | null> {
   return driverPromise;
 }
 
+// nodes.key_tail = keyTail(key), indexed so exact `::name` resolution is a
+// btree lookup (files written before it existed have no such column).
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS nodes (
-  key TEXT PRIMARY KEY, repo TEXT, file TEXT, label TEXT, type TEXT, degree INTEGER, attrs TEXT
+  key TEXT PRIMARY KEY, key_tail TEXT, repo TEXT, file TEXT, label TEXT, type TEXT, degree INTEGER, attrs TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_repo  ON nodes(repo);
 CREATE INDEX IF NOT EXISTS idx_nodes_type  ON nodes(type);
 CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
+CREATE INDEX IF NOT EXISTS idx_nodes_key_tail ON nodes(key_tail);
 CREATE INDEX IF NOT EXISTS idx_nodes_file  ON nodes(repo, file);
 CREATE TABLE IF NOT EXISTS edges (
   source TEXT NOT NULL, target TEXT NOT NULL, type TEXT, confidence REAL,
@@ -137,6 +144,12 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 const repoOf = (key: string): string => key.split('::')[0] ?? '';
 const fileOf = (key: string): string => key.split('::')[1] ?? '';
 const labelFromKey = (key: string): string => key.split('::').slice(2).join('::') || key;
+/** Text after the last `::`. A key ending in `::name` has the same tail as `::name`. */
+const keyTail = (key: string): string => {
+  const i = key.lastIndexOf('::');
+  return i < 0 ? key : key.slice(i + 2);
+};
+const INSERT_NODE = 'INSERT OR REPLACE INTO nodes(key,key_tail,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?,?)';
 
 /** Stream the in-memory graph into a fresh sqlite db. Returns false if no
  *  driver is available (caller falls back to the JSON write). */
@@ -152,7 +165,7 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
   db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;');
   db.exec(SCHEMA);
 
-  const insNode = db.prepare('INSERT OR REPLACE INTO nodes(key,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?)');
+  const insNode = db.prepare(INSERT_NODE);
   const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo,evidence) VALUES(?,?,?,?,?,?,?)');
 
   const degree = new Map<string, number>();
@@ -174,6 +187,7 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
       const { label, type, repo, file, ...rest } = attrs as Record<string, unknown>;
       insNode.run(
         key,
+        keyTail(key),
         (repo as string) ?? repoOf(key),
         (file as string) ?? fileOf(key),
         (label as string) ?? labelFromKey(key),
@@ -229,7 +243,7 @@ export async function createSystemGraphSqliteWriter(basePath: string): Promise<S
   const db = open(dbPath);
   db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;');
   db.exec(SCHEMA);
-  const insNode = db.prepare('INSERT OR REPLACE INTO nodes(key,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?)');
+  const insNode = db.prepare(INSERT_NODE);
   const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo,evidence) VALUES(?,?,?,?,?,?,?)');
   const updDegree = db.prepare('UPDATE nodes SET degree=? WHERE key=?');
 
@@ -252,7 +266,7 @@ export async function createSystemGraphSqliteWriter(basePath: string): Promise<S
           if (nodeKeys.has(key)) continue; // dedup — mirrors the hasNode guard
           nodeKeys.add(key);
           const attrs = node.community !== undefined ? JSON.stringify({ community: node.community }) : null;
-          insNode.run(key, repoName, node.file ?? fileOf(key), node.label ?? labelFromKey(key), node.type ?? '', 0, attrs);
+          insNode.run(key, keyTail(key), repoName, node.file ?? fileOf(key), node.label ?? labelFromKey(key), node.type ?? '', 0, attrs);
         }
         for (const edge of graph.links ?? []) {
           const src = `${repoName}::${edge.source}`;
@@ -274,8 +288,8 @@ export async function createSystemGraphSqliteWriter(basePath: string): Promise<S
         for (const e of edges ?? []) {
           const src = `${e.sourceRepo}::${e.sourceNode}`;
           const tgt = `${e.targetRepo}::${e.targetNode}`;
-          if (!nodeKeys.has(src)) { nodeKeys.add(src); insNode.run(src, e.sourceRepo, fileOf(src), e.sourceNode, 'external', 0, null); }
-          if (!nodeKeys.has(tgt)) { nodeKeys.add(tgt); insNode.run(tgt, e.targetRepo, fileOf(tgt), e.targetNode, 'external', 0, null); }
+          if (!nodeKeys.has(src)) { nodeKeys.add(src); insNode.run(src, keyTail(src), e.sourceRepo, fileOf(src), e.sourceNode, 'external', 0, null); }
+          if (!nodeKeys.has(tgt)) { nodeKeys.add(tgt); insNode.run(tgt, keyTail(tgt), e.targetRepo, fileOf(tgt), e.targetNode, 'external', 0, null); }
           const conf = typeof e.confidence === 'number' ? e.confidence : null;
           insEdge.run(src, tgt, e.edgeType, conf, e.sourceRepo, e.targetRepo, e.evidence ?? null);
           edgeCount++;
@@ -309,6 +323,9 @@ function chunked<T>(xs: T[], n = CHUNK): T[][] {
   return out;
 }
 const placeholders = (n: number): string => Array(n).fill('?').join(',');
+/** Edges a traversal follows: not `contains`, confidence ≥ 0.7 (or unset), of `types` when given. */
+const neighborFilter = (types?: string[]): string =>
+  `(confidence IS NULL OR confidence >= 0.7) AND (type IS NULL OR type <> 'contains')${types?.length ? ` AND type IN (${placeholders(types.length)})` : ''}`;
 /** Escape LIKE's wildcards for `ESCAPE '\'`. */
 const likeEscape = (s: string): string => s.replace(/[\\%_]/g, (c) => `\\${c}`);
 
@@ -328,11 +345,14 @@ function rowToEdge(r: any): GraphEdge {
 class SqliteGraphStore implements GraphStore {
   /** Files written before cross-repo evidence was stored have no `evidence` column. */
   private readonly evidenceCol: string;
+  /** Files written before it existed have no `nodes.key_tail`: exact resolution scans them. */
+  private readonly hasKeyTail: boolean;
   private readonly hasRegexp: boolean;
 
   constructor(private db: SqliteDb) {
     const cols = db.prepare('PRAGMA table_info(edges)').all().map((c) => c.name as string);
     this.evidenceCol = cols.includes('evidence') ? 'evidence' : 'NULL AS evidence';
+    this.hasKeyTail = db.prepare('PRAGMA table_info(nodes)').all().some((c) => c.name === 'key_tail');
     this.hasRegexp = this.registerRegexp();
   }
 
@@ -353,16 +373,24 @@ class SqliteGraphStore implements GraphStore {
   resolveNodes(name: string, repo?: string, fuzzy = false): Array<{ key: string; label: string }> {
     const params: unknown[] = [];
     let where: string;
+    let repoCol = 'repo';
     if (fuzzy) {
       where = `label LIKE '%' || ? || '%' ESCAPE '\\' AND type NOT IN (${placeholders(NON_SYMBOL_TYPES.length)})`;
       params.push(likeEscape(name), ...NON_SYMBOL_TYPES);
+    } else if (this.hasKeyTail) {
+      // `=` / substr compare bytes: case-sensitive and wildcard-free. Every OR
+      // arm has an index (key, label, key_tail); key_tail narrows the suffix
+      // test to the keys that can end in `::name`.
+      where = '(key = ? OR label = ? OR (key_tail = ? AND substr(key, -length(?)) = ?))';
+      params.push(name, name, keyTail(`::${name}`), `::${name}`, `::${name}`);
+      repoCol = '+repo'; // `+`: filter only — keeps the planner on the OR's indexes, not a scan of the repo
     } else {
-      // `=` / substr compare bytes: case-sensitive and wildcard-free.
       where = '(key = ? OR label = ? OR substr(key, -length(?)) = ?)';
       params.push(name, name, `::${name}`, `::${name}`);
     }
-    if (repo) { where += ' AND repo = ?'; params.push(repo); }
-    return this.db.prepare(`SELECT key, label FROM nodes WHERE ${where} LIMIT 5000`).all(...params)
+    if (repo) { where += ` AND ${repoCol} = ?`; params.push(repo); }
+    // rowid = insertion order, the order a scan returns (callers may take the first match).
+    return this.db.prepare(`SELECT key, label FROM nodes WHERE ${where} ORDER BY rowid LIMIT 5000`).all(...params)
       .map((r) => ({ key: r.key as string, label: (r.label as string) || labelFromKey(r.key) }));
   }
 
@@ -408,34 +436,39 @@ class SqliteGraphStore implements GraphStore {
     return out;
   }
 
-  dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] } {
+  dependents(nodeKeys: string[], limit: number, maxRows?: number): { edges: GraphEdge[]; total: number; repos: string[]; truncated: boolean } {
     const set = new Set(nodeKeys);
     const sym = [...SYMMETRIC_EDGE_TYPES];
     const edges: GraphEdge[] = [];
     const repos = new Set<string>();
     let total = 0;
+    let read = 0;
     const take = (r: any) => {
       if (set.has(r.source as string)) return; // dependents are from OUTSIDE the set
       total++;
       repos.add((r.source_repo as string) || repoOf(r.source as string));
       if (edges.length < limit) edges.push(rowToEdge(r));
     };
+    const full = () => maxRows !== undefined && read >= maxRows;
+    const scan = (sql: string, params: unknown[]) => {
+      const rows = this.db.prepare(`${sql} LIMIT ?`).all(...params, maxRows === undefined ? -1 : maxRows - read); // -1 = no limit
+      read += rows.length;
+      for (const r of rows) take(r);
+    };
     for (const batch of chunked(nodeKeys)) {
+      if (full()) break;
       const ph = placeholders(batch.length);
-      for (const r of this.db.prepare(
-        `SELECT source, target, type, ${this.evidenceCol}, source_repo FROM edges WHERE target IN (${ph}) AND (type IS NULL OR type <> 'contains')`,
-      ).all(...batch)) take(r);
-      for (const r of this.db.prepare(
-        `SELECT target AS source, source AS target, type, ${this.evidenceCol}, target_repo AS source_repo FROM edges WHERE source IN (${ph}) AND type IN (${placeholders(sym.length)})`,
-      ).all(...batch, ...sym)) take(r);
+      scan(`SELECT source, target, type, ${this.evidenceCol}, source_repo FROM edges WHERE target IN (${ph}) AND (type IS NULL OR type <> 'contains')`, batch);
+      if (!full()) {
+        scan(`SELECT target AS source, source AS target, type, ${this.evidenceCol}, target_repo AS source_repo FROM edges WHERE source IN (${ph}) AND type IN (${placeholders(sym.length)})`, [...batch, ...sym]);
+      }
     }
-    return { edges, total, repos: [...repos] };
+    return { edges, total, repos: [...repos], truncated: full() };
   }
 
   neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[] {
     const out = new Set<string>();
-    const typeClause = types?.length ? ` AND type IN (${placeholders(types.length)})` : '';
-    const conf = `(confidence IS NULL OR confidence >= 0.7) AND (type IS NULL OR type <> 'contains')${typeClause}`;
+    const conf = neighborFilter(types);
     const tp = types ?? [];
     if (direction === 'callees' || direction === 'both') {
       for (const r of this.db.prepare(`SELECT target FROM edges WHERE source = ? AND ${conf}`).all(key, ...tp)) out.add(r.target as string);
@@ -444,6 +477,30 @@ class SqliteGraphStore implements GraphStore {
       for (const r of this.db.prepare(`SELECT source FROM edges WHERE target = ? AND ${conf}`).all(key, ...tp)) out.add(r.source as string);
     }
     return [...out];
+  }
+
+  neighborEdges(keys: string[], direction: GraphDirection, types: string[] | undefined, limit: number): Array<[string, string]> {
+    const filter = neighborFilter(types);
+    const tp = types ?? [];
+    const out: Array<[string, string]> = [];
+    for (const batch of chunked(keys)) {
+      if (out.length >= limit) break;
+      const ph = placeholders(batch.length);
+      const parts: string[] = [];
+      const params: unknown[] = [];
+      if (direction === 'callees' || direction === 'both') {
+        parts.push(`SELECT source AS k, target AS n FROM edges WHERE source IN (${ph}) AND ${filter}`);
+        params.push(...batch, ...tp);
+      }
+      if (direction === 'callers' || direction === 'both') {
+        parts.push(`SELECT target AS k, source AS n FROM edges WHERE target IN (${ph}) AND ${filter}`);
+        params.push(...batch, ...tp);
+      }
+      for (const r of this.db.prepare(`${parts.join(' UNION ALL ')} LIMIT ?`).all(...params, limit - out.length)) {
+        out.push([r.k as string, r.n as string]);
+      }
+    }
+    return out;
   }
 
   labelsOf(keys: string[]): Map<string, string> {
@@ -560,10 +617,11 @@ class JsonGraphStore implements GraphStore {
     }
     return out;
   }
-  dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] } {
+  dependents(nodeKeys: string[], limit: number, maxRows = Number.POSITIVE_INFINITY): { edges: GraphEdge[]; total: number; repos: string[]; truncated: boolean } {
     const set = new Set(nodeKeys);
     const all: GraphEdge[] = [];
     for (const e of this.edges) {
+      if (all.length >= maxRows) break;
       const type = this.et(e);
       if (type === 'contains') continue;
       if (set.has(e.target) && !set.has(e.source)) all.push(this.edge(e));
@@ -572,7 +630,7 @@ class JsonGraphStore implements GraphStore {
       }
     }
     const repos = [...new Set(all.map((e) => repoOf(e.source)))];
-    return { edges: all.slice(0, limit), total: all.length, repos };
+    return { edges: all.slice(0, limit), total: all.length, repos, truncated: all.length >= maxRows };
   }
   private adj(direction: GraphDirection, types?: string[]): Map<string, Set<string>> {
     const cacheKey = `${direction}|${types?.join(',') ?? '*'}`;
@@ -593,6 +651,17 @@ class JsonGraphStore implements GraphStore {
     return m;
   }
   neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[] { return [...(this.adj(direction, types).get(key) ?? [])]; }
+  neighborEdges(keys: string[], direction: GraphDirection, types: string[] | undefined, limit: number): Array<[string, string]> {
+    const adj = this.adj(direction, types);
+    const out: Array<[string, string]> = [];
+    for (const k of keys) {
+      for (const n of adj.get(k) ?? []) {
+        if (out.length >= limit) return out;
+        out.push([k, n]);
+      }
+    }
+    return out;
+  }
   labelsOf(keys: string[]): Map<string, string> {
     const want = new Set(keys);
     const m = new Map<string, string>();

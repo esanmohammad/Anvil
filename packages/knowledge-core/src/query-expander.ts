@@ -30,9 +30,12 @@ export interface QueryExpansion {
   weights: number[];
 }
 
-// Cache: SHA-256(query|classifier-type) → expansion, 10 min LRU.
+// Cache: `type::query` → expansion, LRU (a hit is re-inserted at the Map's
+// most-recent end; a full cache evicts its first key), entries expire 10 min
+// after they were generated. An expansion is a few short snippets, so 4096
+// entries stay small while sparing repeat LLM calls.
 const expansionCache = new Map<string, { exp: QueryExpansion; ts: number }>();
-const CACHE_MAX = 128;
+const CACHE_MAX = 4096;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
 function cacheKey(query: string, type: string): string {
@@ -42,17 +45,17 @@ function cacheKey(query: string, type: string): string {
 function getCache(key: string): QueryExpansion | null {
   const e = expansionCache.get(key);
   if (!e) return null;
-  if (Date.now() - e.ts > CACHE_TTL_MS) {
-    expansionCache.delete(key);
-    return null;
-  }
+  expansionCache.delete(key);
+  if (Date.now() - e.ts > CACHE_TTL_MS) return null;
+  expansionCache.set(key, e);
   return e.exp;
 }
 
 function setCache(key: string, exp: QueryExpansion): void {
+  expansionCache.delete(key);
   if (expansionCache.size >= CACHE_MAX) {
-    const oldest = expansionCache.keys().next().value;
-    if (oldest !== undefined) expansionCache.delete(oldest);
+    const lru = expansionCache.keys().next().value;
+    if (lru !== undefined) expansionCache.delete(lru);
   }
   expansionCache.set(key, { exp, ts: Date.now() });
 }

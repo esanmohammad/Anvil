@@ -67,12 +67,21 @@ All implemented in `src/tools/`:
   `calls` edges by default; `relations` (`imports`, `uses`, `type-ref`,
   `inherits`, `all`) lists the others, grouped by relation. Symbol
   resolution is exact by default via `store.resolveNodes` (full
-  `repo::file::entity` id, label, or `::name` suffix — case-sensitive;
-  `fuzzy:true` = case-insensitive substring of symbol names).
+  `repo::file::entity` id, label, or `::name` suffix — case-sensitive,
+  index-backed; `fuzzy:true` = case-insensitive substring of symbol names).
   `impact_analysis` follows dependents up to `depth` hops; it and
   `detect_changes` mark cross-repo endpoints of the file as
   `[file-level]`. `detect_changes` maps `git diff -U0` hunks onto entity
   line ranges derived from declaration lines at the base commit.
+  Multi-hop traversals are bounded (`graph.ts:TraversalBudget`): at most
+  `TRAVERSAL_MAX_NODES` (50k) nodes discovered and `TRAVERSAL_BUDGET_MS`
+  (1 s) of wall clock per call, neighbours fetched one batched query per
+  frontier slice (`store.neighborEdges`). `trace_path` with `to` is a
+  bidirectional BFS (expands the smaller frontier); out of budget it answers
+  "No path … found within the traversal budget (explored N nodes, depth D
+  of M …)", never a bare "No path". `impact_analysis` / `detect_changes`
+  count at most 50k dependent edges per hop (`dependents(…, maxRows)`,
+  shown as `50000+`) and note a hop the clock cut off.
 - **Profiles** (`profile.ts`) — `list_repos`, `get_repo_profile`. Read
   from `<KB>/<repo>/profile.json` via `loadProfile` /
   `loadAllProfiles`.
@@ -329,6 +338,10 @@ Tests at `src/__tests__/`:
   evidence, workspace edges, symmetric / multi-hop / file-level impact,
   symbol resolution, relations, `search_graph` regex, `get_repo_graph`
   edges, hunk-precise and deleted-file `detect_changes`, `find_dead_code`.
+- `graph-traversal.test.ts` — `trace_path` shortest paths vs a plain BFS on
+  seeded random graphs (direction, relations, confidence, maxDepth); node
+  cap + wall-clock budget on a 63k-node fan-out graph (`trace_path`,
+  `impact_analysis` lower-bound counts and cut-off hops).
 - `tool-inputs.test.ts` — argument validation (`isError`), descriptors vs
   behaviour, `search_exact` without an embedder, search metrics, hints.
 - `http-stateless.test.ts` — stateless `/mcp` serving (no session affinity).
