@@ -114,6 +114,7 @@ export function extractImports(lines: string[], lang: string): string[] {
     if (lang === 'typescript' || lang === 'javascript') {
       const m = trimmed.match(/^import\s+.*from\s+['"]([@\w/.-]+)['"]/);
       if (m) imports.push(m[1]);
+      for (const r of trimmed.matchAll(/\brequire\(\s*['"]([@\w/.-]+)['"]\s*\)/g)) imports.push(r[1]);
     } else if (lang === 'python') {
       const m = trimmed.match(/^(?:from\s+([\w.]+)\s+)?import\s+([\w., ]+)/);
       if (m) imports.push(m[1] ?? m[2]);
