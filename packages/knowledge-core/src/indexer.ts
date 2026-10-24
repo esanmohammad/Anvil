@@ -28,7 +28,8 @@ import {
   EMBED_PENDING_KEY, LEGACY_CHUNKS_KEY, indexedRepoNames, iterateRepoChunks, readEmbedPending, repoChunksKey, splitLegacyChunks,
 } from './repo-chunks.js';
 import type { EmbedPending, RepoChunkTotals } from './repo-chunks.js';
-import { writeSystemGraphSqlite, createSystemGraphSqliteWriter } from './graph-store.js';
+import { writeSystemGraphSqlite, createSystemGraphSqliteWriter, openSystemGraphSqliteUpdater } from './graph-store.js';
+import type { SystemGraphSqliteUpdater } from './graph-store.js';
 import { resolveIndexConcurrency, runReposPooled } from './index-pool.js';
 import { processRepoPipeline, getRepoSha, getRepoShaAsync, getRemoteShaAsync, readRepoIndexMeta } from './repo-pipeline.js';
 import type { RepoJob, RepoResult, RepoIndexMeta } from './repo-pipeline.js';
@@ -252,9 +253,31 @@ export class KnowledgeIndexer {
     // last unbounded structure). Fall back to the in-memory builder only when no
     // sqlite driver is available (small/local indexes; also gives the JSON
     // fallback + community detection that the streamed path drops as unused).
-    const graphWriter = await createSystemGraphSqliteWriter(basePath);
-    const graphBuilder = graphWriter ? null : new ProjectGraphBuilder();
+    // An existing current-schema file is updated in place instead: only the
+    // re-indexed and removed repos' nodes/edges and the cross-repo edge set
+    // change, in one transaction readers don't see until it commits — so the
+    // graph's cost tracks the change, not the corpus. Forced runs rebuild; a
+    // failed update falls back to a rebuild from the stored per-repo graphs.
+    let graphUpdater: SystemGraphSqliteUpdater | null = opts?.force ? null : await openSystemGraphSqliteUpdater(basePath);
+    let graphUpdateFailed = false;
+    const graphUpdateFailure = (e: unknown) => {
+      if (!graphUpdateFailed) log(`Warning: in-place graph update failed (${e instanceof Error ? e.message : e}); rebuilding the system graph`);
+      graphUpdateFailed = true;
+    };
+    if (graphUpdater) {
+      try { graphUpdater.removeRepos([...reposToIndex.map((r) => r.name), ...removedRepos]); } catch (e) { graphUpdateFailure(e); }
+    }
+    let graphWriter = graphUpdater ? null : await createSystemGraphSqliteWriter(basePath);
+    const graphBuilder = graphUpdater || graphWriter ? null : new ProjectGraphBuilder();
     if (graphBuilder) await graphBuilder.init();
+    const addRepoGraph = (name: string, g: GraphifyOutput): void => {
+      if (graphUpdater) {
+        if (!graphUpdateFailed) try { graphUpdater.addRepoGraph(name, g); } catch (e) { graphUpdateFailure(e); }
+      } else if (graphWriter) graphWriter.addRepoGraph(name, g);
+      else graphBuilder!.addRepoGraph(name, g);
+    };
+    // Detector + service-mesh edges; the updater takes the complete set at once.
+    const allCrossEdges: Parameters<SystemGraphSqliteUpdater['replaceCrossRepoEdges']>[0] = [];
 
     // Only changed repos get jobs — skipped repos are served from their stored
     // graph.json/signals.json below, so they are never cloned or re-parsed.
@@ -286,8 +309,7 @@ export class KnowledgeIndexer {
       onResult: (res) => {
         if (res.graph) {
           try {
-            if (graphWriter) graphWriter.addRepoGraph(res.repoName, res.graph);
-            else graphBuilder!.addRepoGraph(res.repoName, res.graph);
+            addRepoGraph(res.repoName, res.graph);
           } catch (e) { log(`Warning: addRepoGraph failed for ${res.repoName}: ${e}`); }
         }
         if (res.workspaceMap && res.workspaceMap.packages.length > 0) workspaceMaps.set(res.repoName, res.workspaceMap);
@@ -303,19 +325,19 @@ export class KnowledgeIndexer {
       },
     });
     // Skipped repos: their per-repo graphs were persisted when they were last
-    // indexed — stream each into the system-graph writer (one at a time, the
-    // graph never accumulates) and rehydrate the persisted workspace packages
-    // for cross-repo correlation. No clone, no AST parse.
+    // indexed — a rebuild streams each into the system-graph writer (one at a
+    // time, the graph never accumulates); an in-place update already has them.
+    // Either way, rehydrate the persisted workspace packages for cross-repo
+    // correlation. No clone, no AST parse.
     for (const name of skippedRepos) {
       const meta = skippedMeta.get(name);
       repoStats.push({ name, chunkCount: meta?.chunkCount ?? 0, language: '' });
-      try {
-        const g = await storage.blobs.getJson<GraphifyOutput>(`${name}/graph.json`);
-        if (g) {
-          if (graphWriter) graphWriter.addRepoGraph(name, g);
-          else graphBuilder!.addRepoGraph(name, g);
-        }
-      } catch (e) { log(`Warning: stored graph load failed for ${name}: ${e}`); }
+      if (!graphUpdater) {
+        try {
+          const g = await storage.blobs.getJson<GraphifyOutput>(`${name}/graph.json`);
+          if (g) addRepoGraph(name, g);
+        } catch (e) { log(`Warning: stored graph load failed for ${name}: ${e}`); }
+      }
       if (meta?.workspacePackages?.length) {
         workspaceMaps.set(name, {
           repoPath: '',
@@ -397,8 +419,9 @@ export class KnowledgeIndexer {
         } catch { /* a repo without signals just contributes no edges this cycle */ }
       }
       const crossEdges = correlateCrossRepoEdges(signalsMap, workspaceMaps);
+      for (const e of crossEdges) allCrossEdges.push(e); // spread overflows the stack past ~100k edges
       if (graphWriter) graphWriter.addCrossRepoEdges(crossEdges);
-      else graphBuilder!.addCrossRepoEdges(crossEdges);
+      else if (graphBuilder) graphBuilder.addCrossRepoEdges(crossEdges);
       crossRepoEdgeCount = crossEdges.length;
       log(`Detected ${crossEdges.length} cross-repo edges (signals from ${signalsMap.size}/${repos.length} repos)`);
     }
@@ -417,8 +440,9 @@ export class KnowledgeIndexer {
             },
           });
           if (meshEdges.length > 0) {
+            for (const e of meshEdges) allCrossEdges.push(e);
             if (graphWriter) graphWriter.addCrossRepoEdges(meshEdges);
-            else graphBuilder!.addCrossRepoEdges(meshEdges);
+            else if (graphBuilder) graphBuilder.addCrossRepoEdges(meshEdges);
             crossRepoEdgeCount += meshEdges.length;
             log(`Service mesh: ${meshEdges.length} edges inferred`);
           }
@@ -435,6 +459,27 @@ export class KnowledgeIndexer {
 
     // 9. Persist the system graph.
     report({ phase: 'graphing', message: 'Saving system graph...', percent: 90, etaSeconds: -1 });
+    if (graphUpdater && !graphUpdateFailed) {
+      try {
+        graphUpdater.replaceCrossRepoEdges(allCrossEdges);
+        const { nodeCount, edgeCount } = graphUpdater.finalize();
+        log(`Updated project graph in place (${reposToIndex.length} re-indexed, ${removedRepos.length} removed repos: ${nodeCount} nodes, ${edgeCount} edges)`);
+        await uploadSystemGraphIfRemote(storage, basePath, log);
+      } catch (e) { graphUpdateFailure(e); }
+    }
+    if (graphUpdater && graphUpdateFailed) {
+      try { graphUpdater.abort(); } catch { /* already rolled back */ }
+      graphWriter = await createSystemGraphSqliteWriter(basePath);
+      if (graphWriter) {
+        for (const r of repos) {
+          try {
+            const g = await storage.blobs.getJson<GraphifyOutput>(`${r.name}/graph.json`);
+            if (g) graphWriter.addRepoGraph(r.name, g);
+          } catch (e) { log(`Warning: stored graph load failed for ${r.name}: ${e}`); }
+        }
+        graphWriter.addCrossRepoEdges(allCrossEdges);
+      }
+    }
     if (graphWriter) {
       // Streamed path: nodes/edges already written per-repo; backfill degrees +
       // close. Community detection is skipped — `systemCommunity` has no readers.
@@ -446,10 +491,10 @@ export class KnowledgeIndexer {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[knowledge-core] Could not persist system graph (streamed): ${msg}. Cross-repo graph tools will be unavailable; search and embeddings are unaffected.`);
       }
-    } else {
+    } else if (graphBuilder) {
       // In-memory fallback (no sqlite driver): detect communities, then write
       // the whole graph to sqlite if a driver appears, else the legacy JSON blob.
-      graphBuilder!.detectCommunities();
+      graphBuilder.detectCommunities();
       try {
         const wroteSqlite = await writeSystemGraphSqlite(basePath, graphBuilder!);
         if (wroteSqlite) {
