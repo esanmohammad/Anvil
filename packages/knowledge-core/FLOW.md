@@ -16,12 +16,12 @@ indexFromPath(project, dir, opts)              ← src/indexer.ts
         │           include only those with .git inside
         │     └─ detectLanguage(repo) per entry
         │
-        └─ indexer.buildKB(project, repos, DEFAULT_CONFIG, opts)
+        └─ indexer.buildKB(project, repos, opts.config ?? loadKnowledgeConfig(project), opts)
               │
               ▼ (11 steps below)
 
 embedFromPath(project, opts)
-  └─ indexer.embedChunks(project, DEFAULT_CONFIG, opts)
+  └─ indexer.embedChunks(project, opts.config ?? loadKnowledgeConfig(project), opts)
         │
         ▼ (described in §3 below)
 ```
@@ -39,8 +39,12 @@ buildKB(project, repos, config, opts):
   │       sha = getRepoSha(repo.path)              ← git rev-parse HEAD (ls-remote for cloneUrl)
   │       meta = readRepoIndexMeta(<basePath>/<repo>/index_meta.json)
   │       tree = getWorkingTreeState(repo.path)    ← uncommitted edits (local checkouts)
-  │       if !force && meta.lastIndexedSha === sha && tree === meta.workingTree: skip
+  │       if !force && meta.lastIndexedSha === sha && tree === meta.workingTree
+  │          && graph.json exists && signals.json.version === CROSS_REPO_SIGNALS_VERSION
+  │          && meta.chunkIdVersion === CHUNK_ID_VERSION: skip
   │       else add to reposToIndex
+  │     removedRepos = index_stats.json repos − current repos
+  │     nothing to index && no removedRepos → return (no-op)
   │
   ├─ Step 2 — LLM repo profiling (skipped if !isLlmAvailable())
   │     profileProject(project, repos, { force, onProgress })
@@ -58,26 +62,30 @@ buildKB(project, repos, config, opts):
   │                ? diffWorkingTreeStates(meta.workingTree, tree)   ← edits since last index
   │                : getAllChanges(repo.path, meta.lastIndexedSha)   ← + indexed edits no longer dirty
   │       useIncremental = diff && !diff.fallbackToFull && (added+modified+deleted) > 0
+  │       (meta on another CHUNK_ID_VERSION → treated as absent: full re-chunk)
   │       useIncremental
-  │         ? chunkChangedFiles(repo, name, project, cfg, diff, write)
+  │         ? chunkChangedFiles(repo, name, project, cfg, diff, write, meta.files)
   │         : chunkRepo(repo, name, project, cfg, meta?.files, write)
+  │             └─ boundaries: tree-sitter definitions (regex fallback), each
+  │                pulled up over its leading comments / decorators
   │       write → <repo>/chunks.shard.ndjson (local scratch, streamed)
+  │       fileIndex = every file the repo has (incremental: cached − diffed + re-chunked)
   │
   │     Steps 3, 5 and 6 run together per repo (repo-pipeline.ts:processCheckout)
   │     in an adaptive worker pool, in-thread on fallback. Each repo:
   │       workspaceMap = detectWorkspace(repo.path)    ← Step 5
   │       chunk to the shard (above)
   │       graph = Step 6 (below); write graph.json + GRAPH_REPORT.md
-  │       write <repo>/signals.json = extractCrossRepoSignals(repo.path)
+  │       write <repo>/signals.json = extractCrossRepoSignals(repo.path, { ignorePatterns })
   │     As each repo finishes, the main thread streams its graph into
   │     system_graph.sqlite (graphWriter.addRepoGraph — nodes namespaced
   │     <repo>::<id>). Skipped repos are served from their stored graph.json.
   │
-  ├─ Step 4 — Structural dedup (streamed)
-  │     dedupShardsToChunks(shards) → <basePath>/chunks.json
-  │           ├─ computeStructuralHash per chunk (strip comments,
-  │           │  collapse whitespace, normalize idents, sha256)
-  │           └─ keep one per hash bucket
+  ├─ Step 4 — Merge chunks (streamed)
+  │     mergeShardsToChunks(shards, carryForward) → <basePath>/chunks.json
+  │           ├─ fresh shards first, then the previous corpus filtered to
+  │           │  skipped repos + unchanged files still in a partial repo's fileIndex
+  │           └─ one chunk per id (no cross-file / cross-repo dedup)
   │
   ├─ Step 5 — Workspace detection (in the per-repo worker)
   │     detectWorkspace(repo.path)
@@ -88,9 +96,10 @@ buildKB(project, repos, config, opts):
   │       graph = await incrementalGraphUpdate(existingGraph,
   │                     changedFiles, deletedFiles, repo.path, { workspaceMap })
   │     else:
-  │       graph = await buildAstGraph(repo.path, { workspaceMap })
-  │           └─ 6 phases: ws nodes, entity extraction, import resolution,
-  │                        type refs, call disambiguation, inheritance, contains
+  │       graph = await buildAstGraph(repo.path, { workspaceMap, ignorePatterns })
+  │           └─ 6 phases: ws nodes, entity extraction (tree-sitter, regex
+  │              fallback), import resolution, type refs, call disambiguation,
+  │              inheritance, contains — names resolve within a language family
   │
   ├─ Step 7 — Cross-repo edges (when repos.length > 1 or workspaces present)
   │     edges = correlateCrossRepoEdges(<repo>/signals.json for every repo, workspaceMaps)
@@ -112,14 +121,18 @@ buildKB(project, repos, config, opts):
   │      instead, runs Louvain, and writes system_graph_v2.json)
   │
   ├─ Step 10 — Save deleted files
-  │     write <basePath>/deleted_files.json   ← merged into a list not yet applied
+  │     write <basePath>/deleted_files.json   ← changed + deleted files of previously
+  │                                             indexed repos, merged into a list not yet applied
   │
   └─ Step 11 — Per-repo metadata
         for repo in reposToIndex:
           write <basePath>/<repo>/index_meta.json {
-            lastIndexedSha, workingTree, lastIndexedAt, chunkCount,
-            embeddingProvider: 'pending', files: fileIndex
+            lastIndexedSha, workingTree, lastIndexedAt, chunkCount, files: fileIndex,
+            chunkIdVersion, embeddingProvider: 'pending',
+            embeddingModel / embeddingDimensions: kept from the previous meta
           }
+        for repo in removedRepos: delete <basePath>/<repo>/
+        write index_stats.json { repos, totalChunks, crossRepoEdges, … }
 
 returns BuildKBResult { project, repos, totalChunks, totalTokens,
                         crossRepoEdges, durationMs, chunksPath }
@@ -130,19 +143,22 @@ returns BuildKBResult { project, repos, totalChunks, totalTokens,
 ```
 embedChunks(project, config, opts):
   │
-  ├─ chunks = JSON.parse(read(<basePath>/chunks.json))
-  ├─ store  = new VectorStore(<basePath>/lancedb); await init()
+  ├─ store = storage.vectors; await init({ healCorrupt: true })
+  ├─ crossRepoEdges = index_stats.json.crossRepoEdges     ← counted by buildKB
   │
-  ├─ existingIds = await store.getChunkIds(project)
-  ├─ newChunks   = chunks.filter(c => !existingIds.has(c.id))
-  ├─ deletedFiles = read(<basePath>/deleted_files.json) || []
-  │
-  ├─ if newChunks.length === 0 && deletedFiles.length === 0:
-  │      return cached IndexStats
-  │
-  ├─ Apply deletes:
+  ├─ Apply deletes FIRST (ids are position-keyed — an unmoved chunk of a
+  │  changed file keeps its id):
+  │     deletedFiles = read(<basePath>/deleted_files.json) || []
   │     for [repoName, filePaths] in groupByRepo(deletedFiles):
   │       store.deleteFileChunks(project, repoName, filePaths)
+  │
+  ├─ existingIds = await store.getChunkIds(project)
+  ├─ stream chunks.json (NDJSON): totals, listedIds, newChunkCount
+  ├─ sweep: store.deleteChunksByIds(existingIds − listedIds)   ← skipped if chunks.json is empty
+  │
+  ├─ if newChunkCount === 0 && deletedFiles.length === 0:
+  │      ensureFtsIndex + ensureScalarIndexes + maintainVectorIndex(rowsWritten 0)
+  │      bump index_generation; return stats
   │
   ├─ embedder = createEmbeddingProvider(config.embedding)
   │     'auto' resolution:
@@ -155,19 +171,18 @@ embedChunks(project, config, opts):
   │       gemini CLI authenticated       → GeminiOAuthEmbedder
   │       else throw
   │
-  ├─ batchSize = embedder.name === 'ollama' ? 10 : 50
-  │  batchDelay = embedder.name === 'ollama' ? 50  : 100
+  ├─ batchSize   = CODE_SEARCH_EMBEDDING_BATCH_SIZE  ?? (ollama ? 10 : 128)
+  │  concurrency = ollama ? 1 : CODE_SEARCH_EMBEDDING_CONCURRENCY ?? 8
   │
-  ├─ for i = 0; i < texts.length; i += batchSize:
-  │      embeddings.push(...await embedder.embed(slice))
-  │      report progress + ETA
-  │      sleep batchDelay between batches
+  ├─ stream chunks.json again; new chunks → batches, `concurrency` in flight,
+  │  each batch embedded then store.addChunks(batch); progress + ETA
+  │  (no inter-batch delay — 429s back off inside the embedder)
   │
-  ├─ embeddedChunks = newChunks.map((c,i) => ({ ...c, embedding: embeddings[i] }))
-  ├─ store.addChunks(embeddedChunks)
-  │
+  ├─ ensureFtsIndex (when anything new) + ensureScalarIndexes + maintainVectorIndex(rowsWritten)
+  ├─ clear deleted_files.json
   └─ for repoName in repoNames:
-       update index_meta.json { embeddingProvider: embedder.name, lastIndexedAt }
+       update index_meta.json { embeddingProvider, embeddingModel,
+                                embeddingDimensions, lastIndexedAt }
 
 returns IndexStats { project, repos, totalChunks, totalTokens,
                      embeddingProvider, embeddingDimensions, ..., indexDurationMs }
