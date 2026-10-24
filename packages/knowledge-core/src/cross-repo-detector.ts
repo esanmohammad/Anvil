@@ -996,7 +996,8 @@ export function correlateCrossRepoEdges(
 
   for (const strategy of strategies) {
     try {
-      allEdges.push(...strategy.fn());
+      // Not push(...edges): past ~120k arguments that throws and drops the strategy.
+      for (const edge of strategy.fn()) allEdges.push(edge);
     } catch {
       // Individual strategy failure should not block others
     }

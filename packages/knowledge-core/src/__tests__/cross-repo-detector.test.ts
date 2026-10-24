@@ -382,4 +382,13 @@ describe('correlateCrossRepoEdges — scale', () => {
     assert.equal(edges.length, 8 * (N / 2) + 5 * N);
     assert.ok(ms < 5000, `correlating ${N} repos took ${ms.toFixed(0)} ms`);
   });
+
+  it('keeps every edge of a strategy too large to spread into one call', () => {
+    // 600 repos sharing one type: 179,700 edges, past V8's ~120k argument limit.
+    const N = 600;
+    const signals = new Map<string, CrossRepoSignals>(
+      Array.from({ length: N }, (_, i) => [`svc-${i}`, { types: { Tenant: 'src/tenant.ts' } }]),
+    );
+    assert.equal(correlateCrossRepoEdges(signals).length, (N * (N - 1)) / 2);
+  });
 });
