@@ -21,7 +21,8 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   the next part starts at it, is named after it and has `parentEntity` =
   the outer entity (other parts are `name$N`). A definition's leading
   comments / decorators belong to its chunk. Chunk ids are
-  `hash(repoName, filePath, startLine, endLine)` (`CHUNK_ID_VERSION` = 2).
+  `hash(repoName, filePath, startLine, endLine)`; `CHUNK_ID_VERSION` (= 3)
+  is bumped when ids or boundaries change.
   `chunkChangedFiles` returns the whole repo's `fileIndex` (cached entries
   minus the diffed paths, plus the re-chunked ones).
 - `walkDir` / `langFromExt` / `extractImports` / `extractNamedImports` /
@@ -309,9 +310,11 @@ uncommitted working-tree state matches the `workingTree` snapshot indexed
 last time (`getWorkingTreeState`: path → content hash of every file
 differing from HEAD) **and** its stored artifacts are current: `graph.json`,
 `signals.json` at `CROSS_REPO_SIGNALS_VERSION`, chunks at
-`CHUNK_ID_VERSION`. A repo on an older chunk-id version is re-chunked from
-scratch (no file cache, nothing carried forward) — so an upgrade that bumps
-it re-embeds every chunk once. Otherwise, at an unchanged HEAD the change
+`CHUNK_ID_VERSION`. A repo on an older chunk version is re-chunked from
+scratch (no file cache, nothing carried forward), so an upgrade that changes
+chunking reaches every repo at once; only chunks whose text changed are
+re-embedded (unchanged ones keep their id, or reuse by content hash).
+Otherwise, at an unchanged HEAD the change
 set is `diffWorkingTreeStates(indexed, current)` (new/changed edits, plus
 reverted ones re-chunked back to HEAD); after new commits it is
 `getAllChanges(repo, prevSha)` plus indexed edits no longer dirty → if

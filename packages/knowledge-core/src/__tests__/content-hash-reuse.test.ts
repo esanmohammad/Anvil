@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import type { CodeChunk } from '@esankhan3/anvil-knowledge-core';
 import { VectorStore, contentHash } from '../vector-store.js';
+import { CHUNK_ID_VERSION } from '../chunker.js';
 import { fn, withKbFixture } from './kb-fixture.js';
 
 const names = (rows: CodeChunk[]) => rows.map((r) => r.entityName).sort();
@@ -57,6 +58,24 @@ describe('embedding reuse by content hash', () => {
       assert.equal(f.embedded() - before, 1, 'only the space probe is embedded; unchanged text is reused');
       const after = await f.rows();
       assert.deepEqual(after.map((r) => r.id).sort(), rows.map((r) => r.id).sort(), 'current ids, legacy rows swept');
+    });
+  });
+
+  it('a chunk-version bump re-chunks every repo but re-embeds no unchanged text', async (t) => {
+    await withKbFixture(t, async (f) => {
+      f.repo('svc', { 'a.ts': fn('aaa') + fn('bbb'), 'b.ts': fn('ccc') });
+      await f.index();
+      const blobs = f.storage().blobs;
+      const meta = await blobs.getJson<Record<string, unknown>>('svc/index_meta.json');
+      await blobs.putJson('svc/index_meta.json', { ...meta, chunkIdVersion: CHUNK_ID_VERSION - 1 });
+      const ids = (await f.rows()).map((r) => r.id).sort();
+
+      const before = f.embedded();
+      await f.index();
+      const after = await blobs.getJson<{ chunkIdVersion?: number }>('svc/index_meta.json');
+      assert.equal(after?.chunkIdVersion, CHUNK_ID_VERSION, 'repo was re-chunked');
+      assert.equal(f.embedded() - before, 0, 'unchanged chunks re-embedded');
+      assert.deepEqual((await f.rows()).map((r) => r.id).sort(), ids);
     });
   });
 
