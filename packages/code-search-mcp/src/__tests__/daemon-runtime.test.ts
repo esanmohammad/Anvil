@@ -35,6 +35,8 @@ before(async () => {
 });
 after(async () => {
   wrapper?.kill();
+  // A failed run can leave the wrapper's child daemon behind.
+  try { process.kill(Number(readFileSync(pidFile(), 'utf-8')), 'SIGKILL'); } catch { /* gone */ }
   await embedder.close();
   rmSync(root, { recursive: true, force: true });
 });
