@@ -120,7 +120,11 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   vector + FTS search, file-level deletes, FTS index build when missing or
   under an older config's name (`ensureFtsIndex`; `optimize()` keeps it
   current), IVF vector index build / in-place retrain (`ensureVectorIndex`),
-  `vectorIndexState`.
+  `vectorIndexState`. BM25 also matches words fused into camelCase
+  identifiers: a `contentSplit` column (`identifierParts`) has its own FTS
+  index, and `fullTextSearch` sums matches on both columns. Columns added
+  after a table was created are backfilled in SQL by the next writer
+  (`ensureColumns`) — no re-embed.
 - `maintainVectorIndex` / `planVectorIndex` / `readVectorIndexHealth`
   (`src/vector-index-maintenance.ts`) — write-path vector-index lifecycle:
   build at `minRows`, retrain once rows written since the last training

@@ -98,7 +98,7 @@ describe('index integrity', () => {
       await f.index();
 
       assert.deepEqual(byRepo(await f.rows(), 'gone'), []);
-      assert.deepEqual(await f.search('goneFnUnique'), []);
+      assert.deepEqual(byRepo(await f.search('goneFnUnique'), 'gone'), []);
       assert.equal(await f.storage().blobs.exists('gone/index_meta.json'), false);
     });
   });

@@ -351,11 +351,29 @@ API:
 | `vectorIndexState()` | row count + the vector index's indexed / unindexed rows |
 | `optimizeIndexes()` | fold appended rows into every index, compact, prune old versions |
 
-FTS index on `contextualizedContent` (`contextualizedContent_idx`, with
-positions, stop words kept). The write path builds it once; `optimize()` folds
-later appends in, and until then they are still found by term search (not by
-phrase search). The index name stands for its config: a config change ships
-with a new name, and `ensureFtsIndex` builds the new index then drops the old.
+Two FTS indexes:
+
+- `contextualizedContent_idx` on `contextualizedContent` — positions (for
+  phrase search), stop words kept.
+- `contentSplit_idx` on `contentSplit` — the parts of the chunk's compound
+  identifiers only (`identifierParts`: `verifyExpectedBacklogCount` →
+  `verify Expected Backlog Count`; plain words, ALL_CAPS and punctuation
+  dropped), so words fused into camelCase identifiers become terms without a
+  plain word counting twice. No positions.
+
+`fullTextSearch` sums a match of the query on the first and of its
+camelCase-split form on the second (words containing `_` stay off the split
+query — the tokenizer already splits them on the original column). On a table
+with no `contentSplit_idx` it searches the original column only.
+
+The write path builds each index once; `optimize()` folds later appends in,
+and until then they are still found by term search (not by phrase search). An
+index name stands for its config: a config change ships with a new name, and
+`ensureFtsIndex` builds the new index then drops the old. Before that it adds
+any derived column an older writer's table lacks (`ensureColumns`, also run
+before the first add): the column is computed in SQL from existing columns, so
+the migration writes only the new column's files — no re-embedding, no row
+rewrite.
 
 The vector index (IVF_FLAT, or IVF_PQ when `storage.vector.lancedb.index` is
 set) is managed by `vector-index-maintenance.ts` on the write path. It is built
