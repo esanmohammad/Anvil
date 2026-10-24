@@ -185,9 +185,13 @@ function patternsForLanguage(lang: string): BoundaryPattern[] {
   }
 }
 
-/** Bump when chunk ids change scheme: buildKB re-chunks (never skips or carries
- *  forward) a repo whose index_meta records another version. 2 = repo-scoped ids. */
-export const CHUNK_ID_VERSION = 2;
+/** Bump when chunk ids change scheme or chunk boundaries change: buildKB
+ *  re-chunks (never skips or carries forward) a repo whose index_meta records
+ *  another version, so an existing index picks up the new chunking without
+ *  waiting for each file to change. Chunks whose text is unchanged keep their
+ *  vectors (same id, or reuse by content hash). 2 = repo-scoped ids;
+ *  3 = JS/TS top-level variables and nested-definition split points. */
+export const CHUNK_ID_VERSION = 3;
 
 /** Ids are unique per project: the same path + line range in two repos must
  *  not collide, and fields are separated so (a.ts, 1, 23) ≠ (a.ts, 12, 3). */

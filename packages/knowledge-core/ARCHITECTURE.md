@@ -217,8 +217,9 @@ overflow ends instead before the last nested function / method definition
 it holds (also moved up over its annotations), so the next part starts at
 that definition and is named after it, with `parentEntity` = the outer
 entity. Other parts are `name$<part number>` (`name$1`, `name$2`, …).
-Chunk id = `sha256(repoName \0 filePath \0 startLine \0 endLine)[0:16]`
-(`CHUNK_ID_VERSION` = 2).
+Chunk id = `sha256(repoName \0 filePath \0 startLine \0 endLine)[0:16]`.
+`CHUNK_ID_VERSION` (= 3) is bumped when ids or boundaries change, so buildKB
+re-chunks already-indexed repos once.
 
 `chunkChangedFiles(repo, name, project, cfg, gitDiff, onChunk?, cachedFiles?)`
 — chunks `gitDiff.added + gitDiff.modified`; its `fileIndex` is

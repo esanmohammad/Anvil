@@ -49,8 +49,9 @@ export interface RepoIndexMeta {
   /** Uncommitted state indexed alongside `lastIndexedSha` (local checkouts):
    *  path → content hash of every file differing from HEAD. */
   workingTree?: WorkingTreeState;
-  /** Chunk-id scheme the repo's chunks were written with ({@link CHUNK_ID_VERSION});
-   *  absent before v2. Any other value → the repo is re-chunked from scratch. */
+  /** Chunk-id scheme + boundary rules the repo's chunks were written with
+   *  ({@link CHUNK_ID_VERSION}); absent before v2. Any other value → the repo
+   *  is re-chunked from scratch. */
   chunkIdVersion?: number;
 }
 
