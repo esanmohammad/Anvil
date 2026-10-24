@@ -9,7 +9,7 @@ import type { BlobStorePort, StorageBundle } from './storage/ports.js';
 import { maintainVectorIndex, readVectorIndexHealth } from './vector-index-maintenance.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
-import { correlateCrossRepoEdges } from './cross-repo-detector.js';
+import { correlateCrossRepoEdges, CROSS_REPO_SIGNALS_VERSION } from './cross-repo-detector.js';
 import { getWorkingTreeState, sameWorkingTreeState } from './git-diff.js';
 import type { WorkingTreeState } from './git-diff.js';
 import type { CrossRepoSignals } from './cross-repo-detector.js';
@@ -167,18 +167,22 @@ export class KnowledgeIndexer {
         : sameWorkingTreeState(meta?.workingTree ?? {}, getWorkingTreeState(repo.path));
       if (meta && currentSha && meta.lastIndexedSha === currentSha && treeUnchanged) {
         // A skipped repo is served entirely from its stored artifacts (graph +
-        // cross-repo signals) — no clone, no AST re-parse. An index written
-        // before signals existed must be re-indexed once to backfill them.
+        // cross-repo signals) — no clone, no AST re-parse. An index whose
+        // signals are missing or in an older format must be re-indexed once
+        // to (re)extract them.
+        const signals = await storage.blobs
+          .getJson<CrossRepoSignals>(`${repo.name}/signals.json`)
+          .catch(() => null);
         const hasArtifacts =
           (await storage.blobs.exists(`${repo.name}/graph.json`)) &&
-          (await storage.blobs.exists(`${repo.name}/signals.json`));
+          signals?.version === CROSS_REPO_SIGNALS_VERSION;
         if (hasArtifacts) {
           skippedRepos.push(repo.name);
           skippedMeta.set(repo.name, meta);
           log(`Skipping ${repo.name} — unchanged (${currentSha.slice(0, 7)})`);
         } else {
           reposToIndex.push(repo);
-          log(`Re-indexing ${repo.name} — unchanged but stored graph/signals missing (pre-upgrade index)`);
+          log(`Re-indexing ${repo.name} — unchanged but stored graph/signals missing or outdated (pre-upgrade index)`);
         }
       } else {
         reposToIndex.push(repo);

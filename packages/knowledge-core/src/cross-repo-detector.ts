@@ -22,13 +22,21 @@ import { detectWorkspace } from './workspace-detector.js';
  * have all working trees locally.
  */
 
-/** Per-repo, JSON-serializable inputs to the 14 correlation strategies. */
+/** Bump when the bundle's content changes meaning; buildKB re-extracts (re-indexes)
+ *  a repo whose stored bundle carries another version. 2 = repo-relative paths. */
+export const CROSS_REPO_SIGNALS_VERSION = 2;
+
+/** Per-repo, JSON-serializable inputs to the 14 correlation strategies. File
+ *  paths are relative to the repo root — the same keys the code graph uses. */
 export interface CrossRepoSignals {
+  /** Bundle format ({@link CROSS_REPO_SIGNALS_VERSION}); absent before v2. */
+  version?: number;
   /** Scoped (@org/…) npm deps from package.json (shared-npm-deps). */
   npmDeps?: string[];
   /** Exported TS interface/type names → defining file (shared-types). */
   types?: Record<string, string>;
-  /** Env var names from .env.example/.template/.sample (env-var-correlation). */
+  /** Env var names from .env.example/.template/.sample and env reads in code
+   *  (env-var-correlation). */
   envVars?: string[];
   /** Event/topic/channel names → file (event-schemas). */
   events?: Record<string, string>;
@@ -58,33 +66,36 @@ export interface CrossRepoSignals {
   constants?: Record<string, { name: string; filePath: string }>;
 }
 
-/** Recursively find files matching a predicate, skipping common non-source dirs */
+/** Recursively find files under `root` matching a predicate, skipping common
+ *  non-source dirs. Paths — both those passed to `match` and those returned —
+ *  are relative to `root`, so neither the filters nor the recorded files
+ *  depend on where the repo is checked out. */
 function walkFiles(
-  dir: string,
-  match: (filePath: string) => boolean,
+  root: string,
+  match: (relPath: string) => boolean,
   maxFiles: number = 5000,
 ): string[] {
   const results: string[] = [];
   const skipDirs = new Set(['node_modules', 'dist', '.git', '.next', 'build', 'coverage', '__pycache__', '.venv', 'vendor']);
 
-  function walk(currentDir: string): void {
+  function walk(relDir: string): void {
     if (results.length >= maxFiles) return;
     let entries: string[];
     try {
-      entries = readdirSync(currentDir);
+      entries = readdirSync(join(root, relDir));
     } catch {
       return;
     }
     for (const entry of entries) {
       if (results.length >= maxFiles) return;
       if (skipDirs.has(entry)) continue;
-      const fullPath = join(currentDir, entry);
+      const relPath = join(relDir, entry);
       try {
-        const stat = statSync(fullPath);
+        const stat = statSync(join(root, relPath));
         if (stat.isDirectory()) {
-          walk(fullPath);
-        } else if (stat.isFile() && match(fullPath)) {
-          results.push(fullPath);
+          walk(relPath);
+        } else if (stat.isFile() && match(relPath)) {
+          results.push(relPath);
         }
       } catch {
         // Skip inaccessible files
@@ -92,8 +103,16 @@ function walkFiles(
     }
   }
 
-  walk(dir);
+  walk('');
   return results;
+}
+
+/** Client call path → route-key form: `${…}` interpolations and `:name`
+ *  segments become `:param`. Null when only params remain (`/${path}`) — that
+ *  would match every parameterised route. */
+function normalizeClientPath(path: string): string | null {
+  const p = path.replace(/\$\{[^}]*\}/g, ':param').replace(/:[a-zA-Z]+/g, ':param');
+  return /[a-zA-Z0-9]/.test(p.replace(/:param/g, '')) ? p : null;
 }
 
 /** Read file contents safely, returning empty string on failure */
@@ -135,7 +154,7 @@ function extractTypes(repoPath: string): Record<string, string> {
 
   const typeMap: Record<string, string> = {};
   for (const filePath of tsFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     let match: RegExpExecArray | null;
     typeExportPattern.lastIndex = 0;
     while ((match = typeExportPattern.exec(content)) !== null) {
@@ -159,6 +178,25 @@ function extractEnvVars(repoPath: string): string[] {
       vars.add(match[1]);
     }
   }
+
+  // Env reads in code — most services never ship a .env template.
+  const codePatterns = [
+    /process\.env(?:\.|\[\s*['"`])([A-Z][A-Z0-9_]{2,})\b/g, // Node
+    /\bos\.(?:Getenv|LookupEnv|getenv|environ\.get)\(\s*["']([A-Z][A-Z0-9_]{2,})["']/g, // Go, Python
+    /\bos\.environ\[\s*["']([A-Z][A-Z0-9_]{2,})["']\s*\]/g, // Python
+    /System\.getenv\(\s*"([A-Z][A-Z0-9_]{2,})"/g, // Java
+  ];
+  const sourceFiles = walkFiles(repoPath, (f) => ['.ts', '.js', '.go', '.py', '.java'].includes(extname(f)), 3000);
+  for (const filePath of sourceFiles) {
+    const content = safeReadFile(join(repoPath, filePath));
+    for (const pattern of codePatterns) {
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(content)) !== null) {
+        vars.add(match[1]);
+      }
+    }
+  }
   return [...vars];
 }
 
@@ -178,7 +216,7 @@ function extractEvents(repoPath: string): Record<string, string> {
 
   const eventMap: Record<string, string> = {};
   for (const filePath of sourceFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     for (const pattern of eventPatterns) {
       pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
@@ -205,12 +243,13 @@ function extractApiEndpoints(repoPath: string): { routes: Record<string, string>
     // Spring MVC: @RequestMapping(value = "/x"), @GetMapping("/x"), …
     /@(RequestMapping|GetMapping|PostMapping|PutMapping|PatchMapping|DeleteMapping)\s*\((?:[^)]*?(?:value|path)\s*=\s*)?"(\/[a-zA-Z0-9/:._{}-]+)"/g,
   ];
-  // HTTP client call patterns
+  // HTTP client call patterns. Paths may interpolate template-literal params
+  // (`/invoices/${id}`), and the URL may start from a `${BASE_URL}` instead of a host.
   const httpCallPatterns = [
-    /(?:axios|fetch|http|client)\.(get|post|put|patch|delete)\s*\(\s*[`'"](?:https?:\/\/[^/]*?)?(\/[a-zA-Z0-9/:._-]+)['"`]/g,
-    /fetch\s*\(\s*[`'"](?:https?:\/\/[^/]*?)?(\/[a-zA-Z0-9/:._-]+)['"`]/g,
+    /(?:axios|fetch|http|client)\.(get|post|put|patch|delete)\s*\(\s*[`'"](?:https?:\/\/[^/]*?|\$\{[^}]*\})?(\/(?:[a-zA-Z0-9/:._-]|\$\{[^}]*\})+)['"`]/g,
+    /fetch\s*\(\s*[`'"](?:https?:\/\/[^/]*?|\$\{[^}]*\})?(\/(?:[a-zA-Z0-9/:._-]|\$\{[^}]*\})+)['"`]/g,
     // Service-name URLs built by hand: "http://user/customers", `http://user%s/login`, `http://user${domain}/cards`
-    /["'`]https?:\/\/[a-z][a-z0-9-]*(?:%s|\$\{[^}]*\})?(\/[a-zA-Z0-9/:._-]+)["'`]/g,
+    /["'`]https?:\/\/[a-z][a-z0-9-]*(?:%s|\$\{[^}]*\})?(\/(?:[a-zA-Z0-9/:._-]|\$\{[^}]*\})+)["'`]/g,
     // Java URI builders: new ServiceUri(new Hostname("payment"), …, "/paymentAuth")
     /Hostname\s*\(\s*"[a-z][a-z0-9-]*"\s*\)[^;]*?"(\/[a-zA-Z0-9/:._{}-]+)"/g,
   ];
@@ -225,7 +264,7 @@ function extractApiEndpoints(repoPath: string): { routes: Record<string, string>
   const clients: Record<string, string> = {};
 
   for (const filePath of sourceFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
 
     for (const pattern of routeDefPatterns) {
       pattern.lastIndex = 0;
@@ -242,8 +281,8 @@ function extractApiEndpoints(repoPath: string): { routes: Record<string, string>
       pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(content)) !== null) {
-        const clientPath = (match[2] ?? match[1]).replace(/:[a-zA-Z]+/g, ':param');
-        if (!(clientPath in clients)) clients[clientPath] = filePath;
+        const clientPath = normalizeClientPath(match[2] ?? match[1]);
+        if (clientPath && !(clientPath in clients)) clients[clientPath] = filePath;
       }
     }
   }
@@ -259,7 +298,7 @@ function extractGrpc(repoPath: string): { defs: Record<string, string>; clients:
   const protoFiles = walkFiles(repoPath, (f) => extname(f) === '.proto', 500);
   const defs: Record<string, string> = {};
   for (const filePath of protoFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     serviceDefPattern.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = serviceDefPattern.exec(content)) !== null) {
@@ -274,7 +313,7 @@ function extractGrpc(repoPath: string): { defs: Record<string, string>; clients:
   }, 3000);
   const clients: Record<string, string> = {};
   for (const filePath of sourceFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
 
     tsClientPattern.lastIndex = 0;
     let match: RegExpExecArray | null;
@@ -318,7 +357,7 @@ function extractDbTables(repoPath: string): Record<string, string> {
   const skipTables = new Set(['information_schema', 'pg_catalog', 'dual', 'sqlite_master', 'schema_migrations']);
 
   for (const filePath of allFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     for (const pattern of patterns) {
       pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
@@ -345,7 +384,7 @@ function extractRedisPrefixes(repoPath: string): Record<string, string> {
 
   const prefixMap: Record<string, string> = {};
   for (const filePath of sourceFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     for (const pattern of redisPatterns) {
       pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
@@ -382,7 +421,7 @@ function extractBuckets(repoPath: string): Record<string, string> {
   }, 3000);
 
   for (const filePath of sourceFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     for (const pattern of s3Patterns) {
       pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
@@ -406,10 +445,10 @@ function extractOpenApi(repoPath: string): { specPaths: Record<string, string>; 
   const pathPattern = /^\s*(?:\/[a-zA-Z0-9/:._{}*-]+)\s*:/gm;
   const jsonPathPattern = /"(\/[a-zA-Z0-9/:._{}*-]+)"\s*:/g;
 
-  // HTTP client patterns (complement to Strategy 5)
+  // HTTP client patterns (complement to Strategy 5); template-literal paths as there
   const httpCallPatterns = [
-    /(?:axios|fetch|http|client|httpGet|httpPost|httpPut|httpDelete)\s*\(\s*[^,]*?,?\s*['"`](\/[a-zA-Z0-9/:._-]+)['"`]/g,
-    /fetch\s*\(\s*[`'"](?:https?:\/\/[^/]*?)?(\/[a-zA-Z0-9/:._-]+)['"`]/g,
+    /(?:axios|fetch|http|client|httpGet|httpPost|httpPut|httpDelete)\s*\(\s*[^,]*?,?\s*['"`](\/(?:[a-zA-Z0-9/:._-]|\$\{[^}]*\})+)['"`]/g,
+    /fetch\s*\(\s*[`'"](?:https?:\/\/[^/]*?|\$\{[^}]*\})?(\/(?:[a-zA-Z0-9/:._-]|\$\{[^}]*\})+)['"`]/g,
   ];
 
   const specPaths: Record<string, string> = {};
@@ -419,7 +458,7 @@ function extractOpenApi(repoPath: string): { specPaths: Record<string, string>; 
   }, 200);
 
   for (const filePath of specFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     if (filePath.endsWith('.json')) {
       jsonPathPattern.lastIndex = 0;
       let match: RegExpExecArray | null;
@@ -447,13 +486,13 @@ function extractOpenApi(repoPath: string): { specPaths: Record<string, string>; 
   }, 3000);
   const httpCalls: Record<string, string> = {};
   for (const filePath of sourceFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     for (const pattern of httpCallPatterns) {
       pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(content)) !== null) {
-        const callPath = (match[2] ?? match[1]).replace(/:[a-zA-Z]+/g, ':param');
-        if (!(callPath in httpCalls)) httpCalls[callPath] = filePath;
+        const callPath = normalizeClientPath(match[2] ?? match[1]);
+        if (callPath && !(callPath in httpCalls)) httpCalls[callPath] = filePath;
       }
     }
   }
@@ -475,7 +514,7 @@ function extractComposeRefs(repoPath: string): Array<{ file: string; service: st
   }, 50);
 
   for (const filePath of foundFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
 
     dependsOnPattern.lastIndex = 0;
     let match: RegExpExecArray | null;
@@ -515,7 +554,7 @@ function extractK8sRefs(repoPath: string): Array<{ file: string; service: string
   }, 500);
 
   for (const filePath of k8sFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
 
     svcRefPattern.lastIndex = 0;
     let match: RegExpExecArray | null;
@@ -549,7 +588,7 @@ function extractConstants(repoPath: string): Record<string, { name: string; file
   }, 3000);
 
   for (const filePath of sourceFiles) {
-    const content = safeReadFile(filePath);
+    const content = safeReadFile(join(repoPath, filePath));
     const patterns = [tsConstPattern, goConstPattern];
     for (const pattern of patterns) {
       pattern.lastIndex = 0;
@@ -573,6 +612,7 @@ export function extractCrossRepoSignals(repoPath: string): CrossRepoSignals {
   const grpc = extractGrpc(repoPath);
   const openapi = extractOpenApi(repoPath);
   return {
+    version: CROSS_REPO_SIGNALS_VERSION,
     npmDeps: extractNpmDeps(repoPath),
     types: extractTypes(repoPath),
     envVars: extractEnvVars(repoPath),
@@ -595,6 +635,12 @@ export function extractCrossRepoSignals(repoPath: string): CrossRepoSignals {
 // ---------------------------------------------------------------------------
 // CORRELATE — persisted signals across repos → edges (no filesystem)
 // ---------------------------------------------------------------------------
+
+/** Runtime/platform env vars that services read regardless of what they talk to. */
+const GENERIC_ENV_VARS = new Set([
+  'NODE_ENV', 'NODE_OPTIONS', 'PORT', 'HOST', 'HOSTNAME', 'LOG_LEVEL', 'DEBUG',
+  'ENV', 'ENVIRONMENT', 'APP_ENV', 'GO_ENV', 'TZ', 'HOME', 'PATH', 'PWD', 'CI',
+]);
 
 /** Symmetric pairwise join over a per-repo string→file map. */
 function joinPairwise(
@@ -703,9 +749,18 @@ export function correlateCrossRepoEdges(
     {
       name: 'env-var-correlation',
       fn: () => {
+        // A var (nearly) every repo reads links every pair of repos and says
+        // nothing about any one of them: drop runtime generics, and any var read
+        // by more than max(5, a quarter of the repos) — e.g. an org-wide SENTRY_DSN.
+        const readers = new Map<string, number>();
+        for (const s of signals.values()) {
+          for (const v of new Set(s.envVars ?? [])) readers.set(v, (readers.get(v) ?? 0) + 1);
+        }
+        const ambient = Math.max(5, signals.size / 4);
         const perRepo = new Map<string, Record<string, string>>();
         for (const [name, s] of signals) {
-          if (s.envVars?.length) perRepo.set(name, Object.fromEntries(s.envVars.map((v) => [v, 'env'])));
+          const vars = (s.envVars ?? []).filter((v) => !GENERIC_ENV_VARS.has(v) && readers.get(v)! <= ambient);
+          if (vars.length) perRepo.set(name, Object.fromEntries(vars.map((v) => [v, 'env'])));
         }
         return joinPairwise(perRepo, (a, b, v) => ({
           sourceRepo: a,
