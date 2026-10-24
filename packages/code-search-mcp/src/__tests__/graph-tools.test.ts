@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execSync } from 'node:child_process';
@@ -210,12 +210,12 @@ describe('detect_changes', () => {
       git('config user.name test');
       git('config commit.gpgsign false');
       writeFileSync(join(repoDir, 'a.ts'), 'export function handleRequest() {}\n');
-      writeFileSync(join(repoDir, 'b.ts'), 'export function dbQuery() {}\n');
+      writeFileSync(join(repoDir, 'b.ts'), 'export function dbQuery() {\n  return 1;\n}\n');
       git('add -A');
       git('commit -q -m init');
       baseSha = execSync('git rev-parse HEAD', { cwd: repoDir }).toString().trim();
-      // uncommitted change to b.ts (where dbQuery lives in the fixture graph)
-      appendFileSync(join(repoDir, 'b.ts'), '// touched\n');
+      // uncommitted change inside dbQuery's body (b.ts in the fixture graph)
+      writeFileSync(join(repoDir, 'b.ts'), 'export function dbQuery() {\n  return 2;\n}\n');
     } catch {
       rmSync(ws, { recursive: true, force: true });
       return; // git unavailable — skip

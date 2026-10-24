@@ -5,45 +5,31 @@
 import type { ServerContext } from '../server.js';
 import { getRetriever, getBlobStore, findChunksInProject } from '@esankhan3/anvil-knowledge-core';
 import { resolvedKnowledgeConfig } from '../core/env-config.js';
+import { metrics } from '../observability/metrics.js';
+import { toolError, toolText, validateArgs, type InputSchema, type ToolResult } from './validate.js';
+
+const queryProps = {
+  query: { type: 'string', minLength: 1, description: 'Search query (natural language or code identifier)' },
+  maxResults: { type: 'integer', minimum: 1, description: 'Max results to return (default: 10)' },
+  repos: { type: 'array', items: { type: 'string' }, description: 'Only search these repos (optional)' },
+};
 
 export function registerSearchTools() {
   return [
     {
       name: 'search_code',
-      description: 'Hybrid search across all repos using vector + BM25 + graph expansion + reranking. Best for general queries.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          query: { type: 'string', description: 'Search query (natural language or code identifier)' },
-          maxResults: { type: 'number', description: 'Max results to return (default: 10)' },
-          repos: { type: 'array', items: { type: 'string' }, description: 'Filter to specific repos (optional)' },
-        },
-        required: ['query'],
-      },
+      description: 'Hybrid search across all repos using vector + BM25 + graph expansion + reranking. Best for general queries. Needs the embedder.',
+      inputSchema: { type: 'object' as const, properties: queryProps, required: ['query'] },
     },
     {
       name: 'search_semantic',
-      description: 'Vector-only semantic search. Best for conceptual questions like "how does X work?"',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          query: { type: 'string', description: 'Search query' },
-          maxResults: { type: 'number', description: 'Max results (default: 10)' },
-        },
-        required: ['query'],
-      },
+      description: 'Vector-only semantic search. Best for conceptual questions like "how does X work?". Needs the embedder.',
+      inputSchema: { type: 'object' as const, properties: queryProps, required: ['query'] },
     },
     {
       name: 'search_exact',
-      description: 'BM25 keyword search. Best for exact function names, error codes, file paths.',
-      inputSchema: {
-        type: 'object' as const,
-        properties: {
-          query: { type: 'string', description: 'Exact search query' },
-          maxResults: { type: 'number', description: 'Max results (default: 10)' },
-        },
-        required: ['query'],
-      },
+      description: 'BM25 keyword search, led by exact symbol-name and exact-phrase hits. Best for exact function names, error codes, file paths. Works without the embedder.',
+      inputSchema: { type: 'object' as const, properties: queryProps, required: ['query'] },
     },
     {
       name: 'get_code_snippet',
@@ -51,45 +37,53 @@ export function registerSearchTools() {
       inputSchema: {
         type: 'object' as const,
         properties: {
-          id: { type: 'string', description: 'Qualified id "repo::filePath::entity" (or "repo::filePath" for a whole file)' },
-          repo: { type: 'string', description: 'Repository name (alternative to id)' },
-          file: { type: 'string', description: 'File path relative to repo root (alternative to id)' },
-          entity: { type: 'string', description: 'Entity name (optional; with repo/file)' },
+          id: { type: 'string', minLength: 1, description: 'Qualified id "repo::filePath::entity" (or "repo::filePath" for a whole file)' },
+          repo: { type: 'string', minLength: 1, description: 'Repository name (alternative to id)' },
+          file: { type: 'string', minLength: 1, description: 'File path relative to repo root (alternative to id)' },
+          entity: { type: 'string', minLength: 1, description: 'Entity name (optional; with repo/file)' },
         },
       },
     },
   ];
 }
 
+const SCHEMAS = new Map(registerSearchTools().map((t) => [t.name, t.inputSchema as InputSchema]));
+/** Metric `mode` label per tool — the same values InProcessBackend records. */
+const METRIC_MODE: Record<string, string> = { search_code: 'hybrid', search_semantic: 'vector', search_exact: 'bm25' };
+
 export async function handleSearchTool(
   name: string,
   args: Record<string, unknown>,
   ctx: ServerContext,
-): Promise<{ content: Array<{ type: string; text: string }> } | null> {
+): Promise<ToolResult | null> {
+  const schema = SCHEMAS.get(name);
+  if (!schema) return null;
+  const invalid = validateArgs(schema, args);
+  if (invalid) return toolError(`${name}: ${invalid}`);
+
   // get_code_snippet reads chunks.json directly — embedder-independent, so it
   // does its own existence check rather than gating on ctx.indexReady.
   if (name === 'get_code_snippet') return await handleGetCodeSnippet(args, ctx);
 
-  if (!['search_code', 'search_semantic', 'search_exact'].includes(name)) return null;
-
-  if (!ctx.indexReady) {
-    return { content: [{ type: 'text', text: 'Index not ready. Run reindex tool or wait for auto-indexing to complete.' }] };
+  // BM25 needs no embeddings, so search_exact serves whatever the index already
+  // holds; the vector modes wait for the index to finish.
+  if (!ctx.indexReady && name !== 'search_exact') {
+    return toolText('Index not ready — indexing is still running or has not completed. Check index_status for progress.');
   }
 
+  const query = args.query as string;
+  const maxResults = (args.maxResults as number | undefined) ?? 10;
+  const repos = args.repos as string[] | undefined;
+  const modeMap: Record<string, string> = {
+    search_code: 'vector+bm25+graph',
+    search_semantic: 'vector',
+    search_exact: 'bm25',
+  };
+
+  const started = Date.now();
+  let outcome: 'ok' | 'error' = 'ok';
   try {
-    // getRetriever imported at top
     const retriever = await getRetriever(ctx.projectName, resolvedKnowledgeConfig());
-
-    const query = args.query as string;
-    const maxResults = (args.maxResults as number) || 10;
-    const repos = args.repos as string[] | undefined;
-
-    const modeMap: Record<string, string> = {
-      search_code: 'vector+bm25+graph',
-      search_semantic: 'vector',
-      search_exact: 'bm25',
-    };
-
     const result = await retriever.retrieve(query, {
       maxChunks: maxResults,
       // A search tool returns a fixed COUNT of results; the config token budget
@@ -102,7 +96,7 @@ export async function handleSearchTool(
     });
 
     if (result.chunks.length === 0) {
-      return { content: [{ type: 'text', text: `No results found for "${query}"` }] };
+      return toolText(`No results found for "${query}"${ctx.indexReady ? '' : ' (indexing has not completed — check index_status)'}`);
     }
 
     const text = result.chunks.map((sc, i) => {
@@ -110,10 +104,16 @@ export async function handleSearchTool(
       return `### ${i + 1}. ${c.repoName}/${c.filePath}:${c.startLine} (score: ${sc.score.toFixed(3)}, source: ${sc.source})\n\`\`\`${c.language}\n${c.content}\n\`\`\``;
     }).join('\n\n');
 
-    return { content: [{ type: 'text', text: `Found ${result.chunks.length} results for "${query}" (${result.totalTokens} tokens):\n\n${text}` }] };
+    return toolText(`Found ${result.chunks.length} results for "${query}" (${result.totalTokens} tokens):\n\n${text}`);
   } catch (err) {
+    outcome = 'error';
+    metrics.errors.inc({ kind: 'search' });
     const msg = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: 'text', text: `Search failed: ${msg}` }] };
+    return toolError(`Search failed: ${msg}`);
+  } finally {
+    const mode = METRIC_MODE[name];
+    metrics.queriesTotal.inc({ mode, outcome });
+    metrics.queryDuration.observe((Date.now() - started) / 1000, { mode });
   }
 }
 
@@ -121,7 +121,7 @@ export async function handleSearchTool(
 async function handleGetCodeSnippet(
   args: Record<string, unknown>,
   ctx: ServerContext,
-): Promise<{ content: Array<{ type: string; text: string }> }> {
+): Promise<ToolResult> {
   let repo = args.repo as string | undefined;
   let file = args.file as string | undefined;
   let entity = args.entity as string | undefined;
@@ -133,7 +133,7 @@ async function handleGetCodeSnippet(
     else if (parts.length === 2) { file = parts[1]; }
   }
   if (!repo || !file) {
-    return { content: [{ type: 'text', text: 'Provide id="repo::file::entity" or repo + file (entity optional).' }] };
+    return toolError('get_code_snippet: provide id="repo::file::entity" or repo + file (entity optional).');
   }
 
   try {
@@ -179,6 +179,6 @@ async function handleGetCodeSnippet(
     return { content: [{ type: 'text', text }] };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: 'text', text: `Failed to read chunks: ${msg}` }] };
+    return toolError(`Failed to read chunks: ${msg}`);
   }
 }
