@@ -129,6 +129,11 @@ export async function handleSearchTool(
   }
 }
 
+/** `entity` names this chunk: its own name, or `Class.member` for a member. */
+function namesEntity(c: { entityName?: string; parentEntity?: string }, entity: string): boolean {
+  return c.entityName === entity || (!!c.parentEntity && `${c.parentEntity}.${c.entityName}` === entity);
+}
+
 /** Fetch source for one entity from chunks.json (NDJSON or legacy array) by qualified name. */
 async function handleGetCodeSnippet(
   args: Record<string, unknown>,
@@ -172,12 +177,12 @@ async function handleGetCodeSnippet(
     if (matches.length === 0 && (await getBlobStore(ctx.projectName, resolvedKnowledgeConfig()).exists('chunks.json'))) {
       matches = await findChunksInProject(
         ctx.projectName,
-        (c) => c.repoName === repo && c.filePath === file && (!entity || c.entityName === entity),
+        (c) => c.repoName === repo && c.filePath === file && (!entity || namesEntity(c, entity)),
         5,
         resolvedKnowledgeConfig(),
       );
       if (matches.length === 0 && entity) {
-        matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && c.entityName === entity, 5, resolvedKnowledgeConfig());
+        matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && namesEntity(c, entity), 5, resolvedKnowledgeConfig());
       }
     }
     if (matches.length === 0) {

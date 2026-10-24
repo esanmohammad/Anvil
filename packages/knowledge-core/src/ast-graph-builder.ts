@@ -686,7 +686,11 @@ export async function buildAstGraph(
       let currentClassId: string | null = null;
 
       for (const tsEntity of tsResult.entities) {
-        const entityId = `${relPath}::${tsEntity.name}`;
+        // Members are `Class.member` so same-name methods of different classes
+        // (every `constructor` / `__init__`) stay separate nodes; label = name.
+        const entityId = tsEntity.parent
+          ? `${relPath}::${tsEntity.parent}.${tsEntity.name}`
+          : `${relPath}::${tsEntity.name}`;
         const entityType = tsEntity.type === 'struct' ? 'struct'
           : tsEntity.type === 'trait' ? 'trait'
           : tsEntity.type === 'enum' ? 'enum'
@@ -746,7 +750,9 @@ export async function buildAstGraph(
           const name = pat.nameExtractor(trimmed);
           if (!name) break;
 
-          const entityId = `${relPath}::${name}`;
+          const classId: string | null = currentClassId;
+          const inClass: boolean = classId !== null && indent > currentClassIndent && (pat.type === 'function' || pat.type === 'method');
+          const entityId: string = inClass ? `${classId}.${name}` : `${relPath}::${name}`;
           const parentNames = extractInheritance(trimmed, lang);
 
           nodes.push({ id: entityId, label: name, type: pat.type, file: relPath });
@@ -764,9 +770,9 @@ export async function buildAstGraph(
 
           registerSymbol(name, entityId);
 
-          if (currentClassId && indent > currentClassIndent && (pat.type === 'function' || pat.type === 'method')) {
-            edges.push({ source: currentClassId, target: entityId, type: 'contains', confidence: 1.0 });
-            const className = currentClassId.split('::').pop();
+          if (inClass && classId) {
+            edges.push({ source: classId, target: entityId, type: 'contains', confidence: 1.0 });
+            const className = classId.split('::').pop();
             if (className) registerSymbol(`${className}.${name}`, entityId);
           } else {
             edges.push({ source: relPath, target: entityId, type: 'contains', confidence: 1.0 });

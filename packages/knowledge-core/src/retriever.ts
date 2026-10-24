@@ -339,15 +339,16 @@ export class HybridRetriever {
 
     for (const sc of fused) {
       if (nodeIds.length >= maxSeeds) break;
-      const { repoName, entityName, filePath } = sc.chunk;
+      const { repoName, entityName, filePath, parentEntity } = sc.chunk;
       if (!entityName) continue;
       if (seenFiles.has(filePath)) continue; // diversify across files
       seenFiles.add(filePath);
 
       const baseName = entityName.replace(/\$\d+$/, '');
 
-      // Exact: the entity node in this repo+file (try normalized + original name).
-      const exact = store.nodesInFiles(repoName, [filePath], baseName);
+      // Exact: the entity node in this repo+file (class members are
+      // `Class.member` nodes; try normalized + original name).
+      const exact = store.nodesInFiles(repoName, [filePath], parentEntity ? `${parentEntity}.${baseName}` : baseName);
       if (exact.length > 0) { nodeIds.push(exact[0]); continue; }
       if (entityName !== baseName) {
         const exactOrig = store.nodesInFiles(repoName, [filePath], entityName);

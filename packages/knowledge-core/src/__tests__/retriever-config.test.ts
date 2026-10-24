@@ -67,3 +67,17 @@ describe('retrieverFreshnessMs', () => {
     assert.equal(retrieverFreshnessMs(), 30_000);
   });
 });
+
+describe('getChunksByEntity', () => {
+  it('resolves a class-qualified method to that class\'s chunk', async (t) => {
+    await withKbFixture(t, async (f) => {
+      f.repo('svc', { 'ui.ts': 'export class Board {\n  render() { return "board"; }\n}\n\nexport class Card {\n  render() { return "card"; }\n}\n' });
+      await f.index();
+      const v = f.storage().vectors;
+      await v.init();
+      const hits = await v.getChunksByEntity([{ repoName: 'svc', filePath: 'ui.ts', entityName: 'Card.render' }]);
+      assert.equal(hits.length, 1);
+      assert.match(hits[0].chunk.content, /"card"/);
+    });
+  });
+});

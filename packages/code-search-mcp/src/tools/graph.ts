@@ -7,7 +7,7 @@
  * indexes) — see knowledge-core/src/graph-store.ts. Tools query slices, so
  * org-scale graphs (900k+ nodes) no longer bust V8's string limit on read.
  * Per-repo tools (`get_repo_graph`, `find_dead_code`) still read the per-repo
- * `<KB>/<repo>/graph.json`. Node key convention: `repo::filePath::entity`.
+ * `<KB>/<repo>/graph.json`. Node key convention: `repo::filePath::entity` (class members: `entity` = `Class.member`).
  */
 
 import { existsSync } from 'node:fs';

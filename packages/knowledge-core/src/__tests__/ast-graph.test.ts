@@ -32,6 +32,7 @@ before(async () => {
   write('js/a.js', "const b = require('./b');\nfunction go() { return b.x; }\n");
   write('js/b.js', 'function x() { return 1; }\nmodule.exports = { x };\n');
   write('ui/Card.tsx', 'export class Board {\n  render() { return <div className="b">{rows.map((r) => <Row key={r} />)}</div>; }\n  click() { return track(); }\n}\nexport function track() { return 1; }\n');
+  write('py/two.py', 'class A:\n    def render(self):\n        return 1\n\nclass B:\n    def render(self):\n        return helper()\n\ndef helper():\n    return 2\n');
   graph = await buildAstGraph(root, {});
 });
 
@@ -44,8 +45,16 @@ describe('buildAstGraph', () => {
   });
 
   it('makes class methods graph nodes', () => {
-    const run = graph.nodes.find((n) => n.id === 'ts/service.ts::run');
+    const run = graph.nodes.find((n) => n.id === 'ts/service.ts::Service.run');
     assert.equal(run?.type, 'method');
+  });
+
+  it('gives same-name methods of different classes their own nodes', () => {
+    const ids = graph.nodes.map((n) => n.id);
+    assert.ok(ids.includes('py/two.py::A.render') && ids.includes('py/two.py::B.render'), ids.filter((i) => i.startsWith('py/two')).join(', '));
+    assert.ok(graph.links.some((e) => e.source === 'py/two.py::B.render' && e.target === 'py/two.py::helper' && e.type === 'calls'));
+    assert.ok(!graph.links.some((e) => e.source === 'py/two.py::A.render' && e.type === 'calls'));
+    assert.ok(graph.links.some((e) => e.source === 'py/two.py::A' && e.target === 'py/two.py::A.render' && e.type === 'contains'));
   });
 
   it('treats require() as an import', () => {
@@ -53,7 +62,7 @@ describe('buildAstGraph', () => {
   });
 
   it('parses .tsx with the TSX grammar', () => {
-    assert.ok(graph.links.some((e) => e.source === 'ui/Card.tsx::click' && e.target === 'ui/Card.tsx::track' && e.type === 'calls'));
-    assert.ok(graph.nodes.some((n) => n.id === 'ui/Card.tsx::render'));
+    assert.ok(graph.links.some((e) => e.source === 'ui/Card.tsx::Board.click' && e.target === 'ui/Card.tsx::track' && e.type === 'calls'));
+    assert.ok(graph.nodes.some((n) => n.id === 'ui/Card.tsx::Board.render'));
   });
 });

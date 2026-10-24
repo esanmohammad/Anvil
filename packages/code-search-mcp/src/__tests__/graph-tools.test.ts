@@ -61,6 +61,8 @@ const REPO_GRAPH = {
 
 const CHUNKS = [
   { id: 'c1', repoName: 'app', filePath: 'a.ts', entityName: 'handleRequest', startLine: 1, endLine: 3, content: 'function handleRequest() { return 1; }', language: 'typescript' },
+  { id: 'c2', repoName: 'app', filePath: 'ui.ts', entityName: 'render', parentEntity: 'Board', startLine: 2, endLine: 2, content: 'render() { return "board"; }', language: 'typescript' },
+  { id: 'c3', repoName: 'app', filePath: 'ui.ts', entityName: 'render', parentEntity: 'Card', startLine: 5, endLine: 5, content: 'render() { return "card"; }', language: 'typescript' },
 ];
 
 const PROJECT_GRAPH = {
@@ -155,6 +157,12 @@ describe('get_code_snippet', () => {
   it('returns source for a qualified id', async () => {
     const r = await handleSearchTool('get_code_snippet', { id: 'app::a.ts::handleRequest' }, ctx());
     assert.match(text(r), /function handleRequest/);
+  });
+
+  it('resolves a class-qualified method id to that class\'s method', async () => {
+    const t = text(await handleSearchTool('get_code_snippet', { id: 'app::ui.ts::Card.render' }, ctx()));
+    assert.match(t, /"card"/);
+    assert.doesNotMatch(t, /"board"/);
   });
 
   it('reports when nothing matches', async () => {

@@ -320,7 +320,7 @@ edges (`SYMMETRIC_EDGE_TYPES`: topics, tables, Redis keys, buckets, shared
 types / constants / env vars / npm deps) out of it, so both sides of a
 shared topic see each other.
 
-Node id convention: `<repo>::<filePath>::<entity>` (matches AST graph
+Node id convention: `<repo>::<filePath>::<entity>`, class members `<repo>::<filePath>::<Class>.<member>` (matches AST graph
 builder's namespacing). `get_architecture` reads `PROJECT_GRAPH.json` /
 `PROJECT_SUMMARY.md` through the project's blob store (`getBlobStore`),
 not knowledge-core's `ANVIL_HOME`-based loaders.

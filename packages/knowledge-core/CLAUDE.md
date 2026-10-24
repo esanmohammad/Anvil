@@ -34,7 +34,9 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 - `buildAstGraph` / `incrementalGraphUpdate` / `generateGraphReport`
   (`src/ast-graph-builder.ts`) — per-repo entity + import graph with
   6-phase build (workspace nodes, entity extraction, import resolution,
-  type refs, call disambiguation, inheritance, contains edges).
+  type refs, call disambiguation, inheritance, contains edges). Node ids
+  are `file::entity`, class members `file::Class.member` (label = the
+  member name) so same-name methods of different classes stay distinct.
 - `createSystemGraphSqliteWriter` / `openSystemGraphStore`
   (`src/graph-store.ts`) + `getGraphStore` (`src/storage/resolve.ts`) — the
   merged system graph. `buildKB` streams each repo's nodes/edges and the
