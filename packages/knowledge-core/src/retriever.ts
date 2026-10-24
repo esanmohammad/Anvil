@@ -17,32 +17,42 @@ import { classifyQuery } from '@esankhan3/anvil-knowledge-core';
 
 export type RetrievalMode = 'vector' | 'bm25' | 'vector+bm25' | 'vector+graph' | 'vector+bm25+graph';
 
-// Query embedding LRU cache — avoids re-embedding repeated queries. The Map
-// keeps insertion order, so a hit is re-inserted (most recently used last)
-// and a full cache evicts its first key (least recently used). Entries expire
-// 10 minutes after they were embedded. One entry is a number[] of 1024–1536
-// dims (8–12 KB), so a full cache holds ≤ ~48 MB per process.
+// Query embedding LRU cache — avoids re-embedding repeated queries. Keyed by
+// the embedder's identity (name, model, dimensions) plus the query, so two
+// embedders in one process never share a vector. The Map keeps insertion
+// order, so a hit is re-inserted (most recently used last) and a full cache
+// evicts its first key (least recently used). Entries expire 10 minutes after
+// they were embedded. One entry is a number[] of 1024–1536 dims (8–12 KB), so
+// a full cache holds ≤ ~48 MB per process.
 const queryEmbeddingCache = new Map<string, { embedding: number[]; timestamp: number }>();
 const CACHE_MAX_SIZE = 4096;
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-function getCachedEmbedding(query: string): number[] | null {
-  const entry = queryEmbeddingCache.get(query);
+const embeddingCacheKey = (embedder: EmbeddingProvider, query: string): string =>
+  `${embedder.name}\0${embedder.model ?? ''}\0${embedder.dimensions}\0${query}`;
+
+function getCachedEmbedding(key: string): number[] | null {
+  const entry = queryEmbeddingCache.get(key);
   if (!entry) return null;
-  queryEmbeddingCache.delete(query);
+  queryEmbeddingCache.delete(key);
   if (Date.now() - entry.timestamp > CACHE_TTL_MS) return null;
-  queryEmbeddingCache.set(query, entry);
+  queryEmbeddingCache.set(key, entry);
   return entry.embedding;
 }
 
-function cacheEmbedding(query: string, embedding: number[]): void {
-  queryEmbeddingCache.delete(query);
+function cacheEmbedding(key: string, embedding: number[]): void {
+  queryEmbeddingCache.delete(key);
   if (queryEmbeddingCache.size >= CACHE_MAX_SIZE) {
     const lru = queryEmbeddingCache.keys().next().value;
     if (lru !== undefined) queryEmbeddingCache.delete(lru);
   }
-  queryEmbeddingCache.set(query, { embedding, timestamp: Date.now() });
+  queryEmbeddingCache.set(key, { embedding, timestamp: Date.now() });
 }
+
+// Neighbour rows graph expansion reads per seed. On the bench graph 99.9% of
+// nodes have ≤ 100 (p99 = 19), so their expansion is complete; a hub seed
+// (hundreds to thousands of callers) is cut to its first 100.
+const EXPANSION_ROWS_PER_SEED = 100;
 
 // Auto repo-routing (WS-8) is OFF by default. At org scale (>10 repos) the
 // router hard-filters to ≤60% of repos by *repo-profile* similarity — so a
@@ -162,10 +172,11 @@ export class HybridRetriever {
     // (cache-first) then searches, all inside its own promise.
     const vectorPromise: Promise<ScoredChunk[]> = useVector
       ? (async () => {
-          let emb = getCachedEmbedding(query);
+          const cacheKey = embeddingCacheKey(this.embedder, query);
+          let emb = getCachedEmbedding(cacheKey);
           if (!emb) {
             emb = await this.embedder.embedSingle(query);
-            cacheEmbedding(query, emb);
+            cacheEmbedding(cacheKey, emb);
           }
           return this.vectorStore.vectorSearch(emb, { limit: 50, filter });
         })()
@@ -368,8 +379,10 @@ export class HybridRetriever {
 
   // ---------------------------------------------------------------
   // Tripartite expansion: dependencies + dependents (definitions follow via
-  // chunk lookup). neighborsOf already drops `contains` edges + low-confidence
-  // edges, matching the prior in-graph filter.
+  // chunk lookup). neighborEdges applies neighborsOf's filter (no `contains`
+  // edges, no low-confidence edges) and reads at most
+  // EXPANSION_ROWS_PER_SEED rows per seed, so a hub seed can't turn into
+  // thousands of chunk lookups.
   // ---------------------------------------------------------------
   private tripartiteExpand(seedNodeIds: string[]): string[] {
     const store = this.graphStore;
@@ -379,7 +392,7 @@ export class HybridRetriever {
 
     for (const seed of seedNodeIds) {
       // 'both' = outgoing (dependencies) + incoming (dependents).
-      for (const n of store.neighborsOf(seed, 'both')) {
+      for (const [, n] of store.neighborEdges([seed], 'both', undefined, EXPANSION_ROWS_PER_SEED)) {
         if (!seedSet.has(n)) expanded.add(n);
       }
     }

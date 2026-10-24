@@ -160,6 +160,14 @@ for (const [kind, build] of [['sqlite', buildSqlite], ['json', buildJson]] as co
       assert.deepEqual(keys(store.resolveNodes('src/pipeline/chainA.ts::startPipeline')), ['orders::src/pipeline/chainA.ts::startPipeline']);
     });
 
+    it('resolves by a multi-segment key suffix and by a cross-repo endpoint name, within a repo', () => {
+      assert.deepEqual(keys(store.resolveNodes('/api/orders/:param')), ['orders::src/server.ts::/api/orders/:param', 'web::src/api/orders.ts::/api/orders/:param']);
+      assert.deepEqual(keys(store.resolveNodes('src/server.ts::/api/orders/:param')), ['orders::src/server.ts::/api/orders/:param']);
+      assert.deepEqual(keys(store.resolveNodes('/api/orders/:param', 'web')), ['web::src/api/orders.ts::/api/orders/:param']);
+      assert.deepEqual(keys(store.resolveNodes('orders/:param')), []);
+      assert.deepEqual(keys(store.resolveNodes('server.ts::getOrderById')), []);
+    });
+
     it('exact resolution is case-sensitive and treats % and _ literally', () => {
       assert.deepEqual(store.resolveNodes('%'), []);
       assert.deepEqual(keys(store.resolveNodes('get_order')), ['orders::src/server.ts::get_order']);
@@ -203,6 +211,37 @@ for (const [kind, build] of [['sqlite', buildSqlite], ['json', buildJson]] as co
   });
 }
 
+describe('SqliteGraphStore — exact name resolution is index-backed', () => {
+  it('never scans the nodes table, with or without a repo', async () => {
+    const dir = join(root, 'plan');
+    const store = await buildSqlite(dir);
+    const Database = (await import('better-sqlite3')).default;
+    const proto = Database.prototype as any; // record the SQL the store prepares
+    const prepare = proto.prepare;
+    const sqls: string[] = [];
+    proto.prepare = function (this: unknown, sql: string) {
+      if (/FROM nodes/.test(sql)) sqls.push(sql);
+      return prepare.call(this, sql);
+    };
+    try {
+      store.resolveNodes('Order');
+      store.resolveNodes('src/models.ts::Order', 'orders');
+      store.resolveNodes('orders::src/models.ts::Order');
+    } finally {
+      proto.prepare = prepare;
+      store.close();
+    }
+    assert.equal(sqls.length, 3);
+    const db = new Database(join(dir, 'system_graph.sqlite'), { readonly: true });
+    try {
+      for (const sql of sqls) {
+        const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...Array((sql.match(/\?/g) ?? []).length).fill(null)) as Array<{ detail: string }>;
+        assert.ok(!plan.some((r) => /^SCAN nodes/.test(r.detail)), `${sql}\n${plan.map((r) => r.detail).join('\n')}`);
+      }
+    } finally { db.close(); }
+  });
+});
+
 describe('SqliteGraphStore — files written before evidence was stored', () => {
   it('still reads edges (evidence absent)', async () => {
     const dir = join(root, 'old');
@@ -223,6 +262,10 @@ describe('SqliteGraphStore — files written before evidence was stored', () => 
     assert.equal(total, 1);
     assert.equal(edges[0].evidence, undefined);
     assert.deepEqual(store.dependents(['a::x.ts::r'], 10).repos, ['b']);
+    // No key_tail column: exact resolution falls back to the scan, same answers.
+    assert.deepEqual(keys(store.resolveNodes('r')), ['a::x.ts::r', 'b::y.ts::r']);
+    assert.deepEqual(keys(store.resolveNodes('y.ts::r')), ['b::y.ts::r']);
+    assert.deepEqual(keys(store.resolveNodes('r', 'a')), ['a::x.ts::r']);
     store.close();
   });
 });

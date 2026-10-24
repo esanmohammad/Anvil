@@ -41,6 +41,33 @@ describe('query-embedding cache (HybridRetriever)', () => {
   });
 });
 
+describe('query-embedding cache — keyed by embedder', () => {
+  it('never hands one embedder another embedder\'s vector for the same query', async () => {
+    const calls: string[] = [];
+    const searched: number[][] = [];
+    const store = { vectorSearch: async (emb: number[]) => { searched.push(emb); return []; } } as any;
+    const retriever = (id: string, name: string, model: string | undefined, dimensions: number) => {
+      const vector = Array.from({ length: dimensions }, (_, i) => (i === 0 ? id.length : 0));
+      const embedder = {
+        name, model, dimensions,
+        embed: async (t: string[]) => t.map(() => vector),
+        embedSingle: async () => { calls.push(id); return vector; },
+      } as unknown as EmbeddingProvider;
+      return new HybridRetriever(store, embedder, null, { maxChunks: 8, maxTokens: 12000, hybridWeights: { vector: 0.5, bm25: 0.3, graph: 0.2 } });
+    };
+    const query = 'embedder identity probe';
+    const a = retriever('a', 'openai', 'text-embedding-3-large', 3);
+    const otherModel = retriever('bb', 'openai', 'text-embedding-3-small', 3);
+    const otherDims = retriever('ccc', 'openai', 'text-embedding-3-large', 4);
+    const otherName = retriever('dddd', 'voyage', 'text-embedding-3-large', 3);
+    const sameAsA = retriever('eeeee', 'openai', 'text-embedding-3-large', 3);
+
+    for (const r of [a, otherModel, otherDims, otherName, sameAsA]) await r.retrieve(query, { mode: 'vector' });
+    assert.deepEqual(calls, ['a', 'bb', 'ccc', 'dddd'], 'each embedder identity embeds once; the same identity reuses the vector');
+    assert.deepEqual(searched.map((v) => `${v[0]}/${v.length}`), ['1/3', '2/3', '3/4', '4/3', '1/3']);
+  });
+});
+
 describe('query-expansion cache (expandQuery)', () => {
   it('evicts the least recently used query, keeping one that was hit', async () => {
     const asked: string[] = [];

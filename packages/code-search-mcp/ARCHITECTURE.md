@@ -367,7 +367,8 @@ The system-graph tools query knowledge-core's `GraphStore`
 (`getGraphStore` → `system_graph.sqlite`, JSON fallback for older
 indexes) by slice, never loading the whole graph. `store.resolveNodes(name,
 repo?, fuzzy?)` resolves a symbol to node keys — exact by default (full key,
-`label`, or a `::name` key suffix; case-sensitive, no wildcards), so a full
+`label`, or a `::name` key suffix; case-sensitive, no wildcards; index
+lookups on SQLite), so a full
 `repo::file::entity` id works; `fuzzy:true` = case-insensitive substring of
 symbol labels (files and cross-repo endpoints skipped). Traversal tools take
 `relations` (`calls` default; `imports`, `uses`, `type-ref`, `inherits`,

@@ -45,8 +45,10 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   dependents, cross-repo edges, neighbors — per key, or batched as
   `neighborEdges` with a row limit) to the retriever's graph expansion
   and the MCP graph tools. Edges keep `type`, `confidence` and (cross-repo)
-  `evidence`. Exact name resolution is case-sensitive and wildcard-free and
-  accepts a full `repo::file::entity` id; `dependents` treats
+  `evidence`. Exact name resolution is case-sensitive and wildcard-free,
+  accepts a full `repo::file::entity` id, and is index-backed (`nodes.label`
+  + `nodes.key_tail`; a file written before `key_tail` existed is scanned
+  until the next index rebuilds it); `dependents` treats
   `SYMMETRIC_EDGE_TYPES` (shared topic / table / key / bucket / type /
   constant / env var / npm dep) as two-way; `crossRepoEdges` includes
   same-repo `workspace-dep` edges.
@@ -94,8 +96,8 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 - `HybridRetriever` (`src/retriever.ts`) — vector ⫽ BM25 ⫽ literal tiers
   (entityName exact/substring for bare identifiers, exact phrase for
   multi-token queries) → weighted RRF (`CODE_SEARCH_RRF_K`, default 10) +
-  exact-symbol pin + dedupe + per-file cap → one-hop AST expansion →
-  optional cross-encoder rerank. Expansion runs only when a reranker is
+  exact-symbol pin + dedupe + per-file cap → one-hop AST expansion (≤ 100
+  neighbour rows per seed) → optional cross-encoder rerank. Expansion runs only when a reranker is
   configured or the fused pool can't fill `maxChunks`; its chunks are
   appended after the fused pool.
 - `VectorStore` (`src/vector-store.ts`) — LanceDB-backed; supports
@@ -322,7 +324,8 @@ hold. The embed step records `embeddingProvider` / `embeddingModel` /
 - `repoFilter` (or `repos`) scopes the search. With neither, the query
   router filters repos only when `CODE_SEARCH_AUTO_ROUTE=1`.
 - Query embedding cached for 10 min (LRU 4096: a hit refreshes recency, a
-  full cache evicts the least recently used query).
+  full cache evicts the least recently used query), keyed by the embedder's
+  name / model / dimensions plus the query, so embedders never share vectors.
 - Returns `{ chunks, graphContext, totalTokens, query }`. `graphContext`
   is always `''`.
 

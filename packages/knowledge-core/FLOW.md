@@ -211,7 +211,8 @@ retriever.retrieve(query, opts):                ← src/retriever.ts
   ├─ Phase 1 — parallel retrieval
   │     [vec, bm25, exact, phrase] = await Promise.all([
   │       useVector ? store.vectorSearch(emb, { limit:50, filter })  : []
-  │                   └─ emb: query-embedding cache, else embedder.embedSingle
+  │                   └─ emb: query-embedding cache (key: embedder name / model /
+  │                      dimensions + query), else embedder.embedSingle
   │       useBm25   ? store.fullTextSearch(query, 50, filter)        : []
   │       bare identifier && mode !== 'vector'
   │         ? (≥3 chars ? store.searchByEntitySubstring(q, 20, filter)
@@ -238,8 +239,9 @@ retriever.retrieve(query, opts):                ← src/retriever.ts
   │           ├─ pick top fused chunks, one per file (diversify)
   │           └─ resolve <repo>::<file>::<entity> → graph node id
   │     expandedIds = tripartiteExpand(seedNodeIds)
-  │           ├─ graphStore.neighborsOf(seed, 'both') — one hop, both directions,
-  │           │  confidence ≥ 0.7, excluding 'contains'
+  │           ├─ graphStore.neighborEdges([seed], 'both', undefined, 100) — one hop,
+  │           │  both directions, confidence ≥ 0.7, excluding 'contains',
+  │           │  ≤ 100 rows per seed
   │           └─ drop module / package nodes
   │     astChunks = await store.getChunksByEntity(parsedLookups)
   │

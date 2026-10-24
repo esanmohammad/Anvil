@@ -67,8 +67,8 @@ All implemented in `src/tools/`:
   `calls` edges by default; `relations` (`imports`, `uses`, `type-ref`,
   `inherits`, `all`) lists the others, grouped by relation. Symbol
   resolution is exact by default via `store.resolveNodes` (full
-  `repo::file::entity` id, label, or `::name` suffix — case-sensitive;
-  `fuzzy:true` = case-insensitive substring of symbol names).
+  `repo::file::entity` id, label, or `::name` suffix — case-sensitive,
+  index-backed; `fuzzy:true` = case-insensitive substring of symbol names).
   `impact_analysis` follows dependents up to `depth` hops; it and
   `detect_changes` mark cross-repo endpoints of the file as
   `[file-level]`. `detect_changes` maps `git diff -U0` hunks onto entity
