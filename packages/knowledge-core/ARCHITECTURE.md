@@ -382,7 +382,10 @@ rewrite.
 The vector index (IVF_FLAT, or IVF_PQ when `storage.vector.lancedb.index` is
 set) is managed by `vector-index-maintenance.ts` on the write path. It is built
 once the table reaches `minRows`, and `optimize()` folds appends into the
-existing centroids. The writer counts rows written since the last training and
+existing centroids. `optimize()` rewrites every index each call (several GB at
+1M rows, kept until versions older than `CODE_SEARCH_LANCE_RETENTION_HOURS`,
+default 1, are pruned), so a writer run that wrote, deleted and trained
+nothing, and left no row unindexed (`hasUnindexedRows`), skips it. The writer counts rows written since the last training and
 retrains in place (`createIndex(..., { replace: true })`) once that reaches
 `trainedRows × CODE_SEARCH_VECTOR_RETRAIN_RATIO` (default 1; 0 disables), when
 the configured index type changes, or once for an index with no training

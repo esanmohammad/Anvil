@@ -759,6 +759,8 @@ export class KnowledgeIndexer {
     // "delete everything".
     const orphanIds = full && scopeChunks === 0 ? [] : [...existingIds].filter((id) => !listedIds.has(id));
     const staleLeft = [...staleRows].flatMap(([id, hashes]) => [...hashes].map((h) => ({ id, contentHash: h })));
+    // At least this many rows go (a removed repo has at least one).
+    const rowsDeleted = staleLeft.length + orphanIds.length + removedRepos.length;
     const sweep = async (): Promise<void> => {
       // A stale row whose id no listed chunk took can go by id (cheap IN-list
       // deletes); only ids a new chunk now holds need the exact pair.
@@ -805,7 +807,7 @@ export class KnowledgeIndexer {
       // (build / due retrain / optimize — a prior run may also have died before
       // folding its appends in).
       await vectorStore.ensureScalarIndexes();
-      const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: 0, probes });
+      const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: 0, rowsDeleted, probes });
       await storage.blobs.putJson(EMBED_PENDING_KEY, { all: false, repos: [], removed: [] } satisfies EmbedPending);
       // optimize() prunes dataset versions past the retention window; readers
       // only reopen on a generation bump, so signal them or a reader pinned to
@@ -999,7 +1001,7 @@ export class KnowledgeIndexer {
     // last training reach the retrain ratio, and optimizes (folds this run's
     // appends into every index, compacts, prunes).
     await vectorStore.ensureScalarIndexes();
-    const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: stored, probes });
+    const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: stored, rowsDeleted, probes });
     log(`Stored ${newChunkCount} new chunks in LanceDB (${reused} reused by content, ${deletedFiles.length} files re-planned)`);
     // The stale-file list is applied — clear it, or a later no-change cycle
     // (buildKB returns early without rewriting it) would wipe those files again

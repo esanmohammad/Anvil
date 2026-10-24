@@ -147,7 +147,10 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   build at `minRows`, retrain once rows written since the last training
   reach `trainedRows × CODE_SEARCH_VECTOR_RETRAIN_RATIO` (default 1; 0
   disables), on an index-type config change, or once for an index with no
-  training record; then `optimize()`. After a (re)training — or once, for
+  training record; then `optimize()` — skipped on a run that wrote, deleted
+  and trained nothing and left no row unindexed, since it rewrites every
+  index (several GB at 1M rows); it prunes dataset versions older than
+  `CODE_SEARCH_LANCE_RETENTION_HOURS` (default 1). After a (re)training — or once, for
   an index never calibrated — it calibrates `nprobes`: the fewest IVF probes
   whose recall@10 vs an exact scan reaches 0.95 on ~100 query-like probes
   the embed run samples (entity names, the names split into words, comment
@@ -381,7 +384,7 @@ are not re-embedded. The
 stale-file list is cleared once an embed applies it; `buildKB` merges into a
 list not yet applied rather than overwriting it. Every embed run —
 including one with nothing new to embed — ends with `maintainVectorIndex`
-(build / due retrain / optimize); the nothing-new path then bumps the index
+(build / due retrain / optimize unless the run was idle); the nothing-new path then bumps the index
 generation because optimize prunes old dataset versions readers may still
 hold. The embed step records `embeddingProvider` / `embeddingModel` /
 `embeddingDimensions` in each repo's `index_meta.json`.

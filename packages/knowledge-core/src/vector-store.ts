@@ -277,6 +277,20 @@ export class VectorStore implements VectorStorePort {
     }
   }
 
+  /** Whether any index has rows appended since it was last folded in. */
+  async hasUnindexedRows(): Promise<boolean> {
+    if (!this.table) return false;
+    try {
+      const indexes: Array<{ name: string }> = await this.table.listIndices();
+      for (const { name } of indexes) {
+        if (((await this.table.indexStats(name))?.numUnindexedRows ?? 0) > 0) return true;
+      }
+      return false;
+    } catch {
+      return true; // unknown → fold, as an optimize would
+    }
+  }
+
   /** Fold newly-appended rows into the existing FTS/scalar/vector indexes (and
    *  compact fragments). Run on the write path AFTER an incremental embed so the
    *  unindexed tail doesn't grow across reindexes and drag scans back in. Work is
@@ -286,10 +300,12 @@ export class VectorStore implements VectorStorePort {
     try {
       // Also prune old dataset versions: Lance is MVCC and optimize() alone
       // keeps every version, so a 6h reindex cycle grows the bucket forever
-      // (measured: +50-100% of dataset size per cycle). Retention must exceed
-      // the readers' refresh window (retriever TTL / invalidate broadcast) so
-      // an in-flight reader never loses the version it has open.
-      const hours = Number(process.env.CODE_SEARCH_LANCE_RETENTION_HOURS) || 24;
+      // (measured: +50-100% of dataset size per cycle; each optimize also
+      // rewrites every index — several GB at 1M rows). Retention must exceed
+      // the readers' refresh window (retriever TTL, default 30 s / invalidate
+      // broadcast) so an in-flight reader never loses the version it has open;
+      // an hour is far past it.
+      const hours = Number(process.env.CODE_SEARCH_LANCE_RETENTION_HOURS) || 1;
       await this.table.optimize({ cleanupOlderThan: new Date(Date.now() - hours * 3_600_000) });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

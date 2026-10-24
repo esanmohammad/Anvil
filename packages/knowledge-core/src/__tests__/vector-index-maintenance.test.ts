@@ -215,6 +215,25 @@ describe('maintainVectorIndex — real LanceDB', () => {
     });
   });
 
+  it('skips optimize on a cycle that changed nothing and left nothing unindexed', async (t) => {
+    await withStore(t, async ({ storage }) => {
+      const v = storage.vectors;
+      await v.addChunks(rows(200), { skipIndex: true });
+      await maintainVectorIndex(v, storage.blobs, { ...quiet, rowsWritten: 200 });
+      let optimized = 0;
+      const real = v.optimizeIndexes.bind(v);
+      v.optimizeIndexes = async () => { optimized++; await real(); };
+
+      await maintainVectorIndex(v, storage.blobs, { ...quiet, rowsWritten: 0 });
+      assert.equal(optimized, 0, 'an idle cycle rewrote the indexes');
+      await maintainVectorIndex(v, storage.blobs, { ...quiet, rowsWritten: 0, rowsDeleted: 3 });
+      assert.equal(optimized, 1, 'a cycle that deleted rows is folded');
+      await v.addChunks(rows(10), { skipIndex: true });
+      await maintainVectorIndex(v, storage.blobs, { ...quiet, rowsWritten: 10 });
+      assert.equal(optimized, 2, 'a cycle that wrote rows is folded');
+    });
+  });
+
   it('keeps the record when the table state is unreadable after optimize', async (t) => {
     await withStore(t, async ({ storage }) => {
       const v = storage.vectors;
