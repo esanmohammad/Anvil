@@ -16,7 +16,7 @@
 /** The two primitives the gate needs — structural, so it doesn't widen the
  *  VectorStorePort (the exact/bypass baseline is LanceDB-specific). */
 export interface RecallProbe {
-  vectorSearchIds(queryEmbedding: number[], k: number): Promise<string[]>;
+  vectorSearchIds(queryEmbedding: number[], k: number, nprobes?: number): Promise<string[]>;
   vectorSearchExactIds(queryEmbedding: number[], k: number): Promise<string[]>;
 }
 
@@ -46,4 +46,35 @@ export async function measureRecallAtK(
   }
   const n = queries.length;
   return { k, queries: n, meanRecall: n > 0 ? sum / n : 1, minRecall: n > 0 ? min : 1 };
+}
+
+/** The fewest IVF probes whose mean recall@k over `queries` reaches `target`
+ *  (recall rises with probes, so a binary search over 1..maxNprobes). The
+ *  exact baseline is computed once per query. When even `maxNprobes` misses
+ *  the target (quantization loss), returns `maxNprobes` with its recall. */
+export async function calibrateNprobes(
+  store: RecallProbe,
+  queries: number[][],
+  opts: { k: number; target: number; maxNprobes: number },
+): Promise<{ nprobes: number; recall: number }> {
+  const exact: string[][] = [];
+  for (const q of queries) exact.push(await store.vectorSearchExactIds(q, opts.k));
+  const recallAt = async (nprobes: number): Promise<number> => {
+    let sum = 0;
+    for (let i = 0; i < queries.length; i++) {
+      const approx = new Set(await store.vectorSearchIds(queries[i], opts.k, nprobes));
+      sum += exact[i].length > 0 ? exact[i].filter((id) => approx.has(id)).length / exact[i].length : 1;
+    }
+    return queries.length > 0 ? sum / queries.length : 1;
+  };
+  let best = { nprobes: opts.maxNprobes, recall: await recallAt(opts.maxNprobes) };
+  if (best.recall < opts.target) return best;
+  let lo = 1;
+  let hi = opts.maxNprobes;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const recall = await recallAt(mid);
+    if (recall >= opts.target) { hi = mid; best = { nprobes: mid, recall }; } else lo = mid + 1;
+  }
+  return best;
 }

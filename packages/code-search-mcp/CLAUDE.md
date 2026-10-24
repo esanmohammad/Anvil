@@ -87,8 +87,8 @@ All implemented in `src/tools/`:
   `loadAllProfiles`.
 - **Index** (`index-tools.ts`) — `index_status`. Reads
   `KnowledgeIndexer.getStats(project)`, including the vector-index line
-  (type, partitions, training size + rows since, unindexed rows) from the
-  writer's `vector_index.json`.
+  (type, partitions, training size + rows since, unindexed rows, calibrated
+  probes per query + their recall) from the writer's `vector_index.json`.
 - Every handler validates its arguments against its own `inputSchema`
   (`tools/validate.ts:validateArgs`); bad input and thrown errors return
   `isError: true`.

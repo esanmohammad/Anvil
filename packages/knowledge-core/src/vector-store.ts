@@ -20,10 +20,16 @@ function isCorruptVectorStore(err: unknown): boolean {
   );
 }
 
-/** IVF partitions probed per vector query (recall/latency dial; env-tunable so
- *  it can be adjusted on the VM without a redeploy). No effect until the IVF
- *  index exists (ensureVectorIndex). */
-const VECTOR_NPROBES = Math.max(1, parseInt(process.env.CODE_SEARCH_VECTOR_NPROBES ?? '', 10) || 40);
+/** IVF partitions probed per vector query. The writer calibrates it per index
+ *  (vector_index.json: the fewest probes reaching the target recall on
+ *  query-like probes) and readers apply it via setCalibratedNprobes.
+ *  CODE_SEARCH_VECTOR_NPROBES overrides it — e.g. to trade recall for latency
+ *  on a VM without a redeploy; DEFAULT_NPROBES applies when there is neither.
+ *  No effect until the IVF index exists (ensureVectorIndex). */
+const ENV_NPROBES = parseInt(process.env.CODE_SEARCH_VECTOR_NPROBES ?? '', 10) > 0
+  ? parseInt(process.env.CODE_SEARCH_VECTOR_NPROBES ?? '', 10)
+  : undefined;
+const DEFAULT_NPROBES = 40;
 
 /** Insert a space at camelCase / PascalCase / acronym boundaries
  *  (`parseHTTPResponse` → `parse HTTP Response`) so identifier parts become
@@ -82,6 +88,7 @@ export class VectorStore implements VectorStorePort {
   private indexConfig?: IvfPqIndexConfig;
   private initialized: boolean = false;
   private columnsEnsured = false;
+  private calibratedNprobes?: number;
   /** Whether the table has the identifier-split FTS index (absent on tables
    *  no upgraded writer has touched yet); resolved on first search. */
   private splitFts?: Promise<boolean>;
@@ -424,18 +431,21 @@ export class VectorStore implements VectorStorePort {
     opts?: {
       limit?: number;
       filter?: string;
+      /** Probe count for this query only (calibration). */
+      nprobes?: number;
     },
   ): Promise<ScoredChunk[]> {
     if (!this.table) return [];
     // nprobes = IVF partitions scanned per query (no-op on a flat/un-indexed
-    // table). Higher = better recall, more work. `indexConfig` (IVF_PQ / S3
-    // deployments) wins when set; otherwise the env-tunable VECTOR_NPROBES.
+    // table). Higher = better recall, more work. Precedence: this call's
+    // value, `indexConfig` (IVF_PQ / S3 deployments), the env override, the
+    // writer-calibrated value, the default.
     // refineFactor (IVF_PQ only) re-ranks the top nprobes·refine candidates
     // with exact distance against the retained raw vectors (ADR §5.5).
     let query = this.table
       .search(queryEmbedding)
       .limit(opts?.limit ?? 20)
-      .nprobes(this.indexConfig?.nprobes ?? VECTOR_NPROBES);
+      .nprobes(opts?.nprobes ?? this.indexConfig?.nprobes ?? ENV_NPROBES ?? this.calibratedNprobes ?? DEFAULT_NPROBES);
     if (this.indexConfig?.refineFactor) query = query.refineFactor(this.indexConfig.refineFactor);
     if (opts?.filter) query = query.where(opts.filter);
     const results = await query.toArray();
@@ -448,8 +458,8 @@ export class VectorStore implements VectorStorePort {
 
   /** Approximate (IVF_PQ, index-backed) nearest-neighbor ids — applies the
    *  configured nprobes/refineFactor via vectorSearch. Used by the recall gate. */
-  async vectorSearchIds(queryEmbedding: number[], k: number): Promise<string[]> {
-    const results = await this.vectorSearch(queryEmbedding, { limit: k });
+  async vectorSearchIds(queryEmbedding: number[], k: number, nprobes?: number): Promise<string[]> {
+    const results = await this.vectorSearch(queryEmbedding, { limit: k, nprobes });
     return results.map((s) => s.chunk.id);
   }
 
@@ -501,6 +511,11 @@ export class VectorStore implements VectorStorePort {
       // FTS index may not exist
       return [];
     }
+  }
+
+  /** Use the writer-calibrated probe count (vector_index.json) for queries. */
+  setCalibratedNprobes(nprobes: number | undefined): void {
+    this.calibratedNprobes = nprobes && nprobes > 0 ? nprobes : undefined;
   }
 
   private hasSplitFts(): Promise<boolean> {

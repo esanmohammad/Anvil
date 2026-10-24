@@ -387,6 +387,19 @@ retrains in place (`createIndex(..., { replace: true })`) once that reaches
 the configured index type changes, or once for an index with no training
 record. Training + health are recorded in `vector_index.json`.
 
+Probes per query (`nprobes`) are calibrated per index, not fixed: partitions
+grow as √rows, so a fixed count probes an ever smaller share, and short
+queries (identifiers, a few words) embed away from code chunks — their nearest
+centroids are often not where their nearest neighbours are (measured on the
+bench corpus: recall@10 0.99 at 10 of 164 probes for chunk-vector queries,
+0.58 for real queries). After each (re)training — or once for an index never
+calibrated — `maintainVectorIndex` embeds ~100 query-like probes sampled by the
+embed run (entity names, the names split into words, comment lines) and
+`calibrateNprobes` binary-searches the fewest probes whose mean recall@10 vs an
+exact scan (`bypassVectorIndex`) reaches 0.95. Readers take it from
+`vector_index.json`; precedence: index config `nprobes` →
+`CODE_SEARCH_VECTOR_NPROBES` → calibrated → 40.
+
 ## 11. Reranker (`src/reranker.ts`)
 
 | Class | Default endpoint / model |

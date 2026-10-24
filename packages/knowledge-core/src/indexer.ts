@@ -7,7 +7,7 @@ import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 import { resolveStorage, invalidateGraphStores } from './storage/resolve.js';
 import type { BlobStorePort, StorageBundle } from './storage/ports.js';
 import { maintainVectorIndex, readVectorIndexHealth } from './vector-index-maintenance.js';
-import { contentHash } from './vector-store.js';
+import { contentHash, splitIdentifiers } from './vector-store.js';
 import { cosineSimilarity } from './query-router.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
@@ -621,11 +621,25 @@ export class KnowledgeIndexer {
     let newChunkCount = 0;
     const repoChunkCounts = new Map<string, number>();
     const listedIds = new Set<string>();
+    // A reservoir sample of named chunks: the source of the query-like probes
+    // that calibrate the vector index's nprobes (maintainVectorIndex).
+    const probeChunks: CodeChunk[] = [];
+    let named = 0;
+    let seed = 0x2545f491;
+    const rand = (): number => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 2 ** 32;
     for await (const c of storage.blobs.iterateNdjson<CodeChunk>('chunks.json')) {
       totalChunks++;
       totalTokens += c.tokens;
       repoChunkCounts.set(c.repoName, (repoChunkCounts.get(c.repoName) ?? 0) + 1);
       listedIds.add(c.id);
+      if (c.entityName && c.entityName.length >= 4) {
+        named++;
+        if (probeChunks.length < CALIBRATION_PROBES) probeChunks.push(c);
+        else {
+          const j = Math.floor(rand() * named);
+          if (j < CALIBRATION_PROBES) probeChunks[j] = c;
+        }
+      }
       if (existingIds.has(c.id)) continue;
       // Same id, same text as a stale row: keep that row as it is.
       const stale = staleRows.get(c.id);
@@ -655,6 +669,8 @@ export class KnowledgeIndexer {
       await vectorStore.deleteChunksByIds(byId);
     };
     const repoNames = [...repoChunkCounts.keys()];
+    const probes = async (): Promise<number[][]> =>
+      probeChunks.length > 0 ? createEmbeddingProvider(config.embedding).embed(calibrationProbeTexts(probeChunks)) : [];
 
     if (newChunkCount === 0 && deletedFiles.length === 0) {
       await sweep();
@@ -671,7 +687,7 @@ export class KnowledgeIndexer {
       // (build / due retrain / optimize — a prior run may also have died before
       // folding its appends in).
       await vectorStore.ensureScalarIndexes();
-      const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: 0 });
+      const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: 0, probes });
       // optimize() prunes dataset versions past the retention window; readers
       // only reopen on a generation bump, so signal them or a reader pinned to
       // a pruned version would lose its files.
@@ -864,7 +880,7 @@ export class KnowledgeIndexer {
     // last training reach the retrain ratio, and optimizes (folds this run's
     // appends into every index, compacts, prunes).
     await vectorStore.ensureScalarIndexes();
-    const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: stored });
+    const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: stored, probes });
     log(`Stored ${newChunkCount} new chunks in LanceDB (${reused} reused by content, ${deletedFiles.length} files re-planned)`);
     // The stale-file list is applied — clear it, or a later no-change cycle
     // (buildKB returns early without rewriting it) would wipe those files again
@@ -1250,6 +1266,26 @@ async function indexFingerprint(basePath: string, blobs: BlobStorePort): Promise
   return `${mt(join(basePath, 'lancedb'))}:${mt(join(basePath, 'system_graph.sqlite'))}`;
 }
 
+/** Chunks sampled per embed run for nprobes calibration probes. */
+const CALIBRATION_PROBES = 100;
+
+/** Query-like texts for nprobes calibration, from sampled chunks: the entity
+ *  name as typed (identifier queries), split into lowercase words, or the
+ *  first line of a comment in the chunk (natural-language queries). Short
+ *  texts like these embed away from code chunks, as real queries do. */
+function calibrationProbeTexts(chunks: CodeChunk[]): string[] {
+  return chunks.map((c, i) => {
+    const name = c.entityName!;
+    const words = splitIdentifiers(name).replace(/_/g, ' ').toLowerCase();
+    if (i % 3 === 0) return name;
+    if (i % 3 === 1) return words;
+    const comment = c.content.split('\n')
+      .map((l) => l.trim().match(/^(?:\/\/+|#+|\/\*+|\*+)\s*(.{12,})/)?.[1])
+      .find(Boolean);
+    return comment?.replace(/\*\/\s*$/, '').trim() || words;
+  });
+}
+
 /** Bump the change-signal read replicas poll on their freshness TTL. Written
  *  after every completed write phase (buildKB, embedChunks) — non-fatal, the
  *  in-process invalidate still covers the writer's own cache. */
@@ -1373,6 +1409,8 @@ async function buildRetriever(
   // Load vector store
   const vectorStore = storage.vectors;
   await vectorStore.init();
+  // The probe count the writer calibrated for this index (vector_index.json).
+  vectorStore.setCalibratedNprobes((await readVectorIndexHealth(storage.blobs))?.nprobes);
 
   // Open the system-graph store for graph-augmented retrieval. It prefers
   // system_graph.sqlite (org scale, bounded slice queries) and falls back to

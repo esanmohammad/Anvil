@@ -109,6 +109,15 @@ export interface VectorIndexHealth {
   numIndexedRows?: number;
   /** Rows not yet folded into the index (served by brute-force scan). */
   numUnindexedRows?: number;
+  /** IVF probes per query, calibrated at the last training: the fewest whose
+   *  recall@10 against an exact scan reaches the target on query-like probes
+   *  (short identifier / NL texts, which embed away from code chunks, so a
+   *  probe count fit to chunk-like queries would under-probe). Readers use it
+   *  unless CODE_SEARCH_VECTOR_NPROBES or the index config sets one. */
+  nprobes?: number;
+  /** That recall@10, and how many probe queries measured it. */
+  calibratedRecall?: number;
+  calibrationQueries?: number;
   checkedAt: string;
   lastError?: string;
 }
