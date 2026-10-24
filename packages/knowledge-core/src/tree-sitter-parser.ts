@@ -18,7 +18,8 @@ const require = createRequire(import.meta.url);
 
 export interface TreeSitterEntity {
   name: string;
-  type: 'function' | 'class' | 'method' | 'interface' | 'type' | 'struct' | 'enum' | 'trait' | 'module';
+  /** `const` = a JS/TS top-level variable whose value isn't a function. */
+  type: 'function' | 'class' | 'method' | 'interface' | 'type' | 'struct' | 'enum' | 'trait' | 'module' | 'const';
   startLine: number;     // 0-based
   endLine: number;       // 0-based
   startByte: number;
@@ -26,6 +27,7 @@ export interface TreeSitterEntity {
   parent?: string;       // containing class/struct name
   signature?: string;    // function signature (params + return type)
   isExported: boolean;
+  local: boolean;        // inside a function body (named or anonymous)
   body: string;          // full source text of this entity
 }
 
@@ -42,13 +44,20 @@ export interface TreeSitterCallSite {
   containingEntity?: string;  // which entity contains this call
 }
 
+export interface TreeSitterTypeRef {
+  name: string;          // referenced type (or JSX component / instantiated class) name
+  qualifier?: string;    // package of a Go `pkg.Type`
+  startLine: number;
+  containingEntity?: string;  // which entity contains this reference
+}
+
 export interface FileParseResult {
   filePath: string;
   language: string;
   entities: TreeSitterEntity[];
   imports: TreeSitterImport[];
   callSites: TreeSitterCallSite[];
-  typeReferences: string[];  // type names referenced in the file
+  typeReferences: TreeSitterTypeRef[];
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +120,25 @@ interface LanguageQueries {
   entities: string;
   imports: string;
   calls: string;
+  /** Type names a definition uses (`@type`); declaration names are dropped in code. */
+  typeRefs: string;
 }
+
+/** JS/TS variables that define something: every top-level (or exported)
+ *  `const` / `let` / `var`, and a function-valued one at any depth. */
+const JS_VARIABLE_ENTITIES = `
+    (program (lexical_declaration (variable_declarator name: (identifier) @name) @entity))
+    (program (variable_declaration (variable_declarator name: (identifier) @name) @entity))
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name) @entity)) @export
+    (export_statement declaration: (variable_declaration (variable_declarator name: (identifier) @name) @entity)) @export
+    (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)]) @entity
+`;
+
+/** A capitalised JSX tag is a component reference (lowercase = an HTML element). */
+const JSX_TYPE_REFS = `
+    (jsx_opening_element name: (identifier) @type (#match? @type "^[A-Z]"))
+    (jsx_self_closing_element name: (identifier) @type (#match? @type "^[A-Z]"))
+`;
 
 const TS_QUERIES: LanguageQueries = {
   entities: `
@@ -126,7 +153,12 @@ const TS_QUERIES: LanguageQueries = {
     (export_statement declaration: (interface_declaration name: (type_identifier) @name) @entity) @export
     (export_statement declaration: (type_alias_declaration name: (type_identifier) @name) @entity) @export
     (export_statement declaration: (enum_declaration name: (identifier) @name) @entity) @export
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function) @entity))) @export
+    (ambient_declaration (lexical_declaration (variable_declarator name: (identifier) @name) @entity))
+    (ambient_declaration (variable_declaration (variable_declarator name: (identifier) @name) @entity))
+    (ambient_declaration (function_signature name: (identifier) @name) @entity)
+    (statement_block (function_signature name: (identifier) @name) @entity)
+    (statement_block (export_statement declaration: (function_signature name: (identifier) @name) @entity) @export)
+    ${JS_VARIABLE_ENTITIES}
   `,
   imports: `
     (import_statement source: (string) @source) @import
@@ -135,6 +167,11 @@ const TS_QUERIES: LanguageQueries = {
   calls: `
     (call_expression function: (identifier) @callee) @call
     (call_expression function: (member_expression property: (property_identifier) @callee)) @call
+  `,
+  typeRefs: `
+    (type_identifier) @type
+    (new_expression constructor: (identifier) @type)
+    ${JSX_TYPE_REFS}
   `,
 };
 
@@ -146,10 +183,14 @@ const JS_QUERIES: LanguageQueries = {
     (method_definition name: (property_identifier) @name) @entity
     (export_statement declaration: (function_declaration name: (identifier) @name) @entity) @export
     (export_statement declaration: (class_declaration name: (identifier) @name) @entity) @export
-    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function) @entity))) @export
+    ${JS_VARIABLE_ENTITIES}
   `,
   imports: TS_QUERIES.imports,
   calls: TS_QUERIES.calls,
+  typeRefs: `
+    (new_expression constructor: (identifier) @type)
+    ${JSX_TYPE_REFS}
+  `,
 };
 
 const GO_QUERIES: LanguageQueries = {
@@ -166,6 +207,9 @@ const GO_QUERIES: LanguageQueries = {
     (call_expression function: (identifier) @callee) @call
     (call_expression function: (selector_expression field: (field_identifier) @callee)) @call
   `,
+  typeRefs: `
+    (type_identifier) @type
+  `,
 };
 
 const PY_QUERIES: LanguageQueries = {
@@ -180,6 +224,9 @@ const PY_QUERIES: LanguageQueries = {
   calls: `
     (call function: (identifier) @callee) @call
     (call function: (attribute attribute: (identifier) @callee)) @call
+  `,
+  typeRefs: `
+    (type (identifier) @type)
   `,
 };
 
@@ -198,6 +245,9 @@ const RUST_QUERIES: LanguageQueries = {
     (call_expression function: (identifier) @callee) @call
     (call_expression function: (field_expression field: (field_identifier) @callee)) @call
   `,
+  typeRefs: `
+    (type_identifier) @type
+  `,
 };
 
 const JAVA_QUERIES: LanguageQueries = {
@@ -212,6 +262,9 @@ const JAVA_QUERIES: LanguageQueries = {
   `,
   calls: `
     (method_invocation name: (identifier) @callee) @call
+  `,
+  typeRefs: `
+    (type_identifier) @type
   `,
 };
 
@@ -229,6 +282,10 @@ const PHP_QUERIES: LanguageQueries = {
   calls: `
     (function_call_expression function: (name) @callee) @call
     (member_call_expression name: (name) @callee) @call
+  `,
+  typeRefs: `
+    (named_type (name) @type)
+    (object_creation_expression (name) @type)
   `,
 };
 
@@ -263,7 +320,6 @@ type EntityType = TreeSitterEntity['type'];
 const NODE_TYPE_TO_ENTITY: Record<string, EntityType> = {
   // TypeScript / JavaScript
   function_declaration: 'function',
-  arrow_function: 'function',
   class_declaration: 'class',
   method_definition: 'method',
   interface_declaration: 'interface',
@@ -292,6 +348,12 @@ function detectEntityType(node: TSNode, _language: string): EntityType {
   // Direct mapping
   const mapped = NODE_TYPE_TO_ENTITY[t];
   if (mapped) return mapped;
+
+  // JS/TS variable: a function when its value is one
+  if (t === 'variable_declarator') {
+    const value = node.childForFieldName('value')?.type;
+    return value === 'arrow_function' || value === 'function_expression' ? 'function' : 'const';
+  }
 
   // Go: type_declaration wrapping type_spec
   if (t === 'type_declaration' || t === 'type_spec') {
@@ -381,6 +443,13 @@ function enclosingClassName(node: TSNode): string | undefined {
     }
   }
   return undefined;
+}
+
+function isLocal(node: TSNode): boolean {
+  for (let cursor = node.parent; cursor; cursor = cursor.parent) {
+    if (FUNCTION_NODES.has(cursor.type)) return true;
+  }
+  return false;
 }
 
 function findContainingEntity(node: TSNode): string | undefined {
@@ -543,6 +612,20 @@ function parseImportMatches(
 // Call site parsing
 // ---------------------------------------------------------------------------
 
+/** Innermost entity containing byte `at`: a call in a method belongs to the
+ *  method, not to its class. */
+function innermostEntity(entities: TreeSitterEntity[], at: number): string | undefined {
+  let containingEntity: string | undefined;
+  let span = Infinity;
+  for (const e of entities) {
+    if (at >= e.startByte && at < e.endByte && e.endByte - e.startByte < span) {
+      containingEntity = e.name;
+      span = e.endByte - e.startByte;
+    }
+  }
+  return containingEntity;
+}
+
 function parseCallMatches(
   matches: QueryMatch[],
   entities: TreeSitterEntity[],
@@ -555,20 +638,7 @@ function parseCallMatches(
 
     const callee = calleeCapture.node.text;
     const startLine = calleeCapture.node.startPosition.row;
-    const at = calleeCapture.node.startIndex;
-
-    // Innermost containing entity: a call in a method belongs to the method,
-    // not to its class.
-    let containingEntity: string | undefined;
-    let span = Infinity;
-    for (const e of entities) {
-      if (at >= e.startByte && at < e.endByte && e.endByte - e.startByte < span) {
-        containingEntity = e.name;
-        span = e.endByte - e.startByte;
-      }
-    }
-
-    callSites.push({ callee, startLine, containingEntity });
+    callSites.push({ callee, startLine, containingEntity: innermostEntity(entities, calleeCapture.node.startIndex) });
   }
 
   return callSites;
@@ -578,22 +648,30 @@ function parseCallMatches(
 // Type reference extraction
 // ---------------------------------------------------------------------------
 
-function extractTypeReferences(entities: TreeSitterEntity[]): string[] {
-  const typeRefs = new Set<string>();
-  // Match PascalCase identifiers in signatures that look like type references
-  const typeRefPattern = /(?<!['"@/\\])\b([A-Z][A-Za-z0-9]*(?:<[^>]+>)?)\b/g;
+/** Containers whose type name is the last segment of a namespace-qualified
+ *  name (`React.FC`, `java.util.List`), which bare-name resolution can't place.
+ *  A Go `pkg.Type` (`qualified_type`) keeps its package as the qualifier. */
+const QUALIFIED_TYPE_NODES = new Set(['nested_type_identifier', 'scoped_type_identifier']);
 
-  for (const entity of entities) {
-    if (entity.signature) {
-      let m: RegExpExecArray | null;
-      while ((m = typeRefPattern.exec(entity.signature)) !== null) {
-        const ref = m[1].replace(/<.*>$/, ''); // strip generics
-        if (!BUILTIN_TYPES.has(ref)) typeRefs.add(ref);
-      }
+function parseTypeRefMatches(matches: QueryMatch[], entities: TreeSitterEntity[]): TreeSitterTypeRef[] {
+  const refs: TreeSitterTypeRef[] = [];
+  for (const match of matches) {
+    const node = match.captures.find((c) => c.name === 'type')?.node;
+    if (!node || BUILTIN_TYPES.has(node.text)) continue;
+    const parent = node.parent;
+    const qualifier = parent?.type === 'qualified_type' ? parent.childForFieldName('package')?.text : undefined;
+    if (node.type === 'type_identifier' && parent && !qualifier) {
+      // `class Foo`, `type Foo struct`, `<T>` declare a name rather than use one.
+      if (parent.childForFieldName('name')?.equals(node) || QUALIFIED_TYPE_NODES.has(parent.type)) continue;
     }
+    refs.push({
+      name: node.text,
+      ...(qualifier ? { qualifier } : {}),
+      startLine: node.startPosition.row,
+      containingEntity: innermostEntity(entities, node.startIndex),
+    });
   }
-
-  return [...typeRefs];
+  return refs;
 }
 
 const BUILTIN_TYPES = new Set([
@@ -649,6 +727,9 @@ export async function parseFile(
     if (!nameCapture || !entityCapture) continue;
 
     const entityNode = entityCapture.node;
+    // `const x = require('…')` belongs to the CommonJS import block, not the definitions.
+    const value = entityNode.type === 'variable_declarator' ? entityNode.childForFieldName('value') : null;
+    if (value?.type === 'call_expression' && value.childForFieldName('function')?.text === 'require') continue;
     const name = nameCapture.node.text;
     let type = detectEntityType(entityNode, language);
     // Python `def` in a class, Rust `fn` in an impl: methods of that type.
@@ -687,6 +768,7 @@ export async function parseFile(
       parent: parentName,
       signature,
       isExported: exported,
+      local: isLocal(entityNode),
       body,
     });
   }
@@ -700,7 +782,8 @@ export async function parseFile(
   const callSites = parseCallMatches(callMatches, entities);
 
   // --- Type references ---
-  const typeReferences = extractTypeReferences(entities);
+  const typeRefMatches = runQueryWithFallback(lang, queries.typeRefs, rootNode);
+  const typeReferences = parseTypeRefMatches(typeRefMatches, entities);
 
   tree.delete();
 

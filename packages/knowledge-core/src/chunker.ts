@@ -2,10 +2,10 @@
  * Code chunking at definition boundaries.
  *
  * Splits source files in a repository into semantic CodeChunk objects at
- * function / class / method boundaries — taken from tree-sitter for the
- * languages it parses, else from language-specific regex patterns. A
- * definition's leading comments / decorators belong to its chunk. Uses a
- * simple recursive directory walker (no external glob dependency).
+ * function / class / method (and JS/TS top-level variable) boundaries — taken
+ * from tree-sitter for the languages it parses, else from language-specific
+ * regex patterns. A definition's leading comments / decorators belong to its
+ * chunk. Uses a simple recursive directory walker (no external glob dependency).
  */
 
 import { createHash } from 'node:crypto';
@@ -249,17 +249,22 @@ function contextualizedTokens(contextPrefix: string, content: string): number {
 
 /**
  * Split oversized content into sub-chunks that fit within maxTokens.
- * Splits at line boundaries, preserving as much context as possible.
+ * Splits at line boundaries, preserving as much context as possible. A part
+ * that overflows ends before the last of its `cuts` lines (indices where a
+ * nested definition starts) when it holds one, so the next part starts there.
  */
 function splitOversizedContent(
   contentLines: string[],
   maxContentChars: number,
+  cuts: Set<number> = new Set(),
 ): string[] {
   const parts: string[] = [];
   let current: string[] = [];
   let currentLen = 0;
+  let start = 0; // index of current[0]
 
-  for (const line of contentLines) {
+  for (let i = 0; i < contentLines.length; i++) {
+    const line = contentLines[i];
     const lineLen = line.length + 1; // +1 for newline
 
     // If a single line exceeds the budget, hard-truncate it
@@ -270,13 +275,17 @@ function splitOversizedContent(
         currentLen = 0;
       }
       parts.push(line.slice(0, maxContentChars));
+      start = i + 1;
       continue;
     }
 
-    if (currentLen + lineLen > maxContentChars && current.length > 0) {
-      parts.push(current.join('\n'));
-      current = [];
-      currentLen = 0;
+    while (currentLen + lineLen > maxContentChars && current.length > 0) {
+      let cut = i;
+      for (let c = i; c > start; c--) if (cuts.has(c)) { cut = c; break; }
+      parts.push(current.slice(0, cut - start).join('\n'));
+      current = current.slice(cut - start);
+      currentLen = current.reduce((n, l) => n + l.length + 1, 0);
+      start = cut;
     }
     current.push(line);
     currentLen += lineLen;
@@ -298,26 +307,34 @@ const TREE_SITTER_LANGS = new Set(supportedLanguages());
 
 const CHUNK_TYPE: Record<TreeSitterEntity['type'], CodeChunk['entityType']> = {
   function: 'function', method: 'method', class: 'class', interface: 'interface', type: 'type',
-  struct: 'class', enum: 'type', trait: 'interface', module: 'class',
+  struct: 'class', enum: 'type', trait: 'interface', module: 'class', const: 'const',
 };
 
-/** Definition boundaries from tree-sitter: top-level definitions and class
- *  members, never a function nested in another function's body. null when the
- *  language isn't parsed or the parse yields nothing (→ regex boundaries). */
-async function treeSitterBoundaries(filePath: string, content: string, lang: string, ext: string): Promise<Boundary[] | null> {
+/** Definition boundaries from tree-sitter: top-level definitions (JS/TS
+ *  top-level variables included) and class members. A definition inside a
+ *  function body (named or anonymous) or a top-level variable is not a
+ *  boundary; a nested function / method comes back in `nested`, where an
+ *  oversized parent is split. null when the language isn't parsed or the
+ *  parse yields nothing (→ regex boundaries). */
+async function treeSitterBoundaries(
+  filePath: string, content: string, lang: string, ext: string,
+): Promise<{ boundaries: Boundary[]; nested: Boundary[] } | null> {
   const grammar = ext === '.tsx' ? 'tsx' : lang;
   if (!TREE_SITTER_LANGS.has(grammar)) return null;
   const parsed = await parseFile(filePath, content, grammar).catch(() => null);
   if (!parsed || parsed.entities.length === 0) return null;
-  const fns = parsed.entities.filter((e) => e.type === 'function' || e.type === 'method');
-  const nested = (e: TreeSitterEntity) =>
-    fns.some((f) => f !== e && f.startByte <= e.startByte && e.endByte <= f.endByte);
-  const byLine = new Map<number, Boundary>();
+  const consts = parsed.entities.filter((e) => e.type === 'const');
+  const isNested = (e: TreeSitterEntity) =>
+    e.local || consts.some((c) => c !== e && c.startByte <= e.startByte && e.endByte <= c.endByte);
+  const top = new Map<number, Boundary>();
+  const nested = new Map<number, Boundary>();
   for (const e of parsed.entities) {
-    if (nested(e) || byLine.has(e.startLine)) continue;
-    byLine.set(e.startLine, { line: e.startLine, entityType: CHUNK_TYPE[e.type], entityName: e.name, parentEntity: e.parent });
+    const into = !isNested(e) ? top : e.type === 'function' || e.type === 'method' ? nested : undefined;
+    if (!into || into.has(e.startLine)) continue;
+    into.set(e.startLine, { line: e.startLine, entityType: CHUNK_TYPE[e.type], entityName: e.name, parentEntity: e.parent });
   }
-  return [...byLine.values()].sort((a, b) => a.line - b.line);
+  const sorted = (byLine: Map<number, Boundary>) => [...byLine.values()].sort((a, b) => a.line - b.line);
+  return { boundaries: sorted(top), nested: sorted(nested) };
 }
 
 /** Comment, doc-comment, decorator and attribute lines directly above a
@@ -352,7 +369,9 @@ async function chunkFile(
   const maxContentChars = maxContentTokens * 4;
 
   // Find boundary line indices
-  let boundaries = await treeSitterBoundaries(filePath, raw, lang, ext);
+  const parsed = await treeSitterBoundaries(filePath, raw, lang, ext);
+  let boundaries = parsed?.boundaries;
+  const nested = parsed?.nested ?? [];
   if (!boundaries) {
     boundaries = [];
     for (let i = 0; i < lines.length; i++) {
@@ -369,12 +388,14 @@ async function chunkFile(
       }
     }
   }
-  // Pull each boundary up over its leading annotations (never past the
-  // previous boundary).
-  for (let b = 0; b < boundaries.length; b++) {
-    const floor = b > 0 ? boundaries[b - 1].line + 1 : 0;
-    while (boundaries[b].line > floor && LEADING_ANNOTATION.test(lines[boundaries[b].line - 1].trimStart())) {
-      boundaries[b].line--;
+  // Pull each boundary (and nested definition) up over its leading
+  // annotations (never past the previous one).
+  for (const list of [boundaries, nested]) {
+    for (let b = 0; b < list.length; b++) {
+      const floor = b > 0 ? list[b - 1].line + 1 : 0;
+      while (list[b].line > floor && LEADING_ANNOTATION.test(lines[list[b].line - 1].trimStart())) {
+        list[b].line--;
+      }
     }
   }
 
@@ -422,13 +443,24 @@ async function chunkFile(
     if (contextualizedTokens(contextPrefix, content) <= maxTokens) {
       pushChunk(content, startLine, startLine + contentLines.length - 1, entityType, entityName, parentEntity);
     } else {
-      // Split oversized content into parts that fit
-      const parts = splitOversizedContent(contentLines, maxContentChars);
+      // Split oversized content into parts that fit, starting parts at nested
+      // definitions where possible: such a part is named after its definition,
+      // parented to this entity; any other part is `name$<part number>`.
+      const first = startLine - 1;
+      const defAt = new Map(nested
+        .filter((n) => n.line > first && n.line < first + contentLines.length)
+        .map((n) => [n.line - first, n]));
+      const parts = splitOversizedContent(contentLines, maxContentChars, new Set(defAt.keys()));
       let lineOffset = startLine;
       for (let p = 0; p < parts.length; p++) {
         const partLines = parts[p].split('\n').length;
-        const partName = entityName ? `${entityName}$${p + 1}` : undefined;
-        pushChunk(parts[p], lineOffset, lineOffset + partLines - 1, entityType, partName, parentEntity);
+        const def = defAt.get(lineOffset - startLine);
+        if (def) {
+          pushChunk(parts[p], lineOffset, lineOffset + partLines - 1, def.entityType, def.entityName, entityName);
+        } else {
+          const partName = entityName ? `${entityName}$${p + 1}` : undefined;
+          pushChunk(parts[p], lineOffset, lineOffset + partLines - 1, entityType, partName, parentEntity);
+        }
         lineOffset += partLines;
       }
     }
@@ -488,8 +520,7 @@ export interface ChunkResult {
  * Chunk all source files in a repository into semantic CodeChunk objects.
  *
  * Walks the directory tree, skipping common non-source directories, and
- * splits each source file at function/class/method boundaries using
- * language-specific regex patterns.
+ * splits each source file at its definition boundaries (see `chunkFile`).
  *
  * When `cachedFiles` is provided, unchanged files (matching content hash)
  * are skipped — only new/modified files are chunked and returned.

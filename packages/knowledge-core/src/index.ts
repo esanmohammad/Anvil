@@ -59,5 +59,6 @@ export type {
   TreeSitterEntity,
   TreeSitterImport,
   TreeSitterCallSite,
+  TreeSitterTypeRef,
   FileParseResult,
 } from './tree-sitter-parser.js';

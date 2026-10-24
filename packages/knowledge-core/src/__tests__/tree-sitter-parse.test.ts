@@ -68,4 +68,60 @@ describe('tree-sitter parseFile', () => {
       assert.ok(r.callSites.some((c) => c.callee === s.callee), `${language}: call ${s.callee} missing from ${r.callSites.map((c) => c.callee)}`);
     });
   }
+
+  it('reports JS/TS top-level variables, local function definitions and ambient declarations', async () => {
+    const src = [
+      "const fs = require('fs');",
+      'export const TEMPLATE_TYPE = { SERVICE: 1 };',
+      'let counter = 0;',
+      'export const double = (n: number) => n * 2;',
+      'export function run() {',
+      '  const local = 1;',
+      '  const onSave = () => local;',
+      '  return onSave();',
+      '}',
+      "declare module 'm' {",
+      '  export const VARIANTS: string[];',
+      '  export function isEmpty(v: unknown): boolean;',
+      '}',
+      'declare function boot(): void;',
+    ].join('\n');
+    const r = await parseFile('a.ts', src, 'typescript');
+    const type = (n: string) => r?.entities.find((e) => e.name === n)?.type;
+    assert.equal(type('TEMPLATE_TYPE'), 'const');
+    assert.equal(r?.entities.find((e) => e.name === 'TEMPLATE_TYPE')?.isExported, true);
+    assert.equal(type('counter'), 'const');
+    assert.equal(type('double'), 'function');
+    assert.equal(type('onSave'), 'function');
+    assert.equal(r?.entities.find((e) => e.name === 'onSave')?.local, true);
+    assert.equal(r?.entities.find((e) => e.name === 'double')?.local, false);
+    assert.equal(type('VARIANTS'), 'const');
+    assert.equal(type('isEmpty'), 'function');
+    assert.equal(type('boot'), 'function');
+    assert.equal(type('fs'), undefined, 'a require() binding is an import');
+    assert.equal(type('local'), undefined, 'a local non-function variable is not a definition');
+  });
+
+  it('reports type references with the entity that contains them', async () => {
+    const go = await parseFile('h.go', [
+      'package h',
+      'type Handler struct{ req Req; repo *store.Repo }',
+      'func (h *Handler) Run(r Req) (*Res, error) {',
+      '  t.Fatal("expected error when Missing fails")',
+      '  return &Res{}, nil',
+      '}',
+    ].join('\n'), 'go');
+    const refs = (r: typeof go) => r?.typeReferences.map((t) => `${t.containingEntity}>${t.name}`) ?? [];
+    for (const ref of ['Handler>Req', 'Run>Handler', 'Run>Req', 'Run>Res']) assert.ok(refs(go).includes(ref), `go: ${ref} missing from ${refs(go)}`);
+    assert.ok(!refs(go).some((r) => r.endsWith('>Missing')), 'a name inside a string is not a reference');
+    assert.ok(!refs(go).includes('Handler>Handler'), 'a declaration name is not a reference');
+    assert.equal(go?.typeReferences.find((t) => t.name === 'Repo')?.qualifier, 'store');
+
+    const tsx = await parseFile('b.tsx', 'export function Board(o: Order): Receipt {\n  return <div><Row item={new Item()} /></div> as Receipt;\n}\n', 'tsx');
+    for (const ref of ['Board>Order', 'Board>Receipt', 'Board>Row', 'Board>Item']) assert.ok(refs(tsx).includes(ref), `tsx: ${ref} missing from ${refs(tsx)}`);
+    assert.ok(!refs(tsx).includes('Board>div'), 'an intrinsic JSX element is not a reference');
+
+    const js = await parseFile('c.js', 'const initial = { end: SENDING_END.NEVER };\nfunction App() { return <Provider>{new Store()}</Provider>; }\n', 'javascript');
+    assert.deepEqual(refs(js).sort(), ['App>Provider', 'App>Store']);
+  });
 });
