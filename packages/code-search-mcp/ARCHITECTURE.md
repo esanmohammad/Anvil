@@ -366,11 +366,17 @@ source for that entity.
 The system-graph tools query knowledge-core's `GraphStore`
 (`getGraphStore` → `system_graph.sqlite`, JSON fallback for older
 indexes) by slice, never loading the whole graph. `store.resolveNodes(name,
-repo?, fuzzy?)` resolves a symbol to node keys — exact by default (full key,
+repo?, fuzzy?, limit?)` resolves a symbol to node keys — exact by default (full key,
 `label`, or a `::name` key suffix; case-sensitive, no wildcards; index
 lookups on SQLite), so a full
 `repo::file::entity` id works; `fuzzy:true` = case-insensitive substring of
-symbol labels (files and cross-repo endpoints skipped). Traversal tools take
+symbol labels (files and cross-repo endpoints skipped; read from the
+store's trigram index, a bounded scan on files written before it).
+`graph.ts:resolveKeys` caps a fuzzy name at `FUZZY_MATCH_CAP` (200) start
+nodes, in the store's order — past that the answer adds "matched more than
+200 symbols — be more specific" — and a term under 3 characters is matched
+exactly, with a note, so resolution can't flood the traversal or the
+answer. Traversal tools take
 `relations` (`calls` default; `imports`, `uses`, `type-ref`, `inherits`,
 `all`) and pass the edge types to the store, so imports, type references
 and inheritance are never reported as calls.
@@ -383,7 +389,7 @@ and inheritance are never reported as calls.
 | `find_dependencies` | `GraphStore` | same, `dependencies(keys, 30, types)` |
 | `impact_analysis` | `GraphStore` | scope = `nodesInFiles(repo, [file], entity?)` (`entity` may be a full id) → `dependents` hop by hop up to `depth` (default 2, max 5; ≤ 1000 edges kept, ≤ 50k counted per hop — `N+` when capped); with `entity`, the file's `external` (cross-repo endpoint) nodes join the scope and their dependents are marked `[file-level]`; no nodes for the file → `isError` |
 | `trace_path` | `GraphStore` | level-by-level BFS over `neighborEdges(frontier, direction, types, limit)` (`confidence ≥ 0.7`, unweighted, one query per ≤ 400 keys); with `to`, bidirectional (smaller frontier first) shortest path (≥ 1 hop), else the reachable tree (≤`maxDepth` ≤ 10, cap 50) |
-| `search_graph` | `GraphStore` | `searchNodes`: name = case-insensitive regex over symbol labels (invalid → `isError`), type / file / repo filters; rank by non-`contains` degree; top `limit` |
+| `search_graph` | `GraphStore` | `searchNodes`: name = case-insensitive regex over symbol labels (invalid → `isError`; a plain substring of 3+ ASCII characters is narrowed through the trigram index first), type / file / repo filters; rank by non-`contains` degree; top `limit` |
 | `find_dead_code` | `<repo>/graph.json` + indexed chunk text | entity nodes (function/method/class/…) with zero non-`contains` in-degree whose name doesn't occur again in their own file (vector store `getChunksByFile`, else `chunks.json`) |
 | `detect_changes` | git + `GraphStore` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)`; added / deleted files → every node; modified files → entities whose range at the base overlaps a `git diff -U0` old-side hunk (ranges run from each entity's declaration line in `git show base:file` to the next declaration; an entity whose declaration isn't found is kept) + module node when a hunk falls outside every range + the file's endpoints (`[file-level]`) → one hop of `dependents` (same caps as `impact_analysis`; skipped, with a note, when the affected nodes alone exceed the budget) |
 | `get_architecture` | `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` / profiles | renders the CLI-generated project graph; degrades to profiles, then to a "no data" hint |

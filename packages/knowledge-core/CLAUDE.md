@@ -65,7 +65,13 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   `evidence`. Exact name resolution is case-sensitive and wildcard-free,
   accepts a full `repo::file::entity` id, and is index-backed (`nodes.label`
   + `nodes.key_tail`; a file written before `key_tail` existed is scanned
-  until the next index rebuilds it); `dependents` treats
+  until the next index rebuilds it). Fuzzy resolution (case-insensitive
+  substring of symbol labels) reads `nodes_fts`, a contentless FTS5 trigram
+  index over `nodes.label` the writer builds at finalize, in rowid order up
+  to `limit`; a file without it (written before it existed, or by a driver
+  without FTS5 / trigram) is scanned up to `limit`, never altered. A fuzzy
+  term under `FUZZY_MIN_CHARS` (3) characters matches exactly. `searchNodes`
+  narrows a plain-substring name through the same index; `dependents` treats
   `SYMMETRIC_EDGE_TYPES` (shared topic / table / key / bucket / type /
   constant / env var / npm dep) as two-way; `crossRepoEdges` includes
   same-repo `workspace-dep` edges.

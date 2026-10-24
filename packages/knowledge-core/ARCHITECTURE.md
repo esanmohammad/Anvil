@@ -529,9 +529,13 @@ key_tail, repo, file, label, type, degree, attrs)` and `edges(source,
 target, type, confidence, source_repo, target_repo, evidence)` —
 `evidence` (the route / topic / table / package a cross-repo edge was
 matched on) is NULL for AST edges; `key_tail` is the key's text after its
-last `::` (indexed). Files written before either column existed are still
-read (`NULL AS evidence`; exact resolution by scan) until the next index
-rebuilds them.
+last `::` (indexed). `nodes_fts` is a contentless FTS5 table with the
+`trigram` tokenizer over `nodes.label` (rowid = `nodes.rowid`), filled in
+one statement at finalize; a driver whose SQLite lacks FTS5 / trigram
+(< 3.34) writes the file without it. Files written before either column or
+`nodes_fts` existed are still read (`NULL AS evidence`; exact resolution by
+scan; fuzzy matching by a scan up to its limit) until the next index
+rebuilds them — readers never alter the schema.
 
 Query semantics (both the SQLite store and the JSON fallback):
 `resolveNodes` is exact by default — full key, `label`, or a `::name` key
@@ -539,7 +543,12 @@ suffix, case-sensitive and wildcard-free, matches in insertion order; on
 SQLite every arm is an index lookup (primary key, `label`, `key_tail` —
 a key ending in `::name` has the same tail as `::name`); `fuzzy` =
 case-insensitive substring of symbol labels (`module` / `external` nodes
-skipped), a scan.
+skipped) — on SQLite the candidates come from `nodes_fts` in rowid order
+(with a repo, only between the repo's first node and its last symbol) and
+are re-checked with the scan's `LIKE`, so `LIMIT` stops the read (a file
+without the index, or a driver that can't read it, scans); a fuzzy term
+under `FUZZY_MIN_CHARS` (3) characters matches exactly instead. At most
+`limit` matches (default 5000).
 `callers` / `dependencies` / `neighborsOf` / `neighborEdges` take an
 edge-type filter (omitted = every type but `contains`); `callers` /
 `dependencies` return `{ key, type }`. `neighborEdges(keys, direction,
@@ -553,7 +562,9 @@ arbitrary order), edges out of it too, returned flipped so `source` is the
 dependent; with `maxRows` it stops after that many edges (`truncated`).
 `searchNodes` `name` is a case-insensitive
 regex over symbol labels (a `regexp` SQL user function; JS filtering on a
-driver without user functions); an invalid pattern throws.
+driver without user functions); an invalid pattern throws. A name without
+regex syntax (printable ASCII, 3+ characters) is a plain substring:
+`nodes_fts` narrows the rows the regex checks.
 
 `ProjectGraphBuilder` — `graphology` directed multi-graph, used by
 `buildKB` only when no SQLite driver loads. Lazy-loads `graphology` +

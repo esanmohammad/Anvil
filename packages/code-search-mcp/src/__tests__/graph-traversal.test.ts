@@ -3,7 +3,9 @@
  * agrees with a plain BFS on small random graphs (direction, relations, the
  * confidence filter, maxDepth), and every traversal stays inside its budget on
  * a high-fan-out graph — node cap and wall clock — and says so instead of
- * answering "No path" or reporting a partial count as exact.
+ * answering "No path" or reporting a partial count as exact. A fuzzy name
+ * resolves to at most FUZZY_CAP start nodes (saying so), and a term under 3
+ * characters is matched exactly.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -16,8 +18,9 @@ import { createSystemGraphSqliteWriter, getGraphStore, invalidateRetriever } fro
 import { handleGraphTool } from '../tools/graph.js';
 import type { ServerContext } from '../server.js';
 
-// Mirrors TRAVERSAL_MAX_NODES in tools/graph.ts.
+// Mirrors TRAVERSAL_MAX_NODES / FUZZY_MATCH_CAP in tools/graph.ts.
 const MAX_NODES = 50_000;
+const FUZZY_CAP = 200;
 
 let tmp = '';
 let stashDataDir: string | undefined;
@@ -265,5 +268,49 @@ describe('traversal budget on a high-fan-out graph', () => {
       assert.doesNotMatch(t, /### Hop 2/);
       assert.match(t, /traversal budget/);
     } finally { restoreClock(); reads.restore(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fuzzy resolution — bounded before the traversal starts
+// ---------------------------------------------------------------------------
+
+describe('fuzzy resolution', () => {
+  // handleThing0..249 and ab, each calling sink.
+  before(async () => {
+    const names = [...Array.from({ length: 250 }, (_, i) => `handleThing${i}`), 'ab'];
+    await writeGraph('fuzzy', [...names, 'sink'].map((name) => ({ name })), names.map((s) => ({ s, t: 'sink', type: 'calls', confidence: 0.9 })));
+  });
+
+  it('a name matching more than FUZZY_CAP symbols starts from the first FUZZY_CAP and says so', async () => {
+    const store: any = await getGraphStore('fuzzy');
+    const firstBatch: number[] = [];
+    const orig = store.neighborEdges;
+    store.neighborEdges = (keys: string[], ...rest: unknown[]) => { firstBatch.push(keys.length); return orig.call(store, keys, ...rest); };
+    try {
+      const t = await call('fuzzy', 'trace_path', { from: 'thing', fuzzy: true });
+      assert.match(t, /^# Reachable from "thing"/);
+      assert.match(t, new RegExp(`"thing" matched more than ${FUZZY_CAP} symbols — be more specific`));
+      assert.equal(firstBatch[0], FUZZY_CAP);
+    } finally { delete store.neighborEdges; }
+    const deps = await call('fuzzy', 'find_dependencies', { function: 'Thing', fuzzy: true });
+    assert.match(deps, /sink/);
+    assert.match(deps, new RegExp(`matched more than ${FUZZY_CAP} symbols`));
+  });
+
+  it('no note under the cap', async () => {
+    const t = await call('fuzzy', 'trace_path', { from: 'Thing1', to: 'sink', fuzzy: true }); // 111 matches
+    assert.match(t, /^# Path \(1 hops\)/);
+    assert.doesNotMatch(t, /matched more than/);
+  });
+
+  it('a term under 3 characters is matched exactly, and the answer says so', async () => {
+    const t = await call('fuzzy', 'trace_path', { from: 'ab', to: 'sink', fuzzy: true });
+    assert.match(t, /^# Path \(1 hops\)\n\nab → sink/);
+    assert.match(t, /needs at least 3 characters — "ab" was matched exactly/);
+    const none = await call('fuzzy', 'find_callers', { function: 'AB', fuzzy: true });
+    assert.match(none, /^No entity found matching "AB"/);
+    assert.match(none, /needs at least 3 characters/);
+    assert.doesNotMatch(none, /Try fuzzy:true/);
   });
 });
