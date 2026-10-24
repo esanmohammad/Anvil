@@ -269,7 +269,9 @@ reason (`toolError`).
 | `search_semantic` | `'vector'` (single-source) |
 | `search_exact` | `'bm25'` (single-source) |
 
-The three search tools (`query`, `maxResults` ≥ 1, `repos`):
+The three search tools (`query`, `maxResults` ≥ 1, `repos` — an array,
+one name, or a comma-separated string, coerced to a list; one naming no
+repo is an error):
 
 1. Guard on `ctx.indexReady` — except `search_exact`: BM25 needs no
    embedder, so it serves whatever the index holds.

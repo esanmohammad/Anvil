@@ -90,7 +90,11 @@ describe('input validation', () => {
     ['search', 'search_code', { query: '   ' }, /query/],
     ['search', 'search_code', { query: 5 }, /query.*string/],
     ['search', 'search_code', { query: 'x', maxResults: 0 }, /maxResults/],
-    ['search', 'search_exact', { query: 'x', repos: 'app' }, /repos.*array/],
+    ['search', 'search_exact', { query: 'x', repos: 5 }, /"repos" must be a non-empty array of strings or a non-empty string/],
+    ['search', 'search_exact', { query: 'x', repos: { app: true } }, /repos/],
+    ['search', 'search_exact', { query: 'x', repos: [] }, /repos/],
+    ['search', 'search_exact', { query: 'x', repos: '' }, /repos/],
+    ['search', 'search_exact', { query: 'x', repos: ' , ' }, /repos.*at least one/],
     ['search', 'get_code_snippet', {}, /id|repo/],
     ['graph', 'detect_changes', {}, /repo/],
     ['graph', 'trace_path', { from: 'a', direction: 'sideways' }, /direction.*callees, callers, both/],
@@ -120,6 +124,15 @@ describe('search_exact without an embedder', () => {
     const r: any = await handleSearchTool('search_exact', { query: 'refundCustomer' }, ctx(false));
     assert.notEqual(r.isError, true, text(r));
     assert.match(text(r), /refundCustomer/);
+  });
+
+  it('accepts repos as an array, one name, or a comma-separated list — and applies it', async () => {
+    for (const repos of [['app'], 'app', 'other, app']) {
+      const r: any = await handleSearchTool('search_exact', { query: 'refundCustomer', repos }, ctx());
+      assert.notEqual(r.isError, true, `${JSON.stringify(repos)}: ${text(r)}`);
+      assert.match(text(r), /refundCustomer/, JSON.stringify(repos));
+    }
+    assert.match(text(await handleSearchTool('search_exact', { query: 'refundCustomer', repos: 'other' }, ctx())), /No results/);
   });
 
   it('records the query metrics', async () => {

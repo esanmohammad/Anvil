@@ -46,7 +46,8 @@ All implemented in `src/tools/`:
 - **Search** (`search.ts`) — `search_code` (hybrid),
   `search_semantic` (vector-only), `search_exact` (BM25) all call
   `getRetriever(project).retrieve(query, opts)` and record the query
-  metrics. `search_exact` skips the `ctx.indexReady` gate (BM25 needs no
+  metrics. `repos` may be an array, one name, or a comma-separated
+  string (agents send all three). `search_exact` skips the `ctx.indexReady` gate (BM25 needs no
   embedder). `get_code_snippet` fetches one entity's source from the
   vector store, else `chunks.json` (embedder-independent — works in
   BM25-only mode).
@@ -229,7 +230,8 @@ text body for `/metrics`. Pre-declared `metrics` namespace covers
 `code_search_vector_index_growth_ratio`.
 `InProcessBackend.search` and the MCP search tools (`tools/search.ts`)
 record `queriesTotal` / `queryDuration` / `errors`; the two vector-index
-gauges are refreshed per scrape by the `collectMetrics` hook `server.ts` passes to `startHttpTransport` (reads the
+gauges are refreshed per scrape by the `collectMetrics` hook `server.ts`
+passes to `startHttpTransport` (reads the
 writer's `vector_index.json` blob, since in cluster mode the HTTP workers
 aren't the writer; a failing collector never fails the scrape). Other call
 sites are wiring points for future work.

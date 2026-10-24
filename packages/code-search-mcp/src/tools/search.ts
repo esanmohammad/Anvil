@@ -11,8 +11,19 @@ import { toolError, toolText, validateArgs, type InputSchema, type ToolResult } 
 const queryProps = {
   query: { type: 'string', minLength: 1, description: 'Search query (natural language or code identifier)' },
   maxResults: { type: 'integer', minimum: 1, description: 'Max results to return (default: 10)' },
-  repos: { type: 'array', items: { type: 'string' }, description: 'Only search these repos (optional)' },
+  // Agents send repos as an array, one name, or a comma-joined string — all accepted.
+  repos: {
+    anyOf: [
+      { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1 },
+      { type: 'string', minLength: 1 },
+    ],
+    description: 'Only search these repos (optional): an array of names, one name, or a comma-separated list',
+  },
 };
+
+/** `repos` as a list of names; [] when it names none (e.g. ","). */
+const repoList = (v: unknown): string[] =>
+  (Array.isArray(v) ? v.map(String) : String(v).split(',')).map((s) => s.trim()).filter((s) => s.length > 0);
 
 export function registerSearchTools() {
   return [
@@ -73,7 +84,8 @@ export async function handleSearchTool(
 
   const query = args.query as string;
   const maxResults = (args.maxResults as number | undefined) ?? 10;
-  const repos = args.repos as string[] | undefined;
+  const repos = args.repos === undefined || args.repos === null ? undefined : repoList(args.repos);
+  if (repos?.length === 0) return toolError(`${name}: "repos" must name at least one repo.`);
   const modeMap: Record<string, string> = {
     search_code: 'vector+bm25+graph',
     search_semantic: 'vector',

@@ -9,17 +9,28 @@ export const toolText = (text: string): ToolResult => ({ content: [{ type: 'text
 export const toolError = (text: string): ToolResult => ({ content: [{ type: 'text', text }], isError: true });
 
 interface PropSchema {
-  type: string;
+  type?: string;
+  anyOf?: PropSchema[];
   description?: string;
   enum?: string[];
   items?: PropSchema;
+  minItems?: number;
   minimum?: number;
   maximum?: number;
   minLength?: number;
 }
 export interface InputSchema { type: 'object'; properties: Record<string, PropSchema>; required?: string[] }
 
+const describe = (p: PropSchema): string => (p.type === 'array'
+  ? `${p.minItems ? 'a non-empty ' : 'an '}array of ${p.items?.type ?? 'value'}s`
+  : `${p.minLength ? 'a non-empty ' : 'a '}${p.type}`);
+
 function checkValue(name: string, v: unknown, p: PropSchema): string | null {
+  if (p.anyOf) {
+    return p.anyOf.some((branch) => checkValue(name, v, branch) === null)
+      ? null
+      : `"${name}" must be ${p.anyOf.map(describe).join(' or ')}.`;
+  }
   switch (p.type) {
     case 'string':
       if (typeof v !== 'string') return `"${name}" must be a string.`;
@@ -36,6 +47,7 @@ function checkValue(name: string, v: unknown, p: PropSchema): string | null {
       break;
     case 'array':
       if (!Array.isArray(v)) return `"${name}" must be an array.`;
+      if (p.minItems !== undefined && v.length < p.minItems) return `"${name}" must not be empty.`;
       for (const item of v) {
         const err = p.items ? checkValue(`${name}[]`, item, p.items) : null;
         if (err) return err;
