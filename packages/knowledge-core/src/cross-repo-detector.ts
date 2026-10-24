@@ -203,7 +203,8 @@ function extractEnvVars(repoPath: string): string[] {
 function extractEvents(repoPath: string): Record<string, string> {
   // Match patterns like: TOPIC = 'user.created', channel: 'orders', event: 'payment_completed'
   const eventPatterns = [
-    /(?:topic|TOPIC|channel|CHANNEL|event|EVENT|queue|Queue|QUEUE)\w*\s*[:=]\s*['"`]([a-zA-Z0-9._-]+)['"`]/g,
+    // Capitalized forms cover Go struct fields: kafka.ReaderConfig{Topic: "orders"}
+    /(?:[tT]opic|TOPIC|[cC]hannel|CHANNEL|[eE]vent|EVENT|[qQ]ueue|QUEUE)\w*\s*[:=]\s*['"`]([a-zA-Z0-9._-]+)['"`]/g,
     // Spring AMQP / RabbitMQ
     /convertAndSend\s*\(\s*"([a-zA-Z0-9._-]+)"/g,
     /@RabbitListener\s*\([^)]*queues\s*=\s*"([a-zA-Z0-9._-]+)"/g,

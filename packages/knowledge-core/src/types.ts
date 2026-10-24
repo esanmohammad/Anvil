@@ -116,6 +116,8 @@ export interface VectorIndexHealth {
 // Embedding provider interface
 export interface EmbeddingProvider {
   readonly name: string;
+  /** Model id the vectors come from — recorded per repo, checked on open. */
+  readonly model?: string;
   readonly dimensions: number;
   embed(texts: string[]): Promise<number[][]>;
   embedSingle(text: string): Promise<number[]>;

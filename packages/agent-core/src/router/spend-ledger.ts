@@ -9,7 +9,8 @@
  * ANVIL_HOME` to relocate the entire `~/.anvil/` tree (memory-core convention).
  */
 
-import Database from 'better-sqlite3';
+import type BetterSqlite3 from 'better-sqlite3';
+import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -79,11 +80,16 @@ export function defaultSpendLedgerPath(): string {
   return join(root, 'router', 'spend.sqlite');
 }
 
+// better-sqlite3 is an optional native dependency: loaded only when a ledger
+// is opened, so importing agent-core never requires it.
+const requireOptional = createRequire(import.meta.url);
+
 export class SpendLedger {
-  readonly db: Database.Database;
+  readonly db: BetterSqlite3.Database;
 
   constructor(public readonly filePath: string = defaultSpendLedgerPath()) {
     mkdirSync(dirname(filePath), { recursive: true });
+    const Database = requireOptional('better-sqlite3') as typeof BetterSqlite3;
     this.db = new Database(filePath);
     this.db.pragma('journal_mode = WAL');
     this.db.exec(SPEND_LEDGER_SCHEMA_SQL);

@@ -476,11 +476,16 @@ export class KnowledgeIndexer {
       const sha = result?.sha ?? getRepoSha(repo.path);
       const totalChunkCount = result ? Object.values(result.fileIndex).reduce((sum: number, f: any) => sum + f.chunkCount, 0) : 0;
       if (sha) {
+        // The repo's unchanged rows keep the vector space they were embedded in
+        // until the embed step records the next one.
+        const prev = await readRepoIndexMeta(basePath, repo.name, storage.blobs);
         await writeRepoIndexMeta(storage.blobs, repo.name, {
           lastIndexedSha: sha,
           lastIndexedAt: new Date().toISOString(),
           chunkCount: totalChunkCount,
           embeddingProvider: 'pending',
+          embeddingModel: prev?.embeddingModel,
+          embeddingDimensions: prev?.embeddingDimensions,
           files: result?.fileIndex,
           workingTree: result?.workingTree,
           chunkIdVersion: CHUNK_ID_VERSION,
@@ -785,6 +790,8 @@ export class KnowledgeIndexer {
         const meta = await storage.blobs.getJson<RepoIndexMeta>(metaKey);
         if (meta) {
           meta.embeddingProvider = embedder.name;
+          meta.embeddingModel = embedder.model;
+          meta.embeddingDimensions = embedder.dimensions;
           meta.lastIndexedAt = new Date().toISOString();
           await storage.blobs.putJson(metaKey, meta);
         }
@@ -1129,11 +1136,15 @@ const retrieverCache = new Map<string, RetrieverCacheEntry>();
  * invalidated that way, so it relies on this TTL check to notice the writer's
  * reindex and rebuild. 0 disables. env: CODE_SEARCH_RETRIEVER_TTL_MS.
  */
-const RETRIEVER_FRESHNESS_MS = Math.max(0, parseInt(process.env.CODE_SEARCH_RETRIEVER_TTL_MS ?? '', 10) || 30_000);
+export function retrieverFreshnessMs(): number {
+  const ms = parseInt(process.env.CODE_SEARCH_RETRIEVER_TTL_MS ?? '', 10);
+  return Number.isFinite(ms) && ms >= 0 ? ms : 30_000;
+}
+const RETRIEVER_FRESHNESS_MS = retrieverFreshnessMs();
 
 function retrieverCacheKey(project: string, config: KnowledgeConfig): string {
   const e = config.embedding;
-  return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}`;
+  return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}::${JSON.stringify(config.retrieval)}`;
 }
 
 /** Cheap change-signal for a project's index. Primary: the `index_generation`
@@ -1287,18 +1298,22 @@ async function buildRetriever(
   const embedder = createEmbeddingProvider(config.embedding);
 
   // Vector-space safety: refuse to run if the index was embedded with a
-  // different provider/dimension than what the current config resolves to.
-  // Garbage results from silent space mismatch are worse than a hard error.
+  // different provider, model or dimension than the current config resolves
+  // to. Garbage results from silent space mismatch are worse than a hard error.
   try {
     for (const entry of await listRepoNames(storage)) {
       const meta = await readRepoIndexMeta(basePath, entry, storage.blobs);
-      if (!meta || !meta.embeddingProvider || meta.embeddingProvider === 'pending') continue;
-      if (meta.embeddingProvider !== embedder.name) {
+      if (!meta) continue;
+      const built =
+        (meta.embeddingProvider && meta.embeddingProvider !== 'pending' && meta.embeddingProvider !== embedder.name && `provider "${meta.embeddingProvider}"`) ||
+        (meta.embeddingModel !== undefined && embedder.model !== undefined && meta.embeddingModel !== embedder.model && `model "${meta.embeddingModel}"`) ||
+        (meta.embeddingDimensions !== undefined && meta.embeddingDimensions !== embedder.dimensions && `${meta.embeddingDimensions} dimensions`);
+      if (built) {
         throw new Error(
           `[knowledge-core] Vector-space mismatch for repo "${entry}": ` +
-          `index built with "${meta.embeddingProvider}" but retrieval is using "${embedder.name}". ` +
-          `Reindex with consistent embedding provider, or revert the config change. ` +
-          `(set CODE_SEARCH_EMBEDDING_PROVIDER or config.embedding.provider to match the index.)`,
+          `index built with ${built} but retrieval is using "${embedder.name}" model "${embedder.model ?? ''}" (${embedder.dimensions} dimensions). ` +
+          `Reindex with force, or revert the config change ` +
+          `(CODE_SEARCH_EMBEDDING_PROVIDER / _MODEL / _DIMENSIONS or config.embedding).`,
         );
       }
     }

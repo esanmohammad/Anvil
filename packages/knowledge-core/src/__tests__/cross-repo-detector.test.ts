@@ -83,6 +83,9 @@ before(() => {
   write('billing-worker', 'main.go', 'dsn := os.Getenv("BILLING_DB_URL")\nport := os.Getenv("PORT")\n');
   write('billing-worker', 'jobs/export.py', 'bucket = os.environ.get("INVOICE_BUCKET")\nport = os.environ["PORT"]\n');
 
+  // Go kafka-go consumer: the topic is a struct field.
+  write('notifier', 'consumer.go', 'r := kafka.NewReader(kafka.ReaderConfig{Brokers: brokers, Topic: "order-created", GroupID: "notifier"})\n');
+
   // A checkout whose location contains a path-filter keyword ("deploy").
   write('deploy/checkout', 'config/app.yaml', 'url: "billing.prod.svc"\n');
 });
@@ -112,6 +115,10 @@ describe('extractCrossRepoSignals — polyglot coverage', () => {
 
   it('does not throw on a bare fetch() with a single capture group', () => {
     assert.doesNotThrow(() => extractCrossRepoSignals(join(root, 'gateway')));
+  });
+
+  it('finds Go kafka-go topics set as a struct field', () => {
+    assert.ok('order-created' in (extractCrossRepoSignals(join(root, 'notifier')).events ?? {}));
   });
 
   it('finds RabbitMQ queue names with dashes', () => {

@@ -38,6 +38,10 @@ export interface RepoIndexMeta {
   lastIndexedAt: string;
   chunkCount: number;
   embeddingProvider: string;
+  /** Embedding model + dimensions the repo's vectors were written with (set at
+   *  embed time); a retriever with a different vector space refuses to open. */
+  embeddingModel?: string;
+  embeddingDimensions?: number;
   files?: Record<string, FileIndexEntry>;
   /** Serializable workspace packages (WorkspaceMap holds Maps, which don't
    *  survive JSON) — rehydrated for cross-repo correlation on skipped repos. */

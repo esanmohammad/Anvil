@@ -329,16 +329,8 @@ export class VectorStore implements VectorStorePort {
     if (!this.table) {
       this.table = await this.db.createTable('chunks', rows, { mode: 'overwrite' });
     } else {
-      // Delete existing chunks for the same project, then add new ones
-      // This handles re-indexing
-      const project = chunks[0]?.project;
-      if (project) {
-        try {
-          await this.table.delete(`project = '${project.replace(/'/g, "''")}'`);
-        } catch {
-          /* ok if empty */
-        }
-      }
+      // Replace rows with the given ids, keep everything else.
+      await this.deleteChunksByIds(rows.map((r) => r.id));
       await this.table.add(rows);
     }
     // Rebuild FTS index after data changes

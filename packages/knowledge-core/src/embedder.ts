@@ -121,7 +121,7 @@ async function embedFetch(opts: {
 export class CodestralEmbedder implements EmbeddingProvider {
   readonly name = 'codestral';
   readonly dimensions: number;
-  private readonly model: string;
+  readonly model: string;
   private readonly apiKey: string | undefined;
 
   constructor(options?: { model?: string; dimensions?: number; apiKey?: string }) {
@@ -171,7 +171,7 @@ export class CodestralEmbedder implements EmbeddingProvider {
 export class VoyageEmbedder implements EmbeddingProvider {
   readonly name = 'voyage';
   readonly dimensions: number;
-  private readonly model: string;
+  readonly model: string;
   private readonly apiKey: string | undefined;
 
   constructor(options?: { model?: string; dimensions?: number; apiKey?: string }) {
@@ -221,7 +221,7 @@ export class VoyageEmbedder implements EmbeddingProvider {
 export class OpenAIEmbedder implements EmbeddingProvider {
   readonly name = 'openai';
   readonly dimensions: number;
-  private readonly model: string;
+  readonly model: string;
   private readonly apiKey: string | undefined;
 
   constructor(options?: { model?: string; dimensions?: number; apiKey?: string }) {
@@ -437,7 +437,7 @@ async function refreshGeminiAccessToken(
 export class GeminiOAuthEmbedder implements EmbeddingProvider {
   readonly name = 'gemini-oauth';
   readonly dimensions: number;
-  private readonly model: string;
+  readonly model: string;
 
   constructor(options?: { model?: string; dimensions?: number }) {
     this.model = options?.model ?? 'text-embedding-004';
@@ -517,7 +517,7 @@ export class GeminiOAuthEmbedder implements EmbeddingProvider {
 export class OpenAICompatibleEmbedder implements EmbeddingProvider {
   readonly name = 'openai-compatible';
   readonly dimensions: number;
-  private readonly model: string;
+  readonly model: string;
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
 

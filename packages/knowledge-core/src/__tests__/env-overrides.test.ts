@@ -95,6 +95,33 @@ describe('loadKnowledgeConfig + applyEnvOverrides (P1)', () => {
     assert.equal(cfg.embedding.provider, 'openai');
   });
 
+  it('credential + endpoint env vars override values already in the config (last-write)', () => {
+    process.env.CODE_SEARCH_EMBEDDING_API_KEY = 'k-env';
+    process.env.CODE_SEARCH_EMBEDDING_BASE_URL = 'http://embed.env';
+    process.env.CODE_SEARCH_RERANKER_MODEL = 'rerank-env';
+    process.env.CODE_SEARCH_RERANKER_API_KEY = 'rr-env';
+    process.env.CODE_SEARCH_RERANKER_BASE_URL = 'http://rerank.env';
+    const prevOllama = process.env.CODE_SEARCH_OLLAMA_HOST;
+    process.env.CODE_SEARCH_OLLAMA_HOST = 'http://ollama.env';
+    try {
+      const cfg = applyEnvOverrides({
+        ...DEFAULT_CONFIG,
+        embedding: { provider: 'ollama', apiKey: 'k-cfg', baseUrl: 'http://embed.cfg', ollamaHost: 'http://ollama.cfg' },
+        retrieval: { ...DEFAULT_CONFIG.retrieval, reranker: { provider: 'cohere', model: 'rerank-cfg', apiKey: 'rr-cfg', baseUrl: 'http://rerank.cfg' } },
+      });
+      assert.equal(cfg.embedding.apiKey, 'k-env');
+      assert.equal(cfg.embedding.baseUrl, 'http://embed.env');
+      assert.equal(cfg.embedding.ollamaHost, 'http://ollama.env');
+      const reranker = normalizeRerankerConfig(cfg.retrieval.reranker);
+      assert.equal(reranker.model, 'rerank-env');
+      assert.equal(reranker.apiKey, 'rr-env');
+      assert.equal(reranker.baseUrl, 'http://rerank.env');
+    } finally {
+      if (prevOllama === undefined) delete process.env.CODE_SEARCH_OLLAMA_HOST;
+      else process.env.CODE_SEARCH_OLLAMA_HOST = prevOllama;
+    }
+  });
+
   it('reranker env vars normalize into struct shape', () => {
     process.env.CODE_SEARCH_RERANKER_PROVIDER = 'custom';
     process.env.CODE_SEARCH_RERANKER_MODEL = 'rerank-test';

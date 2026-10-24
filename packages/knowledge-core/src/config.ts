@@ -222,22 +222,22 @@ export function applyEnvOverrides(config: KnowledgeConfig): KnowledgeConfig {
     if (Number.isFinite(n)) next.embedding.dimensions = n;
   }
   const embedKey = env('EMBEDDING_API_KEY');
-  if (embedKey && !next.embedding.apiKey) next.embedding.apiKey = embedKey;
+  if (embedKey) next.embedding.apiKey = embedKey;
   const embedBase = env('EMBEDDING_BASE_URL');
-  if (embedBase && !next.embedding.baseUrl) next.embedding.baseUrl = embedBase;
+  if (embedBase) next.embedding.baseUrl = embedBase;
   const ollamaHost = env('OLLAMA_HOST') ?? process.env.OLLAMA_HOST;
-  if (ollamaHost && !next.embedding.ollamaHost) next.embedding.ollamaHost = ollamaHost;
+  if (ollamaHost) next.embedding.ollamaHost = ollamaHost;
 
   // Reranker
   const rerankerStruct = normalizeRerankerConfig(next.retrieval.reranker);
   const rerankerProvider = env('RERANKER_PROVIDER');
   if (rerankerProvider) rerankerStruct.provider = rerankerProvider as RerankerProviderId;
   const rerankerModel = env('RERANKER_MODEL') ?? process.env.RERANKER_MODEL;
-  if (rerankerModel && !rerankerStruct.model) rerankerStruct.model = rerankerModel;
+  if (rerankerModel) rerankerStruct.model = rerankerModel;
   const rerankerKey = env('RERANKER_API_KEY');
-  if (rerankerKey && !rerankerStruct.apiKey) rerankerStruct.apiKey = rerankerKey;
+  if (rerankerKey) rerankerStruct.apiKey = rerankerKey;
   const rerankerBase = env('RERANKER_BASE_URL');
-  if (rerankerBase && !rerankerStruct.baseUrl) rerankerStruct.baseUrl = rerankerBase;
+  if (rerankerBase) rerankerStruct.baseUrl = rerankerBase;
   next.retrieval.reranker = rerankerStruct;
 
   // Retrieval tuning
