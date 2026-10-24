@@ -1,10 +1,11 @@
 /**
  * Structured JSON logger (P7).
  *
- * Replaces `console.error` with one-JSON-line-per-event when
- * `telemetry.structuredLogs` is enabled. Falls back to passthrough text
- * mode otherwise so the dashboard's existing scrape-stderr pattern still
- * works during the migration.
+ * The server, daemon and CLI write their stderr log lines through this
+ * logger: one JSON object per line when `telemetry.structuredLogs` is
+ * enabled, otherwise passthrough text (`[component] msg`, the historical
+ * stderr format that scrapers match on). Lines knowledge-core prints itself
+ * are not routed through it.
  */
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -75,8 +76,7 @@ export class Logger {
       const entry: LogEntry = { level, msg, ts: new Date().toISOString(), ...fields };
       this.opts.write(JSON.stringify(entry));
     } else {
-      const comp = fields?.component ? `[${fields.component}]` : '';
-      this.opts.write(`${level.toUpperCase()} ${comp} ${msg}`);
+      this.opts.write(fields?.component ? `[${fields.component}] ${msg}` : msg);
     }
   }
 }
@@ -90,4 +90,19 @@ export function getLogger(): Logger {
 
 export function configureLogger(opts: LoggerOpts): void {
   _default = new Logger(opts);
+}
+
+export type ComponentLogger = Pick<Logger, 'debug' | 'info' | 'warn' | 'error'>;
+
+/**
+ * Logger bound to a component name that resolves the process-wide logger on
+ * every call — safe to create at module load, before `configureLogger` runs.
+ */
+export function getComponentLogger(component: string): ComponentLogger {
+  return {
+    debug: (msg, fields) => getLogger().debug(msg, { component, ...fields }),
+    info: (msg, fields) => getLogger().info(msg, { component, ...fields }),
+    warn: (msg, fields) => getLogger().warn(msg, { component, ...fields }),
+    error: (msg, fields) => getLogger().error(msg, { component, ...fields }),
+  };
 }

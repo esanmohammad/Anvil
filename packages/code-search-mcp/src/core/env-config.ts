@@ -11,7 +11,7 @@ import { execSync as _execSync } from 'node:child_process';
 import {
   resolveCodeSearchConfig,
   type CodeSearchConfig,
-  parseCliFlags,
+  type DeepPartial,
   toKnowledgeConfig,
 } from './config.js';
 import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
@@ -21,7 +21,7 @@ export interface ServerConfig {
   // Server
   port: number;
   host: string;
-  transport: 'stdio' | 'sse' | 'streamable-http';
+  transport: 'stdio' | 'streamable-http';
 
   // Storage
   dataDir: string;
@@ -67,12 +67,14 @@ export interface ServerConfig {
 
 let _config: ServerConfig | null = null;
 
+/** Mirrors agent-core's single-shot resolution (which is what indexing
+ *  actually uses): an explicit cli/api/none wins; anything else auto-detects. */
 function resolveLlmMode(
-  explicit: CodeSearchConfig['llm']['mode'] | undefined,
+  explicit: string | undefined,
   apiKey: string | undefined,
   claudeBin: string,
 ): ServerConfig['llmMode'] {
-  if (explicit && explicit !== 'none') {
+  if (explicit === 'cli' || explicit === 'api' || explicit === 'none') {
     if (explicit === 'api' && !apiKey) {
       console.error(
         `[code-search-mcp] WARNING: LLM_MODE=api but no API key found. ` +
@@ -106,14 +108,17 @@ export function resolvedKnowledgeConfig(): KnowledgeConfig {
   return toKnowledgeConfig(loadServerConfig().__unified);
 }
 
-export function loadServerConfig(opts?: { argv?: string[]; workspaceDir?: string }): ServerConfig {
+/** Resolve once and cache. The first caller (the `code-search-mcp` entry)
+ *  passes the CLI patch + workspace dir; later callers get the cached result. */
+export function loadServerConfig(opts?: { cli?: DeepPartial<CodeSearchConfig>; workspaceDir?: string }): ServerConfig {
   if (_config) return _config;
 
-  const cli = opts?.argv ? parseCliFlags(opts.argv).patch : undefined;
-  const c = resolveCodeSearchConfig({ cli, workspaceDir: opts?.workspaceDir });
+  const c = resolveCodeSearchConfig({ cli: opts?.cli, workspaceDir: opts?.workspaceDir });
 
   const rerankerStruct = normalizeRerankerConfig(c.reranker);
-  const llmMode = resolveLlmMode(c.llm.mode, c.llm.apiKey, c.llm.claudeBin);
+  // resolveCodeSearchConfig bridged cfg.llm.mode into ANVIL_LLM_MODE (an
+  // explicit ANVIL_LLM_MODE wins) — agent-core reads that variable.
+  const llmMode = resolveLlmMode(process.env.ANVIL_LLM_MODE ?? c.llm.mode, c.llm.apiKey, c.llm.claudeBin);
 
   _config = {
     port: c.server.port,

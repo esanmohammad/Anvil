@@ -9,7 +9,7 @@
  * LOCAL MODE (self-hosted, has repos + index locally):
  *   code-search-mcp --local /path/to/repos           # index local repos
  *   code-search-mcp --local github:org-name           # clone from GitHub
- *   code-search-mcp --serve                           # HTTP server mode
+ *   code-search-mcp --serve [path]                    # HTTP server mode
  *
  * Environment:
  *   CODE_SEARCH_SERVER            — remote server URL (default mode)
@@ -18,63 +18,17 @@
  *   OLLAMA_HOST                   — Ollama endpoint (local mode)
  */
 
-import { resolve } from 'node:path';
+import { resolve, basename, join } from 'node:path';
 import { existsSync } from 'node:fs';
-import { printConfig, resolveCodeSearchConfig, parseCliFlags } from './core/config.js';
+import { homedir } from 'node:os';
+import { printConfig, resolveCodeSearchConfig, parseCliFlags, exportDataDir } from './core/config.js';
+import { loadServerConfig } from './core/env-config.js';
+import { validateProjectName } from './core/project-name.js';
+import { configureLogger, getComponentLogger } from './observability/logger.js';
 
-const args = process.argv.slice(2);
+const log = getComponentLogger('code-search-mcp');
 
-// P3 — short-circuit `--print-config` so users can verify the resolved
-// settings without booting the MCP server. Honors all the same precedence
-// layers (defaults → file → env → CLI flags).
-if (args.includes('--print-config')) {
-  const { patch } = parseCliFlags(args.filter((a) => a !== '--print-config'));
-  const cfg = resolveCodeSearchConfig({ cli: patch });
-  process.stdout.write(printConfig(cfg) + '\n');
-  process.exit(0);
-}
-
-// ── Parse arguments ──────────────────────────────────────────────────
-
-let mode: 'remote' | 'local' | 'serve' = 'remote'; // DEFAULT: remote proxy
-let remoteUrl: string | null = null;
-let apiKey: string | undefined;
-let source: string | null = null;
-let projectName: string | null = null;
-let githubToken: string | undefined;
-let force = false;
-let port: string | undefined;
-let transport: string | undefined;
-let authMode: string | undefined;
-
-for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--remote' && args[i + 1]) {
-    mode = 'remote';
-    remoteUrl = args[++i];
-  } else if (args[i] === '--local') {
-    mode = 'local';
-    // Next arg might be a source path (if it doesn't start with --)
-    if (args[i + 1] && !args[i + 1].startsWith('--')) {
-      source = args[++i];
-    }
-  } else if (args[i] === '--serve') {
-    mode = 'serve';
-  } else if (args[i] === '--api-key' && args[i + 1]) {
-    apiKey = args[++i];
-  } else if (args[i] === '--project' && args[i + 1]) {
-    projectName = args[++i];
-  } else if (args[i] === '--token' && args[i + 1]) {
-    githubToken = args[++i];
-  } else if (args[i] === '--force') {
-    force = true;
-  } else if (args[i] === '--port' && args[i + 1]) {
-    port = args[++i];
-  } else if (args[i] === '--transport' && args[i + 1]) {
-    transport = args[++i];
-  } else if (args[i] === '--auth' && args[i + 1]) {
-    authMode = args[++i];
-  } else if (args[i] === '--help' || args[i] === '-h') {
-    console.error(`
+const HELP = `
 Code Search MCP — multi-repo code intelligence via MCP
 
 REMOTE MODE (default — connects to a deployed server):
@@ -99,7 +53,7 @@ REMOTE MODE (default — connects to a deployed server):
       }
     }
 
-LOCAL MODE (self-hosted — indexes repos locally):
+LOCAL MODE (self-hosted — indexes repos locally, serves over stdio):
   code-search-mcp --local /path/to/repos             Index local directory
   code-search-mcp --local github:org-name             Clone from GitHub org
   code-search-mcp --local --project my-project        Serve existing index
@@ -107,40 +61,100 @@ LOCAL MODE (self-hosted — indexes repos locally):
   Options:
     --project <name>        Project name (default: derived from source)
     --token <token>         GitHub token (or GITHUB_TOKEN env)
-    --force                 Force full re-index
+    --force                 Force a full re-index at startup
 
-SERVER MODE (deploy as HTTP service):
-  code-search-mcp --serve                             Start HTTP server
-  code-search-mcp --serve --port 3100 --auth api-key
+SERVER MODE (deploy as HTTP service — Streamable HTTP on /mcp):
+  code-search-mcp --serve [path]                      Start HTTP server (project "default")
+  code-search-mcp --serve /repos --port 3100 --auth api-key
+  (--local <path> --serve and --serve --local <path> are equivalent)
 
   Options:
-    --port <port>           HTTP port (default: 3100)
-    --auth <mode>           none | api-key | jwt
-    --transport <mode>      streamable-http | sse
+    --port <port>           HTTP port (default: 3100) = --server.port
+    --host <host>           Bind address = --server.host
+    --auth <mode>           none | api-key | jwt = --auth.mode
+    --project <name>        Project name (default: "default")
 
   Environment:
-    CODE_SEARCH_TRANSPORT           streamable-http | sse
     CODE_SEARCH_PORT                HTTP port (default: 3100)
     CODE_SEARCH_AUTH_MODE           none | api-key | jwt
     CODE_SEARCH_AUTH_API_KEYS       Comma-separated API keys
     CODE_SEARCH_EMBEDDING_PROVIDER  auto | codestral | openai | voyage | ollama | custom
     CODE_SEARCH_EMBEDDING_API_KEY   Unified embedding API key
     CODE_SEARCH_DATA_DIR            Data directory override
-`);
-    process.exit(0);
-  } else if (!args[i].startsWith('-')) {
-    // Bare arg — could be a source path or a remote URL
-    const arg = args[i];
-    if (arg.startsWith('http://') || arg.startsWith('https://')) {
-      mode = 'remote';
-      remoteUrl = arg;
-    } else {
-      // Treat as local source for backward compat
-      mode = 'local';
-      source = arg;
-    }
+
+CONFIG (every mode):
+  --<dotted.path> <value>   Any CodeSearchConfig leaf, e.g. --retrieval.max-chunks 12
+  --print-config            Print the resolved config (secrets redacted) and exit
+`;
+
+function usageError(msg: string): never {
+  log.error(`${msg} — see --help`);
+  process.exit(2);
+}
+
+// ── Parse arguments ──────────────────────────────────────────────────
+// Config flags (`--<dotted.path>`, `--port`, `--auth`, …) are split off by
+// parseCliFlags; the mode flags below are order-independent.
+
+const { patch, rest, unknown } = parseCliFlags(process.argv.slice(2));
+if (unknown.length) usageError(`unknown flag(s): ${unknown.join(', ')}`);
+
+let printOnly = false;
+let serve = false;
+let local = false;
+let remoteUrl: string | null = null;
+let apiKey: string | undefined;
+let source: string | null = null;
+let projectName: string | null = null;
+let githubToken: string | undefined;
+let force = false;
+
+for (let i = 0; i < rest.length; i++) {
+  const arg = rest[i];
+  const value = (): string => {
+    const v = rest[i + 1];
+    if (v === undefined || v.startsWith('--')) usageError(`${arg} needs a value`);
+    i++;
+    return v;
+  };
+  // `--local` / `--serve` take an optional source path.
+  const optionalPath = (): string | null => (rest[i + 1] !== undefined && !rest[i + 1].startsWith('-') ? rest[++i] : null);
+  switch (arg) {
+    case '--print-config': printOnly = true; break;
+    case '--remote': remoteUrl = value(); break;
+    case '--local': local = true; source = optionalPath() ?? source; break;
+    case '--serve': serve = true; source = optionalPath() ?? source; break;
+    case '--api-key': apiKey = value(); break;
+    case '--project': projectName = value(); break;
+    case '--token': githubToken = value(); break;
+    case '--force': force = true; break;
+    case '--help':
+    case '-h':
+      process.stderr.write(HELP);
+      process.exit(0);
+    default:
+      if (arg.startsWith('-')) usageError(`unknown flag: ${arg}`);
+      // Bare arg — a remote URL, or a local source for backward compat.
+      if (/^https?:\/\//.test(arg)) remoteUrl = arg;
+      else source = arg;
   }
 }
+
+const mode: 'remote' | 'local' | 'serve' = serve ? 'serve' : remoteUrl ? 'remote' : local || source ? 'local' : 'remote';
+const workspaceDir = source && !source.startsWith('github:') ? resolve(source) : process.cwd();
+
+const preview = resolveCodeSearchConfig({ cli: patch, workspaceDir });
+if ((preview.server.transport as string) === 'sse') {
+  usageError('SSE transport is not supported — the server speaks Streamable HTTP on /mcp (drop --transport / CODE_SEARCH_TRANSPORT)');
+}
+if (mode === 'serve') patch.server = { ...patch.server, transport: 'streamable-http' };
+
+if (printOnly) {
+  process.stdout.write(printConfig(resolveCodeSearchConfig({ cli: patch, workspaceDir })) + '\n');
+  process.exit(0);
+}
+
+configureLogger({ structured: preview.telemetry.structuredLogs });
 
 // ── Execute ──────────────────────────────────────────────────────────
 
@@ -157,7 +171,7 @@ SERVER MODE (deploy as HTTP service):
         ?? process.env.CODE_SEARCH_AUTH_API_KEY;
 
       if (!serverUrl) {
-        console.error(`[code-search-mcp] No remote server configured.
+        log.error(`No remote server configured.
 
 Set CODE_SEARCH_SERVER environment variable:
   export CODE_SEARCH_SERVER=https://your-server:3100
@@ -179,18 +193,10 @@ For help:
       return;
     }
 
-    // ── SERVE MODE (HTTP server) ───────────────────────────────────
-    if (mode === 'serve') {
-      if (port) process.env.CODE_SEARCH_PORT = port;
-      if (authMode) process.env.CODE_SEARCH_AUTH_MODE = authMode;
-      process.env.CODE_SEARCH_TRANSPORT = transport === 'sse' ? 'sse' : 'streamable-http';
+    // ── LOCAL (stdio) / SERVE (HTTP) — same source resolution ──────
+    const config = loadServerConfig({ cli: patch, workspaceDir });
+    exportDataDir(config.__unified);
 
-      const { startServer } = await import('./server.js');
-      await startServer(projectName ?? 'default', source ? resolve(source) : null);
-      return;
-    }
-
-    // ── LOCAL MODE (stdio with local repos) ────────────────────────
     let directoryPath: string | null = null;
 
     if (source?.startsWith('github:')) {
@@ -200,39 +206,43 @@ For help:
       const org = slashIdx > 0 ? spec.slice(0, slashIdx) : spec;
       const pattern = slashIdx > 0 ? spec.slice(slashIdx + 1) : undefined;
 
-      if (!projectName) projectName = org;
+      if (!projectName && mode === 'local') projectName = org;
 
-      console.error(`[code-search-mcp] Cloning repos from github:${org}${pattern ? `/${pattern}` : ''}...`);
+      log.info(`Cloning repos from github:${org}${pattern ? `/${pattern}` : ''}...`);
       const repos = await cloneOrUpdateOrg(org, {
         pattern,
         token: githubToken,
-        onProgress: (m) => console.error(m),
+        onProgress: (m) => log.info(m),
       });
-      console.error(`[code-search-mcp] ${repos.length} repos ready`);
+      log.info(`${repos.length} repos ready`);
 
-      const { homedir } = await import('node:os');
-      const { join } = await import('node:path');
       directoryPath = join(homedir(), '.code-search', org);
 
     } else if (source) {
       directoryPath = resolve(source);
       if (!existsSync(directoryPath)) {
-        console.error(`[code-search-mcp] Directory not found: ${directoryPath}`);
+        log.error(`Directory not found: ${directoryPath}`);
         process.exit(1);
       }
-      if (!projectName) {
-        projectName = directoryPath.split('/').filter(Boolean).pop() || 'project';
-      }
-
-    } else if (!projectName) {
+    } else if (local && !projectName) {
       directoryPath = process.cwd();
-      projectName = directoryPath.split('/').filter(Boolean).pop() || 'project';
+    }
+
+    // Serve mode keeps the historical "default" namespace; stdio local mode
+    // names the project after its source directory.
+    if (!projectName) {
+      projectName = mode === 'serve' ? 'default' : (directoryPath && basename(directoryPath)) || 'project';
+    }
+    try {
+      validateProjectName(projectName);
+    } catch (err) {
+      usageError((err as Error).message);
     }
 
     const { startServer } = await import('./server.js');
-    await startServer(projectName!, directoryPath);
+    await startServer(projectName, directoryPath, { force });
   } catch (err) {
-    console.error(`[code-search-mcp] Fatal:`, err);
+    log.error(`Fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
     process.exit(1);
   }
 })();
