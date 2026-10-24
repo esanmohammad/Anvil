@@ -503,35 +503,50 @@ export class VectorStore implements VectorStorePort {
   async fullTextSearch(queryText: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
     if (!this.table) return [];
     try {
-      let q;
+      // Apply the same repo filter as vectorSearch — without it, BM25 results
+      // leak across repos even when the caller scoped to specific repos.
+      const run = (q: any) => (filter ? q.where(filter) : q).toArray();
+      // FTS rows carry `_score` on this binding (0.27.x); `_relevance_score`
+      // is the legacy field name — reading only that flattened every BM25
+      // score to the 0.5 fallback.
+      const score = (r: any): number => r._score ?? r._relevance_score ?? 0.5;
       // Words containing '_' are already split into terms on the original
       // column; sending them to the split column too would count them again
       // for camelCase spellings of the same words (TRIGGER_TO_WEB_TYPE vs
       // triggerToWebType) and outrank the definition.
       const splitQuery = splitIdentifiers(queryText.replace(/[A-Za-z0-9]*_[A-Za-z0-9_]*/g, ' '));
-      if (/[A-Za-z0-9]/.test(splitQuery) && (await this.hasIndex('contentSplit_idx'))) {
+      const useSplit = /[A-Za-z0-9]/.test(splitQuery) && (await this.hasIndex('contentSplit_idx'));
+      const original = run(this.table.search(queryText, 'fts', 'contextualizedContent').limit(limit));
+      let results: Array<{ row: any; score: number }>;
+      if (useSplit) {
         // Original tokens on the original column, identifier parts on the
         // split column; a row's score is the sum. An exact identifier keeps
         // its rare full token, and "expected backlog count" also reaches
-        // `verifyExpectedBacklogCount`.
-        const { BooleanQuery, MatchQuery, Occur } = await import('@lancedb/lancedb');
-        q = this.table.query().fullTextSearch(new BooleanQuery([
-          [Occur.Should, new MatchQuery(queryText, 'contextualizedContent')],
-          [Occur.Should, new MatchQuery(splitQuery, 'contentSplit')],
-        ])).limit(limit);
+        // `verifyExpectedBacklogCount`. Two searches, not one BooleanQuery:
+        // that cost ~1.5× their sum at 1M rows. A single identifier matches
+        // by parts only where all of them occur — `getUserById` reaches
+        // `getUserByIdOrThrow`, not every row with a `get…` and an `…Id`.
+        const { MatchQuery, Operator } = await import('@lancedb/lancedb');
+        const single = !/\s/.test(queryText.trim());
+        const [a, b] = await Promise.all([
+          original,
+          run(this.table.query()
+            .fullTextSearch(new MatchQuery(splitQuery, 'contentSplit', single ? { operator: Operator.And } : undefined))
+            .limit(limit)),
+        ]);
+        const byId = new Map<string, { row: any; score: number }>();
+        for (const r of [...a, ...b]) {
+          const hit = byId.get(r.id);
+          if (hit) hit.score += score(r);
+          else byId.set(r.id, { row: r, score: score(r) });
+        }
+        results = [...byId.values()].sort((x, y) => y.score - x.score).slice(0, limit);
       } else {
-        q = this.table.search(queryText, 'fts', 'contextualizedContent').limit(limit);
+        results = (await original).map((r: any) => ({ row: r, score: score(r) }));
       }
-      // Apply the same repo filter as vectorSearch — without it, BM25 results
-      // leak across repos even when the caller scoped to specific repos.
-      if (filter) q = q.where(filter);
-      const results = await q.toArray();
-      // FTS rows carry `_score` on this binding (0.27.x); `_relevance_score`
-      // is the legacy field name — reading only that flattened every BM25
-      // score to the 0.5 fallback.
-      return results.map((r: any) => ({
-        chunk: rowToChunk(r),
-        score: r._score ?? r._relevance_score ?? 0.5,
+      return results.map(({ row, score: s }) => ({
+        chunk: rowToChunk(row),
+        score: s,
         source: 'bm25' as const,
       }));
     } catch {

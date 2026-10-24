@@ -373,8 +373,12 @@ Three FTS indexes:
 
 `fullTextSearch` sums a match of the query on the first and of its
 camelCase-split form on the second (words containing `_` stay off the split
-query — the tokenizer already splits them on the original column). On a table
-with no `contentSplit_idx` it searches the original column only.
+query — the tokenizer already splits them on the original column). They run as
+two searches whose top rows are merged by id (one `BooleanQuery` over both cost
+~1.5× the pair at 1M rows). For a single identifier the split form must match
+all its parts (`getUserById` reaches `getUserByIdOrThrow`, not every row with a
+`get…` and an `…Id`); multi-word queries match any. On a table with no
+`contentSplit_idx` it searches the original column only.
 
 The write path builds each index once; `optimize()` folds later appends in,
 and until then they are still found by term search (not by phrase search). An

@@ -63,6 +63,22 @@ describe('identifier-aware BM25', () => {
     assert.deepEqual(ids(await store.fullTextSearch('expected backlog count', 10, "id = 'prose'")), [], 'filter still applies');
   });
 
+  it("a single identifier matches a row by its parts only when all of them occur", async (t) => {
+    if (!(await lanceAvailable(t))) return;
+    const store = new VectorStore(join(base, 'parts'));
+    await store.init();
+    await store.addChunks([
+      chunk('exact', 'const u = getUserById(id);'),
+      chunk('longer', 'return getUserByIdOrThrow(id);'),
+      chunk('some', 'const c = getConfig(); lookupById(c);'),
+    ], { skipIndex: true });
+    await store.ensureFtsIndex();
+    const hits = ids(await store.fullTextSearch('getUserById', 10));
+    assert.equal(hits[0], 'exact');
+    assert.ok(hits.includes('longer'), 'an identifier containing the query is found by its parts');
+    assert.ok(!hits.includes('some'), 'a row sharing only some of the parts is not a match');
+  });
+
   it('a snake_case constant query is not outranked by camelCase spellings of its words', async (t) => {
     if (!(await lanceAvailable(t))) return;
     const store = new VectorStore(join(base, 'snake'));
