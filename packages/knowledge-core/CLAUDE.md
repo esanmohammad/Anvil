@@ -319,13 +319,22 @@ deleted — even when nothing else changed.
 `embedChunks` is independently incremental: it diffs `chunks.json`
 against existing chunk IDs in LanceDB and only embeds the new ones.
 Deleted and changed files are read from `deleted_files.json` (written by
-`buildKB`; a repo's first index lists nothing) and their rows removed
-**before** the id diff — chunk ids are position-keyed, so a changed file's
-unmoved chunks keep their ids and must be wiped first to be re-embedded.
-Rows whose ids `chunks.json` no longer lists (removed repos, deletions a
-fallback re-chunk caught, older id schemes) are swept; an empty
-`chunks.json` is never treated as "delete everything" (the fs backend writes
-NDJSON via temp file + rename, so a crash can't leave a truncated one). The
+`buildKB`; a repo's first index lists nothing): their rows are stale. Chunk
+ids are position-keyed, so a changed file's new chunks can take a stale row's
+id — the diff treats stale ids as not embedded (a stale row whose id and text
+both come back is kept), and the stale rows are deleted after the embed loop
+by exact `(id, contentHash)`. Rows whose ids `chunks.json` no longer lists
+(removed repos, deletions a fallback re-chunk caught, older id schemes) are
+swept after the loop too; an empty `chunks.json` is never treated as "delete
+everything" (the fs backend writes NDJSON via temp file + rename, so a crash
+can't leave a truncated one). Until the sweep, stale and orphaned rows keep
+their vectors available for **reuse by content**: each embed batch looks up
+`contentHash` (SHA-256 of the embedded text; BTREE-indexed) and takes a
+stored vector instead of a provider call. The first batch with hits embeds
+one of those texts and compares (cosine > 0.99), so a provider / model /
+dimension change never reuses a vector. Upgrades that change chunk ids,
+unchanged functions in an edited file, and identical code in another repo
+are not re-embedded. The
 stale-file list is cleared once an embed applies it; `buildKB` merges into a
 list not yet applied rather than overwriting it. Every embed run —
 including one with nothing new to embed — ends with `maintainVectorIndex`

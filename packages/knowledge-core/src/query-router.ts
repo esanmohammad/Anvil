@@ -55,7 +55,7 @@ function profileToSearchText(profile: RepoProfile): string {
  * Compute cosine similarity between two vectors of equal length.
  * Returns a value in [-1, 1]; higher means more similar.
  */
-function cosineSimilarity(a: number[], b: number[]): number {
+export function cosineSimilarity(a: number[], b: number[]): number {
   let dot = 0;
   let normA = 0;
   let normB = 0;

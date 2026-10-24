@@ -80,6 +80,12 @@ export interface VectorStorePort {
   ): Promise<Array<{ id: string; content: string; entityName: string; tokens: number }>>;
   deleteChunksByIds(ids: string[]): Promise<void>;
   deleteFileChunks(project: string, repoName: string, filePaths: string[]): Promise<void>;
+  /** (id, contentHash) of every row of the given files. */
+  getFileRowHashes(project: string, repoName: string, filePaths: string[]): Promise<Array<{ id: string; contentHash: string }>>;
+  /** A stored vector per content hash found — embedding reuse for identical text. */
+  getVectorsByContentHash(hashes: string[]): Promise<Map<string, number[]>>;
+  /** Delete exactly these rows, matched on id AND contentHash. */
+  deleteRows(rows: Array<{ id: string; contentHash: string }>): Promise<void>;
   getChunkIds(project: string): Promise<string[]>;
   getStats(): Promise<{ rowCount: number } | null>;
   hasData(): Promise<boolean>;

@@ -7,6 +7,8 @@ import { createEmbeddingProvider } from '@esankhan3/anvil-knowledge-core';
 import { resolveStorage, invalidateGraphStores } from './storage/resolve.js';
 import type { BlobStorePort, StorageBundle } from './storage/ports.js';
 import { maintainVectorIndex, readVectorIndexHealth } from './vector-index-maintenance.js';
+import { contentHash } from './vector-store.js';
+import { cosineSimilarity } from './query-router.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
 import { ProjectGraphBuilder } from '@esankhan3/anvil-knowledge-core';
 import { correlateCrossRepoEdges, CROSS_REPO_SIGNALS_VERSION } from './cross-repo-detector.js';
@@ -569,14 +571,16 @@ export class KnowledgeIndexer {
       .getJson<{ crossRepoEdges?: number }>('index_stats.json')
       .catch(() => null))?.crossRepoEdges ?? 0;
 
-    // Wipe the rows of changed/deleted files (listed by buildKB) BEFORE taking
-    // the id snapshot below: chunk ids are hash(filePath, startLine, endLine),
-    // so a changed file's unmoved chunks keep their ids — wiped after the
-    // snapshot they would be skipped as "already embedded" and lost. Wiped
-    // first, the file is re-embedded whole from chunks.json.
+    // Rows of changed/deleted files (listed by buildKB) are stale. Chunk ids are
+    // hash(repoName, filePath, startLine, endLine), so a changed file's new
+    // chunks can take ids its old rows hold: note each stale row's
+    // (id, contentHash), treat those ids as not embedded in the diff below, and
+    // delete exactly those rows after the embed loop. Until then their vectors
+    // stay in the table for reuse by content. A stale row whose id and text
+    // both come back is simply kept.
     const deletedFiles = await this.getDeletedFiles(storage.blobs);
+    const staleRows = new Map<string, Set<string>>(); // id → contentHashes
     if (deletedFiles.length > 0) {
-      // Group by repo for efficient deletion (file path matching, not chunk ids)
       const byRepo = new Map<string, string[]>();
       for (const d of deletedFiles) {
         const list = byRepo.get(d.repoName) ?? [];
@@ -584,8 +588,12 @@ export class KnowledgeIndexer {
         byRepo.set(d.repoName, list);
       }
       for (const [repoName, filePaths] of byRepo) {
-        log(`Removing stale chunks for ${filePaths.length} changed/deleted files from ${repoName}...`);
-        await vectorStore.deleteFileChunks(project, repoName, filePaths);
+        log(`Re-planning ${filePaths.length} changed/deleted files from ${repoName}...`);
+        for (const r of await vectorStore.getFileRowHashes(project, repoName, filePaths)) {
+          const hashes = staleRows.get(r.id) ?? new Set<string>();
+          hashes.add(r.contentHash);
+          staleRows.set(r.id, hashes);
+        }
       }
     }
 
@@ -599,6 +607,7 @@ export class KnowledgeIndexer {
         for (const id of existingChunks) existingIds.add(id);
       }
     } catch { /* first run — no existing data */ }
+    for (const id of staleRows.keys()) existingIds.delete(id);
 
     // Pass 1 — stream chunks.json to tally totals + how many need embedding,
     // WITHOUT ever holding all chunks in memory. At org scale (~810k chunks,
@@ -617,23 +626,38 @@ export class KnowledgeIndexer {
       totalTokens += c.tokens;
       repoChunkCounts.set(c.repoName, (repoChunkCounts.get(c.repoName) ?? 0) + 1);
       listedIds.add(c.id);
-      if (!existingIds.has(c.id)) newChunkCount++;
+      if (existingIds.has(c.id)) continue;
+      // Same id, same text as a stale row: keep that row as it is.
+      const stale = staleRows.get(c.id);
+      if (stale?.delete(contentHash(c.contextualizedContent))) {
+        existingIds.add(c.id);
+        continue;
+      }
+      newChunkCount++;
     }
     log(`Loaded ${totalChunks} chunks from ${chunksPath}`);
 
     // chunks.json is the corpus: rows it no longer lists — a removed repo, a
     // file deletion a fallback re-chunk caught, chunks from an older id scheme
-    // — are swept. An empty chunks.json is treated as a failed build, not as
-    // "delete everything".
+    // — are swept, after the embed loop so their vectors can be reused first
+    // (their ids can't collide with a listed chunk). An empty chunks.json is
+    // treated as a failed build, not as "delete everything".
     const orphanIds = totalChunks > 0 ? [...existingIds].filter((id) => !listedIds.has(id)) : [];
-    if (orphanIds.length > 0) {
-      log(`Removing ${orphanIds.length} rows no longer in ${chunksPath}...`);
-      await vectorStore.deleteChunksByIds(orphanIds);
-      for (const id of orphanIds) existingIds.delete(id);
-    }
+    const staleLeft = [...staleRows].flatMap(([id, hashes]) => [...hashes].map((h) => ({ id, contentHash: h })));
+    const sweep = async (): Promise<void> => {
+      // A stale row whose id no listed chunk took can go by id (cheap IN-list
+      // deletes); only ids a new chunk now holds need the exact pair.
+      const takenIds = staleLeft.filter((r) => listedIds.has(r.id));
+      const byId = [...staleLeft.filter((r) => !listedIds.has(r.id)).map((r) => r.id), ...orphanIds];
+      if (staleLeft.length > 0) log(`Removing ${staleLeft.length} stale rows of changed/deleted files...`);
+      if (orphanIds.length > 0) log(`Removing ${orphanIds.length} rows no longer in ${chunksPath}...`);
+      await vectorStore.deleteRows(takenIds);
+      await vectorStore.deleteChunksByIds(byId);
+    };
     const repoNames = [...repoChunkCounts.keys()];
 
     if (newChunkCount === 0 && deletedFiles.length === 0) {
+      await sweep();
       // All vectors already present, so DON'T re-embed. But build the full-text
       // (BM25) index if it is missing: a prior run that wrote vectors then
       // aborted before the post-loop FTS build leaves none, and this "nothing
@@ -685,6 +709,48 @@ export class KnowledgeIndexer {
     const concurrency = isOllama ? 1 : envInt('CODE_SEARCH_EMBEDDING_CONCURRENCY', 8);
 
     log(`Embedding ${newChunkCount} new chunks with ${embedder.name} (${totalChunks - newChunkCount} cached, batch ${batchSize} × concurrency ${concurrency})...`);
+    // The contentHash index must exist before the reuse lookups below (an
+    // upgraded table gets the column and its index here, not after the loop).
+    await vectorStore.ensureScalarIndexes();
+
+    // Embedding reuse: a chunk whose exact text a row already holds takes that
+    // row's vector instead of a provider call. Only within one embedding space:
+    // the first batch with reusable vectors embeds one of those texts and
+    // compares (every batch waits on that one answer), so a provider / model /
+    // dimension change never reuses a vector.
+    let reused = 0;
+    let sameSpace: Promise<boolean> | undefined;
+    const embedBatch = async (chunks: CodeChunk[]): Promise<number[][]> => {
+      const texts = chunks.map((c) => c.contextualizedContent);
+      const hashes = texts.map(contentHash);
+      const known = await vectorStore.getVectorsByContentHash([...new Set(hashes)]);
+      const vectors: Array<number[] | undefined> = hashes.map((h) => known.get(h));
+      let fromStore = vectors.filter(Boolean).length;
+      const hit = vectors.findIndex(Boolean);
+      if (hit >= 0) {
+        let probe: number[] | undefined;
+        const stored = vectors[hit]!;
+        sameSpace ??= embedder.embed([texts[hit]]).then(([v]) => {
+          probe = v;
+          return v.length === stored.length && cosineSimilarity(v, stored) > 0.99;
+        });
+        if (!(await sameSpace)) {
+          vectors.fill(undefined);
+          fromStore = 0;
+        }
+        if (probe) {
+          if (vectors[hit]) fromStore--;
+          vectors[hit] = probe;
+        }
+      }
+      const missing = vectors.flatMap((v, i) => (v ? [] : [i]));
+      if (missing.length > 0) {
+        const fresh = await embedder.embed(missing.map((i) => texts[i]));
+        missing.forEach((i, k) => { vectors[i] = fresh[k]; });
+      }
+      reused += fromStore;
+      return vectors as number[][];
+    };
 
     // Stream chunks.json a second time and embed only the new ones, in batches.
     // Up to `concurrency` batches are in flight at once. Embedded rows go into
@@ -732,7 +798,7 @@ export class KnowledgeIndexer {
       const task = (async () => {
         if (aborted) return;
         try {
-          const batchEmbeddings = await embedder.embed(batchChunks.map((c) => c.contextualizedContent));
+          const batchEmbeddings = await embedBatch(batchChunks);
           if (aborted) return;
           pending.push(...batchChunks.map((chunk, j) => ({ ...chunk, embedding: batchEmbeddings[j] })));
           embedded += batchChunks.length;
@@ -781,6 +847,7 @@ export class KnowledgeIndexer {
       try { await flush(); } catch (err) { aborted = err; }
     }
     if (aborted) throw aborted; // no zombies left running; fail the run cleanly
+    await sweep();
 
     // Build the full-text + scalar indexes if missing, after all batches are
     // inserted; existing ones are kept and optimize() below folds the appends in.
@@ -798,7 +865,7 @@ export class KnowledgeIndexer {
     // appends into every index, compacts, prunes).
     await vectorStore.ensureScalarIndexes();
     const vectorIndex = await maintainVectorIndex(vectorStore, storage.blobs, { rowsWritten: stored });
-    log(`Stored ${newChunkCount} new chunks in LanceDB (${deletedFiles.length} removed)`);
+    log(`Stored ${newChunkCount} new chunks in LanceDB (${reused} reused by content, ${deletedFiles.length} files re-planned)`);
     // The stale-file list is applied — clear it, or a later no-change cycle
     // (buildKB returns early without rewriting it) would wipe those files again
     // with nothing left to re-embed them.

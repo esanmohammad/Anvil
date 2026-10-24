@@ -146,17 +146,19 @@ embedChunks(project, config, opts):
   ├─ store = storage.vectors; await init({ healCorrupt: true })
   ├─ crossRepoEdges = index_stats.json.crossRepoEdges     ← counted by buildKB
   │
-  ├─ Apply deletes FIRST (ids are position-keyed — an unmoved chunk of a
-  │  changed file keeps its id):
+  ├─ Plan stale rows (ids are position-keyed — a changed file's new chunks
+  │  can take its old rows' ids):
   │     deletedFiles = read(<basePath>/deleted_files.json) || []
-  │     for [repoName, filePaths] in groupByRepo(deletedFiles):
-  │       store.deleteFileChunks(project, repoName, filePaths)
+  │     staleRows = store.getFileRowHashes(project, repo, files)   ← (id, contentHash)
   │
-  ├─ existingIds = await store.getChunkIds(project)
+  ├─ existingIds = await store.getChunkIds(project) − stale ids
   ├─ stream chunks.json (NDJSON): totals, listedIds, newChunkCount
-  ├─ sweep: store.deleteChunksByIds(existingIds − listedIds)   ← skipped if chunks.json is empty
+  │     (a stale row whose id + contentHash come back is kept, not re-embedded)
+  ├─ orphanIds = existingIds − listedIds                         ← none if chunks.json is empty
+  │  sweep() = store.deleteRows(stale rows left) + store.deleteChunksByIds(orphanIds)
   │
   ├─ if newChunkCount === 0 && deletedFiles.length === 0:
+  │      sweep()
   │      ensureFtsIndex + ensureScalarIndexes + maintainVectorIndex(rowsWritten 0)
   │      bump index_generation; return stats
   │
@@ -174,10 +176,14 @@ embedChunks(project, config, opts):
   ├─ batchSize   = CODE_SEARCH_EMBEDDING_BATCH_SIZE  ?? (ollama ? 10 : 128)
   │  concurrency = ollama ? 1 : CODE_SEARCH_EMBEDDING_CONCURRENCY ?? 8
   │
-  ├─ stream chunks.json again; new chunks → batches, `concurrency` in flight,
-  │  each batch embedded into a buffer that store.addChunks appends once it
+  ├─ ensureScalarIndexes (contentHash BTREE before the reuse lookups)
+  ├─ stream chunks.json again; new chunks → batches, `concurrency` in flight;
+  │  per batch: store.getVectorsByContentHash(hashes) → reuse stored vectors
+  │  (first batch with hits embeds one of them and compares — same space only),
+  │  embed the rest; rows go into a buffer that store.addChunks appends once it
   │  holds 4,096 rows (and at the end) — one LanceDB commit per append;
   │  progress + ETA (no inter-batch delay — 429s back off inside the embedder)
+  ├─ sweep()
   │
   ├─ ensureFtsIndex (when anything new; builds only if missing / older config)
   │  + ensureScalarIndexes + maintainVectorIndex(rowsWritten) — its optimize()

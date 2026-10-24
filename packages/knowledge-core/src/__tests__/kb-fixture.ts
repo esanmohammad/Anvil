@@ -1,7 +1,7 @@
 /**
  * Shared fixture for indexing integration tests: a temp workspace of git
  * repos, a data dir (CODE_SEARCH_DATA_DIR), and a local OpenAI-compatible
- * embedding stub (deterministic vector per text) that counts embedded texts.
+ * embedding stub (deterministic vector per model + text) that counts embedded texts.
  * Drives the real buildKB + embedChunks and a real LanceDB table.
  */
 
@@ -57,10 +57,10 @@ export async function withKbFixture(
     let raw = '';
     req.on('data', (c) => { raw += c; });
     req.on('end', () => {
-      const { input } = JSON.parse(raw) as { input: string[] };
+      const { input, model } = JSON.parse(raw) as { input: string[]; model: string };
       texts += input.length;
       const data = input.map((text) => {
-        const h = createHash('sha256').update(text).digest();
+        const h = createHash('sha256').update(`${model}\0${text}`).digest();
         return { embedding: Array.from({ length: DIM }, (_, i) => h[i] / 255) };
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
