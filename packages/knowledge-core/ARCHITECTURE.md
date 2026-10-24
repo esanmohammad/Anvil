@@ -459,10 +459,13 @@ Final selection via `packWithinBudget(chunks, maxTokens, maxChunks)`.
 | 6 | Package→file `contains` edges |
 
 Every tree-sitter entity is a node (JS/TS top-level variables as type
-`const`). Calls, type references, inheritance and named-import `uses`
-resolve only within a language family (TS/TSX/JS share one) — a name in a
-Java file never binds to a Python definition. A Go `pkg.Type` reference
-resolves only to the one `Type` declared in a directory named `pkg`.
+`const`). A tree-sitter call or type reference starts at its containing
+entity; one outside every entity (module-level code, e.g. inside a
+`describe` callback) starts at the file. Calls, type references,
+inheritance and named-import `uses` resolve only within a language family
+(TS/TSX/JS share one) — a name in a Java file never binds to a Python
+definition. A Go `pkg.Type` reference resolves only to the one `Type`
+declared in a directory named `pkg`.
 
 Per-edge `confidence` (0..1). The retriever's expansion and the
 `trace_path` tool follow only non-`contains` edges with confidence ≥ 0.7 —

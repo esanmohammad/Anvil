@@ -617,13 +617,15 @@ function findEntityAtLine(entities: ExtractedEntity[], line: number): ExtractedE
   return best;
 }
 
-/** The entity a tree-sitter call / type reference belongs to: `file::<its
- *  containing entity>` when that is a node (a class member's id is
- *  `file::Class.member`, so it isn't), else the nearest entity starting at or
- *  above the line, else the file. */
+/** The entity a tree-sitter call / type reference belongs to: the file when
+ *  no entity contains it (module-level code, e.g. a `describe` callback);
+ *  else `file::<its containing entity>` when that is a node, else (a class
+ *  member, whose id is `file::Class.member`) the nearest entity starting at
+ *  or above the line. */
 function sourceEntityAt(fileEntities: ExtractedEntity[], relPath: string, containingEntity: string | undefined, line: number): string {
-  const id = containingEntity ? `${relPath}::${containingEntity}` : undefined;
-  if (id && fileEntities.some((e) => e.id === id)) return id;
+  if (!containingEntity) return relPath;
+  const id = `${relPath}::${containingEntity}`;
+  if (fileEntities.some((e) => e.id === id)) return id;
   return findEntityAtLine(fileEntities, line)?.id ?? relPath;
 }
 

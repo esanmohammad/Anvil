@@ -40,6 +40,7 @@ before(async () => {
   write('go/store/repo.go', 'package store\n\ntype Repo struct{}\n');
   write('go/web/request.go', 'package web\n\ntype Request struct{}\n');
   write('ui/App.jsx', "function Row() { return null; }\nexport function App() { return <div><Row /></div>; }\n");
+  write('ui/App.test.jsx', "const mockProps = { a: 1 };\ndescribe('App', () => {\n  it('renders', () => { render(<App {...mockProps} />); track(); });\n});\n");
   graph = await buildAstGraph(root, {});
 });
 
@@ -88,6 +89,12 @@ describe('buildAstGraph', () => {
     ]) assert.ok(refs.includes(ref), `${ref} missing from ${refs.join(', ')}`);
     // `http.Request` is net/http's type, not the one declared in package `web`.
     assert.ok(!refs.some((r) => r.endsWith('::Request')), refs.join(', '));
+  });
+
+  it('attributes module-level references to the file, not the declaration above them', () => {
+    const from = (target: string) => graph.links.filter((e) => e.target === target && e.source.startsWith('ui/App.test.jsx')).map((e) => `${e.source} -${e.type}->`);
+    assert.deepEqual(from('ui/App.jsx::App'), ['ui/App.test.jsx -type-ref->']);
+    assert.deepEqual(from('ui/Card.tsx::track'), ['ui/App.test.jsx -calls->']);
   });
 
   it('parses .tsx with the TSX grammar', () => {

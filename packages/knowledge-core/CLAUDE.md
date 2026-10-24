@@ -50,7 +50,8 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   are `file::entity`, class members `file::Class.member` (label = the
   member name) so same-name methods of different classes stay distinct;
   JS/TS top-level variables are `const` nodes. Calls and type refs start at
-  the entity that makes them; a Go `pkg.Type` resolves only to the `Type`
+  the entity that makes them (module-level code, e.g. a `describe`
+  callback: the file); a Go `pkg.Type` resolves only to the `Type`
   declared in a directory named `pkg`.
 - `createSystemGraphSqliteWriter` / `openSystemGraphStore`
   (`src/graph-store.ts`) + `getGraphStore` (`src/storage/resolve.ts`) — the
