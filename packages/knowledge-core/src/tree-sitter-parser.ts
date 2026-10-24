@@ -433,33 +433,35 @@ function extractSignature(entityNode: TSNode, entityType: EntityType, _content: 
 // Query execution with fallback
 // ---------------------------------------------------------------------------
 
-function runQuery(
-  language: TSLanguage,
-  querySource: string,
-  rootNode: TSNode,
-): QueryMatch[] {
-  try {
-    const query = new TSQuery(language,querySource);
-    return query.matches(rootNode);
-  } catch {
-    // Query syntax mismatch for this grammar version — return empty
-    return [];
+// Compiled once per (grammar, source): compiling is far costlier than matching,
+// and every file of a language runs the same queries. null = doesn't compile.
+const compiledQueries = new WeakMap<TSLanguage, Map<string, TSQuery | null>>();
+
+function compiledQuery(language: TSLanguage, querySource: string): TSQuery | null {
+  let byLang = compiledQueries.get(language);
+  if (!byLang) compiledQueries.set(language, (byLang = new Map()));
+  if (!byLang.has(querySource)) {
+    try {
+      byLang.set(querySource, new TSQuery(language, querySource));
+    } catch {
+      byLang.set(querySource, null); // syntax mismatch for this grammar version
+    }
   }
+  return byLang.get(querySource)!;
 }
 
 /**
- * Try running a query. If the full query fails (some patterns may not match
- * this grammar), try each pattern individually and collect what works.
+ * Run a query. If the full query doesn't compile for this grammar (some
+ * patterns name nodes it lacks), run each pattern that does individually.
  */
 function runQueryWithFallback(
   language: TSLanguage,
   querySource: string,
   rootNode: TSNode,
 ): QueryMatch[] {
-  const fullResult = runQuery(language, querySource, rootNode);
-  if (fullResult.length > 0) return fullResult;
+  const full = compiledQuery(language, querySource);
+  if (full) return full.matches(rootNode);
 
-  // Split into individual patterns and try each
   const patterns = querySource
     .split('\n')
     .map((l) => l.trim())
@@ -467,12 +469,8 @@ function runQueryWithFallback(
 
   const results: QueryMatch[] = [];
   for (const pattern of patterns) {
-    try {
-      const q = new TSQuery(language,pattern);
-      results.push(...q.matches(rootNode));
-    } catch {
-      // This specific pattern doesn't work with this grammar — skip
-    }
+    const q = compiledQuery(language, pattern);
+    if (q) results.push(...q.matches(rootNode));
   }
   return results;
 }
