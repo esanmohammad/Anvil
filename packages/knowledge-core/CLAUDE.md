@@ -83,7 +83,8 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   split into `extractCrossRepoSignals(repoPath)` (per-repo tree scan, runs in
   the worker while the clone exists, persisted as `<repo>/signals.json`) +
   `correlateCrossRepoEdges(signals, workspaceMaps)` (pure data join — partial
-  cycles correlate stored signals without cloning unchanged repos)
+  cycles correlate stored signals without cloning unchanged repos; hash joins
+  on the shared value, O(signals + edges), not O(repos²))
   for inter-repo edges (npm/workspace deps, shared types, env vars, shared
   events/topics, HTTP routes, gRPC services, DB schemas, Redis keys, S3
   buckets, OpenAPI contracts, docker-compose + k8s service refs — both
@@ -299,7 +300,12 @@ comment-style entry to `HASH_COMMENT_LANGS` / `SLASH_COMMENT_LANGS` in
 
 Add an extract function (per-repo tree scan → field on `CrossRepoSignals`)
 plus a correlate strategy (join over the persisted signals) inside
-`cross-repo-detector.ts`. `CrossRepoEdge.edgeType` is a closed string
+`cross-repo-detector.ts`. Join on the shared value — `joinPairwise`
+(symmetric, earlier repo = source) or `joinProviderConsumer` (directional)
+are hash joins; never loop over repo pairs, an org-wide index has thousands
+of repos. Normalize fuzzy values (e.g. route params → `:param`) at extract
+time so the join stays exact. Extend the golden edge set in
+`cross-repo-detector.test.ts`. `CrossRepoEdge.edgeType` is a closed string
 union — add the new value to `types.ts`.
 
 ### Incremental indexing path

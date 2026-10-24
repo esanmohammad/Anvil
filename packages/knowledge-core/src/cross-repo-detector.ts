@@ -670,39 +670,51 @@ const GENERIC_ENV_VARS = new Set([
   'ENV', 'ENVIRONMENT', 'APP_ENV', 'GO_ENV', 'TZ', 'HOME', 'PATH', 'PWD', 'CI',
 ]);
 
-/** Symmetric pairwise join over a per-repo string→file map. */
-function joinPairwise(
-  perRepo: Map<string, Record<string, string>>,
-  makeEdge: (nameA: string, nameB: string, key: string, fileA: string, fileB: string) => CrossRepoEdge,
+/** Symmetric join over a per-repo key→value map: one edge per pair of repos
+ *  holding the same key, the earlier repo (in map order) as `a`. Hash join —
+ *  each key's holders are indexed as the repos are visited, so the cost is
+ *  O(keys + edges), not O(repos²). */
+function joinPairwise<V>(
+  perRepo: Map<string, Record<string, V>>,
+  makeEdge: (nameA: string, nameB: string, key: string, valueA: V, valueB: V) => CrossRepoEdge,
 ): CrossRepoEdge[] {
   const edges: CrossRepoEdge[] = [];
-  const repoNames = [...perRepo.keys()];
-  for (let i = 0; i < repoNames.length; i++) {
-    for (let j = i + 1; j < repoNames.length; j++) {
-      const a = perRepo.get(repoNames[i])!;
-      const b = perRepo.get(repoNames[j])!;
-      for (const [key, fileA] of Object.entries(a)) {
-        const fileB = b[key];
-        if (fileB !== undefined) edges.push(makeEdge(repoNames[i], repoNames[j], key, fileA, fileB));
+  const holders = new Map<string, Array<[repo: string, value: V]>>();
+  for (const [repo, values] of perRepo) {
+    for (const [key, value] of Object.entries(values)) {
+      const earlier = holders.get(key);
+      if (!earlier) {
+        holders.set(key, [[repo, value]]);
+        continue;
       }
+      for (const [earlierRepo, earlierValue] of earlier) edges.push(makeEdge(earlierRepo, repo, key, earlierValue, value));
+      earlier.push([repo, value]);
     }
   }
   return edges;
 }
 
-/** Directional join: providers (defs/routes/specs) × consumers (clients). */
+/** Directional join: providers (defs/routes/specs) × consumers (clients) on
+ *  the same key, across repos. Hash join — consumers are indexed by key, then
+ *  each provided key is looked up once: O(keys + edges). */
 function joinProviderConsumer(
   providers: Map<string, Record<string, string>>,
   consumers: Map<string, Record<string, string>>,
   makeEdge: (providerRepo: string, consumerRepo: string, key: string, providerFile: string, consumerFile: string) => CrossRepoEdge,
 ): CrossRepoEdge[] {
+  const consumersByKey = new Map<string, Array<[repo: string, file: string]>>();
+  for (const [consumerRepo, consumed] of consumers) {
+    for (const [key, consumerFile] of Object.entries(consumed)) {
+      const list = consumersByKey.get(key);
+      if (list) list.push([consumerRepo, consumerFile]);
+      else consumersByKey.set(key, [[consumerRepo, consumerFile]]);
+    }
+  }
   const edges: CrossRepoEdge[] = [];
   for (const [providerRepo, provided] of providers) {
-    for (const [consumerRepo, consumed] of consumers) {
-      if (providerRepo === consumerRepo) continue;
-      for (const [key, providerFile] of Object.entries(provided)) {
-        const consumerFile = consumed[key];
-        if (consumerFile !== undefined) edges.push(makeEdge(providerRepo, consumerRepo, key, providerFile, consumerFile));
+    for (const [key, providerFile] of Object.entries(provided)) {
+      for (const [consumerRepo, consumerFile] of consumersByKey.get(key) ?? []) {
+        if (consumerRepo !== providerRepo) edges.push(makeEdge(providerRepo, consumerRepo, key, providerFile, consumerFile));
       }
     }
   }
@@ -727,17 +739,19 @@ function buildRepoNameMap(repoNames: string[]): Map<string, string> {
   return map;
 }
 
-function pick(signals: Map<string, CrossRepoSignals>, field: keyof CrossRepoSignals): Map<string, Record<string, string>> {
-  const out = new Map<string, Record<string, string>>();
+function pick<V = string>(signals: Map<string, CrossRepoSignals>, field: keyof CrossRepoSignals): Map<string, Record<string, V>> {
+  const out = new Map<string, Record<string, V>>();
   for (const [name, s] of signals) {
-    const v = s[field] as Record<string, string> | undefined;
+    const v = s[field] as Record<string, V> | undefined;
     if (v && Object.keys(v).length > 0) out.set(name, v);
   }
   return out;
 }
 
 /** Join persisted per-repo signals into cross-repo edges. Pure data — a
- *  partial cycle correlates fresh + stored signals without any working tree. */
+ *  partial cycle correlates fresh + stored signals without any working tree.
+ *  Every strategy joins on the shared value (hash join or name lookup), so the
+ *  cost grows with the signals and the edges emitted, not with repo pairs. */
 export function correlateCrossRepoEdges(
   signals: Map<string, CrossRepoSignals>,
   workspaceMaps?: Map<string, WorkspaceMap>,
@@ -968,31 +982,15 @@ export function correlateCrossRepoEdges(
     },
     {
       name: 'shared-constants',
-      fn: () => {
-        const edges: CrossRepoEdge[] = [];
-        const repoNames = [...signals.keys()].filter((n) => signals.get(n)!.constants && Object.keys(signals.get(n)!.constants!).length > 0);
-        for (let i = 0; i < repoNames.length; i++) {
-          for (let j = i + 1; j < repoNames.length; j++) {
-            const constsA = signals.get(repoNames[i])!.constants!;
-            const constsB = signals.get(repoNames[j])!.constants!;
-            for (const [value, infoA] of Object.entries(constsA)) {
-              const infoB = constsB[value];
-              if (infoB) {
-                edges.push({
-                  sourceRepo: repoNames[i],
-                  sourceNode: `${infoA.filePath}::${infoA.name}`,
-                  targetRepo: repoNames[j],
-                  targetNode: `${infoB.filePath}::${infoB.name}`,
-                  edgeType: 'shared-constant',
-                  evidence: `Shared constant value: "${value}" (${infoA.name} / ${infoB.name})`,
-                  confidence: 0.7,
-                });
-              }
-            }
-          }
-        }
-        return edges;
-      },
+      fn: () => joinPairwise(pick<{ name: string; filePath: string }>(signals, 'constants'), (a, b, value, infoA, infoB) => ({
+        sourceRepo: a,
+        sourceNode: `${infoA.filePath}::${infoA.name}`,
+        targetRepo: b,
+        targetNode: `${infoB.filePath}::${infoB.name}`,
+        edgeType: 'shared-constant',
+        evidence: `Shared constant value: "${value}" (${infoA.name} / ${infoB.name})`,
+        confidence: 0.7,
+      })),
     },
   ];
 
