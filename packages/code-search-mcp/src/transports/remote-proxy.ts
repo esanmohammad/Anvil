@@ -5,6 +5,10 @@
  * This is the DEFAULT mode for end users. No repos, no index, no embeddings
  * needed locally. All infra lives on the remote server.
  *
+ * The remote serves /mcp statelessly, so every forwarded call is one
+ * independent POST — there is no session to keep. Remote failures (HTTP
+ * errors, JSON-RPC errors) surface to the local client as JSON-RPC errors.
+ *
  * Usage:
  *   code-search-mcp --remote https://your-server:3100 --api-key sk-xxx
  *
@@ -20,30 +24,57 @@
  *   }
  */
 
-import { Server } from '@modelcontextprotocol/server';
+import { Server, ProtocolError, ProtocolErrorCode } from '@modelcontextprotocol/server';
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
+import { PACKAGE_VERSION } from '../core/version.js';
+import { getComponentLogger } from '../observability/logger.js';
+
+const log = getComponentLogger('code-search-mcp');
 
 interface RemoteProxyConfig {
   serverUrl: string;
   apiKey?: string;
 }
 
-/**
- * Make an authenticated MCP request to the remote server.
- * Handles session management transparently.
- */
+interface JsonRpcMessage {
+  jsonrpc: '2.0';
+  id?: number | string | null;
+  method?: string;
+  result?: unknown;
+  error?: { code: number; message: string; data?: unknown };
+}
+
+/** Every JSON message carried by a text/event-stream body (an event's
+ *  `data:` lines joined with "\n", per the SSE spec). */
+export function parseSseMessages(text: string): unknown[] {
+  const messages: unknown[] = [];
+  for (const event of text.split(/\r?\n\r?\n/)) {
+    const data = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).replace(/^ /, ''))
+      .join('\n');
+    if (!data) continue;
+    try { messages.push(JSON.parse(data)); } catch { /* not a JSON event */ }
+  }
+  return messages;
+}
+
+/** Authenticated JSON-RPC over the remote server's stateless /mcp endpoint. */
 class RemoteConnection {
   private serverUrl: string;
   private apiKey: string | undefined;
-  private sessionId: string | null = null;
+  private nextId = 1;
 
   constructor(config: RemoteProxyConfig) {
     this.serverUrl = config.serverUrl.replace(/\/$/, '');
     this.apiKey = config.apiKey;
   }
 
-  /** Send a JSON-RPC request to the remote MCP server */
-  async request(method: string, params: Record<string, unknown> = {}, id: number = 1, _retried = false): Promise<any> {
+  /** Send one request; resolve with its `result`, or throw a ProtocolError
+   *  carrying the remote's JSON-RPC error / the HTTP failure. */
+  async request(method: string, params: Record<string, unknown> = {}): Promise<any> {
+    const id = this.nextId++;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/event-stream',
@@ -51,66 +82,44 @@ class RemoteConnection {
     if (this.apiKey) {
       headers['Authorization'] = `Bearer ${this.apiKey}`;
     }
-    if (this.sessionId) {
-      headers['mcp-session-id'] = this.sessionId;
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.serverUrl}/mcp`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),
+      });
+    } catch (err) {
+      throw new ProtocolError(ProtocolErrorCode.InternalError, `Remote server unreachable: ${err instanceof Error ? err.message : String(err)}`);
     }
-
-    const body = JSON.stringify({
-      jsonrpc: '2.0',
-      id,
-      method,
-      params,
-    });
-
-    const response = await fetch(`${this.serverUrl}/mcp`, {
-      method: 'POST',
-      headers,
-      body,
-    });
 
     if (!response.ok) {
-      // The server reaped our session (idle TTL) → it returns 404 (or 400 on
-      // older servers). Transparently re-initialize a fresh session and retry
-      // once, so a long-lived connection recovers instead of hard-failing.
-      if ((response.status === 404 || response.status === 400) && this.sessionId && method !== 'initialize' && !_retried) {
-        this.sessionId = null;
-        await this.initialize();
-        return this.request(method, params, id, true);
-      }
       const errBody = await response.text().catch(() => '');
-      throw new Error(`Remote server error (${response.status}): ${errBody.slice(0, 300)}`);
+      throw new ProtocolError(ProtocolErrorCode.InternalError, `Remote server error (${response.status}): ${errBody.slice(0, 300)}`);
     }
 
-    // Capture session ID from response headers
-    const newSessionId = response.headers.get('mcp-session-id');
-    if (newSessionId) {
-      this.sessionId = newSessionId;
-    }
-
-    // Parse SSE response (remote MCP uses text/event-stream)
     const contentType = response.headers.get('content-type') ?? '';
-    if (contentType.includes('text/event-stream')) {
-      const text = await response.text();
-      // Extract JSON from SSE data lines
-      for (const line of text.split('\n')) {
-        if (line.startsWith('data: ')) {
-          try {
-            return JSON.parse(line.slice(6));
-          } catch { /* try next line */ }
-        }
-      }
-      throw new Error('No valid JSON in SSE response');
+    const messages = contentType.includes('text/event-stream')
+      ? parseSseMessages(await response.text())
+      : [await response.json()];
+    // The stream can carry notifications / server requests before the answer.
+    const reply = messages.find((m): m is JsonRpcMessage =>
+      typeof m === 'object' && m !== null && (m as JsonRpcMessage).id === id
+      && ('result' in (m as object) || 'error' in (m as object)));
+    if (!reply) {
+      throw new ProtocolError(ProtocolErrorCode.InternalError, `Remote server sent no response for ${method} (id ${id})`);
     }
-
-    return response.json();
+    if (reply.error) throw new ProtocolError(reply.error.code, reply.error.message, reply.error.data);
+    return reply.result;
   }
 
-  /** Initialize the remote session */
+  /** MCP handshake — used at startup as a reachability / credentials check. */
   async initialize(): Promise<any> {
     return this.request('initialize', {
       protocolVersion: '2024-11-05',
       capabilities: {},
-      clientInfo: { name: 'code-search-mcp-proxy', version: '1.0.0' },
+      clientInfo: { name: 'code-search-mcp-proxy', version: PACKAGE_VERSION },
     });
   }
 
@@ -131,85 +140,43 @@ export async function startRemoteProxy(config: RemoteProxyConfig): Promise<void>
   // Verify remote server is reachable
   try {
     const health = await remote.health();
-    console.error(`[code-search-mcp] Connected to remote server at ${config.serverUrl}`);
-    console.error(`[code-search-mcp] Remote status: ${health.status}, project: ${health.project ?? 'unknown'}, index: ${health.indexReady ? 'ready' : 'not ready'}`);
+    log.info(`Connected to remote server at ${config.serverUrl}`);
+    log.info(`Remote status: ${health.status}, project: ${health.project ?? 'unknown'}, index: ${health.indexReady ? 'ready' : 'not ready'}`);
   } catch (err: any) {
-    console.error(`[code-search-mcp] WARNING: Could not reach remote server at ${config.serverUrl}: ${err.message}`);
-    console.error(`[code-search-mcp] Proxy will start anyway — requests will fail until server is available.`);
+    log.warn(`WARNING: Could not reach remote server at ${config.serverUrl}: ${err.message}`);
+    log.warn(`Proxy will start anyway — requests will fail until server is available.`);
   }
 
-  // Initialize remote session
   try {
     await remote.initialize();
-    console.error(`[code-search-mcp] Remote session established`);
+    log.info(`Remote MCP handshake ok`);
   } catch (err: any) {
-    console.error(`[code-search-mcp] WARNING: Session init failed: ${err.message}. Will retry on first request.`);
+    log.warn(`WARNING: Remote MCP handshake failed: ${err.message}. Requests will fail until this is fixed (check --api-key / CODE_SEARCH_API_KEY).`);
   }
 
   // Create local stdio MCP server
   const server = new Server(
-    { name: 'code-search-mcp', version: '1.0.0' },
+    { name: 'code-search-mcp', version: PACKAGE_VERSION },
     { capabilities: { tools: {}, resources: {} } },
   );
 
-  // Forward tools/list — fetch from remote
-  server.setRequestHandler('tools/list', async () => {
-    try {
-      const response = await remote.request('tools/list');
-      return response.result ?? { tools: [] };
-    } catch (err: any) {
-      console.error(`[proxy] Failed to list tools: ${err.message}`);
-      return { tools: [] };
-    }
-  });
+  server.setRequestHandler('tools/list', async () => remote.request('tools/list'));
 
-  // Forward tools/call — proxy to remote
-  server.setRequestHandler('tools/call', async (request) => {
-    try {
-      const response = await remote.request('tools/call', {
-        name: request.params.name,
-        arguments: request.params.arguments ?? {},
-      });
-      return response.result ?? {
-        content: [{ type: 'text', text: 'No response from remote server' }],
-        isError: true,
-      };
-    } catch (err: any) {
-      return {
-        content: [{ type: 'text', text: `Remote server error: ${err.message}` }],
-        isError: true,
-      };
-    }
-  });
+  server.setRequestHandler('tools/call', async (request) => remote.request('tools/call', {
+    name: request.params.name,
+    arguments: request.params.arguments ?? {},
+  }));
 
-  // Forward resources/list
-  server.setRequestHandler('resources/list', async () => {
-    try {
-      const response = await remote.request('resources/list');
-      return response.result ?? { resources: [] };
-    } catch {
-      return { resources: [] };
-    }
-  });
+  server.setRequestHandler('resources/list', async () => remote.request('resources/list'));
 
-  // Forward resources/read
-  server.setRequestHandler('resources/read', async (request) => {
-    try {
-      const response = await remote.request('resources/read', {
-        uri: request.params.uri,
-      });
-      return response.result ?? {
-        contents: [{ uri: request.params.uri, text: 'Not available' }],
-      };
-    } catch (err: any) {
-      return {
-        contents: [{ uri: request.params.uri, text: `Error: ${err.message}` }],
-      };
-    }
-  });
+  server.setRequestHandler('resources/templates/list', async () => remote.request('resources/templates/list'));
+
+  server.setRequestHandler('resources/read', async (request) => remote.request('resources/read', {
+    uri: request.params.uri,
+  }));
 
   // Start stdio transport
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`[code-search-mcp] Proxy running (stdio → ${config.serverUrl})`);
+  log.info(`Proxy running (stdio → ${config.serverUrl})`);
 }
