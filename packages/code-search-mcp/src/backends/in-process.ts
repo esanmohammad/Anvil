@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import {
   getRetriever,
+  invalidateRetriever,
   indexFromPath,
   getKnowledgeBasePath,
   KnowledgeIndexer,
@@ -73,8 +74,8 @@ export class InProcessBackend implements SearchBackend {
     } finally {
       // The retriever is CACHED and shared across requests (getRetriever
       // memoizes per project) — do NOT close it here; that would tear down the
-      // shared LanceDB/SQLite handles under concurrent queries. It's closed only
-      // when a reindex invalidates the cache (invalidateRetriever).
+      // shared LanceDB/SQLite handles under concurrent queries. forceIndex /
+      // invalidate drop it (invalidateRetriever) once the index changed.
       const elapsed = (Date.now() - started) / 1000;
       metrics.queriesTotal.inc({ mode: opts.mode, outcome });
       metrics.queryDuration.observe(elapsed, { mode: opts.mode });
@@ -83,7 +84,7 @@ export class InProcessBackend implements SearchBackend {
 
   async status(): Promise<IndexStatusPayload> {
     const indexer = new KnowledgeIndexer();
-    const stats = await indexer.getStats(this.project);
+    const stats = await indexer.getStats(this.project, this.knowledge);
     return {
       totalChunks: stats.totalChunks,
       repos: stats.repos,
@@ -103,6 +104,8 @@ export class InProcessBackend implements SearchBackend {
       force: opts?.force,
       config: this.knowledge,
     });
+    // The next search must see this index, not the cached retriever's.
+    await invalidateRetriever(this.project);
     return this.status();
   }
 
@@ -120,10 +123,11 @@ export class InProcessBackend implements SearchBackend {
     if (!stats || stats.rowCount === 0) return;
     // Best-effort: delete by file path within each known repo.
     const indexer = new KnowledgeIndexer();
-    const summary = await indexer.getStats(this.project);
+    const summary = await indexer.getStats(this.project, this.knowledge);
     for (const r of summary.repos) {
       await store.deleteFileChunks(this.project, r.name, paths);
     }
+    await invalidateRetriever(this.project);
   }
 
   async close(): Promise<void> {
