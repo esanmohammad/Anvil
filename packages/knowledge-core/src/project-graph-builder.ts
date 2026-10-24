@@ -490,25 +490,23 @@ export async function buildProjectGraph(
     log('Warning: No per-repo graph reports found. Run "anvil index" or refresh KB first for better results.');
   }
 
-  // 3. Collect cross-repo edges from project graph
+  // 3. Collect cross-repo edges from the system graph (sqlite, or its JSON fallback)
   log('Reading cross-repo relationships...');
   const crossRepoEdges: Array<{ source: string; target: string; type: string; evidence: string }> = [];
   try {
-    // graphology export format; absent once only system_graph.sqlite is written.
-    const graphData = await blobs.getJson<{
-      edges?: Array<{ source: string; target: string; attributes?: { crossRepo?: boolean; type?: string; evidence?: string } }>;
-    }>('system_graph_v2.json');
-    for (const e of graphData?.edges ?? []) {
-      if (e.attributes?.crossRepo) {
-        crossRepoEdges.push({
-          source: e.source,
-          target: e.target,
-          type: e.attributes.type ?? 'unknown',
-          evidence: e.attributes.evidence ?? '',
-        });
+    const store = await storage.graph();
+    if (store) {
+      try {
+        // The prompt lists at most 30 (assembleUserPrompt).
+        for (const e of store.crossRepoEdges(undefined, 30).edges) {
+          crossRepoEdges.push({ source: e.source, target: e.target, type: e.type ?? 'unknown', evidence: e.evidence ?? '' });
+        }
+      } finally {
+        store.close();
       }
     }
   } catch { /* skip */ }
+  log(`Read ${crossRepoEdges.length} cross-repo relationships`);
 
   // 4. Assemble prompt
   const userPrompt = assembleUserPrompt(factoryYaml, graphReports, crossRepoEdges);
