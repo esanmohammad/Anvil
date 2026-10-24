@@ -1,495 +1,384 @@
-# @esankhan3/code-search-mcp
+# code-search-mcp
 
-**Your whole codebase, in any MCP client.**
+[![npm](https://img.shields.io/npm/v/@esankhan3/code-search-mcp)](https://www.npmjs.com/package/@esankhan3/code-search-mcp)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-A Model Context Protocol server that wraps `@anvil/knowledge-core`
-behind an MCP-compliant tool surface. Point Claude Code, Claude
-Desktop, or Cursor at it and your agent gains hybrid search,
-caller tracing, and impact analysis across every repo you've
-indexed — local or remote.
+**Code search for AI agents, across every repository you own.**
+
+`code-search-mcp` is a Model Context Protocol server that indexes many
+repositories at once and gives any MCP client (Claude Code, Claude Desktop,
+Cursor, or your own agent) three things that `grep` and plain vector search
+can't:
+
+- **Hybrid search that finds the right code.** It handles exact identifiers,
+  partial names, error strings and plain-English questions in one query path.
+- **A code graph.** Agents can see callers, callees, call chains, dead code,
+  and the blast radius of a diff.
+- **A system graph across repositories.** It links the HTTP routes, gRPC
+  services, Kafka topics, database tables, env vars and shared types that
+  connect your services, so "who consumes this topic?" has an answer.
+
+It runs on a laptop over stdio, or as a shared HTTP server for a whole team.
+It is tested at over a million indexed code chunks.
+
+```sh
+npm install -g @esankhan3/code-search-mcp
+ollama pull bge-m3                                   # or use an OpenAI / Voyage / Mistral key
+claude mcp add code-search -- code-search-mcp --local ~/code
+```
+
+That's it. Your agent now knows your codebase. The **[step-by-step guide](./RUNNING.md)**
+covers every way to run it.
 
 ---
 
-## Why "code search" needs more than grep
+## Contents
 
-MCP gave us a clean way to expose tools to LLM agents. What's
-missing is a *good* tool to expose. `grep` over your repo answers
-"where is this string." Vector search over your repo answers
-"what's semantically near this." Neither answers "who calls this
-function and which other repos depend on it."
+- [What your agent can ask](#what-your-agent-can-ask)
+- [Quick start](#quick-start)
+- [Tools](#tools)
+- [How it works](#how-it-works)
+- [Performance at scale](#performance-at-scale)
+- [Ways to run it](#ways-to-run-it)
+- [Configuration](#configuration)
+- [Security and operations](#security-and-operations)
+- [Supported languages](#supported-languages)
+- [Design principles](#design-principles)
+- [Development](#development)
 
-**code-search-mcp gives agents the answer.** Same hybrid retriever
-that powers Anvil's pipelines, exposed through MCP. Agents get
-AST-aware chunks, cross-repo graph traversal, and a whole-project
-view — without you writing a single tool.
+---
+
+## What your agent can ask
+
+| Question | Tool the agent reaches for |
+|---|---|
+| "Where do we verify JWTs?" | `search_code`: semantic + keyword + symbol search, fused |
+| "Find `CompanySearchResponse`." / "Anything named `*SearchResponse`?" | `search_exact`: exact and partial identifier match, no embedder needed |
+| "Who calls `createInvoice`, and from which repos?" | `find_callers` |
+| "If I change `billing/tax.ts`, what breaks?" | `impact_analysis` (follows dependents across repos) |
+| "What does this diff touch?" | `detect_changes`: diff hunks → changed entities → their dependents |
+| "How does a request get from `checkout` to `ledgerWrite`?" | `trace_path`: shortest call chain |
+| "Which services read the `orders.created` topic?" | `get_cross_repo_edges` |
+| "What does this repo do and how is it laid out?" | `get_repo_profile` / `get_architecture` |
+
+---
+
+## Quick start
+
+**1. Install.** Requires Node.js 20 or newer and `git`.
+
+```sh
+npm install -g @esankhan3/code-search-mcp
+```
+
+This installs three commands: `code-search` (CLI), `code-search-mcp`
+(MCP server) and `code-search-daemon` (watch-and-reindex).
+
+**2. Pick an embedder.** The default (`auto`) uses the first one it finds:
+
+| You have | It uses |
+|---|---|
+| `CODE_SEARCH_EMBEDDING_BASE_URL` set | any OpenAI-compatible endpoint |
+| Ollama running locally | Ollama, model `bge-m3` (fully offline) |
+| `MISTRAL_API_KEY` | Codestral Embed |
+| `OPENAI_API_KEY` | OpenAI |
+| `VOYAGE_API_KEY` | Voyage |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` or a logged-in Gemini CLI | Gemini |
+
+**3. Index and query from the terminal.**
+
+```sh
+code-search index ~/code --project acme       # one repo, or a folder full of repos
+code-search query --project acme "where do we retry failed webhooks"
+code-search query --project acme "WebhookRetryPolicy" --mode bm25
+```
+
+**4. Connect your MCP client.**
+
+```sh
+# Claude Code
+claude mcp add code-search -- code-search-mcp --local ~/code --project acme
+```
 
 ```jsonc
-// claude_desktop_config.json
+// Claude Desktop (claude_desktop_config.json) or Cursor (~/.cursor/mcp.json)
 {
   "mcpServers": {
     "code-search": {
       "command": "code-search-mcp",
-      "args": ["--local", "/path/to/your/projects"]
+      "args": ["--local", "/Users/me/code", "--project", "acme"]
     }
   }
 }
 ```
 
-That's the whole setup. Claude Desktop now knows your codebase.
+The guide covers team servers, Docker, GitHub orgs, object storage and
+troubleshooting: **[RUNNING.md](./RUNNING.md)**.
 
 ---
 
-## Three bin entries (one install)
+## Tools
 
-The npm package ships three binaries. Pick the one that matches the
-job — none of them need a separate install.
-
-| Bin | Use case |
-|---|---|
-| `code-search-mcp` | The MCP-server entry. Three operating modes below. |
-| `code-search` | Standalone CLI: `index` / `query` / `status` / `reset` / `daemon` / `serve` / `mcp`. |
-| `code-search-daemon` | Long-running indexer with file-watcher and JSON-RPC socket. |
-
-### Standalone CLI
-```sh
-code-search index .                                  # index current dir
-code-search query "where do we verify JWTs"          # hybrid by default
-code-search query "createPet" --mode bm25 --top-k 5  # exact-identifier mode
-code-search query --project petshop --format json "adopt pet"  # flags in any order
-code-search status --project petshop                 # JSON report
-code-search reset --project petshop                  # drop the index
-code-search --print-config                           # resolved config (redacted)
-```
-Every `CodeSearchConfig` leaf is settable as `--<dotted-path>` —
-e.g. `--embedding.provider codestral`, `--retrieval.max-chunks 12`,
-`--no-indexing.auto-index`. An unknown flag (or an invalid `--mode` /
-`--format` / `--top-k`) exits with status 2 instead of being ignored.
-`query`, `status` and `--print-config` read the cwd's
-`.code-search.yaml`; `index <path>` reads the one in `<path>`.
-`status` reports where the KB lives (`dataDir`, `kbPath`), whether the
-project is indexed, and whether a daemon answers on its socket.
-`reset` only removes `<dataDir>/<project>` and rejects project names that
-aren't a single path segment (or are the reserved `daemon` / `projects`).
-
-### Daemon mode (long-running indexer)
-```sh
-code-search-daemon --workspace /path/to/repos
-code-search daemon --workspace .        # same, via the CLI wrapper
-```
-Builds the index once, then watches the workspace and debounce-
-reindexes on file events (one index run per batch; results are fresh as
-soon as a run finishes). The project is named after the workspace
-directory. Listens on a UDS socket at `<dataDir>/daemon/<project>.sock`
-(named pipe on Windows) and writes `<project>.pid` next to it; a second
-daemon for the same project refuses to start, and a stopped daemon
-removes only its own socket + pid file. `code-search query` prefers the
-daemon when it answers a ping (`--no-daemon` to skip it), falling back
-to in-process when it doesn't. The MCP server (`--local` / `--serve`)
-does **not** use the daemon — it indexes and searches in-process, so
-don't run both on the same project.
-
-### MCP — three modes (`code-search-mcp` argv)
-
-**Remote proxy (default)**
-```sh
-code-search-mcp                  # default — proxies to remote
-code-search-mcp --remote URL
-```
-Spawns a stdio MCP server that forwards to a remote HTTP server.
-Zero local setup, zero local index — perfect for hosted
-deployments where the index lives in the cloud and dev machines
-stay light. Auth via `CODE_SEARCH_API_KEY`.
-
-**Local**
-```sh
-code-search-mcp --local /path/to/repos
-code-search-mcp --local github:my-org/my-pattern
-```
-Discovers every repo under a path (or clones a GitHub org), builds
-the knowledge base, and serves over stdio. Works fully offline if
-your embedder + reranker are local (Ollama).
-
-**Serve**
-```sh
-code-search-mcp --serve /path/to/repos --port 4000 --auth api-key
-```
-Boots an HTTP server (Streamable HTTP on `/mcp`; there is no SSE
-transport) with `/health`, `/ready`, `/version`, `/status`,
-`/metrics` (Prometheus), `/admin/api/status`, and an admin
-`POST /index`. The port is bound before the startup index runs, so
-probes answer from the start (`/ready` is 503 until the index is
-servable). `--serve <path>`, `--serve --local <path>` and
-`--local <path> --serve` are equivalent; the project is `default`
-unless `--project` says otherwise. Use this to host one index for a
-whole team — every dev points their client at the same URL.
-
-`code-search mcp [path]` is the stdio local mode over the cwd (or
-`path`); `code-search mcp --remote URL` is the remote proxy.
-
----
-
-## Tool surface
-
-Seventeen tools across four categories. Every one of them maps to a
-function in `@anvil/knowledge-core` — you're getting the same
-retrieval pipeline that powers the Anvil dashboard.
+Seventeen tools in four groups. Every tool validates its arguments against
+its schema and returns `isError: true` with a reason when they are wrong.
 
 ### Search
+
 | Tool | What it does |
 |---|---|
-| `search_code` | Hybrid retrieval — vector + BM25 + graph + rerank |
-| `search_semantic` | Vector-only (paraphrases, intent) |
-| `search_exact` | BM25, led by exact symbol-name / phrase hits (identifiers, error codes); works without the embedder |
-| `get_code_snippet` | Fetch the source for one entity by qualified name (cheaper than reading the file) |
+| `search_code` | Hybrid search: vector + keyword + symbol + phrase tiers, fused, then expanded through the code graph and optionally reranked |
+| `search_semantic` | Vector-only: paraphrases and intent |
+| `search_exact` | Literal search led by exact and partial symbol-name and exact-phrase hits; works without an embedder |
+| `get_code_snippet` | The source of one entity by name, cheaper than reading the whole file |
 
 ### Graph
+
 | Tool | What it does |
 |---|---|
-| `get_repo_graph` | Single-repo AST graph — entities and edges (`limit` caps each list) |
-| `get_cross_repo_edges` | Inter-repo edges (HTTP, gRPC, topics, tables, shared types, …), each with its evidence; same-repo workspace-package deps in their own section |
-| `find_callers` | Who calls this symbol — `calls` edges only by default; `relations` adds imports / uses / type-ref / inherits, listed per relation |
-| `find_dependencies` | What this symbol calls (same `relations` option) |
-| `impact_analysis` | What breaks if a file or entity changes — dependents up to `depth` hops (default 2, max 5), cross-repo included |
-| `trace_path` | Multi-hop call chain — shortest path (unweighted BFS) between two symbols, or what is reachable; `calls` edges by default |
-| `search_graph` | Structural query — filter nodes by name (regex over symbol names), type, file, repo; ranked by connectivity |
-| `find_dead_code` | Entities with no incoming edge and no other mention in their file (heuristic) |
-| `detect_changes` | Map a git diff to the entities whose lines changed (whole file for added / deleted files) + their dependents |
-| `get_architecture` | Project overview — repo roles, key flows, connections |
+| `find_callers` / `find_dependencies` | Who calls a symbol, and what it calls. `calls` edges by default; `relations` adds imports, uses, type refs and inheritance |
+| `trace_path` | Shortest call chain between two symbols, or everything reachable from one |
+| `impact_analysis` | Dependents of a file or entity, up to 5 hops, across repositories |
+| `detect_changes` | Maps a git diff to the entities whose lines changed, plus their dependents |
+| `search_graph` | Structural query: nodes by name (regex), type, file or repo, ranked by connectivity |
+| `find_dead_code` | Entities nothing references (heuristic) |
+| `get_repo_graph` | One repository's entities and edges |
+| `get_cross_repo_edges` | Links between repositories, each with the evidence that produced it |
+| `get_architecture` | Project overview: repository roles, key flows, connections |
 
-Symbol arguments take a name (exact, case-sensitive) or a full
-`repo::file::entity` id; `fuzzy: true` matches a case-insensitive
-substring of symbol names. Every tool validates its arguments against
-its input schema — a bad argument returns `isError: true` and the reason.
+Symbols are matched by exact name or full `repo::file::entity` id.
+`fuzzy: true` matches a case-insensitive substring. Multi-hop traversals are
+bounded (50k nodes, 1 s), so a hub symbol in a large org gets a partial
+answer that says so, never a hang.
 
-### Profiles
+### Profiles and index
+
 | Tool | What it does |
 |---|---|
-| `list_repos` | All indexed repos with profiles |
-| `get_repo_profile` | Single repo's tech stack, structure, key entry points |
+| `list_repos` / `get_repo_profile` | Each repository's tech stack, structure and entry points |
+| `index_status` | Chunks per repo, embedder, last index time, vector-index health |
 
-### Index
-| Tool | What it does |
+Plus MCP resources: `code-search://repos`, `code-search://system-graph`,
+`code-search://repo/{name}/profile`, `code-search://repo/{name}/graph`.
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+  subgraph Index["Indexing (incremental)"]
+    direction TB
+    A[Discover repos] --> B[Change check per repo<br/>git SHA + working-tree snapshot]
+    B --> C[AST chunking<br/>tree-sitter, 8 languages]
+    C --> D[Per-repo code graph<br/>calls, imports, types, inheritance]
+    C --> E[Cross-repo signals<br/>routes, topics, tables, env vars, ...]
+    E --> F[Hash-join correlation<br/>14 strategies]
+    D & F --> G[(System graph<br/>SQLite)]
+    C --> H[Embed only changed chunks<br/>reuse vectors by content hash]
+    H --> I[(LanceDB<br/>vectors + full-text + trigram indexes)]
+  end
+  subgraph Query["Query"]
+    direction TB
+    Q[Query] --> K[Classify:<br/>identifier, path, error, natural language]
+    K --> V[Vector] & BM[Keyword BM25<br/>tokens + identifier parts] & S[Symbol names<br/>exact + trigram substring] & P[Exact phrase]
+    V & BM & S & P --> R[Weighted rank fusion<br/>+ exact-symbol pin + dedupe]
+    R --> X[Graph expansion<br/>callers, callees, type refs]
+    X --> RR[Optional cross-encoder rerank]
+  end
+  I --> V & BM & S & P
+  G --> X
+```
+
+**Chunks follow the code's structure.** Files split at definition boundaries
+(functions, classes, methods, top-level constants), not every N lines. Each
+chunk carries a context prefix (file path, module and imports) that is
+embedded with it.
+
+**Four retrieval tiers run in parallel.** Vector search catches intent.
+BM25 runs over the raw tokens and over the parts of compound identifiers, so
+"expected backlog count" finds `verifyExpectedBacklogCount`. A symbol tier
+matches entity names exactly and as substrings through a trigram index, so
+`SearchResponse` finds `CompanySearchResponse`. A phrase tier matches error
+strings word for word. A query classifier weights the tiers per query:
+identifiers lean on keywords, questions lean on vectors.
+
+**The graph does more than draw diagrams.** It feeds retrieval (seed hits pull in
+their callers and callees) and answers structural questions directly.
+Cross-repository edges come from 14 detectors: npm and workspace
+dependencies, shared types, env vars, Kafka and other topics, HTTP routes
+(including template-literal client URLs), gRPC services, database schemas,
+Redis keys, S3 buckets, OpenAPI contracts, docker-compose and Kubernetes
+service references, and shared constants.
+
+**The index maintains itself.**
+- Each cycle touches only what changed:
+  - repositories are checked concurrently;
+  - only changed files are re-chunked;
+  - only chunks whose text changed are re-embedded;
+  - the system graph is updated in place.
+- The vector index retrains itself as the corpus grows.
+- The number of IVF partitions probed per query is auto-calibrated to hit
+  0.95 recall against an exact scan.
+- The embedder is pinned per index: querying with a different model or
+  dimension size is an error, never silently wrong results.
+
+---
+
+## Performance at scale
+
+Measured on one 12-core laptop, over 1.15 million chunks across 360
+repositories, with 600 mixed queries (exact identifiers, partial names,
+natural language and phrases). The corpus was built by replicating real
+repositories. A stub embedder was used, so the timings exclude
+embedding-provider latency.
+
+| | |
 |---|---|
-| `index_status` | Chunk count, embedding provider, last indexed time, vector-index health, chunks per repo |
+| `search_code` latency (p50, 1 client) | **36 ms** |
+| `search_exact` latency (p50, 1 client) | **17 ms** |
+| Throughput, 8 concurrent clients | **26 q/s** (`search_code`), **39 q/s** (`search_exact`) |
+| Vector recall@10 vs exact scan (auto-calibrated) | **0.977** |
+| Re-index, nothing changed | **~15 s** |
+| Re-index after a one-file edit (chunks, graph, embeddings) | **~30–70 s** |
+| Cross-repository edges in the system graph | **454k** |
 
-Plus four MCP resources via `code-search://`:
-`repos`, `system-graph`, `repo/{name}/profile`, `repo/{name}/graph`.
-
----
-
-## What makes the search good
-
-This isn't a thin wrapper. The retrieval pipeline runs:
-
-1. **Vector ⫽ BM25 in parallel** — semantic + lexical recall.
-2. **Reciprocal Rank Fusion** — combine without one dominating.
-3. **AST tripartite expansion** — pull in callers, callees, type
-   refs via the project graph.
-4. **Cross-encoder rerank** — Qwen3-Reranker by default; Cohere /
-   Voyage / OpenAI-compatible swappable.
-
-A query classifier picks adaptive weights — identifier queries
-lean BM25, natural-language leans vector, error codes lean both.
-You don't tune anything; the retriever does it per query.
+On the same queries, the expected file ranked in the top 10 for 100% of
+exact-identifier queries in both search tools. For natural-language
+questions it was 91% with `search_code` and 80% with `search_exact`.
 
 ---
 
-## Multi-repo by design
+## Ways to run it
 
-Unlike single-repo code-search MCPs, this one is built for the
-real world: a team has *many* repos, and the interesting
-questions cross them. Where does this Kafka topic get consumed?
-Which services depend on this proto? What service-mesh edges
-exist between web and api?
+| Mode | Command | Use it for |
+|---|---|---|
+| **Local, stdio** | `code-search-mcp --local ~/code` | One developer; the index lives on your machine |
+| **GitHub org** | `code-search-mcp --local "github:my-org/api-*"` | Clone or refresh matching repos, then serve them |
+| **Team server** | `code-search-mcp --serve ~/code --auth api-key` | One index for everyone, over Streamable HTTP at `/mcp` |
+| **Remote proxy** | `code-search-mcp --remote https://search.internal` | A thin local stdio bridge to a team server; nothing indexed locally |
+| **Daemon** | `code-search-daemon --workspace ~/code` | Watch files and re-index on change; the CLI queries it over a local socket |
+| **Docker** | `docker build -f Dockerfile.all-in-one …` | One image with Ollama, the embedder and reranker models baked in |
 
-Fourteen cross-repo edge strategies cover shared types, Kafka,
-HTTP, gRPC, databases, env vars, npm/workspace deps, k8s,
-docker-compose, proto, Redis, S3, and shared constants. Plus an
-LLM-inferred semantic edge layer. `get_cross_repo_edges`,
-`impact_analysis` and `detect_changes` work *across repos* (shared
-topics, tables and the like count as dependencies both ways);
-`find_callers` and `trace_path` do too with `relations: ["all"]`.
+The team server binds its port before the first index runs, so health
+probes answer immediately (`/ready` is 503 until the index can serve).
+It serves every `/mcp` request statelessly, which makes restarts free and
+lets it scale across cores with `CODE_SEARCH_WORKERS=N`. In that mode one
+primary does all writes and N workers serve.
 
----
-
-## Observability
-
-`code-search-mcp --serve` exposes these endpoints out of the box —
-no scrape config or APM agent required.
-
-| Endpoint | Returns |
-|---|---|
-| `GET /health` | Liveness ping with project + uptime |
-| `GET /ready` | `200` once the index is servable, `503` before (incl. during the startup index) |
-| `GET /version` | Package version + Node + platform |
-| `GET /status` | Current indexing phase + last-success history |
-| `GET /metrics` | Prometheus text format: queries, latency histogram, errors, seconds since the last successful index, chunks per repo, vector-index health |
-| `GET /admin/api/status` | JSON status dashboard for the admin UI (requires auth when auth is on) |
-
-Set `CODE_SEARCH_STRUCTURED_LOGS=1` for one-JSON-line-per-event
-stderr logs from the server, daemon and CLI (lines knowledge-core
-prints itself stay plain), and `CODE_SEARCH_TELEMETRY_RECORD_QUERIES=1`
-to opt into recording query text in spans (off by default — queries
-are PII-shaped).
+For stateless pods, vectors can live in S3 or MinIO (`s3://` LanceDB URIs) and
+index artifacts in MongoDB. See [RUNNING.md § Object storage](./RUNNING.md#9-stateless-deployments-object-storage).
 
 ---
 
-## Multi-project / multi-tenant
+## Configuration
 
-Drop project entries under `<dataDir>/projects/<name>/project.yaml`:
+Five layers, lowest to highest precedence:
+
+1. built-in defaults
+2. `~/.code-search/config.yaml` (per user)
+3. `<workspace>/.code-search.yaml` (per workspace)
+4. `CODE_SEARCH_*` environment variables
+5. CLI flags: any setting as `--<dotted.path> <value>`, e.g. `--retrieval.max-chunks 12`
+
+`code-search --print-config` prints the resolved result with secrets
+redacted. An unknown flag exits with status 2 instead of being ignored.
 
 ```yaml
-workspace: /Users/me/repos/petshop
-scopes: [team-shop]
-quotas:
-  max_queries_per_minute: 60
-  max_embedding_cost_usd: 5
-```
-
-The HTTP server reads the entry of the project it serves once at
-boot and enforces it on every `/mcp` request: the caller's scopes
-must match `scopes` (`*` is admin; API keys are admin; a JWT's
-scopes come from its `scope` claim) or it gets 403, and
-`max_queries_per_minute` caps requests per `(identity, project)` in
-a sliding 1-minute window (429 + `Retry-After`). Not enforced:
-`repos`, `max_embedding_cost_usd` / `max_llm_cost_usd`, and any
-`config:` block (per-project config comes from the workspace's
-`.code-search.yaml`).
-
----
-
-## Server features
-
-### Auth, three flavors
-`none` (local-only, default 127.0.0.1 binding), `api-key`
-(`Authorization: Bearer ...`, timing-safe compare), `jwt` (HS256;
-signature, `iss`, a required `exp` and, when present, `nbf`
-validated; the server refuses to start in `jwt` mode without
-`CODE_SEARCH_AUTH_JWT_SECRET`). Public binding without auth logs a
-warning, because that's what should happen.
-
-### Rate limiting
-`CODE_SEARCH_RATE_LIMIT_PER_MINUTE` (default 100) requests per
-identity in a sliding 1-minute window (each API key counts on its
-own); 429 responses carry `Retry-After`. In cluster mode the limit
-applies to the whole server, not per worker.
-
-### Auto-reindex
-`CODE_SEARCH_REINDEX_INTERVAL=30m` (or `1h`, `6h`, `0` to disable;
-also `indexing.reindex_interval_ms` in YAML or
-`--indexing.reindex-interval-ms`) runs an incremental re-index in
-the background. Anything else (e.g. `90s`) is reported as invalid and
-disables it. Skips itself if a manual index is already running. The
-timer is `unref`'d so it doesn't keep the process alive.
-
-### Status tracking
-Every index call lands in a 50-entry FIFO history with start
-timestamp, success / error, last duration. Available at
-`GET /status`.
-
-### Stateless Streamable HTTP
-Every `/mcp` request is served statelessly by a fresh Server
-instance: modern (2026-07-28) clients negotiate via
-`server/discover`; 2025-era clients are answered by the SDK's
-per-request legacy fallback. No session map, no TTL.
-
-### Admin index endpoint
-`POST /index` with `{ "path": "/repos", "force"?: true }` (re)indexes
-the served project from `path`, which then becomes its directory for
-scheduled reindexes. `project`, if given, must be the served project
-(a server never switches projects — 400 otherwise). Invalid JSON or a
-missing `path` → 400, a body over 64 KiB → 413, an index already
-running → 409. Auth-required when auth is on. The response reports
-chunks, repos and cross-repo edges.
-
-### Cluster mode
-`CODE_SEARCH_WORKERS=N` (2–16) forks N HTTP workers sharing the port.
-The primary is the only writer (startup index, `POST /index` forwarded
-over IPC, scheduled reindex) and pushes its indexing state to the
-workers, so `/status`, `/ready` and `/admin/api/status` look the same
-on every worker; rate limits and quotas are counted once for the whole
-server.
-
----
-
-## How it fits with the rest of Anvil
-
-```
-                    ┌─────────────────────────┐
-                    │   MCP client            │
-                    │   (Claude Code,         │
-                    │    Claude Desktop,      │
-                    │    Cursor, …)           │
-                    └────────────┬────────────┘
-                                 │ stdio / HTTP
-                                 ▼
-                    ┌─────────────────────────┐
-                    │   code-search-mcp       │
-                    │   (this package)        │
-                    │   tools + resources     │
-                    └────────────┬────────────┘
-                                 │ wraps
-                                 ▼
-                    ┌─────────────────────────┐
-                    │   @anvil/knowledge-core │
-                    │   AST chunks +          │
-                    │   project graph +       │
-                    │   hybrid retriever      │
-                    └────────────┬────────────┘
-                                 │ on disk
-                                 ▼
-                    <dataDir>/<project>/
-                    (default ~/.anvil/knowledge-base/)
-```
-
-Three different fronts, one knowledge stack:
-
-- **The CLI** indexes via `anvil index` and retrieves during
-  pipelines.
-- **The dashboard** browses the project graph and surfaces
-  retrieval results in pipeline UI.
-- **code-search-mcp** exposes the same retriever to any MCP
-  client.
-
-If you've already indexed a project with `anvil index`, this
-server picks it up — same `~/.anvil/knowledge-base/` path, same
-LanceDB store, same graph files.
-
----
-
-## Configuration — defaults → file → env → CLI flags
-
-Single resolver in `src/core/config.ts`. Five precedence layers
-(lowest → highest):
-
-1. compiled-in `DEFAULTS`
-2. `~/.code-search/config.yaml` (user-global)
-3. `<workspaceDir>/.code-search.yaml` (per-workspace overlay)
-4. `CODE_SEARCH_*` env vars
-5. CLI flags via `--<dotted-path>` (e.g. `--embedding.provider codestral`)
-
-Run `code-search --print-config` or `code-search-mcp --print-config`
-any time to see the resolved struct (secrets redacted — including
-passwords in URIs and OTEL header values). `--port`, `--host`,
-`--transport` and `--auth` are shorthands for `server.port`,
-`server.host`, `server.transport` and `auth.mode`.
-
-| Var (`CODE_SEARCH_*`) | Effect |
-|---|---|
-| `SERVER` | Remote URL (proxy mode) |
-| `API_KEY` | API key for proxy or serve modes |
-| `DATA_DIR` | Index storage root (default `~/.anvil/knowledge-base`; also `storage.data_dir` / `--storage.data-dir`). Daemon sockets live under `<dataDir>/daemon/` |
-| `PORT` / `HOST` / `TRANSPORT` | HTTP server bind |
-| `AUTH_MODE` / `AUTH_API_KEYS` / `AUTH_JWT_SECRET` | Server auth |
-| `REINDEX_INTERVAL` | `30m` / `1h` / `6h` / `0`; invalid → disabled |
-| `RATE_LIMIT_PER_MINUTE` | Per-identity request limit (sliding window) |
-| `WORKERS` | `>1` → cluster mode |
-| `EMBEDDING_PROVIDER` | `auto` / `codestral` / `voyage` / `openai` / `ollama` / `openai-compatible` / `custom` / `gemini-oauth` |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | Model + dims |
-| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` | Credentials |
-| `OLLAMA_HOST` | Default `http://localhost:11434` |
-| `RERANKER_PROVIDER` | `ollama` (default) / `cohere` / `voyage` / `openai-compatible` / `custom` / `none` |
-| `RERANKER_MODEL` / `RERANKER_API_KEY` / `RERANKER_BASE_URL` | Reranker config |
-| `RETRIEVAL_MAX_CHUNKS` / `RETRIEVAL_MAX_TOKENS` | Retrieval tuning |
-| `AUTO_INDEX` | `false` to disable startup auto-index |
-| `DAEMON_DISABLED` | `code-search query` never uses a daemon |
-| `LLM_MODE` / `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | Profiling + service-mesh LLM (`LLM_MODE` defaults to `none`). Pre-promoted to `ANVIL_LLM_*` so the agent-core integration is silent. |
-| `INDEXING_DEBOUNCE_MS` / `CHUNKING_MAX_TOKENS` | Indexer knobs |
-| `METRICS_ENABLED` / `STRUCTURED_LOGS` / `TELEMETRY_RECORD_QUERIES` | Observability |
-
-### Per-workspace config
-
-Drop a `.code-search.yaml` at the root of your workspace:
-
-```yaml
+# .code-search.yaml
 embedding:
-  provider: codestral
-  model: codestral-embed-2505
-  dimensions: 1024
+  provider: openai          # auto | ollama | openai | voyage | codestral | openai-compatible | gemini-oauth | custom
+  model: text-embedding-3-small
+  dimensions: 1536
 reranker:
-  provider: ollama
-  model: qwen2.5-coder:7b           # the default that actually answers
+  provider: none            # ollama (default, qwen2.5-coder:7b) | cohere | voyage | openai-compatible | none
 retrieval:
   max_chunks: 12
-  hybrid_weights: { vector: 0.55, bm25: 0.3, graph: 0.15 }
 indexing:
-  auto_index: true
-  debounce_ms: 500
+  reindex_interval_ms: 1800000   # team server: re-index every 30 min
 ```
 
-CLI flags override env, env overrides this file, this file overrides
-the user-global `~/.code-search/config.yaml`, that overrides
-`DEFAULTS`.
-
----
-
-## Philosophy
-
-**Multi-repo or nothing.** Real codebases span repos. Code search
-that doesn't is a toy.
-
-**No vendor LLM SDK.** Anything LLM-driven (repo profiling,
-semantic edges) routes through `@anvil/agent-core`'s single-shot —
-the same router, retries, and cost ledger as the rest of Anvil.
-
-**Three modes, one binary.** Remote proxy for hosted, local for
-solo, serve for teams. The dispatcher is `src/index.ts:argv`.
-
-**Stateless serving.** Every `/mcp` request is an independent
-exchange — no session state at all, so restarts and per-request
-proxies (cluster workers) are free.
-
-**Security defaults that don't bite.** Default bind is `127.0.0.1`
-when auth is `none`. API keys compared timing-safe. JWT
-signature + exp (required) + nbf + iss validated. Public binding
-without auth logs a warning instead of pretending it's fine.
-
----
-
-## End-to-end smoke test (T1–T8)
-
-The eight-case smoke that pins the standalone product contract lives
-at `scripts/smoke/run-smoke.sh`. It spins up a tiny `pet-shop` git
-fixture under `/tmp/cs-smoke/`, then runs:
-
-| # | Verifies |
+| Variable (`CODE_SEARCH_…`) | Purpose |
 |---|---|
-| **T1** | `--print-config` env + CLI flag layering, redaction |
-| **T2** | `code-search index` produces a real Ollama-backed index; no stale legacy-env warning |
-| **T3** | `code-search query --mode vector` and `--mode bm25` both return the right file |
-| **T4** | `code-search status` reports provider + chunk count |
-| **T5** | Issue-#6 reproduction: `CODE_SEARCH_EMBEDDING_PROVIDER=openai` actually constructs the OpenAI embedder (skipped when `OPENAI_API_KEY` is unset) |
-| **T6** | Vector-space mismatch guard hard-errors on cross-provider query |
-| **T7** | Daemon round-trip: spawn, UDS socket, query through RPC, file-watcher debounce-reindex |
-| **T8** | HTTP serve: `/health` `/ready` `/version` `/metrics` `/admin/api/status` all 200; Prom text format |
+| `EMBEDDING_PROVIDER` / `_MODEL` / `_DIMENSIONS` / `_API_KEY` / `_BASE_URL` | Embedder |
+| `RERANKER_PROVIDER` / `_MODEL` / `_API_KEY` / `_BASE_URL` | Reranker (`none` to disable) |
+| `DATA_DIR` | Where indexes live (default `~/.anvil/knowledge-base`) |
+| `PORT` / `HOST` | HTTP bind (default `127.0.0.1:3100`) |
+| `AUTH_MODE` / `AUTH_API_KEYS` / `AUTH_JWT_SECRET` | `none` / `api-key` / `jwt` |
+| `REINDEX_INTERVAL` | `30m`, `1h`, `6h` or `0` |
+| `WORKERS` | HTTP worker processes (2–16) |
+| `SERVER` / `API_KEY` | Remote-proxy target and its key |
+| `VECTOR_NPROBES` | Fix IVF probes per query (overrides auto-calibration; lower = faster, less recall) |
+| `STORAGE_VECTOR_URI`, `STORAGE_BLOB_BACKEND`, `STORAGE_MONGO_*`, `STORAGE_S3_*` | Object-storage deployment |
 
-Run it locally:
+The full list is in [RUNNING.md § Configuration reference](./RUNNING.md#configuration-reference).
+
+---
+
+## Security and operations
+
+- **Auth.**
+  - `none`: binds to `127.0.0.1` only.
+  - `api-key`: `Authorization: Bearer …`, compared in constant time.
+  - `jwt`: HS256; signature, issuer and a required `exp` are verified, plus `nbf` when present. The server refuses to start without a secret.
+  - A public bind without auth logs a warning.
+- **Limits.** A per-identity sliding-window rate limit (default 100/min).
+  Per-project scopes and query quotas come from
+  `<dataDir>/projects/<name>/project.yaml`.
+- **Endpoints.**
+  - `GET /health`, `/ready`, `/version`, `/status`.
+  - `GET /metrics`: Prometheus metrics for query counts, latency histogram, errors, index age, chunks per repo and vector-index health.
+  - `GET /admin/api/status`.
+  - `POST /index`: re-index on demand.
+- **Logs and tracing.** `CODE_SEARCH_STRUCTURED_LOGS=1` emits JSON log lines.
+  Query text is kept out of traces unless you opt in with
+  `CODE_SEARCH_TELEMETRY_RECORD_QUERIES=1`.
+
+---
+
+## Supported languages
+
+| Support | Languages / files |
+|---|---|
+| AST chunking, code graph, cross-repo signals | TypeScript, TSX, JavaScript, Python, Go, Java, Rust, PHP |
+| Indexed for search | the above, plus shell, YAML, Terraform/HCL, TOML, `Dockerfile`, `Makefile`, `Jenkinsfile` |
+
+`.gitignore` is respected, and `node_modules`, `dist`, `build`, `vendor`,
+`target` and similar directories are skipped.
+
+---
+
+## Design principles
+
+- **Multi-repo first.** The interesting questions cross repository
+  boundaries, so the index, the graph and the tools all do too.
+- **Scale by doing less.** Every index cycle costs in proportion to what
+  changed, not to the size of the corpus. Every query tier is index-backed.
+  Every graph traversal is bounded.
+- **Never silently wrong.** An embedder mismatch is a hard error. Truncated
+  traversals say they were truncated. Bad tool arguments return the reason.
+- **Local by default, shared when you want.** The same binary serves one
+  laptop over stdio or a whole team over HTTP.
+- **Few moving parts.** Embedded LanceDB and SQLite, no database server to
+  run, a hand-rolled HTTP layer and zero-dependency metrics.
+
+---
+
+## Development
+
+This package lives in a monorepo alongside its retrieval engine,
+`@esankhan3/anvil-knowledge-core`.
 
 ```sh
-npm -w @esankhan3/code-search-mcp run build      # required first
-npm -w @esankhan3/code-search-mcp run smoke      # T1–T8
+npm install                                        # at the repo root
+npm -w @esankhan3/anvil-knowledge-core run build
+npm -w @esankhan3/code-search-mcp run build        # esbuild bundle → dist/
+npm -w @esankhan3/code-search-mcp test
+npm -w @esankhan3/code-search-mcp run smoke        # end-to-end, needs Ollama with bge-m3
 ```
 
-Requirements: Ollama on `$OLLAMA_HOST` (default `localhost:11434`)
-with `bge-m3` pulled. Pass `OPENAI_API_KEY=...` to exercise the T5
-provider-switch path against the real OpenAI endpoint.
+Internals: [ARCHITECTURE.md](./ARCHITECTURE.md). Retrieval engine:
+[knowledge-core](../knowledge-core/ARCHITECTURE.md).
 
-The smoke runs **outside CI** — it requires Ollama + real models —
-so it's a hand-rolled local check, not a release gate. The release
-workflow does enforce a static guard that every bin entry
-(`code-search-mcp` / `code-search` / `code-search-daemon`) is in the
-built tarball before publishing.
+## License
 
----
-
-## Status
-
-Stable. The retrieval and graph layers move with
-`@anvil/knowledge-core`; the MCP surface is locked. New tools
-land additively. P0–P8 of the standalone-product plan
-(`docs/CODE-SEARCH-MCP-STANDALONE-PLAN.md`) have landed; F1–F4
-follow-up fixes verified by `scripts/smoke/run-smoke.sh`.
-
----
-
-## Part of [Anvil](../../) — the AI development pipeline.
+[MIT](./LICENSE)
