@@ -8,9 +8,9 @@
  * ends — each line is serialized/parsed independently, and reads stream
  * line-by-line so the whole file is never one string.
  *
- * The file keeps the historical `chunks.json` name. Files written before
- * this change were a single JSON array; `iterateChunksFile` detects that
- * legacy shape (leading `[`) and falls back to a whole-file parse.
+ * Chunk files written before NDJSON were a single JSON array;
+ * `iterateChunksFile` detects that legacy shape (leading `[`) and falls back
+ * to a whole-file parse.
  */
 
 import { openSync, readSync, closeSync, writeSync, readFileSync, createReadStream } from 'node:fs';
@@ -39,10 +39,11 @@ export function writeChunksFile(path: string, chunks: CodeChunk[]): void {
 /**
  * Streaming NDJSON writer — append chunks one at a time without ever holding
  * the whole set in memory (the inverse of writeChunksFile). Used to stream
- * deduped chunks from per-repo shards into chunks.json at org scale.
+ * a repo's chunks into its shard at org scale. `append` adds to an existing
+ * file instead of truncating it.
  */
-export function createChunkWriter(path: string): { write(c: CodeChunk): void; close(): void } {
-  const fd = openSync(path, 'w');
+export function createChunkWriter(path: string, opts?: { append?: boolean }): { write(c: CodeChunk): void; close(): void } {
+  const fd = openSync(path, opts?.append ? 'a' : 'w');
   let buf = '';
   return {
     write(c: CodeChunk): void {

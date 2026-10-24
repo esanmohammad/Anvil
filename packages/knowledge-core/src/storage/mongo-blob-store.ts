@@ -3,7 +3,7 @@
  *
  * Small JSON/text artifacts (index_meta, profiles, deleted_files, PROJECT_GRAPH,
  * PROJECT_SUMMARY, per-repo graph.json/GRAPH_REPORT, profile_embeddings) live as
- * documents in one collection; large/binary artifacts (chunks.json NDJSON,
+ * documents in one collection; large/binary artifacts (chunk-file NDJSON,
  * system_graph.sqlite) stream through GridFS. Project-scoped to mirror
  * FsBlobStore's per-project basePath: keys are project-relative POSIX paths and
  * never collide across projects (every doc/file carries the project).

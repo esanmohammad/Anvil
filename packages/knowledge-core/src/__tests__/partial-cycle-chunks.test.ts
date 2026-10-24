@@ -1,11 +1,10 @@
 /**
- * Partial-cycle chunks.json carry-forward.
+ * Partial-cycle chunk carry-forward.
  *
  * A reindex only shards the repos (and, on the git-diff incremental path,
- * only the FILES) re-chunked this cycle. Before the carry-forward fix,
- * dedupShardsToChunks rewrote chunks.json from those shards alone — every
- * scheduled partial reindex silently dropped the unchanged repos' chunks
- * (get_code_snippet decay, wrong totals). Pins:
+ * only the FILES) re-chunked this cycle; each repo's chunk file must still
+ * hold all of its chunks afterwards (dropping them meant get_code_snippet
+ * decay and wrong totals). Pins:
  *   1. an untouched repo's chunks survive a cycle that re-chunks another repo
  *   2. an incrementally re-chunked repo keeps its untouched files' chunks
  *   3. deleted files' chunks are gone
@@ -21,6 +20,7 @@ import { randomBytes } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { buildKBFromPath, getBlobStore, getGraphStore, invalidateRetriever, KnowledgeIndexer, loadKnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk } from '@esankhan3/anvil-knowledge-core';
+import { indexedRepoNames, iterateRepoChunks } from '../repo-chunks.js';
 
 const root = join(tmpdir(), `kc-partial-${randomBytes(6).toString('hex')}`);
 const dataDir = join(root, 'data');
@@ -43,12 +43,13 @@ after(async () => {
 });
 
 async function readChunks(project: string): Promise<CodeChunk[]> {
+  const blobs = getBlobStore(project);
   const out: CodeChunk[] = [];
-  for await (const c of getBlobStore(project).iterateNdjson<CodeChunk>('chunks.json')) out.push(c);
+  for await (const c of iterateRepoChunks(blobs, await indexedRepoNames(blobs))) out.push(c);
   return out;
 }
 
-describe('partial cycle — chunks.json carry-forward', () => {
+describe('partial cycle — chunk carry-forward', () => {
   it('preserves unchanged repos and untouched files; drops deleted files; adds new content', async () => {
     const project = `partial-${randomBytes(4).toString('hex')}`;
 
@@ -128,7 +129,7 @@ describe('partial cycle — chunks.json carry-forward', () => {
     const config = loadKnowledgeConfig(project);
     const scratch = join(root, 'writer-scratch');
     mkdirSync(scratch, { recursive: true });
-    // buildKB directly (no embed phase — chunks.json is what's under test) with
+    // buildKB directly (no embed phase — the chunk files are what's under test) with
     // cloneUrl repos, exactly how indexFromRemotes drives the writer.
     const indexer = new KnowledgeIndexer();
     const remotes = [{ name: 'writer-origin', path: join(scratch, 'writer-origin'), language: '', cloneUrl: `file://${origin}` }];

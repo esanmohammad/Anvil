@@ -88,17 +88,19 @@ export interface VectorStorePort {
   getVectorsByContentHash(hashes: string[]): Promise<Map<string, number[]>>;
   /** Delete exactly these rows, matched on id AND contentHash. */
   deleteRows(rows: Array<{ id: string; contentHash: string }>): Promise<void>;
-  getChunkIds(project: string): Promise<string[]>;
+  getChunkIds(project: string, repoNames?: string[]): Promise<string[]>;
+  /** Delete every row of `repoNames`. */
+  deleteRepoRows(project: string, repoNames: string[]): Promise<void>;
   getStats(): Promise<{ rowCount: number } | null>;
   hasData(): Promise<boolean>;
 }
 
 /**
  * Named-key artifact store (ADR §4). Keys are project-relative POSIX paths
- * (`chunks.json`, `<repo>/graph.json`, `<repo>/index_meta.json`, …) — the
- * same names used on disk today, so `FsBlobStore` is a 1:1 mapping. The
+ * (`<repo>/chunks.ndjson`, `<repo>/graph.json`, `<repo>/index_meta.json`, …) —
+ * the same names used on disk today, so `FsBlobStore` is a 1:1 mapping. The
  * streaming NDJSON pair never holds the whole file as one string (the V8
- * `String::kMaxLength` ceiling `chunks.json` can exceed); the binary pair
+ * `String::kMaxLength` ceiling a large chunk file can exceed); the binary pair
  * carries `system_graph.sqlite`.
  */
 export interface BlobStorePort {

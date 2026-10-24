@@ -665,10 +665,12 @@ Steps:
 3. Chunk repos: incremental via `chunkChangedFiles` if `git diff`
    succeeds + non-fallback + non-empty; else `chunkRepo` (with the file
    cache, unless the repo's chunks use an older id scheme).
-4. Merge the per-repo chunk shards plus chunks carried forward from the
-   previous corpus (skipped repos; unchanged files still in a partially
-   re-chunked repo's `fileIndex`) into `chunks.json`, streamed, deduped by
-   chunk id only (`mergeShardsToChunks`).
+4. Write each re-chunked repo's `<repo>/chunks.ndjson` from its shard, plus
+   (partial re-chunk) its previous chunks of unchanged files still in its
+   `fileIndex`; streamed, deduped by chunk id only (`mergeShardsToChunks`).
+   Skipped repos' files are untouched. A legacy project-wide `chunks.json`
+   is split once (`splitLegacyChunks`). The repo change checks before step
+   2 run concurrently (async git).
 5. Workspace detection.
 6. AST graphs: `incrementalGraphUpdate` if possible; else `buildAstGraph`.
    Write `<repo>/graph.json` + `GRAPH_REPORT.md`.
@@ -679,24 +681,28 @@ Steps:
    in-memory `ProjectGraphBuilder` runs Louvain and writes
    `system_graph_v2.json` instead.
 10. Save `deleted_files.json` (changed + deleted files of previously indexed
-    repos; merged into a list not yet applied by an embed run).
+    repos) and `embed_pending.json` (re-chunked + removed repos), each merged
+    into a list not yet applied by an embed run.
 11. Per-repo `index_meta.json` writes (complete `files`, `chunkIdVersion`;
     the previous `embeddingModel` / `embeddingDimensions` are kept), delete
     removed repos' `<repo>/` artifacts, write `index_stats.json`.
 
 ### 19.2 `KnowledgeIndexer.embedChunks(project, config, opts?)`
 
-1. Open `VectorStore` at `<basePath>/lancedb` (`healCorrupt`).
+1. Read repos + totals from `index_stats.json`; open `VectorStore` at
+   `<basePath>/lancedb` (`healCorrupt`). Scope = `embed_pending.json` repos
+   (every repo when the list is absent or the table is empty).
 2. Read `deleted_files.json` (deleted + changed files) →
    `getFileRowHashes` per repo: the stale rows' `(id, contentHash)`. Chunk
    ids are position-keyed, so a changed file's new chunks can take those
    ids; the diff below treats them as not embedded.
-3. Snapshot existing chunk ids (minus stale ids); stream `chunks.json`
-   (NDJSON) to count totals and new ids. A stale row whose id and text both
-   come back is kept.
-4. Plan the sweep: stale rows left (deleted by exact `(id, contentHash)`)
-   and rows whose ids `chunks.json` no longer lists (none when it is
-   empty). Both are deleted after step 5, so their vectors can be reused.
+3. Snapshot the scope's chunk ids (minus stale ids); stream the scope's
+   chunk files for new ids. A stale row whose id and text both come back is
+   kept.
+4. Plan the sweep: stale rows left (deleted by exact `(id, contentHash)`),
+   scope rows whose ids their chunk files no longer list (none when a full
+   pass finds no chunks), and removed repos' rows (by repo name). All are
+   deleted after step 5, so their vectors can be reused.
 5. Embed the new chunks: batches of `CODE_SEARCH_EMBEDDING_BATCH_SIZE`
    (10 for Ollama, else 128) with `CODE_SEARCH_EMBEDDING_CONCURRENCY`
    in flight (Ollama 1, else 8), streamed — no inter-batch delay; 429s

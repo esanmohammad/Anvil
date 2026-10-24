@@ -133,7 +133,7 @@ export class VectorStore implements VectorStorePort {
    *
    *  `healCorrupt` (write path only): force a real read on open so a table
    *  corrupted by a prior killed-mid-write surfaces here, and if it does, drop
-   *  the table and start fresh — the caller rebuilds it from chunks.json. NEVER
+   *  the table and start fresh — the caller rebuilds it from the chunk files. NEVER
    *  pass this on a read/search path: a reader must not delete the index. */
   async init(opts?: { healCorrupt?: boolean }): Promise<void> {
     let lancedb: typeof import('@lancedb/lancedb');
@@ -167,11 +167,11 @@ export class VectorStore implements VectorStorePort {
       // every query (getRetriever → init), which was the dominant serving cost.
     } catch (err) {
       if (opts?.healCorrupt && isCorruptVectorStore(err)) {
-        // Store is unreadable but fully rebuildable from chunks.json: drop it
+        // Store is unreadable but fully rebuildable from the chunk files: drop it
         // and reconnect to an empty dir so the embed loop recreates the table.
         const msg = err instanceof Error ? err.message : String(err);
         console.error(
-          `[knowledge-core] vector store at ${this.dbPath} is corrupt (${msg.slice(0, 160)}); dropping and rebuilding from chunks.json.`,
+          `[knowledge-core] vector store at ${this.dbPath} is corrupt (${msg.slice(0, 160)}); dropping and rebuilding from the chunk files.`,
         );
         this.table = undefined;
         // Local stores only: drop the corrupt dir and recreate. An object-store
@@ -705,18 +705,34 @@ export class VectorStore implements VectorStorePort {
   }
 
   /** Get all chunk IDs for a project (for incremental diff) */
-  async getChunkIds(project: string): Promise<string[]> {
+  /** Ids of the project's rows — of `repoNames` only, when given. */
+  async getChunkIds(project: string, repoNames?: string[]): Promise<string[]> {
     if (!this.table) return [];
+    const esc = (s: string) => s.replace(/'/g, "''");
+    const base = `project = '${esc(project)}'`;
+    // repoName is bitmap-indexed; batches keep each IN-list short.
+    const filters = repoNames
+      ? Array.from({ length: Math.ceil(repoNames.length / 200) }, (_, i) =>
+          `${base} AND repoName IN (${repoNames.slice(i * 200, i * 200 + 200).map((n) => `'${esc(n)}'`).join(', ')})`)
+      : [base];
     try {
-      const escapedProject = project.replace(/'/g, "''");
-      const results = await this.table
-        .query()
-        .where(`project = '${escapedProject}'`)
-        .select(['id'])
-        .toArray();
-      return results.map((r: any) => r.id as string);
+      const ids: string[] = [];
+      for (const where of filters) {
+        for (const r of await this.table.query().where(where).select(['id']).toArray()) ids.push(r.id as string);
+      }
+      return ids;
     } catch {
       return [];
+    }
+  }
+
+  /** Delete every row of `repoNames` (repos dropped from the index). */
+  async deleteRepoRows(project: string, repoNames: string[]): Promise<void> {
+    if (!this.table || repoNames.length === 0) return;
+    const esc = (s: string) => s.replace(/'/g, "''");
+    for (let i = 0; i < repoNames.length; i += 200) {
+      const names = repoNames.slice(i, i + 200).map((n) => `'${esc(n)}'`).join(', ');
+      await this.table.delete(`project = '${esc(project)}' AND repoName IN (${names})`);
     }
   }
 

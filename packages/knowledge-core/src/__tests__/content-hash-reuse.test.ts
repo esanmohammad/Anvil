@@ -17,6 +17,14 @@ import { CHUNK_ID_VERSION } from '../chunker.js';
 import { fn, withKbFixture } from './kb-fixture.js';
 
 const names = (rows: CodeChunk[]) => rows.map((r) => r.entityName).sort();
+
+/** An id-scheme change ships with a chunk-version bump: the next index
+ *  re-chunks the repo, which is what puts its rows up for re-planning. */
+async function markOlderChunkVersion(f: { storage: () => { blobs: { getJson<T>(k: string): Promise<T | null>; putJson(k: string, v: unknown): Promise<void> } } }): Promise<void> {
+  const blobs = f.storage().blobs;
+  const meta = await blobs.getJson<Record<string, unknown>>('svc/index_meta.json');
+  await blobs.putJson('svc/index_meta.json', { ...meta, chunkIdVersion: CHUNK_ID_VERSION - 1 });
+}
 const five = (salt3 = '') => fn('alpha') + fn('beta') + fn('gamma', salt3) + fn('delta') + fn('epsilon');
 
 describe('embedding reuse by content hash', () => {
@@ -52,6 +60,7 @@ describe('embedding reuse by content hash', () => {
       const lancedb = await import('@lancedb/lancedb');
       const table = await (await lancedb.connect(`${process.env.CODE_SEARCH_DATA_DIR}/${f.project}/lancedb`)).openTable('chunks');
       await table.update({ valuesSql: { id: "concat('legacy-', id)" } });
+      await markOlderChunkVersion(f);
 
       const before = f.embedded();
       await f.index();
@@ -99,6 +108,7 @@ describe('embedding reuse by content hash', () => {
       const lancedb = await import('@lancedb/lancedb');
       const table = await (await lancedb.connect(`${process.env.CODE_SEARCH_DATA_DIR}/${f.project}/lancedb`)).openTable('chunks');
       await table.update({ valuesSql: { id: "concat('legacy-', id)" } });
+      await markOlderChunkVersion(f);
       f.config.embedding.model = 'stub-v2';
 
       const before = f.embedded();
