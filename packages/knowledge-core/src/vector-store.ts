@@ -74,9 +74,19 @@ const DERIVED_COLUMNS = [
  *  index and drops the old one. */
 const FTS_INDEXES = [
   // Positions enable PhraseQuery (multi-token literal matching).
-  { column: 'contextualizedContent', name: 'contextualizedContent_idx', withPosition: true },
+  { column: 'contextualizedContent', name: 'contextualizedContent_idx', options: { withPosition: true } },
   // Compound-identifier parts for term search; phrases stay on the original column.
-  { column: 'contentSplit', name: 'contentSplit_idx', withPosition: false },
+  { column: 'contentSplit', name: 'contentSplit_idx', options: { withPosition: false } },
+  // Lowercased trigrams of entity names, verbatim (no stemming, punctuation
+  // kept): the substring tier's candidates (searchByEntitySubstring).
+  {
+    column: 'entityName',
+    name: 'entityName_ngram_idx',
+    options: {
+      withPosition: false, baseTokenizer: 'ngram' as const, ngramMinLength: 3, ngramMaxLength: 3,
+      stem: false, asciiFolding: false,
+    },
+  },
 ];
 
 export class VectorStore implements VectorStorePort {
@@ -89,9 +99,9 @@ export class VectorStore implements VectorStorePort {
   private initialized: boolean = false;
   private columnsEnsured = false;
   private calibratedNprobes?: number;
-  /** Whether the table has the identifier-split FTS index (absent on tables
-   *  no upgraded writer has touched yet); resolved on first search. */
-  private splitFts?: Promise<boolean>;
+  /** Names of the table's indexes (FTS_INDEXES added since are absent on
+   *  tables no upgraded writer has touched yet); resolved on first search. */
+  private indexNames?: Promise<Set<string>>;
 
   /** `dbPath` is a local directory (default) or an object-store URI
    *  (`s3://bucket/prefix`). `storageOptions` carries the LanceDB/object_store
@@ -206,10 +216,11 @@ export class VectorStore implements VectorStorePort {
         // silently breaks phrases containing them — and stop words are
         // meaningful tokens in code and error strings.
         await this.table.createIndex(spec.column, {
-          config: lancedb.Index.fts({ withPosition: spec.withPosition, removeStopWords: false }),
+          config: lancedb.Index.fts({ ...spec.options, removeStopWords: false }),
           name: spec.name,
           replace: true,
         });
+        this.indexNames = undefined;
         // Indexes built under another name carry an older config. Drop them
         // only after the current one exists, so search never lacks an index.
         for (const old of fts) await this.table.dropIndex(old.name);
@@ -498,7 +509,7 @@ export class VectorStore implements VectorStorePort {
       // for camelCase spellings of the same words (TRIGGER_TO_WEB_TYPE vs
       // triggerToWebType) and outrank the definition.
       const splitQuery = splitIdentifiers(queryText.replace(/[A-Za-z0-9]*_[A-Za-z0-9_]*/g, ' '));
-      if (/[A-Za-z0-9]/.test(splitQuery) && (await this.hasSplitFts())) {
+      if (/[A-Za-z0-9]/.test(splitQuery) && (await this.hasIndex('contentSplit_idx'))) {
         // Original tokens on the original column, identifier parts on the
         // split column; a row's score is the sum. An exact identifier keeps
         // its rare full token, and "expected backlog count" also reaches
@@ -534,12 +545,12 @@ export class VectorStore implements VectorStorePort {
     this.calibratedNprobes = nprobes && nprobes > 0 ? nprobes : undefined;
   }
 
-  private hasSplitFts(): Promise<boolean> {
-    this.splitFts ??= (async () => {
+  private async hasIndex(name: string): Promise<boolean> {
+    this.indexNames ??= (async () => {
       const indexes: Array<{ name: string }> = await this.table.listIndices();
-      return indexes.some((i) => i.name === 'contentSplit_idx');
-    })().catch(() => false);
-    return this.splitFts;
+      return new Set(indexes.map((i) => i.name));
+    })().catch(() => new Set<string>());
+    return (await this.indexNames).has(name);
   }
 
   /** Exact-symbol lookup: chunks whose entityName equals one of `names`.
@@ -565,20 +576,31 @@ export class VectorStore implements VectorStorePort {
 
   /** Substring symbol lookup: chunks whose entityName CONTAINS the query,
    *  case-insensitively — the Zoekt-style partial-identifier tier
-   *  (`SearchResponse` finds `CompanySearchResponse`). A projected ILIKE scan
-   *  over the short entityName column: measured ~50ms cold / ~3ms warm at
-   *  450k rows. Results ranked exact > prefix > infix, then shorter names
-   *  (tighter match) first. */
+   *  (`SearchResponse` finds `CompanySearchResponse`). Candidates come from
+   *  the entity-name trigram index (rows holding every trigram of the query,
+   *  shorter names first), kept if they contain the query; a table without
+   *  that index yet, or a query under 3 chars, scans with ILIKE instead —
+   *  ~140ms at 1.15M rows, the slowest search tier before the index. Results
+   *  ranked exact > prefix > infix, then shorter names (tighter match) first. */
   async searchByEntitySubstring(query: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
     if (!this.table || query.length === 0) return [];
-    const esc = query.replace(/'/g, "''").replace(/([%_\\])/g, '\\$1');
-    const cond = `entityName ILIKE '%${esc}%'`;
-    const where = filter ? `(${cond}) AND (${filter})` : cond;
+    const q = query.toLowerCase();
     try {
       // Over-fetch so the JS ranking below sees enough candidates to prefer
       // exact/prefix matches over incidental infix hits.
-      const rows = await this.table.query().where(where).limit(limit * 4).toArray();
-      const q = query.toLowerCase();
+      let rows: any[];
+      if (query.length >= 3 && (await this.hasIndex('entityName_ngram_idx'))) {
+        const { MatchQuery, Operator } = await import('@lancedb/lancedb');
+        let fq = this.table.query()
+          .fullTextSearch(new MatchQuery(query, 'entityName', { operator: Operator.And }))
+          .limit(limit * 4);
+        if (filter) fq = fq.where(filter);
+        rows = (await fq.toArray()).filter((r: any) => (r.entityName ?? '').toLowerCase().includes(q));
+      } else {
+        const esc = query.replace(/'/g, "''").replace(/([%_\\])/g, '\\$1');
+        const cond = `entityName ILIKE '%${esc}%'`;
+        rows = await this.table.query().where(filter ? `(${cond}) AND (${filter})` : cond).limit(limit * 4).toArray();
+      }
       const rank = (name: string): number => {
         const n = name.replace(/\$\d+$/, '').toLowerCase();
         if (n === q) return 0;

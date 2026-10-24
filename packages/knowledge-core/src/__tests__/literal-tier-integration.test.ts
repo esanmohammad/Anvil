@@ -56,6 +56,23 @@ describe('literal tier v2 — real LanceDB', () => {
     assert.equal(hits[0].chunk.entityName, 'MAX_RETRY_COUNT');
   });
 
+  it('substring tier: the writer indexes entity names by trigram; results match the scan', async (t) => {
+    try { await import('@lancedb/lancedb'); } catch { t.skip('lancedb unavailable'); return; }
+    const scanned = await store.searchByEntitySubstring('SearchResponse', 10);
+    await store.ensureFtsIndex();
+    const indexes: Array<{ indexType: string; columns: string[] }> = await (store as any).table.listIndices();
+    assert.ok(indexes.some((i) => i.indexType === 'FTS' && i.columns.includes('entityName')), 'entityName FTS index built');
+    const indexed = await store.searchByEntitySubstring('SearchResponse', 10);
+    assert.deepEqual(indexed.map((h) => h.chunk.entityName), scanned.map((h) => h.chunk.entityName));
+    assert.deepEqual((await store.searchByEntitySubstring('MAX_RETRY', 10)).map((h) => h.chunk.entityName), ['MAX_RETRY_COUNT']);
+    assert.deepEqual(await store.searchByEntitySubstring('searchresponsemapper', 10).then((h) => h.map((x) => x.chunk.entityName)),
+      ['UserSearchResponseMapper'], 'case-insensitive');
+    // Every trigram of 'Searchesponse' occurs in 'SearchResponse', but the
+    // string itself does not: a substring tier must not return it.
+    assert.deepEqual(await store.searchByEntitySubstring('Searchesponse', 10), []);
+    assert.deepEqual((await store.searchByEntitySubstring('SearchResponse', 10, "id = 'a'")).map((h) => h.chunk.id), ['a'], 'filter applies');
+  });
+
   it('phrase tier: adjacent tokens match, shuffled tokens do not', async (t) => {
     try { await import('@lancedb/lancedb'); } catch { t.skip('lancedb unavailable'); return; }
     await store.ensureFtsIndex(); // built withPosition — required for phrases

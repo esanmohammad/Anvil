@@ -139,7 +139,9 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   current), IVF vector index build / in-place retrain (`ensureVectorIndex`),
   `vectorIndexState`. BM25 also matches words fused into camelCase
   identifiers: a `contentSplit` column (`identifierParts`) has its own FTS
-  index, and `fullTextSearch` sums matches on both columns. Columns added
+  index, and `fullTextSearch` sums matches on both columns. The substring
+  tier (`searchByEntitySubstring`) reads a trigram FTS index on `entityName`
+  (`ILIKE` scan until a writer has built it). Columns added
   after a table was created are backfilled in SQL by the next writer
   (`ensureColumns`) — no re-embed.
 - `maintainVectorIndex` / `planVectorIndex` / `readVectorIndexHealth`
