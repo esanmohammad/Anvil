@@ -482,6 +482,18 @@ const SKIP_CALL_NAMES = new Set([
  * Disambiguate a call target using the import graph.
  * Returns the best candidate node ID or null if ambiguous/unknown.
  */
+/** Names only resolve within a language family (TS/TSX/JS share one): a
+ *  name in a Java file never refers to a Python definition. */
+function languageFamily(file: string): string {
+  const lang = langFromExt(extname(file));
+  return lang === 'typescript' || lang === 'javascript' ? 'js' : lang;
+}
+
+function sameFamilyCandidates(name: string, file: string, symbolToIds: Map<string, string[]>): string[] {
+  const family = languageFamily(file);
+  return (symbolToIds.get(name) ?? []).filter((c) => languageFamily(c.split('::')[0]) === family);
+}
+
 function resolveCallTarget(
   calledName: string,
   callerFile: string,
@@ -489,7 +501,7 @@ function resolveCallTarget(
   symbolToIds: Map<string, string[]>,
   fileImportTargets: Map<string, Set<string>>,
 ): { targetId: string; confidence: number } | null {
-  const candidates = symbolToIds.get(calledName);
+  const candidates = sameFamilyCandidates(calledName, callerFile, symbolToIds);
   if (!candidates || candidates.length === 0) return null;
 
   // Single candidate — high confidence
@@ -594,11 +606,11 @@ function findEntityAtLine(entities: ExtractedEntity[], line: number): ExtractedE
 
 export async function buildAstGraph(
   repoPath: string,
-  opts?: { maxFiles?: number; workspaceMap?: WorkspaceMap },
+  opts?: { maxFiles?: number; workspaceMap?: WorkspaceMap; ignorePatterns?: string[] },
 ): Promise<GraphifyOutput> {
   // Phase 0 — Walk: collect all source files
   const files: string[] = [];
-  walkDir(repoPath, files);
+  walkDir(repoPath, files, new Set(opts?.ignorePatterns));
 
   const maxFiles = opts?.maxFiles ?? 5000;
   const sourceFiles = files.slice(0, maxFiles);
@@ -665,7 +677,8 @@ export async function buildAstGraph(
     nodes.push({ id: relPath, label: basename(relPath), type: 'module', file: relPath });
 
     // Try tree-sitter first, fall back to regex
-    const tsResult = await tryTreeSitterParse(filePath, content, lang);
+    // .tsx shares the 'typescript' language id but needs the TSX grammar (JSX).
+    const tsResult = await tryTreeSitterParse(filePath, content, ext === '.tsx' ? 'tsx' : lang);
 
     if (tsResult && tsResult.entities.length > 0) {
       // ── Tree-sitter path: compiler-accurate entity extraction ──
@@ -791,7 +804,7 @@ export async function buildAstGraph(
       for (const name of ni.names) {
         // Look for the specific entity in the target file
         const targetEntityId = `${resolved}::${name}`;
-        const candidates = symbolToIds.get(name);
+        const candidates = sameFamilyCandidates(name, relPath, symbolToIds);
         if (candidates?.includes(targetEntityId)) {
           edges.push({ source: relPath, target: targetEntityId, type: 'uses', confidence: 0.95 });
         } else if (candidates && candidates.length === 1) {
@@ -947,7 +960,7 @@ export async function buildAstGraph(
   // Phase 5 — Inheritance edges (deferred, resolved against multi-candidate map)
   for (const entity of entities) {
     for (const parent of entity.parents) {
-      const candidates = symbolToIds.get(parent);
+      const candidates = sameFamilyCandidates(parent, entity.file, symbolToIds);
       if (!candidates || candidates.length === 0) continue;
       if (candidates.length === 1) {
         edges.push({ source: entity.id, target: candidates[0], type: 'inherits', confidence: 0.95 });
@@ -1082,7 +1095,7 @@ export async function incrementalGraphUpdate(
   changedFiles: string[],
   deletedFiles: string[],
   repoPath: string,
-  opts?: { workspaceMap?: any },
+  opts?: { workspaceMap?: any; ignorePatterns?: string[] },
 ): Promise<GraphifyOutput> {
   // If more than 30% of files changed, full rebuild is faster
   const totalFiles = new Set(existingGraph.nodes.filter(n => n.file).map(n => n.file)).size;

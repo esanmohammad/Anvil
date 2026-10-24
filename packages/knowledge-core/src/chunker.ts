@@ -1,16 +1,20 @@
 /**
- * Regex-based code chunking.
+ * Code chunking at definition boundaries.
  *
  * Splits source files in a repository into semantic CodeChunk objects at
- * function / class / method boundaries.  Uses a simple recursive directory
- * walker (no external glob dependency) and language-specific regex patterns.
+ * function / class / method boundaries — taken from tree-sitter for the
+ * languages it parses, else from language-specific regex patterns. A
+ * definition's leading comments / decorators belong to its chunk. Uses a
+ * simple recursive directory walker (no external glob dependency).
  */
 
 import { createHash } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, relative, extname, basename, dirname } from 'node:path';
 import type { CodeChunk } from '@esankhan3/anvil-knowledge-core';
-import { walkDir, langFromExt, extractImports, isSourceFile } from './file-walker.js';
+import { walkDir, langFromExt, extractImports, isSourceFile, isIgnoredPath } from './file-walker.js';
+import { parseFile, supportedLanguages } from './tree-sitter-parser.js';
+import type { TreeSitterEntity } from './tree-sitter-parser.js';
 
 // ---------------------------------------------------------------------------
 // Language → boundary patterns
@@ -181,9 +185,15 @@ function patternsForLanguage(lang: string): BoundaryPattern[] {
   }
 }
 
-function chunkId(filePath: string, startLine: number, endLine: number): string {
+/** Bump when chunk ids change scheme: buildKB re-chunks (never skips or carries
+ *  forward) a repo whose index_meta records another version. 2 = repo-scoped ids. */
+export const CHUNK_ID_VERSION = 2;
+
+/** Ids are unique per project: the same path + line range in two repos must
+ *  not collide, and fields are separated so (a.ts, 1, 23) ≠ (a.ts, 12, 3). */
+function chunkId(repoName: string, filePath: string, startLine: number, endLine: number): string {
   return createHash('sha256')
-    .update(`${filePath}${startLine}${endLine}`)
+    .update(`${repoName}\0${filePath}\0${startLine}\0${endLine}`)
     .digest('hex')
     .slice(0, 16);
 }
@@ -277,13 +287,50 @@ function splitOversizedContent(
   return parts;
 }
 
-function chunkFile(
+interface Boundary {
+  line: number; // 0-based
+  entityType: CodeChunk['entityType'];
+  entityName: string | undefined;
+  parentEntity?: string;
+}
+
+const TREE_SITTER_LANGS = new Set(supportedLanguages());
+
+const CHUNK_TYPE: Record<TreeSitterEntity['type'], CodeChunk['entityType']> = {
+  function: 'function', method: 'method', class: 'class', interface: 'interface', type: 'type',
+  struct: 'class', enum: 'type', trait: 'interface', module: 'class',
+};
+
+/** Definition boundaries from tree-sitter: top-level definitions and class
+ *  members, never a function nested in another function's body. null when the
+ *  language isn't parsed or the parse yields nothing (→ regex boundaries). */
+async function treeSitterBoundaries(filePath: string, content: string, lang: string, ext: string): Promise<Boundary[] | null> {
+  const grammar = ext === '.tsx' ? 'tsx' : lang;
+  if (!TREE_SITTER_LANGS.has(grammar)) return null;
+  const parsed = await parseFile(filePath, content, grammar).catch(() => null);
+  if (!parsed || parsed.entities.length === 0) return null;
+  const fns = parsed.entities.filter((e) => e.type === 'function' || e.type === 'method');
+  const nested = (e: TreeSitterEntity) =>
+    fns.some((f) => f !== e && f.startByte <= e.startByte && e.endByte <= f.endByte);
+  const byLine = new Map<number, Boundary>();
+  for (const e of parsed.entities) {
+    if (nested(e) || byLine.has(e.startLine)) continue;
+    byLine.set(e.startLine, { line: e.startLine, entityType: CHUNK_TYPE[e.type], entityName: e.name, parentEntity: e.parent });
+  }
+  return [...byLine.values()].sort((a, b) => a.line - b.line);
+}
+
+/** Comment, doc-comment, decorator and attribute lines directly above a
+ *  definition (no blank line between) belong to it. */
+const LEADING_ANNOTATION = /^(\/\/|\/\*|\*|#|@)/;
+
+async function chunkFile(
   filePath: string,
   repoPath: string,
   repoName: string,
   project: string,
   maxTokens: number,
-): CodeChunk[] {
+): Promise<CodeChunk[]> {
   let raw: string;
   try {
     raw = readFileSync(filePath, 'utf-8');
@@ -305,23 +352,29 @@ function chunkFile(
   const maxContentChars = maxContentTokens * 4;
 
   // Find boundary line indices
-  const boundaries: Array<{
-    line: number;
-    entityType: CodeChunk['entityType'];
-    entityName: string | undefined;
-  }> = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trimStart();
-    for (const pat of patterns) {
-      if (pat.regex.test(trimmed)) {
-        boundaries.push({
-          line: i,
-          entityType: pat.entityType,
-          entityName: pat.nameExtractor(trimmed),
-        });
-        break;
+  let boundaries = await treeSitterBoundaries(filePath, raw, lang, ext);
+  if (!boundaries) {
+    boundaries = [];
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trimStart();
+      for (const pat of patterns) {
+        if (pat.regex.test(trimmed)) {
+          boundaries.push({
+            line: i,
+            entityType: pat.entityType,
+            entityName: pat.nameExtractor(trimmed),
+          });
+          break;
+        }
       }
+    }
+  }
+  // Pull each boundary up over its leading annotations (never past the
+  // previous boundary).
+  for (let b = 0; b < boundaries.length; b++) {
+    const floor = b > 0 ? boundaries[b - 1].line + 1 : 0;
+    while (boundaries[b].line > floor && LEADING_ANNOTATION.test(lines[boundaries[b].line - 1].trimStart())) {
+      boundaries[b].line--;
     }
   }
 
@@ -333,10 +386,11 @@ function chunkFile(
     endLine: number,
     entityType: CodeChunk['entityType'],
     entityName: string | undefined,
+    parentEntity?: string,
   ) => {
     const ctxContent = `${contextPrefix}\n${content}`;
     const tokens = Math.ceil(ctxContent.length / 4);
-    const id = chunkId(relPath, startLine, endLine);
+    const id = chunkId(repoName, relPath, startLine, endLine);
     chunks.push({
       id,
       filePath: relPath,
@@ -350,6 +404,7 @@ function chunkFile(
       language: lang,
       entityType,
       entityName,
+      ...(parentEntity ? { parentEntity } : {}),
       tokens,
       imports: fileImports,
       exports: extractExports(content, lang),
@@ -361,10 +416,11 @@ function chunkFile(
     startLine: number,
     entityType: CodeChunk['entityType'],
     entityName: string | undefined,
+    parentEntity?: string,
   ) => {
     const content = contentLines.join('\n');
     if (contextualizedTokens(contextPrefix, content) <= maxTokens) {
-      pushChunk(content, startLine, startLine + contentLines.length - 1, entityType, entityName);
+      pushChunk(content, startLine, startLine + contentLines.length - 1, entityType, entityName, parentEntity);
     } else {
       // Split oversized content into parts that fit
       const parts = splitOversizedContent(contentLines, maxContentChars);
@@ -372,7 +428,7 @@ function chunkFile(
       for (let p = 0; p < parts.length; p++) {
         const partLines = parts[p].split('\n').length;
         const partName = entityName ? `${entityName}$${p + 1}` : undefined;
-        pushChunk(parts[p], lineOffset, lineOffset + partLines - 1, entityType, partName);
+        pushChunk(parts[p], lineOffset, lineOffset + partLines - 1, entityType, partName, parentEntity);
         lineOffset += partLines;
       }
     }
@@ -398,7 +454,7 @@ function chunkFile(
     const startLine = boundaries[i].line;
     const endLine = i + 1 < boundaries.length ? boundaries[i + 1].line - 1 : lines.length - 1;
     const chunkLines = lines.slice(startLine, endLine + 1);
-    pushContentWithSplit(chunkLines, startLine + 1, boundaries[i].entityType, boundaries[i].entityName);
+    pushContentWithSplit(chunkLines, startLine + 1, boundaries[i].entityType, boundaries[i].entityName, boundaries[i].parentEntity);
   }
 
   return chunks;
@@ -442,12 +498,12 @@ export async function chunkRepo(
   repoPath: string,
   repoName: string,
   project: string,
-  config: { maxTokens: number },
+  config: { maxTokens: number; ignorePatterns?: string[] },
   cachedFiles?: Record<string, FileIndexEntry>,
   onChunk?: (chunk: CodeChunk) => void,
 ): Promise<ChunkResult> {
   const files: string[] = [];
-  walkDir(repoPath, files);
+  walkDir(repoPath, files, new Set(config.ignorePatterns));
 
   // When a sink is provided, stream each chunk to it and NEVER accumulate the
   // full array: at org scale a single big repo (e.g. 8k+ files) produces a
@@ -479,7 +535,7 @@ export async function chunkRepo(
 
     // File is new or changed — chunk it
     changedFiles.push(relPath);
-    const chunks = chunkFile(file, repoPath, repoName, project, config.maxTokens);
+    const chunks = await chunkFile(file, repoPath, repoName, project, config.maxTokens);
     if (onChunk) { for (const c of chunks) onChunk(c); } else { allChunks.push(...chunks); }
     fileIndex[relPath] = { contentHash, chunkCount: chunks.length };
   }
@@ -504,24 +560,31 @@ export async function chunkRepo(
 /**
  * Chunk only the files that git diff identified as changed.
  * Much faster than chunkRepo() which iterates ALL files.
+ *
+ * The returned `fileIndex` covers the whole repo: `cachedFiles` (the previous
+ * index) minus the diffed paths, plus the re-chunked ones — so it stays the
+ * complete file list a later full re-chunk diffs against.
  */
 export async function chunkChangedFiles(
   repoPath: string,
   repoName: string,
   project: string,
-  config: { maxTokens: number },
+  config: { maxTokens: number; ignorePatterns?: string[] },
   diff: { added: string[]; modified: string[]; deleted: string[] },
   onChunk?: (chunk: CodeChunk) => void,
+  cachedFiles?: Record<string, FileIndexEntry>,
 ): Promise<ChunkResult> {
+  const ignore = new Set(config.ignorePatterns);
   const allChunks: CodeChunk[] = [];
   const changedFiles: string[] = [];
-  const fileIndex: Record<string, FileIndexEntry> = {};
+  const fileIndex: Record<string, FileIndexEntry> = { ...cachedFiles };
+  for (const relPath of [...diff.added, ...diff.modified, ...diff.deleted]) delete fileIndex[relPath];
 
   // Only chunk added + modified files
   for (const relPath of [...diff.added, ...diff.modified]) {
     const fullPath = join(repoPath, relPath);
     if (!existsSync(fullPath)) continue;
-    if (!isSourceFile(basename(fullPath))) continue;
+    if (!isSourceFile(basename(fullPath)) || isIgnoredPath(relPath, ignore)) continue;
 
     let contents: string;
     try {
@@ -530,7 +593,7 @@ export async function chunkChangedFiles(
 
     changedFiles.push(relPath);
     const contentHash = createHash('sha256').update(contents).digest('hex');
-    const chunks = chunkFile(fullPath, repoPath, repoName, project, config.maxTokens);
+    const chunks = await chunkFile(fullPath, repoPath, repoName, project, config.maxTokens);
     if (onChunk) { for (const c of chunks) onChunk(c); } else { allChunks.push(...chunks); }
     fileIndex[relPath] = { contentHash, chunkCount: chunks.length };
   }

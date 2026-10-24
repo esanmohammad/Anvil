@@ -1,10 +1,9 @@
 /**
  * Local-filesystem BlobStorePort adapter (ADR §4, default backend).
  *
- * A 1:1 mapping of today's `node:fs` artifact I/O: keys are project-relative
- * POSIX paths joined onto a base directory (`getKnowledgeBasePath(project)`).
- * This is the zero-behavior-change default — every method does exactly what
- * the scattered `readFileSync`/`writeFileSync`/`existsSync` calls do today.
+ * Keys are project-relative POSIX paths joined onto a base directory
+ * (`getKnowledgeBasePath(project)`); each method is the plain `node:fs`
+ * operation on that path (NDJSON writes go through a temp file + rename).
  */
 
 import {
@@ -21,6 +20,7 @@ import {
   createReadStream,
   readdirSync,
   statSync,
+  renameSync,
 } from 'node:fs';
 import { join, dirname, posix, sep } from 'node:path';
 import type { BlobStorePort } from './ports.js';
@@ -121,7 +121,11 @@ export class FsBlobStore implements BlobStorePort {
   async putNdjson(key: string, source: AsyncIterable<unknown> | Iterable<unknown>): Promise<void> {
     const abs = this.resolve(key);
     this.ensureParent(abs);
-    const fd = openSync(abs, 'w');
+    // Written to a temp file and renamed into place: a crash mid-stream leaves
+    // the previous file intact rather than a truncated one (chunks.json is
+    // treated as the complete corpus by the embed step).
+    const tmp = `${abs}.tmp-${process.pid}`;
+    const fd = openSync(tmp, 'w');
     let buf = '';
     try {
       for await (const item of source) {
@@ -132,9 +136,13 @@ export class FsBlobStore implements BlobStorePort {
         }
       }
       if (buf.length > 0) writeSync(fd, buf);
-    } finally {
+    } catch (err) {
       closeSync(fd);
+      rmSync(tmp, { force: true });
+      throw err;
     }
+    closeSync(fd);
+    renameSync(tmp, abs);
   }
 
   async *iterateNdjson<T>(key: string): AsyncGenerator<T> {

@@ -1,4 +1,4 @@
-# `@anvil/knowledge-core` — Architecture
+# `@esankhan3/anvil-knowledge-core` — Architecture
 
 Reference for what physically lives in `packages/knowledge-core/src/` and how
 the modules wire together. No future-tense roadmap content — only what
@@ -184,30 +184,48 @@ falls back to `DEFAULT_CONFIG`.
 
 ### 4.1 `walkDir`
 
-Recursive directory walker. `SOURCE_EXTENSIONS = .ts, .tsx, .js, .jsx,
-.py, .go, .rs, .java, .php`. `SKIP_DIRS = node_modules, dist, build,
-.git, vendor, __pycache__, .next`.
+Recursive directory walker. `isSourceFile(name)`: `SOURCE_EXTENSIONS =
+.ts, .tsx, .js, .jsx, .py, .go, .rs, .java, .php` plus the infra formats
+`.sh, .bash, .yaml, .yml, .tf, .hcl, .toml` (whole-file chunks), and
+`SOURCE_FILENAMES = Dockerfile (+ Dockerfile.*), Makefile, Jenkinsfile`.
+`SKIP_DIRS = node_modules, dist, build, .git, vendor, __pycache__, .next`,
+plus any `chunking.ignorePatterns` segment (`isIgnoredPath`).
 
-`langFromExt(ext)` → language string. `extractImports(content, lang)` —
-import path strings. `extractNamedImports` — `{ source, names[] }`.
+`langFromExt(ext)` → language string. `extractImports(lines, lang)` —
+import path strings (`import … from` and `require(…)` for TS/JS).
+`extractNamedImports` — `{ source, names[] }`.
 
 ### 4.2 `chunkRepo` / `chunkChangedFiles`
 
-Per-language regex `BoundaryPattern[]` (TypeScript/JavaScript shown;
-Python, Go, Rust, Java, PHP each have their own). Splits source at
-function/class/method/interface/type boundaries; falls back to a
-fixed-size block when no boundary fits.
+Boundaries come from tree-sitter for the 8 parsed languages: every
+top-level definition and class member starts a chunk (methods get
+`parentEntity` = their class; a function nested in another function stays
+in it). Without a grammar (or a parse with no entities) the per-language
+regex `BoundaryPattern[]` (TS/JS, Python, Go, Rust, Java) is the fallback.
+Each boundary then moves up over the comment / doc-comment / decorator /
+attribute lines directly above it, so a definition's leading annotations
+belong to its chunk. Config formats (yaml, hcl, toml) are whole-file chunks;
+oversized content is split into `name$1`, `name$2`, … parts. Chunk id =
+`sha256(repoName \0 filePath \0 startLine \0 endLine)[0:16]`
+(`CHUNK_ID_VERSION` = 2).
 
-`chunkChangedFiles(repo, name, project, cfg, gitDiff)` — uses
-`gitDiff.added + gitDiff.modified` as the input set, preserves
-unchanged file index entries.
+`chunkChangedFiles(repo, name, project, cfg, gitDiff, onChunk?, cachedFiles?)`
+— chunks `gitDiff.added + gitDiff.modified`; its `fileIndex` is
+`cachedFiles` minus every diffed path plus the re-chunked files, i.e. the
+whole repo.
 
 Returns `{ chunks, fileIndex, deletedFiles, changedFiles }`.
 
 ## 5. Tree-sitter (`src/tree-sitter-parser.ts`)
 
-`web-tree-sitter` WASM. Languages: TypeScript, JavaScript, TSX, Go,
-Python, Rust, Java, PHP. Lazy-loaded via `initTreeSitter()`.
+`web-tree-sitter` WASM with grammars from `@vscode/tree-sitter-wasm`
+(ABI 14/15). Languages: TypeScript, JavaScript, TSX, Go, Python, Rust, Java,
+PHP. Lazy-loaded via `initTreeSitter()`; queries are compiled once per
+grammar. A grammar that fails to load is reported once on stderr and
+`parseFile` returns null (callers use their regex fallback). Used by the
+chunker (boundaries) and the AST graph builder (entities, imports, calls).
+A function directly inside a class / impl is a `method` with that
+`parent`; a call belongs to its innermost containing entity.
 
 Public API:
 
@@ -228,8 +246,8 @@ fallbackToFull }`. `fallbackToFull = true` when git invocation fails.
 `getChangedFilesList(diff)` = `[...added, ...modified]`. `getDeletedFilesList`
 = `diff.deleted`.
 
-Filtered by `SOURCE_EXTS` (broader than chunker's set — adds yaml,
-json, sql, graphql, proto, md, etc).
+Filtered to the walker's `isSourceFile`, so the incremental and full paths
+agree on which files count.
 
 ## 7. Workspace detection (`src/workspace-detector.ts`)
 
@@ -258,8 +276,9 @@ computeStructuralHashes(chunks) → CodeChunk[] with hashes
 deduplicateByStructure(chunks) → { unique, duplicates, savings }
 ```
 
-Also consumed by `@anvil/memory-core`'s drift detector — same canonical
-form, same hash.
+Consumed by `@anvil/memory-core`'s drift detector — same canonical form,
+same hash. The indexer does not dedup chunks with it: every repo keeps its
+own copy of shared code (byte-identical results collapse at query time).
 
 ## 9. Embedders (`src/embedder.ts`)
 
@@ -268,7 +287,7 @@ form, same hash.
 | `CodestralEmbedder` | Mistral | `codestral-embed-2505` | 1024 |
 | `VoyageEmbedder` | Voyage AI | `voyage-code-3` | 1024 |
 | `OpenAIEmbedder` | OpenAI | `text-embedding-3-large` | 1024 |
-| `OllamaEmbedder` | Ollama | `nomic-embed-text` | 768 |
+| `OllamaEmbedder` | Ollama | `bge-m3` | 1024 (per-model table) |
 | `GeminiOAuthEmbedder` | Gemini (OAuth or API key) | `text-embedding-004` | 768 |
 | `OpenAICompatibleEmbedder` | Custom OpenAI-compat | env-driven | env-driven |
 
@@ -295,8 +314,8 @@ API:
 
 | Method | Purpose |
 |---|---|
-| `init()` | open or create `chunks` table; ensure FTS index |
-| `upsertChunks(chunks)` | insert/replace (uses `id` PK) |
+| `init({ healCorrupt? })` | open the `chunks` table (the write path drops a corrupt one); FTS is built on the write path only (`ensureFtsIndex`) |
+| `upsertChunks(chunks)` | replace the rows with these ids, insert the rest |
 | `addChunks(chunks)` | additive insert |
 | `vectorSearch(embedding, { limit, filter })` | k-NN by embedding |
 | `fullTextSearch(queryText, limit)` | LanceDB FTS BM25 |
@@ -411,12 +430,16 @@ Final selection via `packWithinBudget(chunks, maxTokens, maxChunks)`.
 | Phase | What |
 |---|---|
 | 0 | Workspace package nodes |
-| 1 | File walking + entity extraction (regex with tree-sitter override) |
+| 1 | File walking + entity extraction (tree-sitter; regex when a grammar can't parse; `.tsx` uses the TSX grammar) |
 | 2 | Import resolution (relative + module-path + workspace + named) |
 | 3 | Type reference edges from entity bodies |
 | 4 | Import-aware call disambiguation |
 | 5 | Inheritance resolution |
 | 6 | Package→file `contains` edges |
+
+Calls, type references, inheritance and named-import `uses` resolve only
+within a language family (TS/TSX/JS share one) — a name in a Java file never
+binds to a Python definition.
 
 Per-edge `confidence` (0..1). The retriever's expansion and the
 `trace_path` tool follow only non-`contains` edges with confidence ≥ 0.7 —
@@ -461,10 +484,12 @@ none.
 
 `detectCrossRepoEdges(repos, workspaceMaps?)`
 (`src/cross-repo-detector.ts`) — two halves.
-`extractCrossRepoSignals(repoPath)` scans one repo's tree (bounded by
-`walkFiles(dir, match, maxFiles=5000)`) into a JSON-serializable
-`CrossRepoSignals` bundle; `buildKB` runs it in the worker and persists it
-as `<repo>/signals.json`. `correlateCrossRepoEdges(signals,
+`extractCrossRepoSignals(repoPath, { ignorePatterns })` scans one repo's
+tree (bounded by `walkFiles(root, match, maxFiles=5000)`, which works in
+repo-relative paths) into a JSON-serializable `CrossRepoSignals` bundle
+(`version` = `CROSS_REPO_SIGNALS_VERSION`; file paths repo-relative, so edge
+endpoints share the code graph's file keys); `buildKB` runs it in the worker
+and persists it as `<repo>/signals.json`. `correlateCrossRepoEdges(signals,
 workspaceMaps)` runs the 14 join strategies over those bundles and emits
 typed `CrossRepoEdge` rows, so partial cycles correlate stored signals
 without re-scanning unchanged repos.
@@ -518,14 +543,21 @@ hallucination_count?, similarity?, overall }, costs, durations }`.
 
 Steps:
 
-1. Skip check against `index_meta.json`: HEAD sha (`getRepoSha`) and, for
-   local checkouts, the uncommitted working-tree state
-   (`getWorkingTreeState`).
+1. Skip check against `index_meta.json`: HEAD sha (`getRepoSha`), for
+   local checkouts the uncommitted working-tree state
+   (`getWorkingTreeState`), and current stored artifacts (`graph.json`,
+   `signals.json` at `CROSS_REPO_SIGNALS_VERSION`, `chunkIdVersion` =
+   `CHUNK_ID_VERSION`). Repos the previous `index_stats.json` listed but the
+   workspace no longer has are "removed" — a cycle with removals is never a
+   no-op.
 2. LLM repo profiling (skipped if `isLlmAvailable() === false`).
 3. Chunk repos: incremental via `chunkChangedFiles` if `git diff`
-   succeeds + non-fallback + non-empty; else `chunkRepo`.
-4. Structural dedup, streamed from the per-repo chunk shards straight into
-   `chunks.json` (`dedupShardsToChunks`).
+   succeeds + non-fallback + non-empty; else `chunkRepo` (with the file
+   cache, unless the repo's chunks use an older id scheme).
+4. Merge the per-repo chunk shards plus chunks carried forward from the
+   previous corpus (skipped repos; unchanged files still in a partially
+   re-chunked repo's `fileIndex`) into `chunks.json`, streamed, deduped by
+   chunk id only (`mergeShardsToChunks`).
 5. Workspace detection.
 6. AST graphs: `incrementalGraphUpdate` if possible; else `buildAstGraph`.
    Write `<repo>/graph.json` + `GRAPH_REPORT.md`.
@@ -535,27 +567,37 @@ Steps:
    (uploaded when the blob backend is remote). With no SQLite driver, the
    in-memory `ProjectGraphBuilder` runs Louvain and writes
    `system_graph_v2.json` instead.
-10. Save `deleted_files.json` (merged into a list not yet applied by an
-    embed run).
-11. Per-repo `index_meta.json` writes.
+10. Save `deleted_files.json` (changed + deleted files of previously indexed
+    repos; merged into a list not yet applied by an embed run).
+11. Per-repo `index_meta.json` writes (complete `files`, `chunkIdVersion`;
+    the previous `embeddingModel` / `embeddingDimensions` are kept), delete
+    removed repos' `<repo>/` artifacts, write `index_stats.json`.
 
 ### 19.2 `KnowledgeIndexer.embedChunks(project, config, opts?)`
 
-1. Load `chunks.json`.
-2. Open `VectorStore` at `<basePath>/lancedb`.
-3. Read `deleted_files.json` (deleted + changed files) → `deleteFileChunks`
-   per repo. This runs before the id diff: chunk ids are
-   `hash(filePath, startLine, endLine)`, so a changed file's unmoved chunks
-   keep their ids and would otherwise be skipped as already embedded.
-4. Diff against existing chunk IDs → `newChunks`.
-5. Embed in batches: `batchSize = 10` for Ollama, `50` otherwise. Delay
-   `50` ms / `100` ms between batches.
-6. `addChunks(embeddedChunks)`.
+1. Open `VectorStore` at `<basePath>/lancedb` (`healCorrupt`).
+2. Read `deleted_files.json` (deleted + changed files) → `deleteFileChunks`
+   per repo. This runs before the id diff: chunk ids are position-keyed, so
+   a changed file's unmoved chunks keep their ids and would otherwise be
+   skipped as already embedded.
+3. Snapshot existing chunk ids; stream `chunks.json` (NDJSON) to count
+   totals and new ids.
+4. Sweep rows whose ids `chunks.json` no longer lists (skipped when it is
+   empty).
+5. Embed the new chunks: batches of `CODE_SEARCH_EMBEDDING_BATCH_SIZE`
+   (10 for Ollama, else 128) with `CODE_SEARCH_EMBEDDING_CONCURRENCY`
+   in flight (Ollama 1, else 8), streamed — no inter-batch delay; 429s
+   back off inside the embedder.
+6. `addChunks(embeddedChunks)`; rebuild FTS.
 7. Build missing scalar indexes, then `maintainVectorIndex` (build / due
    retrain / optimize; writes `vector_index.json`). An embed run with nothing
    new still runs this step and bumps the index generation.
 8. Clear `deleted_files.json` (applied), then update each repo's
-   `index_meta.json` (`embeddingProvider`, `lastIndexedAt`).
+   `index_meta.json` (`embeddingProvider`, `embeddingModel`,
+   `embeddingDimensions`, `lastIndexedAt`).
+
+The returned stats report the cross-repo edge count from buildKB's
+`index_stats.json`.
 
 ### 19.3 `indexProject` = `buildKB` + `embedChunks`.
 
@@ -601,10 +643,11 @@ packages/knowledge-core/
     ├── claude-runner.ts                   ← deprecated shim → @anvil/agent-core
     │
     ├── chunker.ts                         ← chunkRepo / chunkChangedFiles
+    ├── chunks-io.ts                       ← NDJSON chunk shard writer / reader
     ├── file-walker.ts                     ← walkDir + langFromExt + import extraction
-    ├── git-diff.ts                        ← getAllChanges + helpers
+    ├── git-diff.ts                        ← getAllChanges + working-tree state
     ├── tree-sitter-parser.ts              ← WASM AST parsing
-    ├── structural-hasher.ts               ← canonical hash for dedup + drift
+    ├── structural-hasher.ts               ← canonical hash (memory-core drift)
     ├── workspace-detector.ts              ← manifest registry
     │
     ├── ast-graph-builder.ts               ← per-repo 6-phase graph
@@ -623,18 +666,19 @@ packages/knowledge-core/
     ├── query-classifier.ts                ← classifyQuery
     ├── query-router.ts                    ← QueryRouter
     ├── retriever.ts                       ← HybridRetriever (4-phase)
+    ├── vector-recall.ts                   ← IVF recall@k vs flat-scan check
+    ├── bm25-tokenizers.ts / query-expander.ts / rerank-cache.ts ← P6 primitives (not wired)
     │
     ├── repo-profiler.ts                   ← profileProject + caching
     ├── service-mesh-inferrer.ts           ← Phase A + Phase B
     ├── rag-evaluator.ts                   ← answer + judge
     │
     ├── indexer.ts                         ← KnowledgeIndexer + path facades
+    ├── repo-pipeline.ts                   ← per-repo chunk + graph + signals (RepoIndexMeta)
+    ├── index-pool.ts / index-worker.ts    ← worker-thread pool for repo pipelines
+    ├── storage/                           ← ports + fs / mongo blob stores + resolveStorage
     │
-    └── __tests__/
-        ├── chunker.test.ts
-        ├── query-classifier.test.ts
-        ├── retriever-defaults.test.ts
-        └── structural-hasher.test.ts
+    └── __tests__/                         ← node:test suites (see §22)
 ```
 
 ## 21. Runtime dependencies
@@ -643,7 +687,8 @@ From `package.json`:
 
 - `@anvil/agent-core` — LLM runner shim (`claude-runner.ts`).
 - `@lancedb/lancedb` (0.27.2) — vector store.
-- `web-tree-sitter` (0.26.8) + `tree-sitter-wasms` (0.1.13) — AST parsing.
+- `web-tree-sitter` (0.26.8) + `@vscode/tree-sitter-wasm` (0.3.1, grammars) — AST parsing.
+- `better-sqlite3` (optional; `node:sqlite` fallback) — system graph store.
 - `graphology` (0.26.0) + `-communities-louvain` (2.0.2) +
   `-metrics` (2.4.0) + `-types` (0.24.8) — graph algorithms.
 
@@ -652,11 +697,11 @@ agent-core shim.
 
 ## 22. Tests
 
-`node --test` runs every compiled `dist/__tests__/*.test.js`:
-
-| Test | Covers |
-|---|---|
-| `chunker.test.ts` | boundary extraction, language coverage, fallback chunking |
-| `query-classifier.test.ts` | identifier/path/error-code/NL detection + weights |
-| `retriever-defaults.test.ts` | DEFAULT_CONFIG retrieval shape |
-| `structural-hasher.test.ts` | comment stripping, identifier normalization, dedup |
+`node --test` runs every compiled `dist/__tests__/*.test.js`. Indexing
+integration suites drive the real `buildKB` + `embedChunks` over temp git
+repos with an OpenAI-compatible embedding stub and a real LanceDB table
+(`kb-fixture.ts`): `index-integrity`, `embed-incremental`,
+`cross-repo-graph`, `retriever-config`. Parsing / graph: `tree-sitter-parse`,
+`ast-graph`, `chunker-boundaries`, `cross-repo-detector`. Plus storage
+ports, vector index / recall, retrieval fusion, config / env overrides and
+query classification suites.

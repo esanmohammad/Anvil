@@ -329,16 +329,8 @@ export class VectorStore implements VectorStorePort {
     if (!this.table) {
       this.table = await this.db.createTable('chunks', rows, { mode: 'overwrite' });
     } else {
-      // Delete existing chunks for the same project, then add new ones
-      // This handles re-indexing
-      const project = chunks[0]?.project;
-      if (project) {
-        try {
-          await this.table.delete(`project = '${project.replace(/'/g, "''")}'`);
-        } catch {
-          /* ok if empty */
-        }
-      }
+      // Replace rows with the given ids, keep everything else.
+      await this.deleteChunksByIds(rows.map((r) => r.id));
       await this.table.add(rows);
     }
     // Rebuild FTS index after data changes
@@ -573,11 +565,13 @@ export class VectorStore implements VectorStorePort {
   /** Delete specific chunks by their IDs (for surgical updates) */
   async deleteChunksByIds(ids: string[]): Promise<void> {
     if (!this.table || ids.length === 0) return;
-    // Batch deletes to avoid overly long filter strings
-    const batchSize = 50;
+    // Batched IN-lists: each delete is one table commit, so the batch bounds
+    // both the filter length and the commit count (a full id sweep can be
+    // hundreds of thousands of ids).
+    const batchSize = 1000;
     for (let i = 0; i < ids.length; i += batchSize) {
       const batch = ids.slice(i, i + batchSize);
-      const filter = batch.map((id) => `id = '${id.replace(/'/g, "''")}'`).join(' OR ');
+      const filter = `id IN (${batch.map((id) => `'${id.replace(/'/g, "''")}'`).join(', ')})`;
       try {
         await this.table.delete(filter);
       } catch { /* ok if chunk doesn't exist */ }

@@ -1,7 +1,8 @@
 import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { extname, join } from 'node:path';
+import { basename, join } from 'node:path';
+import { isSourceFile as isIndexedFileName } from './file-walker.js';
 
 export interface GitDiff {
   added: string[];
@@ -12,18 +13,10 @@ export interface GitDiff {
   fallbackToFull: boolean;
 }
 
-const SOURCE_EXTS = new Set([
-  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '.go', '.py', '.rs', '.java', '.php',
-  '.rb', '.swift', '.kt', '.cs', '.scala',
-  '.c', '.cpp', '.h', '.hpp',
-  '.yaml', '.yml', '.json', '.toml', '.xml',
-  '.sql', '.graphql', '.proto',
-  '.md', '.txt',
-]);
-
+/** Exactly the files the walker indexes — a change to any other file can't
+ *  affect the index, and missing one here would leave it stale. */
 function isSourceFile(filePath: string): boolean {
-  return SOURCE_EXTS.has(extname(filePath).toLowerCase());
+  return isIndexedFileName(basename(filePath));
 }
 
 function parseNameStatus(output: string): GitDiff {

@@ -19,7 +19,7 @@ import type { KnowledgeConfig } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk, IndexStats, WorkspaceMap, GraphifyOutput } from '@esankhan3/anvil-knowledge-core';
 import { profileProject, loadAllProfiles } from '@esankhan3/anvil-knowledge-core';
 import { inferServiceMesh } from '@esankhan3/anvil-knowledge-core';
-import { computeStructuralHash } from '@esankhan3/anvil-knowledge-core';
+import { CHUNK_ID_VERSION } from './chunker.js';
 import { createQueryRouter } from '@esankhan3/anvil-knowledge-core';
 import { iterateChunksFile } from './chunks-io.js';
 import { writeSystemGraphSqlite, createSystemGraphSqliteWriter } from './graph-store.js';
@@ -40,55 +40,42 @@ async function writeRepoIndexMeta(blobs: BlobStorePort, repoName: string, meta: 
 }
 
 /**
- * Structural dedup, streaming: read each per-repo shard line-by-line, keep the
- * first chunk per structural hash, write survivors to chunks.json. Bounded
- * memory — a Set of hashes + one chunk at a time, never the whole corpus (this
- * replaces the in-RAM deduplicateByStructure(allChunks) that OOM'd at org scale).
- * Keeps first-seen per hash (repo order) rather than smallest-id, but the
- * survivors are structurally identical, so dedup is functionally equivalent.
+ * Merge the per-repo shards (+ chunks carried forward from the previous
+ * corpus) into chunks.json, streaming: one chunk at a time plus a Set of ids,
+ * never the whole corpus. Every repo keeps its own copy of shared code —
+ * identical code in two repos is two searchable, separately-scoped chunks.
  */
-async function dedupShardsToChunks(
+async function mergeShardsToChunks(
   shardPaths: string[],
   blobs: BlobStorePort,
   chunksKey: string,
   /** Local NDJSON copy of the PREVIOUS chunks.json + which of its chunks to
    *  keep. Absent on a full rebuild (every repo re-chunked) — the shards are
-   *  then the complete corpus, today's behavior. */
+   *  then the complete corpus. */
   carryForward?: { prevPath: string; keep: (c: CodeChunk) => boolean },
-): Promise<{ kept: number; dropped: number; tokens: number }> {
-  // Shards are transient local scratch — read raw. Survivors stream straight
-  // into the durable chunks blob via putNdjson (byte-identical NDJSON to the
-  // prior createChunkWriter); counts are tallied inside the generator and read
-  // back after putNdjson drains it. Fresh shards stream FIRST so a re-chunked
-  // file's new chunk wins the structural-hash dedup over a stale twin.
+): Promise<{ kept: number; tokens: number }> {
+  // Shards are transient local scratch — read raw. Chunks stream straight into
+  // the durable chunks blob via putNdjson; counts are tallied inside the
+  // generator and read back after putNdjson drains it. Fresh shards stream
+  // FIRST so a re-chunked chunk wins over a carried-forward one with its id.
   const seen = new Set<string>();
-  let kept = 0, dropped = 0, tokens = 0;
-  async function* survivors(): AsyncGenerator<CodeChunk> {
-    for (const sp of shardPaths) {
-      if (!existsSync(sp)) continue;
-      for await (const c of iterateChunksFile(sp)) {
-        const h = computeStructuralHash(c.content, c.language).hash;
-        if (seen.has(h)) { dropped++; continue; }
-        seen.add(h);
-        kept++;
-        tokens += c.tokens;
-        yield c;
-      }
-    }
-    if (carryForward && existsSync(carryForward.prevPath)) {
-      for await (const c of iterateChunksFile(carryForward.prevPath)) {
-        if (!carryForward.keep(c)) continue;
-        const h = computeStructuralHash(c.content, c.language).hash;
-        if (seen.has(h)) { dropped++; continue; }
-        seen.add(h);
+  let kept = 0, tokens = 0;
+  async function* merged(): AsyncGenerator<CodeChunk> {
+    const sources: Array<{ path: string; keep: (c: CodeChunk) => boolean }> =
+      shardPaths.filter((sp) => existsSync(sp)).map((sp) => ({ path: sp, keep: () => true }));
+    if (carryForward && existsSync(carryForward.prevPath)) sources.push({ path: carryForward.prevPath, keep: carryForward.keep });
+    for (const { path, keep } of sources) {
+      for await (const c of iterateChunksFile(path)) {
+        if (!keep(c) || seen.has(c.id)) continue;
+        seen.add(c.id);
         kept++;
         tokens += c.tokens;
         yield c;
       }
     }
   }
-  await blobs.putNdjson(chunksKey, survivors());
-  return { kept, dropped, tokens };
+  await blobs.putNdjson(chunksKey, merged());
+  return { kept, tokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -167,13 +154,14 @@ export class KnowledgeIndexer {
         : sameWorkingTreeState(meta?.workingTree ?? {}, getWorkingTreeState(repo.path));
       if (meta && currentSha && meta.lastIndexedSha === currentSha && treeUnchanged) {
         // A skipped repo is served entirely from its stored artifacts (graph +
-        // cross-repo signals) — no clone, no AST re-parse. An index whose
-        // signals are missing or in an older format must be re-indexed once
-        // to (re)extract them.
+        // cross-repo signals + chunks carried forward) — no clone, no AST
+        // re-parse. An index whose signals are missing or in an older format,
+        // or whose chunks use an older id scheme, must be re-indexed once.
         const signals = await storage.blobs
           .getJson<CrossRepoSignals>(`${repo.name}/signals.json`)
           .catch(() => null);
         const hasArtifacts =
+          meta.chunkIdVersion === CHUNK_ID_VERSION &&
           (await storage.blobs.exists(`${repo.name}/graph.json`)) &&
           signals?.version === CROSS_REPO_SIGNALS_VERSION;
         if (hasArtifacts) {
@@ -189,10 +177,21 @@ export class KnowledgeIndexer {
       }
     }
 
-    if (reposToIndex.length === 0) {
+    // Repos the last cycle indexed that are no longer in the workspace: their
+    // chunks drop out of chunks.json below (embedChunks then sweeps their rows)
+    // and their per-repo artifacts are deleted — so this cycle isn't a no-op.
+    const currentRepoNames = new Set(repos.map((r) => r.name));
+    const prevStats = await storage.blobs
+      .getJson<{ repos?: Array<{ name: string }>; crossRepoEdges?: number }>('index_stats.json')
+      .catch(() => null);
+    const removedRepos = (prevStats?.repos ?? [])
+      .map((r) => r.name)
+      .filter((n) => n && n !== '.' && n !== '..' && !/[\\/]/.test(n) && !currentRepoNames.has(n));
+
+    if (reposToIndex.length === 0 && removedRepos.length === 0) {
       log('All repos up to date — nothing to build.');
       report({ phase: 'done', message: 'All repos up to date', percent: 100, etaSeconds: 0, skippedRepos });
-      return { project, repos: [], totalChunks: 0, totalTokens: 0, crossRepoEdges: 0, durationMs: 0, chunksPath: join(basePath, 'chunks.json') };
+      return { project, repos: [], totalChunks: 0, totalTokens: 0, crossRepoEdges: prevStats?.crossRepoEdges ?? 0, durationMs: 0, chunksPath: join(basePath, 'chunks.json') };
     }
 
     // 2. LLM Repo Profiling (WS-1) — skipped if LLM_MODE=none
@@ -311,13 +310,12 @@ export class KnowledgeIndexer {
       }
     }
 
-    // Structural dedup — streaming over the per-repo shards into chunks.json
-    // (bounded memory; replaces the in-RAM dedup that OOM'd at org scale).
+    // Merge the per-repo shards into chunks.json, streaming (bounded memory).
     // PARTIAL CYCLES: the shards only cover repos re-chunked THIS cycle —
     // skipped repos' chunks and an incrementally-chunked repo's untouched
     // files must be carried forward from the previous chunks.json, or every
     // scheduled reindex silently shrinks the corpus to the changed set.
-    report({ phase: 'dedup', message: 'Deduplicating chunks (streaming)...', percent: 68, etaSeconds: -1 });
+    report({ phase: 'dedup', message: 'Merging chunks (streaming)...', percent: 68, etaSeconds: -1 });
     const chunksPath = join(basePath, 'chunks.json');
     const anyPartialShard = [...repoChunkResults.values()].some((r) => !r.shardComplete);
     const needCarry = (skippedRepos.length > 0 || anyPartialShard) && (await storage.blobs.exists('chunks.json'));
@@ -332,25 +330,28 @@ export class KnowledgeIndexer {
       const fullyRechunked = new Set(
         [...repoChunkResults.entries()].filter(([, r]) => r.shardComplete).map(([name]) => name),
       );
-      const removedFiles = new Map<string, Set<string>>(
+      // A partial shard's fileIndex lists every file the repo still has: carry
+      // forward only those, minus the ones re-chunked this cycle.
+      const partial = new Map(
         [...repoChunkResults.entries()]
           .filter(([, r]) => !r.shardComplete)
-          .map(([name, r]) => [name, new Set([...r.changedFiles, ...r.deletedFiles])]),
+          .map(([name, r]) => [name, { files: r.fileIndex, changed: new Set(r.changedFiles) }]),
       );
       carryForward = {
         prevPath,
-        keep: (c) =>
-          currentRepos.has(c.repoName) &&          // repos removed from the org drop out
-          !fullyRechunked.has(c.repoName) &&       // complete shard = replaces the repo wholesale
-          !removedFiles.get(c.repoName)?.has(c.filePath), // partial shard: only its changed/deleted files are replaced
+        keep: (c) => {
+          if (!currentRepos.has(c.repoName)) return false;    // repos removed from the org drop out
+          if (fullyRechunked.has(c.repoName)) return false;   // complete shard = replaces the repo wholesale
+          const p = partial.get(c.repoName);
+          return !p || (c.filePath in p.files && !p.changed.has(c.filePath));
+        },
       };
     }
-    const dedup = await dedupShardsToChunks(shardPaths, storage.blobs, 'chunks.json', carryForward);
+    const merged = await mergeShardsToChunks(shardPaths, storage.blobs, 'chunks.json', carryForward);
     if (carryForward) { try { rmSync(carryForward.prevPath, { force: true }); } catch { /* scratch */ } }
-    const dedupedChunkCount = dedup.kept;
-    const dedupedTokenSum = dedup.tokens;
-    if (dedup.dropped > 0) log(`Structural dedup: ${dedup.dropped} duplicates removed`);
-    log(`Saved ${dedupedChunkCount} chunks to ${chunksPath}`);
+    const mergedChunkCount = merged.kept;
+    const mergedTokenSum = merged.tokens;
+    log(`Saved ${mergedChunkCount} chunks to ${chunksPath}`);
     for (const sp of shardPaths) { try { rmSync(sp, { force: true }); } catch { /* ok */ } }
 
     // 7. Detect cross-repo edges (14 strategies) — correlated from the
@@ -438,19 +439,20 @@ export class KnowledgeIndexer {
       }
     }
 
-    // 11. (chunks.json was written + the chunk arrays freed right after dedup,
+    // 11. (chunks.json was written + the chunk arrays freed right after merging,
     // above — so ~810k chunk objects don't sit in memory through the graph build.)
 
     // 11b. Save stale files list (for incremental embedding cleanup).
-    // Includes both deleted AND modified files: chunk.id is position-keyed
-    // (chunker.ts:179), so an in-place edit at the same line range produces
+    // Includes both deleted AND modified files: chunk ids are position-keyed
+    // (chunker.ts chunkId), so an in-place edit at the same line range produces
     // an identical id and the embedder's id-set filter would otherwise leave
     // the old vector in LanceDB unchanged. Listing modified files here lets
     // embedChunks() wipe their old chunks before re-embedding.
     const allStaleFiles: Array<{ repoName: string; filePath: string }> = [];
     for (const repo of reposToIndex) {
       const result = repoChunkResults.get(repo.name);
-      if (!result) continue;
+      // A repo indexed for the first time has no rows to wipe.
+      if (!result || !(await readRepoIndexMeta(basePath, repo.name, storage.blobs))) continue;
       for (const f of result.deletedFiles ?? []) {
         allStaleFiles.push({ repoName: repo.name, filePath: f });
       }
@@ -475,17 +477,32 @@ export class KnowledgeIndexer {
       const sha = result?.sha ?? getRepoSha(repo.path);
       const totalChunkCount = result ? Object.values(result.fileIndex).reduce((sum: number, f: any) => sum + f.chunkCount, 0) : 0;
       if (sha) {
+        // The repo's unchanged rows keep the vector space they were embedded in
+        // until the embed step records the next one.
+        const prev = await readRepoIndexMeta(basePath, repo.name, storage.blobs);
         await writeRepoIndexMeta(storage.blobs, repo.name, {
           lastIndexedSha: sha,
           lastIndexedAt: new Date().toISOString(),
           chunkCount: totalChunkCount,
           embeddingProvider: 'pending',
+          embeddingModel: prev?.embeddingModel,
+          embeddingDimensions: prev?.embeddingDimensions,
           files: result?.fileIndex,
           workingTree: result?.workingTree,
+          chunkIdVersion: CHUNK_ID_VERSION,
           // Serializable form (WorkspaceMap holds Maps) — rehydrated when this
           // repo is later skipped, for cross-repo workspace-dep correlation.
           workspacePackages: workspaceMaps.get(repo.name)?.packages,
         });
+      }
+    }
+
+    for (const name of removedRepos) {
+      try {
+        await storage.blobs.deletePrefix(`${name}/`);
+        log(`Removed ${name} — no longer in the workspace`);
+      } catch (e) {
+        log(`Warning: could not remove stored artifacts of ${name}: ${e}`);
       }
     }
 
@@ -494,8 +511,8 @@ export class KnowledgeIndexer {
     try {
       await storage.blobs.putJson('index_stats.json', {
         repos: repoStats,
-        totalChunks: dedupedChunkCount,
-        totalTokens: dedupedTokenSum,
+        totalChunks: mergedChunkCount,
+        totalTokens: mergedTokenSum,
         crossRepoEdges: crossRepoEdgeCount,
         embeddingProvider: 'pending',
         lastIndexed: new Date().toISOString(),
@@ -506,13 +523,13 @@ export class KnowledgeIndexer {
     await bumpIndexGeneration(storage.blobs);
 
     const durationMs = Date.now() - startTime;
-    report({ phase: 'done', message: `KB built: ${dedupedChunkCount} chunks, ${crossRepoEdgeCount} edges in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0, skippedRepos });
+    report({ phase: 'done', message: `KB built: ${mergedChunkCount} chunks, ${crossRepoEdgeCount} edges in ${formatEta(Math.ceil(durationMs / 1000))}`, percent: 100, etaSeconds: 0, skippedRepos });
 
     return {
       project,
       repos: repoStats,
-      totalChunks: dedupedChunkCount,
-      totalTokens: dedupedTokenSum,
+      totalChunks: mergedChunkCount,
+      totalTokens: mergedTokenSum,
       crossRepoEdges: crossRepoEdgeCount,
       durationMs,
       chunksPath,
@@ -547,6 +564,10 @@ export class KnowledgeIndexer {
     // drop it and rebuild from chunks.json rather than failing every reindex.
     const vectorStore = storage.vectors;
     await vectorStore.init({ healCorrupt: true });
+    // Cross-repo edges are counted by buildKB (stats rollup), not here.
+    const crossRepoEdges = (await storage.blobs
+      .getJson<{ crossRepoEdges?: number }>('index_stats.json')
+      .catch(() => null))?.crossRepoEdges ?? 0;
 
     // Wipe the rows of changed/deleted files (listed by buildKB) BEFORE taking
     // the id snapshot below: chunk ids are hash(filePath, startLine, endLine),
@@ -590,13 +611,26 @@ export class KnowledgeIndexer {
     let totalTokens = 0;
     let newChunkCount = 0;
     const repoChunkCounts = new Map<string, number>();
+    const listedIds = new Set<string>();
     for await (const c of storage.blobs.iterateNdjson<CodeChunk>('chunks.json')) {
       totalChunks++;
       totalTokens += c.tokens;
       repoChunkCounts.set(c.repoName, (repoChunkCounts.get(c.repoName) ?? 0) + 1);
+      listedIds.add(c.id);
       if (!existingIds.has(c.id)) newChunkCount++;
     }
     log(`Loaded ${totalChunks} chunks from ${chunksPath}`);
+
+    // chunks.json is the corpus: rows it no longer lists — a removed repo, a
+    // file deletion a fallback re-chunk caught, chunks from an older id scheme
+    // — are swept. An empty chunks.json is treated as a failed build, not as
+    // "delete everything".
+    const orphanIds = totalChunks > 0 ? [...existingIds].filter((id) => !listedIds.has(id)) : [];
+    if (orphanIds.length > 0) {
+      log(`Removing ${orphanIds.length} rows no longer in ${chunksPath}...`);
+      await vectorStore.deleteChunksByIds(orphanIds);
+      for (const id of orphanIds) existingIds.delete(id);
+    }
     const repoNames = [...repoChunkCounts.keys()];
 
     if (newChunkCount === 0 && deletedFiles.length === 0) {
@@ -626,7 +660,7 @@ export class KnowledgeIndexer {
         totalTokens,
         embeddingProvider: 'cached',
         embeddingDimensions: 0,
-        crossRepoEdges: 0,
+        crossRepoEdges,
         lastIndexed: new Date().toISOString(),
         indexDurationMs: Date.now() - startTime,
         ...(vectorIndex ? { vectorIndex } : {}),
@@ -761,6 +795,8 @@ export class KnowledgeIndexer {
         const meta = await storage.blobs.getJson<RepoIndexMeta>(metaKey);
         if (meta) {
           meta.embeddingProvider = embedder.name;
+          meta.embeddingModel = embedder.model;
+          meta.embeddingDimensions = embedder.dimensions;
           meta.lastIndexedAt = new Date().toISOString();
           await storage.blobs.putJson(metaKey, meta);
         }
@@ -791,7 +827,7 @@ export class KnowledgeIndexer {
       totalTokens,
       embeddingProvider: embedder.name,
       embeddingDimensions: embedder.dimensions,
-      crossRepoEdges: 0,
+      crossRepoEdges,
       lastIndexed: new Date().toISOString(),
       indexDurationMs: durationMs,
       ...(vectorIndex ? { vectorIndex } : {}),
@@ -1105,11 +1141,15 @@ const retrieverCache = new Map<string, RetrieverCacheEntry>();
  * invalidated that way, so it relies on this TTL check to notice the writer's
  * reindex and rebuild. 0 disables. env: CODE_SEARCH_RETRIEVER_TTL_MS.
  */
-const RETRIEVER_FRESHNESS_MS = Math.max(0, parseInt(process.env.CODE_SEARCH_RETRIEVER_TTL_MS ?? '', 10) || 30_000);
+export function retrieverFreshnessMs(): number {
+  const ms = parseInt(process.env.CODE_SEARCH_RETRIEVER_TTL_MS ?? '', 10);
+  return Number.isFinite(ms) && ms >= 0 ? ms : 30_000;
+}
+const RETRIEVER_FRESHNESS_MS = retrieverFreshnessMs();
 
 function retrieverCacheKey(project: string, config: KnowledgeConfig): string {
   const e = config.embedding;
-  return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}`;
+  return `${project}::${e.provider}:${e.model ?? ''}:${e.dimensions ?? ''}::${JSON.stringify(config.retrieval)}`;
 }
 
 /** Cheap change-signal for a project's index. Primary: the `index_generation`
@@ -1263,18 +1303,22 @@ async function buildRetriever(
   const embedder = createEmbeddingProvider(config.embedding);
 
   // Vector-space safety: refuse to run if the index was embedded with a
-  // different provider/dimension than what the current config resolves to.
-  // Garbage results from silent space mismatch are worse than a hard error.
+  // different provider, model or dimension than the current config resolves
+  // to. Garbage results from silent space mismatch are worse than a hard error.
   try {
     for (const entry of await listRepoNames(storage)) {
       const meta = await readRepoIndexMeta(basePath, entry, storage.blobs);
-      if (!meta || !meta.embeddingProvider || meta.embeddingProvider === 'pending') continue;
-      if (meta.embeddingProvider !== embedder.name) {
+      if (!meta) continue;
+      const built =
+        (meta.embeddingProvider && meta.embeddingProvider !== 'pending' && meta.embeddingProvider !== embedder.name && `provider "${meta.embeddingProvider}"`) ||
+        (meta.embeddingModel !== undefined && embedder.model !== undefined && meta.embeddingModel !== embedder.model && `model "${meta.embeddingModel}"`) ||
+        (meta.embeddingDimensions !== undefined && meta.embeddingDimensions !== embedder.dimensions && `${meta.embeddingDimensions} dimensions`);
+      if (built) {
         throw new Error(
           `[knowledge-core] Vector-space mismatch for repo "${entry}": ` +
-          `index built with "${meta.embeddingProvider}" but retrieval is using "${embedder.name}". ` +
-          `Reindex with consistent embedding provider, or revert the config change. ` +
-          `(set CODE_SEARCH_EMBEDDING_PROVIDER or config.embedding.provider to match the index.)`,
+          `index built with ${built} but retrieval is using "${embedder.name}" model "${embedder.model ?? ''}" (${embedder.dimensions} dimensions). ` +
+          `Reindex with force, or revert the config change ` +
+          `(CODE_SEARCH_EMBEDDING_PROVIDER / _MODEL / _DIMENSIONS or config.embedding).`,
         );
       }
     }

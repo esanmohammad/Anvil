@@ -104,7 +104,7 @@ describe('toKnowledgeConfig (P3 adapter)', () => {
     const k = toKnowledgeConfig(cfg);
     assert.equal(k.embedding.provider, cfg.embedding.provider);
     assert.equal(k.retrieval.maxChunks, cfg.retrieval.maxChunks);
-    assert.deepEqual(k.chunking, cfg.indexing.chunking);
+    assert.deepEqual(k.chunking, { ...cfg.indexing.chunking, ignorePatterns: cfg.indexing.ignorePatterns });
     // Reranker is a struct on both sides now.
     const r = typeof k.retrieval.reranker === 'string' ? { provider: k.retrieval.reranker } : k.retrieval.reranker;
     assert.equal(r.provider, cfg.reranker.provider);

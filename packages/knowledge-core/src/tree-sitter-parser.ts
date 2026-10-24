@@ -83,17 +83,25 @@ async function getParserAndLang(language: string): Promise<{ parser: TSParser; l
   if (!wasmFile) return null;
 
   try {
-    const wasmPath = require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
+    // Grammars built for the web-tree-sitter ABI in use (14/15).
+    const wasmPath = require.resolve(`@vscode/tree-sitter-wasm/wasm/${wasmFile}`);
     const lang = await TSLanguage.load(wasmPath);
     const parser = new TSParser();
     parser.setLanguage(lang);
     const entry = { parser, lang };
     languageParsers.set(language, entry);
     return entry;
-  } catch {
+  } catch (err) {
+    // Callers fall back to regex extraction — say so once, or a broken grammar
+    // silently degrades every graph.
+    if (!grammarLoadWarned.has(language)) {
+      grammarLoadWarned.add(language);
+      console.error(`[knowledge-core] tree-sitter grammar for ${language} failed to load (${err instanceof Error ? err.message : String(err)}); using regex extraction`);
+    }
     return null;
   }
 }
+const grammarLoadWarned = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // Query patterns per language
@@ -122,11 +130,26 @@ const TS_QUERIES: LanguageQueries = {
   `,
   imports: `
     (import_statement source: (string) @source) @import
+    (call_expression function: (identifier) @_fn arguments: (arguments (string) @source) (#eq? @_fn "require")) @import
   `,
   calls: `
     (call_expression function: (identifier) @callee) @call
     (call_expression function: (member_expression property: (property_identifier) @callee)) @call
   `,
+};
+
+/** JavaScript: TS's queries minus the type-only nodes; class names are plain identifiers. */
+const JS_QUERIES: LanguageQueries = {
+  entities: `
+    (function_declaration name: (identifier) @name) @entity
+    (class_declaration name: (identifier) @name) @entity
+    (method_definition name: (property_identifier) @name) @entity
+    (export_statement declaration: (function_declaration name: (identifier) @name) @entity) @export
+    (export_statement declaration: (class_declaration name: (identifier) @name) @entity) @export
+    (export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: (arrow_function) @entity))) @export
+  `,
+  imports: TS_QUERIES.imports,
+  calls: TS_QUERIES.calls,
 };
 
 const GO_QUERIES: LanguageQueries = {
@@ -212,9 +235,10 @@ const PHP_QUERIES: LanguageQueries = {
 function queriesForLanguage(language: string): LanguageQueries | null {
   switch (language) {
     case 'typescript':
-    case 'javascript':
     case 'tsx':
       return TS_QUERIES;
+    case 'javascript':
+      return JS_QUERIES;
     case 'go':
       return GO_QUERIES;
     case 'python':
@@ -342,6 +366,23 @@ function isExported(entityNode: TSNode, language: string, content: string): bool
 // Containing entity (parent class/struct)
 // ---------------------------------------------------------------------------
 
+const FUNCTION_NODES = new Set([
+  'function_declaration', 'function_definition', 'function_item', 'method_definition',
+  'method_declaration', 'arrow_function', 'function_expression',
+]);
+
+/** Name of the class / impl a definition sits in directly — undefined when a
+ *  function body comes first (a nested function is not a method). */
+function enclosingClassName(node: TSNode): string | undefined {
+  for (let cursor = node.parent; cursor; cursor = cursor.parent) {
+    if (FUNCTION_NODES.has(cursor.type)) return undefined;
+    if (cursor.type === 'class_definition' || cursor.type === 'impl_item') {
+      return cursor.namedChildren.find((c) => c.type === 'identifier' || c.type === 'type_identifier')?.text;
+    }
+  }
+  return undefined;
+}
+
 function findContainingEntity(node: TSNode): string | undefined {
   let cursor: TSNode | null = node.parent;
   while (cursor) {
@@ -392,33 +433,35 @@ function extractSignature(entityNode: TSNode, entityType: EntityType, _content: 
 // Query execution with fallback
 // ---------------------------------------------------------------------------
 
-function runQuery(
-  language: TSLanguage,
-  querySource: string,
-  rootNode: TSNode,
-): QueryMatch[] {
-  try {
-    const query = new TSQuery(language,querySource);
-    return query.matches(rootNode);
-  } catch {
-    // Query syntax mismatch for this grammar version — return empty
-    return [];
+// Compiled once per (grammar, source): compiling is far costlier than matching,
+// and every file of a language runs the same queries. null = doesn't compile.
+const compiledQueries = new WeakMap<TSLanguage, Map<string, TSQuery | null>>();
+
+function compiledQuery(language: TSLanguage, querySource: string): TSQuery | null {
+  let byLang = compiledQueries.get(language);
+  if (!byLang) compiledQueries.set(language, (byLang = new Map()));
+  if (!byLang.has(querySource)) {
+    try {
+      byLang.set(querySource, new TSQuery(language, querySource));
+    } catch {
+      byLang.set(querySource, null); // syntax mismatch for this grammar version
+    }
   }
+  return byLang.get(querySource)!;
 }
 
 /**
- * Try running a query. If the full query fails (some patterns may not match
- * this grammar), try each pattern individually and collect what works.
+ * Run a query. If the full query doesn't compile for this grammar (some
+ * patterns name nodes it lacks), run each pattern that does individually.
  */
 function runQueryWithFallback(
   language: TSLanguage,
   querySource: string,
   rootNode: TSNode,
 ): QueryMatch[] {
-  const fullResult = runQuery(language, querySource, rootNode);
-  if (fullResult.length > 0) return fullResult;
+  const full = compiledQuery(language, querySource);
+  if (full) return full.matches(rootNode);
 
-  // Split into individual patterns and try each
   const patterns = querySource
     .split('\n')
     .map((l) => l.trim())
@@ -426,12 +469,8 @@ function runQueryWithFallback(
 
   const results: QueryMatch[] = [];
   for (const pattern of patterns) {
-    try {
-      const q = new TSQuery(language,pattern);
-      results.push(...q.matches(rootNode));
-    } catch {
-      // This specific pattern doesn't work with this grammar — skip
-    }
+    const q = compiledQuery(language, pattern);
+    if (q) results.push(...q.matches(rootNode));
   }
   return results;
 }
@@ -516,11 +555,18 @@ function parseCallMatches(
 
     const callee = calleeCapture.node.text;
     const startLine = calleeCapture.node.startPosition.row;
+    const at = calleeCapture.node.startIndex;
 
-    // Find containing entity by line range
-    const containingEntity = entities.find(
-      (e) => startLine >= e.startLine && startLine <= e.endLine,
-    )?.name;
+    // Innermost containing entity: a call in a method belongs to the method,
+    // not to its class.
+    let containingEntity: string | undefined;
+    let span = Infinity;
+    for (const e of entities) {
+      if (at >= e.startByte && at < e.endByte && e.endByte - e.startByte < span) {
+        containingEntity = e.name;
+        span = e.endByte - e.startByte;
+      }
+    }
 
     callSites.push({ callee, startLine, containingEntity });
   }
@@ -604,7 +650,9 @@ export async function parseFile(
 
     const entityNode = entityCapture.node;
     const name = nameCapture.node.text;
-    const type = detectEntityType(entityNode, language);
+    let type = detectEntityType(entityNode, language);
+    // Python `def` in a class, Rust `fn` in an impl: methods of that type.
+    if (type === 'function' && enclosingClassName(entityNode)) type = 'method';
     const startLine = entityNode.startPosition.row;
     const endLine = entityNode.endPosition.row;
 

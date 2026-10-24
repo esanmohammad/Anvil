@@ -78,7 +78,7 @@ export function langFromExt(ext: string): string {
 // Recursive directory walker
 // ---------------------------------------------------------------------------
 
-export function walkDir(dir: string, collected: string[]): void {
+export function walkDir(dir: string, collected: string[], ignore?: ReadonlySet<string>): void {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -86,7 +86,7 @@ export function walkDir(dir: string, collected: string[]): void {
     return; // permission error or similar — skip
   }
   for (const entry of entries) {
-    if (SKIP_DIRS.has(entry)) continue;
+    if (SKIP_DIRS.has(entry) || ignore?.has(entry)) continue;
     const full = join(dir, entry);
     let stat;
     try {
@@ -95,7 +95,7 @@ export function walkDir(dir: string, collected: string[]): void {
       continue;
     }
     if (stat.isDirectory()) {
-      walkDir(full, collected);
+      walkDir(full, collected, ignore);
     } else if (stat.isFile() && isSourceFile(entry)) {
       collected.push(full);
     }
@@ -106,6 +106,11 @@ export function walkDir(dir: string, collected: string[]): void {
 // Import extraction
 // ---------------------------------------------------------------------------
 
+/** True when any segment of a repo-relative path is an ignore pattern. */
+export function isIgnoredPath(relPath: string, ignore: ReadonlySet<string>): boolean {
+  return ignore.size > 0 && relPath.split(/[\\/]/).some((seg) => ignore.has(seg));
+}
+
 /** Extract import identifiers from lines of a file. */
 export function extractImports(lines: string[], lang: string): string[] {
   const imports: string[] = [];
@@ -114,6 +119,7 @@ export function extractImports(lines: string[], lang: string): string[] {
     if (lang === 'typescript' || lang === 'javascript') {
       const m = trimmed.match(/^import\s+.*from\s+['"]([@\w/.-]+)['"]/);
       if (m) imports.push(m[1]);
+      for (const r of trimmed.matchAll(/\brequire\(\s*['"]([@\w/.-]+)['"]\s*\)/g)) imports.push(r[1]);
     } else if (lang === 'python') {
       const m = trimmed.match(/^(?:from\s+([\w.]+)\s+)?import\s+([\w., ]+)/);
       if (m) imports.push(m[1] ?? m[2]);

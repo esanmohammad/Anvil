@@ -567,7 +567,7 @@ function bridgeLegacyEnvVars(cfg: CodeSearchConfig): void {
 export function toKnowledgeConfig(c: CodeSearchConfig): KnowledgeConfig {
   return {
     embedding: { ...c.embedding },
-    chunking: { ...c.indexing.chunking },
+    chunking: { ...c.indexing.chunking, ignorePatterns: c.indexing.ignorePatterns },
     retrieval: {
       maxChunks: c.retrieval.maxChunks,
       maxTokens: c.retrieval.maxTokens,

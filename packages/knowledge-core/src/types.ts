@@ -1,6 +1,6 @@
 // Code chunk — atomic unit of knowledge
 export interface CodeChunk {
-  id: string;                    // deterministic: sha256(filePath + startLine + endLine)
+  id: string;                    // deterministic: sha256(repoName, filePath, startLine, endLine)
   filePath: string;              // relative to repo root
   repoName: string;
   project: string;
@@ -116,6 +116,8 @@ export interface VectorIndexHealth {
 // Embedding provider interface
 export interface EmbeddingProvider {
   readonly name: string;
+  /** Model id the vectors come from — recorded per repo, checked on open. */
+  readonly model?: string;
   readonly dimensions: number;
   embed(texts: string[]): Promise<number[][]>;
   embedSingle(text: string): Promise<number[]>;
