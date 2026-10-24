@@ -3,7 +3,7 @@
  *
  * Builds a knowledge graph from source code with:
  *   Phase 0: Workspace package nodes
- *   Phase 1: File walking + entity extraction (regex-based, multi-language)
+ *   Phase 1: File walking + entity extraction (tree-sitter, regex fallback)
  *   Phase 2: Import resolution (relative + module-path + workspace + named imports)
  *   Phase 3: Type reference edges from entity bodies
  *   Phase 4: Import-aware call disambiguation (deferred cross-file resolution)
@@ -14,7 +14,7 @@
  *   - symbolToIds (multi-candidate) replaces symbolToId (first-writer-wins)
  *   - Import graph used to disambiguate calls (eliminates false edges)
  *   - Entity-level 'uses' edges from named imports (not just file→file)
- *   - Type reference edges from function signatures
+ *   - Type reference edges from the entity that references the type
  *   - Confidence scoring on every edge (for weighted BFS in retriever)
  */
 
@@ -541,6 +541,19 @@ function resolveCallTarget(
   return null;
 }
 
+/** Go `pkg.Type`: the one `Type` declared in a directory named `pkg` (a Go
+ *  package's name is its directory's). A package outside the repo (`http`)
+ *  has none. */
+function resolveQualifiedType(
+  name: string,
+  qualifier: string,
+  file: string,
+  symbolToIds: Map<string, string[]>,
+): { targetId: string; confidence: number } | null {
+  const inPackage = sameFamilyCandidates(name, file, symbolToIds).filter((c) => basename(dirname(c.split('::')[0])) === qualifier);
+  return inPackage.length === 1 ? { targetId: inPackage[0], confidence: 0.8 } : null;
+}
+
 // ---------------------------------------------------------------------------
 // Extended import resolution (uses language-specific resolvers)
 // ---------------------------------------------------------------------------
@@ -602,6 +615,16 @@ function findEntityAtLine(entities: ExtractedEntity[], line: number): ExtractedE
     else break;
   }
   return best;
+}
+
+/** The entity a tree-sitter call / type reference belongs to: `file::<its
+ *  containing entity>` when that is a node (a class member's id is
+ *  `file::Class.member`, so it isn't), else the nearest entity starting at or
+ *  above the line, else the file. */
+function sourceEntityAt(fileEntities: ExtractedEntity[], relPath: string, containingEntity: string | undefined, line: number): string {
+  const id = containingEntity ? `${relPath}::${containingEntity}` : undefined;
+  if (id && fileEntities.some((e) => e.id === id)) return id;
+  return findEntityAtLine(fileEntities, line)?.id ?? relPath;
 }
 
 export async function buildAstGraph(
@@ -836,18 +859,19 @@ export async function buildAstGraph(
     const fileEntities = entityByFile.get(relPath);
     if (!fileEntities || fileEntities.length === 0) continue;
 
-    // Use tree-sitter type references when available (file-level, more complete)
+    // Tree-sitter type references, each from the entity that makes it
     const tsResult = tsResultByFile.get(relPath);
-    if (tsResult && tsResult.typeReferences.length > 0) {
-      // Tree-sitter extracted all type references from the file — resolve each
+    if (tsResult) {
       const seenTypeRefs = new Set<string>();
-      for (const typeName of tsResult.typeReferences) {
-        if (seenTypeRefs.has(typeName)) continue;
-        seenTypeRefs.add(typeName);
+      for (const ref of tsResult.typeReferences) {
+        const sourceId = sourceEntityAt(fileEntities, relPath, ref.containingEntity, ref.startLine);
+        const refKey = `${sourceId}→${ref.name}`;
+        if (seenTypeRefs.has(refKey)) continue;
+        seenTypeRefs.add(refKey);
 
-        // Attribute to the first entity in the file or the file itself
-        const sourceId = fileEntities[0]?.id ?? relPath;
-        const resolved = resolveCallTarget(typeName, relPath, sourceId, symbolToIds, fileImportTargets);
+        const resolved = ref.qualifier
+          ? resolveQualifiedType(ref.name, ref.qualifier, relPath, symbolToIds)
+          : resolveCallTarget(ref.name, relPath, sourceId, symbolToIds, fileImportTargets);
         if (resolved) {
           edges.push({ source: sourceId, target: resolved.targetId, type: 'type-ref', confidence: Math.min(resolved.confidence, 0.85) });
         }
@@ -900,19 +924,7 @@ export async function buildAstGraph(
         if (calledName.length < 3) continue;
         if (SKIP_CALL_NAMES.has(calledName)) continue;
 
-        // Determine the calling entity — tree-sitter provides containingEntity
-        let sourceEntityId: string;
-        if (callSite.containingEntity) {
-          sourceEntityId = `${relPath}::${callSite.containingEntity}`;
-          // Verify this entity exists (might be a nested name)
-          if (!fileEntities.some(e => e.id === sourceEntityId)) {
-            // Fall back to line-based entity lookup
-            sourceEntityId = findEntityAtLine(fileEntities, callSite.startLine)?.id ?? relPath;
-          }
-        } else {
-          // Module-level call — attribute to file or nearest entity
-          sourceEntityId = findEntityAtLine(fileEntities, callSite.startLine)?.id ?? relPath;
-        }
+        const sourceEntityId = sourceEntityAt(fileEntities, relPath, callSite.containingEntity, callSite.startLine);
 
         // Deduplicate: same source→callee pair
         const edgeKey = `${sourceEntityId}→${calledName}`;

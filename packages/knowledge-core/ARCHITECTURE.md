@@ -76,9 +76,9 @@ interface CodeChunk {
   contextPrefix: string;         // file path, scope chain, imports
   contextualizedContent: string; // contextPrefix + '\n' + content (what gets embedded)
   language: string;
-  entityType: 'function' | 'class' | 'method' | 'interface' | 'type' | 'module' | 'import' | 'block';
+  entityType: 'function' | 'class' | 'method' | 'interface' | 'type' | 'const' | 'module' | 'import' | 'block';
   entityName?: string;
-  parentEntity?: string;
+  parentEntity?: string;         // the class of a member; the outer entity of a split part named after a nested definition
   tokens: number;                // chars / 4
   imports: string[];
   exports: string[];
@@ -199,14 +199,25 @@ import path strings (`import … from` and `require(…)` for TS/JS).
 
 Boundaries come from tree-sitter for the 8 parsed languages: every
 top-level definition and class member starts a chunk (methods get
-`parentEntity` = their class; a function nested in another function stays
-in it). Without a grammar (or a parse with no entities) the per-language
-regex `BoundaryPattern[]` (TS/JS, Python, Go, Rust, Java) is the fallback.
+`parentEntity` = their class). In JS/TS that includes every top-level (or
+exported) `const` / `let` / `var` — `entityType` `const`, or `function`
+when its value is an arrow / function expression — except a
+`x = require(…)` binding, and `.d.ts` ambient declarations (`declare
+const` / `function`, a `declare module` block's exports). So a leading
+import block (imports, `require`s) ends where the first declaration
+starts. A definition inside a function body (named or anonymous callback)
+or inside a top-level variable's value stays in its parent's chunk.
+Without a grammar (or a parse with no entities) the per-language regex
+`BoundaryPattern[]` (TS/JS, Python, Go, Rust, Java) is the fallback.
 Each boundary then moves up over the comment / doc-comment / decorator /
 attribute lines directly above it, so a definition's leading annotations
-belong to its chunk. Config formats (yaml, hcl, toml) are whole-file chunks;
-oversized content is split into `name$1`, `name$2`, … parts. Chunk id =
-`sha256(repoName \0 filePath \0 startLine \0 endLine)[0:16]`
+belong to its chunk. Config formats (yaml, hcl, toml) are whole-file chunks.
+Oversized content is split by size at line boundaries; a part that would
+overflow ends instead before the last nested function / method definition
+it holds (also moved up over its annotations), so the next part starts at
+that definition and is named after it, with `parentEntity` = the outer
+entity. Other parts are `name$<part number>` (`name$1`, `name$2`, …).
+Chunk id = `sha256(repoName \0 filePath \0 startLine \0 endLine)[0:16]`
 (`CHUNK_ID_VERSION` = 2).
 
 `chunkChangedFiles(repo, name, project, cfg, gitDiff, onChunk?, cachedFiles?)`
@@ -223,16 +234,26 @@ Returns `{ chunks, fileIndex, deletedFiles, changedFiles }`.
 PHP. Lazy-loaded via `initTreeSitter()`; queries are compiled once per
 grammar. A grammar that fails to load is reported once on stderr and
 `parseFile` returns null (callers use their regex fallback). Used by the
-chunker (boundaries) and the AST graph builder (entities, imports, calls).
-A function directly inside a class / impl is a `method` with that
-`parent`; a call belongs to its innermost containing entity.
+chunker (boundaries) and the AST graph builder (entities, imports, calls,
+type references). A function directly inside a class / impl is a `method`
+with that `parent`; an entity inside a function body is `local`. JS/TS
+entities include top-level variables (type `const`, or `function` for a
+function value; `require(…)` bindings excluded), function-valued variables
+at any depth, and ambient `.d.ts` declarations. A call or type reference
+belongs to its innermost containing entity. Type references come from AST
+nodes, not text: type identifiers in annotations, fields, literals and
+generics (TS, Go, Rust, Java; Python `type`; PHP `named_type`),
+`new X(…)` (JS/TS/PHP) and capitalised JSX tags (JS/TSX) — never a
+declaration's own name, a name in a string or comment, or a
+namespace-qualified name (`React.FC`); a Go `pkg.Type` keeps `pkg` as its
+`qualifier`.
 
 Public API:
 
 ```ts
 parseFile(filePath, content, language) → FileParseResult
   { entities: TreeSitterEntity[], imports: TreeSitterImport[],
-    callSites: TreeSitterCallSite[] }
+    callSites: TreeSitterCallSite[], typeReferences: TreeSitterTypeRef[] }
 parseFiles(files) → FileParseResult[]
 supportedLanguages() → string[]
 ```
@@ -432,14 +453,16 @@ Final selection via `packWithinBudget(chunks, maxTokens, maxChunks)`.
 | 0 | Workspace package nodes |
 | 1 | File walking + entity extraction (tree-sitter; regex when a grammar can't parse; `.tsx` uses the TSX grammar) |
 | 2 | Import resolution (relative + module-path + workspace + named) |
-| 3 | Type reference edges from entity bodies |
+| 3 | Type reference edges from entity bodies (tree-sitter: from the referencing entity; regex: first 30 lines of each entity) |
 | 4 | Import-aware call disambiguation |
 | 5 | Inheritance resolution |
 | 6 | Package→file `contains` edges |
 
-Calls, type references, inheritance and named-import `uses` resolve only
-within a language family (TS/TSX/JS share one) — a name in a Java file never
-binds to a Python definition.
+Every tree-sitter entity is a node (JS/TS top-level variables as type
+`const`). Calls, type references, inheritance and named-import `uses`
+resolve only within a language family (TS/TSX/JS share one) — a name in a
+Java file never binds to a Python definition. A Go `pkg.Type` reference
+resolves only to the one `Type` declared in a directory named `pkg`.
 
 Per-edge `confidence` (0..1). The retriever's expansion and the
 `trace_path` tool follow only non-`contains` edges with confidence ≥ 0.7 —

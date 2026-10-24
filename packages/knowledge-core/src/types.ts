@@ -10,9 +10,9 @@ export interface CodeChunk {
   contextPrefix: string;         // structural context (file path, scope chain, imports)
   contextualizedContent: string; // contextPrefix + '\n' + content (what gets embedded)
   language: string;
-  entityType: 'function' | 'class' | 'method' | 'interface' | 'type' | 'module' | 'import' | 'block';
-  entityName?: string;           // function/class/method name
-  parentEntity?: string;         // containing class/module
+  entityType: 'function' | 'class' | 'method' | 'interface' | 'type' | 'const' | 'module' | 'import' | 'block';
+  entityName?: string;           // function/class/method/const name
+  parentEntity?: string;         // containing class/module, or the entity a split part is nested in
   tokens: number;                // estimated token count (chars/4)
   imports: string[];             // imported symbols
   exports: string[];             // exported symbols

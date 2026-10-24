@@ -11,11 +11,19 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 - `chunkRepo` / `chunkChangedFiles` (`src/chunker.ts`) — splits files at
   definition boundaries: from tree-sitter for the 8 parsed languages
   (top-level definitions and class members, `parentEntity` = the class;
-  functions nested in functions stay inside), regex patterns otherwise. A
-  definition's leading comments / decorators belong to its chunk. Chunk
-  ids are `hash(repoName, filePath, startLine, endLine)` (`CHUNK_ID_VERSION`
-  = 2). `chunkChangedFiles` returns the whole repo's `fileIndex` (cached
-  entries minus the diffed paths, plus the re-chunked ones).
+  in JS/TS also every top-level `const` / `let` / `var` — `entityType`
+  `const`, or `function` for a function value — except `require(…)`
+  bindings, and `.d.ts` ambient declarations, so a leading import block
+  ends at the first declaration), regex patterns otherwise. Definitions
+  inside a function body (named or anonymous) or a top-level variable's
+  value stay in their parent's chunk; an oversized chunk is split by size,
+  but a part ends before the last nested function / method it holds, so
+  the next part starts at it, is named after it and has `parentEntity` =
+  the outer entity (other parts are `name$N`). A definition's leading
+  comments / decorators belong to its chunk. Chunk ids are
+  `hash(repoName, filePath, startLine, endLine)` (`CHUNK_ID_VERSION` = 2).
+  `chunkChangedFiles` returns the whole repo's `fileIndex` (cached entries
+  minus the diffed paths, plus the re-chunked ones).
 - `walkDir` / `langFromExt` / `extractImports` / `extractNamedImports` /
   `isSourceFile` / `isIgnoredPath` (`src/file-walker.ts`) — directory walker
   (built-in skip dirs + `chunking.ignorePatterns` path segments), language
@@ -25,6 +33,10 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   JS, TSX, Go, Python, Rust, Java, PHP; grammars from
   `@vscode/tree-sitter-wasm`, queries compiled once per grammar. A grammar
   that fails to load is reported once and callers fall back to regex.
+  Entities (with `local` = inside a function body), imports, call sites
+  and type references (AST type identifiers, `new X`, capitalised JSX
+  tags; Go `pkg.Type` keeps `pkg` as `qualifier`), each with its innermost
+  containing entity.
 - `getAllChanges` / `getChangedFilesList` / `getDeletedFilesList`
   (`src/git-diff.ts`) — `git diff --name-status` parsing for incremental
   indexing, filtered to the walker's `isSourceFile`. Returns
@@ -36,7 +48,10 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   6-phase build (workspace nodes, entity extraction, import resolution,
   type refs, call disambiguation, inheritance, contains edges). Node ids
   are `file::entity`, class members `file::Class.member` (label = the
-  member name) so same-name methods of different classes stay distinct.
+  member name) so same-name methods of different classes stay distinct;
+  JS/TS top-level variables are `const` nodes. Calls and type refs start at
+  the entity that makes them; a Go `pkg.Type` resolves only to the `Type`
+  declared in a directory named `pkg`.
 - `createSystemGraphSqliteWriter` / `openSystemGraphStore`
   (`src/graph-store.ts`) + `getGraphStore` (`src/storage/resolve.ts`) — the
   merged system graph. `buildKB` streams each repo's nodes/edges and the
@@ -368,7 +383,7 @@ hold. The embed step records `embeddingProvider` / `embeddingModel` /
 - Retrieval end-to-end? `src/retriever.ts:HybridRetriever.retrieve` is
   the whole pipeline, ~200 LOC.
 - Chunking strategy? `src/chunker.ts:chunkFile` (tree-sitter boundaries,
-  regex fallback, leading annotations).
+  regex fallback, leading annotations, size splits at nested definitions).
 - Cost / pricing for LLM-driven phases? Goes through agent-core's
   `cost.ts` via the runner shim.
 - Provider auto-detect? `embedder.ts:createEmbeddingProvider` `case 'auto':`.
