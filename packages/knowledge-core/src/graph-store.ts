@@ -20,19 +20,46 @@ import { join } from 'node:path';
 // ---------------------------------------------------------------------------
 
 export type GraphDirection = 'callees' | 'callers' | 'both';
-export interface GraphEdge { source: string; target: string; type?: string }
+export interface GraphEdge { source: string; target: string; type?: string; evidence?: string }
 export interface GraphNodeRow { key: string; label: string; type: string; file: string; degree: number }
+/** A neighbouring node and the relation (edge type) that links it. */
+export interface TypedNeighbor { key: string; type: string }
 
-/** Query surface the six system-graph tools need. Implemented over SQLite and
- *  (fallback) over the legacy JSON export. */
+/** Cross-repo edge types that describe a shared resource (topic, table, key
+ *  prefix, bucket, type, constant, env var, dependency) rather than a
+ *  client → provider call: the detector stores one edge per pair in an
+ *  arbitrary order, so each side depends on the other. */
+export const SYMMETRIC_EDGE_TYPES: ReadonlySet<string> = new Set([
+  'event-schema', 'database', 'redis', 's3', 'shared-type', 'shared-constant', 'env-var', 'npm-dep',
+]);
+
+/** Node types that are not symbols: files, and the synthetic endpoints of
+ *  cross-repo edges (labelled `file::thing`). Fuzzy and regex name matching
+ *  skip them unless the caller asks for the type explicitly. */
+const NON_SYMBOL_TYPES = ['module', 'external'];
+
+/**
+ * Query surface the system-graph tools need. Implemented over SQLite and
+ * (fallback) over the legacy JSON export.
+ *
+ * Name resolution (`resolveNodes`): exact by default — a node's full key, its
+ * label, or a `::`-suffix of its key (`file::entity`), case-sensitive;
+ * `fuzzy` = case-insensitive substring of symbol labels. `types` filters by
+ * edge type (`calls`, `imports`, `uses`, `type-ref`, `inherits`, cross-repo
+ * types); omitted = every edge type except `contains`. `crossRepoEdges` also
+ * returns same-repo `workspace-dep` edges. `dependents` follows edges into the
+ * set, plus {@link SYMMETRIC_EDGE_TYPES} edges out of it (returned flipped, so
+ * `source` is always the dependent). `searchNodes` `name` is a case-insensitive
+ * regex over symbol labels; an invalid one throws.
+ */
 export interface GraphStore {
   resolveNodes(name: string, repo?: string, fuzzy?: boolean): Array<{ key: string; label: string }>;
-  callers(targetKeys: string[], limit: number): string[];
-  dependencies(sourceKeys: string[], limit: number): string[];
+  callers(targetKeys: string[], limit: number, types?: string[]): TypedNeighbor[];
+  dependencies(sourceKeys: string[], limit: number, types?: string[]): TypedNeighbor[];
   crossRepoEdges(repo: string | undefined, limit: number): { edges: GraphEdge[]; total: number };
   nodesInFiles(repo: string, files: string[], entity?: string): string[];
   dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] };
-  neighborsOf(key: string, direction: GraphDirection): string[];
+  neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[];
   labelsOf(keys: string[]): Map<string, string>;
   nodeTypes(keys: string[]): Map<string, string>;
   searchNodes(
@@ -58,7 +85,13 @@ export function systemGraphSqlitePath(basePath: string): string {
 // ---------------------------------------------------------------------------
 
 interface SqliteStmt { run(...a: unknown[]): unknown; all(...a: unknown[]): any[]; get(...a: unknown[]): any }
-interface SqliteDb { prepare(sql: string): SqliteStmt; exec(sql: string): void; close(): void }
+interface SqliteDb {
+  prepare(sql: string): SqliteStmt;
+  exec(sql: string): void;
+  close(): void;
+  /** User-defined SQL function — better-sqlite3, and node:sqlite from 22.13 / 23.5. */
+  function?(name: string, options: { deterministic?: boolean }, fn: (...a: any[]) => unknown): unknown;
+}
 type Opener = (path: string) => SqliteDb;
 
 let driverPromise: Promise<Opener | null> | undefined;
@@ -93,7 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(label);
 CREATE INDEX IF NOT EXISTS idx_nodes_file  ON nodes(repo, file);
 CREATE TABLE IF NOT EXISTS edges (
   source TEXT NOT NULL, target TEXT NOT NULL, type TEXT, confidence REAL,
-  source_repo TEXT, target_repo TEXT
+  source_repo TEXT, target_repo TEXT, evidence TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_edges_source    ON edges(source, type);
 CREATE INDEX IF NOT EXISTS idx_edges_target    ON edges(target, type);
@@ -120,7 +153,7 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
   db.exec(SCHEMA);
 
   const insNode = db.prepare('INSERT OR REPLACE INTO nodes(key,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?)');
-  const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo) VALUES(?,?,?,?,?,?)');
+  const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo,evidence) VALUES(?,?,?,?,?,?,?)');
 
   const degree = new Map<string, number>();
   db.exec('BEGIN');
@@ -128,7 +161,8 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
     graph.forEachEdge((source, target, attrs) => {
       const type = (attrs.type ?? attrs.relation ?? null) as string | null;
       const confidence = (typeof attrs.confidence === 'number' ? attrs.confidence : null) as number | null;
-      insEdge.run(source, target, type, confidence, repoOf(source), repoOf(target));
+      const evidence = typeof attrs.evidence === 'string' ? attrs.evidence : null;
+      insEdge.run(source, target, type, confidence, repoOf(source), repoOf(target), evidence);
       if (type !== 'contains') {
         degree.set(source, (degree.get(source) ?? 0) + 1);
         degree.set(target, (degree.get(target) ?? 0) + 1);
@@ -196,7 +230,7 @@ export async function createSystemGraphSqliteWriter(basePath: string): Promise<S
   db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;');
   db.exec(SCHEMA);
   const insNode = db.prepare('INSERT OR REPLACE INTO nodes(key,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?)');
-  const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo) VALUES(?,?,?,?,?,?)');
+  const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo,evidence) VALUES(?,?,?,?,?,?,?)');
   const updDegree = db.prepare('UPDATE nodes SET degree=? WHERE key=?');
 
   const nodeKeys = new Set<string>();
@@ -226,7 +260,7 @@ export async function createSystemGraphSqliteWriter(basePath: string): Promise<S
           if (!nodeKeys.has(src) || !nodeKeys.has(tgt)) continue; // both endpoints must exist
           const type = edge.type ?? 'depends';
           const conf = typeof edge.confidence === 'number' ? edge.confidence : 0.8;
-          insEdge.run(src, tgt, type, conf, repoName, repoName);
+          insEdge.run(src, tgt, type, conf, repoName, repoName, null);
           edgeCount++;
           bump(type, src, tgt);
         }
@@ -243,7 +277,7 @@ export async function createSystemGraphSqliteWriter(basePath: string): Promise<S
           if (!nodeKeys.has(src)) { nodeKeys.add(src); insNode.run(src, e.sourceRepo, fileOf(src), e.sourceNode, 'external', 0, null); }
           if (!nodeKeys.has(tgt)) { nodeKeys.add(tgt); insNode.run(tgt, e.targetRepo, fileOf(tgt), e.targetNode, 'external', 0, null); }
           const conf = typeof e.confidence === 'number' ? e.confidence : null;
-          insEdge.run(src, tgt, e.edgeType, conf, e.sourceRepo, e.targetRepo);
+          insEdge.run(src, tgt, e.edgeType, conf, e.sourceRepo, e.targetRepo, e.evidence ?? null);
           edgeCount++;
           bump(e.edgeType, src, tgt);
         }
@@ -274,94 +308,140 @@ function chunked<T>(xs: T[], n = CHUNK): T[][] {
   for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
   return out;
 }
+const placeholders = (n: number): string => Array(n).fill('?').join(',');
+/** Escape LIKE's wildcards for `ESCAPE '\'`. */
+const likeEscape = (s: string): string => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+
+/** Compile a caller-supplied name filter (case-insensitive). */
+function nameRegex(pattern: string): RegExp {
+  try { return new RegExp(pattern, 'i'); } catch (e) {
+    throw new Error(`Invalid regex for name: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+function rowToEdge(r: any): GraphEdge {
+  const e: GraphEdge = { source: r.source as string, target: r.target as string, type: (r.type as string | null) ?? undefined };
+  if (r.evidence != null) e.evidence = r.evidence as string;
+  return e;
+}
 
 class SqliteGraphStore implements GraphStore {
-  constructor(private db: SqliteDb) {}
+  /** Files written before cross-repo evidence was stored have no `evidence` column. */
+  private readonly evidenceCol: string;
+  private readonly hasRegexp: boolean;
+
+  constructor(private db: SqliteDb) {
+    const cols = db.prepare('PRAGMA table_info(edges)').all().map((c) => c.name as string);
+    this.evidenceCol = cols.includes('evidence') ? 'evidence' : 'NULL AS evidence';
+    this.hasRegexp = this.registerRegexp();
+  }
+
+  private registerRegexp(): boolean {
+    if (typeof this.db.function !== 'function') return false;
+    let last: { src: string; re: RegExp } | undefined;
+    try {
+      this.db.function('regexp', { deterministic: true }, (src: string, value: unknown) => {
+        if (last?.src !== src) last = { src, re: new RegExp(src, 'i') };
+        return typeof value === 'string' && last.re.test(value) ? 1 : 0;
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   resolveNodes(name: string, repo?: string, fuzzy = false): Array<{ key: string; label: string }> {
-    const repoClause = repo ? " AND key LIKE ? || '::%'" : '';
     const params: unknown[] = [];
     let where: string;
     if (fuzzy) {
-      where = "(label LIKE '%' || ? || '%' OR key LIKE '%' || ? || '%')";
-      params.push(name, name);
+      where = `label LIKE '%' || ? || '%' ESCAPE '\\' AND type NOT IN (${placeholders(NON_SYMBOL_TYPES.length)})`;
+      params.push(likeEscape(name), ...NON_SYMBOL_TYPES);
     } else {
-      where = "(label = ? OR key LIKE '%::' || ?)";
-      params.push(name, name);
+      // `=` / substr compare bytes: case-sensitive and wildcard-free.
+      where = '(key = ? OR label = ? OR substr(key, -length(?)) = ?)';
+      params.push(name, name, `::${name}`, `::${name}`);
     }
-    if (repo) params.push(repo);
-    return this.db.prepare(`SELECT key, label FROM nodes WHERE ${where}${repoClause} LIMIT 5000`).all(...params)
+    if (repo) { where += ' AND repo = ?'; params.push(repo); }
+    return this.db.prepare(`SELECT key, label FROM nodes WHERE ${where} LIMIT 5000`).all(...params)
       .map((r) => ({ key: r.key as string, label: (r.label as string) || labelFromKey(r.key) }));
   }
 
-  private distinctEdgeEndpoint(keys: string[], side: 'callers' | 'deps', limit: number): string[] {
+  private typedEndpoints(keys: string[], side: 'callers' | 'deps', limit: number, types?: string[]): TypedNeighbor[] {
     const col = side === 'callers' ? 'source' : 'target';
     const match = side === 'callers' ? 'target' : 'source';
-    const seen = new Set<string>();
+    const typeClause = types?.length ? ` AND type IN (${placeholders(types.length)})` : '';
+    const seen = new Map<string, TypedNeighbor>();
     for (const batch of chunked(keys)) {
-      const ph = batch.map(() => '?').join(',');
       const rows = this.db.prepare(
-        `SELECT DISTINCT ${col} AS v FROM edges WHERE ${match} IN (${ph}) AND (type IS NULL OR type <> 'contains') LIMIT ?`,
-      ).all(...batch, limit);
-      for (const r of rows) { seen.add(r.v as string); if (seen.size >= limit) return [...seen]; }
+        `SELECT DISTINCT ${col} AS v, type FROM edges WHERE ${match} IN (${placeholders(batch.length)}) AND (type IS NULL OR type <> 'contains')${typeClause} LIMIT ?`,
+      ).all(...batch, ...(types ?? []), limit);
+      for (const r of rows) {
+        const type = (r.type as string | null) ?? '';
+        seen.set(`${type}\0${r.v}`, { key: r.v as string, type });
+        if (seen.size >= limit) return [...seen.values()];
+      }
     }
-    return [...seen];
+    return [...seen.values()];
   }
-  callers(targetKeys: string[], limit: number): string[] { return this.distinctEdgeEndpoint(targetKeys, 'callers', limit); }
-  dependencies(sourceKeys: string[], limit: number): string[] { return this.distinctEdgeEndpoint(sourceKeys, 'deps', limit); }
+  callers(targetKeys: string[], limit: number, types?: string[]): TypedNeighbor[] { return this.typedEndpoints(targetKeys, 'callers', limit, types); }
+  dependencies(sourceKeys: string[], limit: number, types?: string[]): TypedNeighbor[] { return this.typedEndpoints(sourceKeys, 'deps', limit, types); }
 
   crossRepoEdges(repo: string | undefined, limit: number): { edges: GraphEdge[]; total: number } {
-    const base = 'FROM edges WHERE source_repo <> target_repo' + (repo ? ' AND (source_repo = ? OR target_repo = ?)' : '');
+    const base = "FROM edges WHERE (source_repo <> target_repo OR type = 'workspace-dep')" + (repo ? ' AND (source_repo = ? OR target_repo = ?)' : '');
     const p: unknown[] = repo ? [repo, repo] : [];
     const total = this.db.prepare(`SELECT COUNT(*) c ${base}`).get(...p).c as number;
-    const edges = this.db.prepare(`SELECT source, target, type ${base} LIMIT ?`).all(...p, limit)
-      .map((r) => ({ source: r.source as string, target: r.target as string, type: r.type as string | undefined }));
+    const edges = this.db.prepare(`SELECT source, target, type, ${this.evidenceCol} ${base} LIMIT ?`).all(...p, limit).map(rowToEdge);
     return { edges, total };
   }
 
   nodesInFiles(repo: string, files: string[], entity?: string): string[] {
     const out: string[] = [];
+    const ent = entity ? ' AND substr(key, -length(?)) = ?' : '';
+    // Keys under a file sort between `<prefix>::` and `<prefix>:;` (';' follows ':').
+    const stmt = this.db.prepare(`SELECT key FROM nodes WHERE repo = ? AND (key = ? OR (key >= ? AND key < ?))${ent} LIMIT 2000`);
     for (const file of files) {
       const prefix = `${repo}::${file}`;
-      const ent = entity ? ' AND key LIKE ?' : '';
-      const params: unknown[] = [repo, prefix, `${prefix}::%`];
-      if (entity) params.push(`%::${entity}`);
-      const rows = this.db.prepare(
-        `SELECT key FROM nodes WHERE repo = ? AND (key = ? OR key LIKE ?)${ent} LIMIT 2000`,
-      ).all(...params);
-      for (const r of rows) out.push(r.key as string);
+      const params: unknown[] = [repo, prefix, `${prefix}::`, `${prefix}:;`];
+      if (entity) params.push(`::${entity}`, `::${entity}`);
+      for (const r of stmt.all(...params)) out.push(r.key as string);
     }
     return out;
   }
 
   dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] } {
     const set = new Set(nodeKeys);
+    const sym = [...SYMMETRIC_EDGE_TYPES];
     const edges: GraphEdge[] = [];
     const repos = new Set<string>();
     let total = 0;
+    const take = (r: any) => {
+      if (set.has(r.source as string)) return; // dependents are from OUTSIDE the set
+      total++;
+      repos.add((r.source_repo as string) || repoOf(r.source as string));
+      if (edges.length < limit) edges.push(rowToEdge(r));
+    };
     for (const batch of chunked(nodeKeys)) {
-      const ph = batch.map(() => '?').join(',');
-      const rows = this.db.prepare(
-        `SELECT source, target, type, source_repo FROM edges WHERE target IN (${ph}) AND (type IS NULL OR type <> 'contains')`,
-      ).all(...batch);
-      for (const r of rows) {
-        if (set.has(r.source as string)) continue; // dependents are from OUTSIDE the set
-        total++;
-        repos.add((r.source_repo as string) || repoOf(r.source as string));
-        if (edges.length < limit) edges.push({ source: r.source as string, target: r.target as string, type: r.type as string | undefined });
-      }
+      const ph = placeholders(batch.length);
+      for (const r of this.db.prepare(
+        `SELECT source, target, type, ${this.evidenceCol}, source_repo FROM edges WHERE target IN (${ph}) AND (type IS NULL OR type <> 'contains')`,
+      ).all(...batch)) take(r);
+      for (const r of this.db.prepare(
+        `SELECT target AS source, source AS target, type, ${this.evidenceCol}, target_repo AS source_repo FROM edges WHERE source IN (${ph}) AND type IN (${placeholders(sym.length)})`,
+      ).all(...batch, ...sym)) take(r);
     }
     return { edges, total, repos: [...repos] };
   }
 
-  neighborsOf(key: string, direction: GraphDirection): string[] {
+  neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[] {
     const out = new Set<string>();
-    const conf = "(confidence IS NULL OR confidence >= 0.7) AND (type IS NULL OR type <> 'contains')";
+    const typeClause = types?.length ? ` AND type IN (${placeholders(types.length)})` : '';
+    const conf = `(confidence IS NULL OR confidence >= 0.7) AND (type IS NULL OR type <> 'contains')${typeClause}`;
+    const tp = types ?? [];
     if (direction === 'callees' || direction === 'both') {
-      for (const r of this.db.prepare(`SELECT target FROM edges WHERE source = ? AND ${conf}`).all(key)) out.add(r.target as string);
+      for (const r of this.db.prepare(`SELECT target FROM edges WHERE source = ? AND ${conf}`).all(key, ...tp)) out.add(r.target as string);
     }
     if (direction === 'callers' || direction === 'both') {
-      for (const r of this.db.prepare(`SELECT source FROM edges WHERE target = ? AND ${conf}`).all(key)) out.add(r.source as string);
+      for (const r of this.db.prepare(`SELECT source FROM edges WHERE target = ? AND ${conf}`).all(key, ...tp)) out.add(r.source as string);
     }
     return [...out];
   }
@@ -393,16 +473,24 @@ class SqliteGraphStore implements GraphStore {
     f: { name?: string; type?: string; file?: string; repo?: string; minDegree?: number },
     limit: number,
   ): { rows: GraphNodeRow[]; total: number } {
+    const re = f.name ? nameRegex(f.name) : undefined;
     const cond: string[] = ['degree >= ?'];
     const p: unknown[] = [f.minDegree ?? 0];
-    if (f.repo) { cond.push("key LIKE ? || '::%'"); p.push(f.repo); }
+    if (f.repo) { cond.push('repo = ?'); p.push(f.repo); }
     if (f.type) { cond.push('type = ?'); p.push(f.type); }
-    if (f.file) { cond.push("file LIKE '%' || ? || '%'"); p.push(f.file); }
-    if (f.name) { cond.push("(label LIKE '%' || ? || '%' OR key LIKE '%' || ? || '%')"); p.push(f.name, f.name); }
+    else if (re) { cond.push(`type NOT IN (${placeholders(NON_SYMBOL_TYPES.length)})`); p.push(...NON_SYMBOL_TYPES); }
+    if (f.file) { cond.push("file LIKE '%' || ? || '%' ESCAPE '\\'"); p.push(likeEscape(f.file)); }
+    if (re && this.hasRegexp) { cond.push('regexp(?, label)'); p.push(f.name); }
     const where = cond.join(' AND ');
+    const toRow = (r: any): GraphNodeRow => ({ key: r.key as string, label: (r.label as string) || labelFromKey(r.key), type: (r.type as string) || '?', file: (r.file as string) || fileOf(r.key), degree: (r.degree as number) ?? 0 });
+    const select = `SELECT key,label,type,file,degree FROM nodes WHERE ${where} ORDER BY degree DESC`;
+    if (re && !this.hasRegexp) {
+      // Driver without user functions: match the label in JS.
+      const all = this.db.prepare(select).all(...p).filter((r) => re.test((r.label as string) ?? ''));
+      return { rows: all.slice(0, limit).map(toRow), total: all.length };
+    }
     const total = this.db.prepare(`SELECT COUNT(*) c FROM nodes WHERE ${where}`).get(...p).c as number;
-    const rows = this.db.prepare(`SELECT key,label,type,file,degree FROM nodes WHERE ${where} ORDER BY degree DESC LIMIT ?`).all(...p, limit)
-      .map((r) => ({ key: r.key as string, label: (r.label as string) || labelFromKey(r.key), type: (r.type as string) || '?', file: (r.file as string) || fileOf(r.key), degree: (r.degree as number) ?? 0 }));
+    const rows = this.db.prepare(`${select} LIMIT ?`).all(...p, limit).map(toRow);
     return { rows, total };
   }
 
@@ -415,39 +503,52 @@ class SqliteGraphStore implements GraphStore {
 // ---------------------------------------------------------------------------
 
 interface JNode { key: string; attributes?: { label?: string; type?: string; repo?: string; file?: string } }
-interface JEdge { source: string; target: string; attributes?: { type?: string; relation?: string; confidence?: number } }
+interface JEdge { source: string; target: string; attributes?: { type?: string; relation?: string; confidence?: number; evidence?: string } }
 
 class JsonGraphStore implements GraphStore {
-  private adjCallees?: Map<string, Set<string>>;
-  private adjCallers?: Map<string, Set<string>>;
+  private adjCache = new Map<string, Map<string, Set<string>>>();
   private degreeCache?: Map<string, number>;
   constructor(private nodes: JNode[], private edges: JEdge[]) {}
 
   private et(e: JEdge): string | undefined { return e.attributes?.type ?? e.attributes?.relation; }
   private label(n: JNode): string { return n.attributes?.label ?? labelFromKey(n.key); }
+  private edge(e: JEdge): GraphEdge {
+    const out: GraphEdge = { source: e.source, target: e.target, type: this.et(e) };
+    if (e.attributes?.evidence != null) out.evidence = e.attributes.evidence;
+    return out;
+  }
 
   resolveNodes(name: string, repo?: string, fuzzy = false): Array<{ key: string; label: string }> {
     const inRepo = (k: string) => !repo || k.startsWith(repo + '::');
+    const lc = name.toLowerCase();
     return this.nodes.filter((n) => inRepo(n.key) && (fuzzy
-      ? ((n.attributes?.label ?? '').includes(name) || n.key.includes(name))
-      : (n.attributes?.label === name || n.key.endsWith('::' + name)))
+      ? !NON_SYMBOL_TYPES.includes(n.attributes?.type ?? '') && this.label(n).toLowerCase().includes(lc)
+      : (n.key === name || this.label(n) === name || n.key.endsWith('::' + name)))
     ).map((n) => ({ key: n.key, label: this.label(n) }));
   }
-  callers(targetKeys: string[], limit: number): string[] {
-    const set = new Set(targetKeys);
-    return [...new Set(this.edges.filter((e) => set.has(e.target) && this.et(e) !== 'contains').map((e) => e.source))].slice(0, limit);
+  private typedEndpoints(keys: string[], side: 'callers' | 'deps', limit: number, types?: string[]): TypedNeighbor[] {
+    const set = new Set(keys);
+    const want = types?.length ? new Set(types) : null;
+    const seen = new Map<string, TypedNeighbor>();
+    for (const e of this.edges) {
+      const type = this.et(e) ?? '';
+      if (type === 'contains' || (want && !want.has(type))) continue;
+      if (!set.has(side === 'callers' ? e.target : e.source)) continue;
+      const key = side === 'callers' ? e.source : e.target;
+      seen.set(`${type}\0${key}`, { key, type });
+      if (seen.size >= limit) break;
+    }
+    return [...seen.values()];
   }
-  dependencies(sourceKeys: string[], limit: number): string[] {
-    const set = new Set(sourceKeys);
-    return [...new Set(this.edges.filter((e) => set.has(e.source) && this.et(e) !== 'contains').map((e) => e.target))].slice(0, limit);
-  }
+  callers(targetKeys: string[], limit: number, types?: string[]): TypedNeighbor[] { return this.typedEndpoints(targetKeys, 'callers', limit, types); }
+  dependencies(sourceKeys: string[], limit: number, types?: string[]): TypedNeighbor[] { return this.typedEndpoints(sourceKeys, 'deps', limit, types); }
   crossRepoEdges(repo: string | undefined, limit: number): { edges: GraphEdge[]; total: number } {
     const cross = this.edges.filter((e) => {
       const s = repoOf(e.source), t = repoOf(e.target);
-      if (!s || !t || s === t) return false;
+      if (!s || !t || (s === t && this.et(e) !== 'workspace-dep')) return false;
       return !repo || s === repo || t === repo;
     });
-    return { edges: cross.slice(0, limit).map((e) => ({ source: e.source, target: e.target, type: this.et(e) })), total: cross.length };
+    return { edges: cross.slice(0, limit).map((e) => this.edge(e)), total: cross.length };
   }
   nodesInFiles(repo: string, files: string[], entity?: string): string[] {
     const out: string[] = [];
@@ -461,26 +562,37 @@ class JsonGraphStore implements GraphStore {
   }
   dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] } {
     const set = new Set(nodeKeys);
-    const all = this.edges.filter((e) => set.has(e.target) && !set.has(e.source) && this.et(e) !== 'contains');
+    const all: GraphEdge[] = [];
+    for (const e of this.edges) {
+      const type = this.et(e);
+      if (type === 'contains') continue;
+      if (set.has(e.target) && !set.has(e.source)) all.push(this.edge(e));
+      else if (type && SYMMETRIC_EDGE_TYPES.has(type) && set.has(e.source) && !set.has(e.target)) {
+        all.push({ ...this.edge(e), source: e.target, target: e.source });
+      }
+    }
     const repos = [...new Set(all.map((e) => repoOf(e.source)))];
-    return { edges: all.slice(0, limit).map((e) => ({ source: e.source, target: e.target, type: this.et(e) })), total: all.length, repos };
+    return { edges: all.slice(0, limit), total: all.length, repos };
   }
-  private adj(direction: GraphDirection): Map<string, Set<string>> {
-    if (direction === 'callees' && this.adjCallees) return this.adjCallees;
-    if (direction === 'callers' && this.adjCallers) return this.adjCallers;
+  private adj(direction: GraphDirection, types?: string[]): Map<string, Set<string>> {
+    const cacheKey = `${direction}|${types?.join(',') ?? '*'}`;
+    const cached = this.adjCache.get(cacheKey);
+    if (cached) return cached;
+    const want = types?.length ? new Set(types) : null;
     const m = new Map<string, Set<string>>();
     const add = (a: string, b: string) => { if (!m.has(a)) m.set(a, new Set()); m.get(a)!.add(b); };
     for (const e of this.edges) {
-      if (!e.source || !e.target || this.et(e) === 'contains') continue;
+      const type = this.et(e);
+      if (!e.source || !e.target || type === 'contains') continue;
+      if (want && !want.has(type ?? '')) continue;
       if ((e.attributes?.confidence ?? 0.8) < 0.7) continue;
       if (direction === 'callees' || direction === 'both') add(e.source, e.target);
       if (direction === 'callers' || direction === 'both') add(e.target, e.source);
     }
-    if (direction === 'callees') this.adjCallees = m;
-    else if (direction === 'callers') this.adjCallers = m;
+    this.adjCache.set(cacheKey, m);
     return m;
   }
-  neighborsOf(key: string, direction: GraphDirection): string[] { return [...(this.adj(direction).get(key) ?? [])]; }
+  neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[] { return [...(this.adj(direction, types).get(key) ?? [])]; }
   labelsOf(keys: string[]): Map<string, string> {
     const want = new Set(keys);
     const m = new Map<string, string>();
@@ -505,15 +617,16 @@ class JsonGraphStore implements GraphStore {
     return (this.degreeCache = d);
   }
   searchNodes(f: { name?: string; type?: string; file?: string; repo?: string; minDegree?: number }, limit: number): { rows: GraphNodeRow[]; total: number } {
+    const re = f.name ? nameRegex(f.name) : undefined;
     const deg = this.degree();
-    let nameTest: (s: string) => boolean = () => true;
-    if (f.name) { try { const re = new RegExp(f.name, 'i'); nameTest = (s) => re.test(s); } catch { const lc = f.name.toLowerCase(); nameTest = (s) => s.toLowerCase().includes(lc); } }
+    const fileLc = f.file?.toLowerCase();
     const matches = this.nodes.filter((n) => {
       if (f.repo && !n.key.startsWith(f.repo + '::')) return false;
-      if (f.type && n.attributes?.type !== f.type) return false;
+      const type = n.attributes?.type ?? '';
+      if (f.type ? type !== f.type : re && NON_SYMBOL_TYPES.includes(type)) return false;
       const file = n.attributes?.file ?? fileOf(n.key);
-      if (f.file && !file.includes(f.file)) return false;
-      if (f.name && !(nameTest(n.attributes?.label ?? '') || nameTest(n.key))) return false;
+      if (fileLc && !file.toLowerCase().includes(fileLc)) return false;
+      if (re && !re.test(this.label(n))) return false;
       return (deg.get(n.key) ?? 0) >= (f.minDegree ?? 0);
     }).map((n) => ({ key: n.key, label: this.label(n), type: n.attributes?.type ?? '?', file: n.attributes?.file ?? fileOf(n.key), degree: deg.get(n.key) ?? 0 }))
       .sort((a, b) => b.degree - a.degree);
