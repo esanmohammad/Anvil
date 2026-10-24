@@ -17,26 +17,29 @@ import { classifyQuery } from '@esankhan3/anvil-knowledge-core';
 
 export type RetrievalMode = 'vector' | 'bm25' | 'vector+bm25' | 'vector+graph' | 'vector+bm25+graph';
 
-// Query embedding LRU cache — avoids re-embedding repeated queries
+// Query embedding LRU cache — avoids re-embedding repeated queries. The Map
+// keeps insertion order, so a hit is re-inserted (most recently used last)
+// and a full cache evicts its first key (least recently used). Entries expire
+// 10 minutes after they were embedded. One entry is a number[] of 1024–1536
+// dims (8–12 KB), so a full cache holds ≤ ~48 MB per process.
 const queryEmbeddingCache = new Map<string, { embedding: number[]; timestamp: number }>();
-const CACHE_MAX_SIZE = 128;
+const CACHE_MAX_SIZE = 4096;
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 function getCachedEmbedding(query: string): number[] | null {
   const entry = queryEmbeddingCache.get(query);
   if (!entry) return null;
-  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
-    queryEmbeddingCache.delete(query);
-    return null;
-  }
+  queryEmbeddingCache.delete(query);
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) return null;
+  queryEmbeddingCache.set(query, entry);
   return entry.embedding;
 }
 
 function cacheEmbedding(query: string, embedding: number[]): void {
+  queryEmbeddingCache.delete(query);
   if (queryEmbeddingCache.size >= CACHE_MAX_SIZE) {
-    // Evict oldest entry
-    const oldest = queryEmbeddingCache.keys().next().value;
-    if (oldest !== undefined) queryEmbeddingCache.delete(oldest);
+    const lru = queryEmbeddingCache.keys().next().value;
+    if (lru !== undefined) queryEmbeddingCache.delete(lru);
   }
   queryEmbeddingCache.set(query, { embedding, timestamp: Date.now() });
 }

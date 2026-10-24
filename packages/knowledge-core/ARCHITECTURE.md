@@ -400,8 +400,8 @@ Pipeline (4 phases):
 1. **Phase 1** — in parallel: `vectorSearch(50)`, `fullTextSearch(50)`,
    and two literal tiers — `searchByEntitySubstring` /
    `searchByEntityName` (20) for a bare identifier, `phraseSearch` (20)
-   for a multi-token query of ≥ 8 chars. Query embedding cached LRU-128,
-   10 min TTL. `'vector'` / `'bm25'` modes return here (`'bm25'` puts the
+   for a multi-token query of ≥ 8 chars. Query embedding cached LRU-4096
+   (a hit refreshes recency), 10 min TTL. `'vector'` / `'bm25'` modes return here (`'bm25'` puts the
    literal hits first).
 2. **Phase 2** — weighted RRF (`k = CODE_SEARCH_RRF_K`, default 10):
    vector + BM25 with weights from `classifyQuery` (falls back to
@@ -468,14 +468,18 @@ Query semantics (both the SQLite store and the JSON fallback):
 `resolveNodes` is exact by default — full key, `label`, or a `::name` key
 suffix, case-sensitive and wildcard-free; `fuzzy` = case-insensitive
 substring of symbol labels (`module` / `external` nodes skipped).
-`callers` / `dependencies` / `neighborsOf` take an edge-type filter
-(omitted = every type but `contains`); `callers` / `dependencies` return
-`{ key, type }`. `crossRepoEdges` returns edges between repos plus
-same-repo `workspace-dep` edges. `dependents` follows edges into the set
-and, for `SYMMETRIC_EDGE_TYPES` (`event-schema`, `database`, `redis`, `s3`,
-`shared-type`, `shared-constant`, `env-var`, `npm-dep` — one stored edge
-per pair, in arbitrary order), edges out of it too, returned flipped so
-`source` is the dependent. `searchNodes` `name` is a case-insensitive
+`callers` / `dependencies` / `neighborsOf` / `neighborEdges` take an
+edge-type filter (omitted = every type but `contains`); `callers` /
+`dependencies` return `{ key, type }`. `neighborEdges(keys, direction,
+types, limit)` is `neighborsOf` for a whole frontier — `[key, neighbour]`
+pairs, one query per 400 keys, at most `limit` rows. `crossRepoEdges`
+returns edges between repos plus same-repo `workspace-dep` edges.
+`dependents` follows edges into the set and, for `SYMMETRIC_EDGE_TYPES`
+(`event-schema`, `database`, `redis`, `s3`, `shared-type`,
+`shared-constant`, `env-var`, `npm-dep` — one stored edge per pair, in
+arbitrary order), edges out of it too, returned flipped so `source` is the
+dependent; with `maxRows` it stops after that many edges (`truncated`).
+`searchNodes` `name` is a case-insensitive
 regex over symbol labels (a `regexp` SQL user function; JS filtering on a
 driver without user functions); an invalid pattern throws.
 

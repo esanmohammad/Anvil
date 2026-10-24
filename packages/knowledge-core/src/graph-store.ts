@@ -49,8 +49,11 @@ const NON_SYMBOL_TYPES = ['module', 'external'];
  * types); omitted = every edge type except `contains`. `crossRepoEdges` also
  * returns same-repo `workspace-dep` edges. `dependents` follows edges into the
  * set, plus {@link SYMMETRIC_EDGE_TYPES} edges out of it (returned flipped, so
- * `source` is always the dependent). `searchNodes` `name` is a case-insensitive
- * regex over symbol labels; an invalid one throws.
+ * `source` is always the dependent); with `maxRows` it stops after that many
+ * edges, and `truncated` says the count stopped there. `neighborEdges` is
+ * `neighborsOf` for many keys at once — `[key, neighbour]` pairs, at most
+ * `limit`. `searchNodes` `name` is a case-insensitive regex over symbol
+ * labels; an invalid one throws.
  */
 export interface GraphStore {
   resolveNodes(name: string, repo?: string, fuzzy?: boolean): Array<{ key: string; label: string }>;
@@ -58,8 +61,9 @@ export interface GraphStore {
   dependencies(sourceKeys: string[], limit: number, types?: string[]): TypedNeighbor[];
   crossRepoEdges(repo: string | undefined, limit: number): { edges: GraphEdge[]; total: number };
   nodesInFiles(repo: string, files: string[], entity?: string): string[];
-  dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] };
+  dependents(nodeKeys: string[], limit: number, maxRows?: number): { edges: GraphEdge[]; total: number; repos: string[]; truncated: boolean };
   neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[];
+  neighborEdges(keys: string[], direction: GraphDirection, types: string[] | undefined, limit: number): Array<[string, string]>;
   labelsOf(keys: string[]): Map<string, string>;
   nodeTypes(keys: string[]): Map<string, string>;
   searchNodes(
@@ -309,6 +313,9 @@ function chunked<T>(xs: T[], n = CHUNK): T[][] {
   return out;
 }
 const placeholders = (n: number): string => Array(n).fill('?').join(',');
+/** Edges a traversal follows: not `contains`, confidence ≥ 0.7 (or unset), of `types` when given. */
+const neighborFilter = (types?: string[]): string =>
+  `(confidence IS NULL OR confidence >= 0.7) AND (type IS NULL OR type <> 'contains')${types?.length ? ` AND type IN (${placeholders(types.length)})` : ''}`;
 /** Escape LIKE's wildcards for `ESCAPE '\'`. */
 const likeEscape = (s: string): string => s.replace(/[\\%_]/g, (c) => `\\${c}`);
 
@@ -408,34 +415,39 @@ class SqliteGraphStore implements GraphStore {
     return out;
   }
 
-  dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] } {
+  dependents(nodeKeys: string[], limit: number, maxRows?: number): { edges: GraphEdge[]; total: number; repos: string[]; truncated: boolean } {
     const set = new Set(nodeKeys);
     const sym = [...SYMMETRIC_EDGE_TYPES];
     const edges: GraphEdge[] = [];
     const repos = new Set<string>();
     let total = 0;
+    let read = 0;
     const take = (r: any) => {
       if (set.has(r.source as string)) return; // dependents are from OUTSIDE the set
       total++;
       repos.add((r.source_repo as string) || repoOf(r.source as string));
       if (edges.length < limit) edges.push(rowToEdge(r));
     };
+    const full = () => maxRows !== undefined && read >= maxRows;
+    const scan = (sql: string, params: unknown[]) => {
+      const rows = this.db.prepare(`${sql} LIMIT ?`).all(...params, maxRows === undefined ? -1 : maxRows - read); // -1 = no limit
+      read += rows.length;
+      for (const r of rows) take(r);
+    };
     for (const batch of chunked(nodeKeys)) {
+      if (full()) break;
       const ph = placeholders(batch.length);
-      for (const r of this.db.prepare(
-        `SELECT source, target, type, ${this.evidenceCol}, source_repo FROM edges WHERE target IN (${ph}) AND (type IS NULL OR type <> 'contains')`,
-      ).all(...batch)) take(r);
-      for (const r of this.db.prepare(
-        `SELECT target AS source, source AS target, type, ${this.evidenceCol}, target_repo AS source_repo FROM edges WHERE source IN (${ph}) AND type IN (${placeholders(sym.length)})`,
-      ).all(...batch, ...sym)) take(r);
+      scan(`SELECT source, target, type, ${this.evidenceCol}, source_repo FROM edges WHERE target IN (${ph}) AND (type IS NULL OR type <> 'contains')`, batch);
+      if (!full()) {
+        scan(`SELECT target AS source, source AS target, type, ${this.evidenceCol}, target_repo AS source_repo FROM edges WHERE source IN (${ph}) AND type IN (${placeholders(sym.length)})`, [...batch, ...sym]);
+      }
     }
-    return { edges, total, repos: [...repos] };
+    return { edges, total, repos: [...repos], truncated: full() };
   }
 
   neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[] {
     const out = new Set<string>();
-    const typeClause = types?.length ? ` AND type IN (${placeholders(types.length)})` : '';
-    const conf = `(confidence IS NULL OR confidence >= 0.7) AND (type IS NULL OR type <> 'contains')${typeClause}`;
+    const conf = neighborFilter(types);
     const tp = types ?? [];
     if (direction === 'callees' || direction === 'both') {
       for (const r of this.db.prepare(`SELECT target FROM edges WHERE source = ? AND ${conf}`).all(key, ...tp)) out.add(r.target as string);
@@ -444,6 +456,30 @@ class SqliteGraphStore implements GraphStore {
       for (const r of this.db.prepare(`SELECT source FROM edges WHERE target = ? AND ${conf}`).all(key, ...tp)) out.add(r.source as string);
     }
     return [...out];
+  }
+
+  neighborEdges(keys: string[], direction: GraphDirection, types: string[] | undefined, limit: number): Array<[string, string]> {
+    const filter = neighborFilter(types);
+    const tp = types ?? [];
+    const out: Array<[string, string]> = [];
+    for (const batch of chunked(keys)) {
+      if (out.length >= limit) break;
+      const ph = placeholders(batch.length);
+      const parts: string[] = [];
+      const params: unknown[] = [];
+      if (direction === 'callees' || direction === 'both') {
+        parts.push(`SELECT source AS k, target AS n FROM edges WHERE source IN (${ph}) AND ${filter}`);
+        params.push(...batch, ...tp);
+      }
+      if (direction === 'callers' || direction === 'both') {
+        parts.push(`SELECT target AS k, source AS n FROM edges WHERE target IN (${ph}) AND ${filter}`);
+        params.push(...batch, ...tp);
+      }
+      for (const r of this.db.prepare(`${parts.join(' UNION ALL ')} LIMIT ?`).all(...params, limit - out.length)) {
+        out.push([r.k as string, r.n as string]);
+      }
+    }
+    return out;
   }
 
   labelsOf(keys: string[]): Map<string, string> {
@@ -560,10 +596,11 @@ class JsonGraphStore implements GraphStore {
     }
     return out;
   }
-  dependents(nodeKeys: string[], limit: number): { edges: GraphEdge[]; total: number; repos: string[] } {
+  dependents(nodeKeys: string[], limit: number, maxRows = Number.POSITIVE_INFINITY): { edges: GraphEdge[]; total: number; repos: string[]; truncated: boolean } {
     const set = new Set(nodeKeys);
     const all: GraphEdge[] = [];
     for (const e of this.edges) {
+      if (all.length >= maxRows) break;
       const type = this.et(e);
       if (type === 'contains') continue;
       if (set.has(e.target) && !set.has(e.source)) all.push(this.edge(e));
@@ -572,7 +609,7 @@ class JsonGraphStore implements GraphStore {
       }
     }
     const repos = [...new Set(all.map((e) => repoOf(e.source)))];
-    return { edges: all.slice(0, limit), total: all.length, repos };
+    return { edges: all.slice(0, limit), total: all.length, repos, truncated: all.length >= maxRows };
   }
   private adj(direction: GraphDirection, types?: string[]): Map<string, Set<string>> {
     const cacheKey = `${direction}|${types?.join(',') ?? '*'}`;
@@ -593,6 +630,17 @@ class JsonGraphStore implements GraphStore {
     return m;
   }
   neighborsOf(key: string, direction: GraphDirection, types?: string[]): string[] { return [...(this.adj(direction, types).get(key) ?? [])]; }
+  neighborEdges(keys: string[], direction: GraphDirection, types: string[] | undefined, limit: number): Array<[string, string]> {
+    const adj = this.adj(direction, types);
+    const out: Array<[string, string]> = [];
+    for (const k of keys) {
+      for (const n of adj.get(k) ?? []) {
+        if (out.length >= limit) return out;
+        out.push([k, n]);
+      }
+    }
+    return out;
+  }
   labelsOf(keys: string[]): Map<string, string> {
     const want = new Set(keys);
     const m = new Map<string, string>();

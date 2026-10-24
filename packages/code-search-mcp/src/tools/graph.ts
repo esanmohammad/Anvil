@@ -5,7 +5,8 @@
  * The cross-repo/system graph is served by knowledge-core's GraphStore
  * (SQLite-backed `system_graph.sqlite`, with a JSON fallback for older
  * indexes) — see knowledge-core/src/graph-store.ts. Tools query slices, so
- * org-scale graphs (900k+ nodes) no longer bust V8's string limit on read.
+ * org-scale graphs (900k+ nodes) no longer bust V8's string limit on read,
+ * and every multi-hop traversal runs under a node + wall-clock budget.
  * Per-repo tools (`get_repo_graph`, `find_dead_code`) still read the per-repo
  * `<KB>/<repo>/graph.json`. Node key convention: `repo::filePath::entity` (class members: `entity` = `Class.member`).
  */
@@ -34,54 +35,124 @@ const repoOf = (key: string): string => key.split('::')[0] ?? '';
 const fileOf = (key: string): string => key.split('::')[1] ?? '';
 
 // ---------------------------------------------------------------------------
-// Call-path traversal — BFS over neighbors fetched lazily from the store
-// (cached per traversal), so only touched nodes are read, never the whole graph.
+// Bounded traversal. Store queries run synchronously on the event loop
+// (better-sqlite3), so one deep trace through the hub nodes of an org graph
+// (900k+ nodes) would stall every other request on its worker. Traversals
+// read one frontier level at a time — one store query per NEIGHBOR_BATCH
+// keys — and stop at the first limit they reach, saying so in the answer:
+// - TRAVERSAL_MAX_NODES: distinct nodes discovered (both halves of a
+//   bidirectional search). 50k is ~5% of an org graph — a frontier that wide
+//   has fanned out through hubs, and a path found past it says little. It
+//   also caps the rows one neighbour query, or one hop of dependents, reads.
+// - TRAVERSAL_BUDGET_MS: wall clock, checked before every query, so a call
+//   overruns it by one query at most. Batched, discovering 50k nodes takes
+//   ~0.1 s, so the clock only stops pathological expansions (dense levels,
+//   a cold page cache); 1 s bounds the stall one call can impose on the
+//   requests sharing its worker.
 // ---------------------------------------------------------------------------
 
-function makeNeighborGetter(store: GraphStore, direction: GraphDirection, types?: string[]): (key: string) => string[] {
-  const cache = new Map<string, string[]>();
-  return (key) => {
-    let v = cache.get(key);
-    if (v === undefined) { v = store.neighborsOf(key, direction, types); cache.set(key, v); }
-    return v;
-  };
-}
+const TRAVERSAL_MAX_NODES = 50_000;
+const TRAVERSAL_BUDGET_MS = 1_000;
+const NEIGHBOR_BATCH = 400; // keys per neighbour query (the store's IN-list chunk)
 
-/** Shortest path (≥ 1 hop) from any `fromKeys` node to any `toKeys` node, ≤ maxDepth hops. */
-function shortestPath(getNeighbors: (k: string) => string[], fromKeys: string[], toKeys: Set<string>, maxDepth: number): string[] | null {
-  const visited = new Set<string>(fromKeys);
-  let frontier: string[][] = fromKeys.map((k) => [k]);
-  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
-    const next: string[][] = [];
-    for (const path of frontier) {
-      for (const nb of getNeighbors(path[path.length - 1])) {
-        if (toKeys.has(nb) && nb !== path[0]) return [...path, nb];
-        if (visited.has(nb)) continue;
-        visited.add(nb);
-        next.push([...path, nb]);
-      }
-    }
-    frontier = next;
+class TraversalBudget {
+  private readonly deadline = Date.now() + TRAVERSAL_BUDGET_MS;
+  /** Distinct nodes discovered so far. */
+  explored = 0;
+  /** Set once a limit stopped the traversal. */
+  exhausted = false;
+  /** Room for another query? Marks the budget exhausted when there isn't. */
+  hasRoom(): boolean {
+    if (this.explored >= TRAVERSAL_MAX_NODES || Date.now() > this.deadline) this.exhausted = true;
+    return !this.exhausted;
   }
-  return null;
 }
 
-/** All nodes reachable from `fromKeys` within maxDepth, with their depth. */
-function reachable(getNeighbors: (k: string) => string[], fromKeys: string[], maxDepth: number, cap = 50): Array<{ key: string; depth: number }> {
+/**
+ * Expand one frontier level: `visit(key, neighbour)` per followed edge until
+ * it returns true (→ true). Stops early, setting `budget.exhausted`, when the
+ * budget runs out or a query returns as many rows as nodes the budget has left.
+ */
+function expandLevel(
+  store: GraphStore, frontier: string[], direction: GraphDirection, types: string[] | undefined,
+  budget: TraversalBudget, visit: (key: string, neighbor: string) => boolean,
+): boolean {
+  for (let i = 0; i < frontier.length; i += NEIGHBOR_BATCH) {
+    if (!budget.hasRoom()) return false;
+    const limit = TRAVERSAL_MAX_NODES - budget.explored;
+    const rows = store.neighborEdges(frontier.slice(i, i + NEIGHBOR_BATCH), direction, types, limit);
+    for (const [key, nb] of rows) if (visit(key, nb)) return true;
+    if (rows.length >= limit) { budget.exhausted = true; return false; }
+  }
+  return false;
+}
+
+const REVERSE: Record<GraphDirection, GraphDirection> = { callees: 'callers', callers: 'callees', both: 'both' };
+
+/**
+ * Shortest path (≥ 1 hop, ending on another node than it starts) from any
+ * `fromKeys` node to any `toKeys` node within maxDepth hops. Bidirectional
+ * BFS: forward along `direction` from `fromKeys`, backward against it from
+ * `toKeys`, each step expanding a whole level of the smaller frontier.
+ * `depth` = levels both halves completed: no path has that many hops or fewer.
+ */
+function shortestPath(
+  store: GraphStore, fromKeys: string[], toKeys: string[], maxDepth: number,
+  direction: GraphDirection, types: string[] | undefined, budget: TraversalBudget,
+): { path: string[] | null; depth: number } {
+  // node → the node it was reached from (null for the half's own start nodes).
+  const fwd = new Map<string, string | null>(fromKeys.map((k) => [k, null]));
+  const bwd = new Map<string, string | null>(toKeys.map((k) => [k, null]));
+  const chain = (m: Map<string, string | null>, k: string): string[] => {
+    const out = [k];
+    for (let p = m.get(k); p != null; p = m.get(p)) out.push(p);
+    return out;
+  };
+  budget.explored = fwd.size + bwd.size;
+  let fFront = [...fwd.keys()];
+  let bFront = [...bwd.keys()];
+  let depth = 0;
+  let path = null as string[] | null;
+  while (depth < maxDepth && fFront.length > 0 && bFront.length > 0) {
+    const forward = fFront.length <= bFront.length;
+    const [mine, other] = forward ? [fwd, bwd] : [bwd, fwd];
+    const next: string[] = [];
+    expandLevel(store, forward ? fFront : bFront, forward ? direction : REVERSE[direction], types, budget, (k, nb) => {
+      if (other.has(nb)) {
+        // Forward the edge is k → nb; backward it is nb → k.
+        const p = forward ? [...chain(fwd, k).reverse(), ...chain(bwd, nb)] : [...chain(fwd, nb).reverse(), ...chain(bwd, k)];
+        if (p[0] !== p[p.length - 1]) { path = p; return true; }
+      }
+      if (!mine.has(nb)) { mine.set(nb, k); next.push(nb); budget.explored++; }
+      return false;
+    });
+    if (path || budget.exhausted) break;
+    if (forward) fFront = next; else bFront = next;
+    depth++;
+  }
+  return { path, depth };
+}
+
+/** Nodes reachable from `fromKeys` within maxDepth, with their depth (BFS, at most `cap`). */
+function reachable(
+  store: GraphStore, fromKeys: string[], maxDepth: number, direction: GraphDirection,
+  types: string[] | undefined, budget: TraversalBudget, cap = 50,
+): Array<{ key: string; depth: number }> {
   const visited = new Set<string>(fromKeys);
   const out: Array<{ key: string; depth: number }> = [];
+  budget.explored = visited.size;
   let frontier = [...fromKeys];
   for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
     const next: string[] = [];
-    for (const k of frontier) {
-      for (const nb of getNeighbors(k)) {
-        if (visited.has(nb)) continue;
-        visited.add(nb);
-        out.push({ key: nb, depth });
-        next.push(nb);
-        if (out.length >= cap) return out;
-      }
-    }
+    const full = expandLevel(store, frontier, direction, types, budget, (_k, nb) => {
+      if (visited.has(nb)) return false;
+      visited.add(nb);
+      budget.explored++;
+      out.push({ key: nb, depth });
+      next.push(nb);
+      return out.length >= cap;
+    });
+    if (full || budget.exhausted) break;
     frontier = next;
   }
   return out;
@@ -98,18 +169,22 @@ function endpointsIn(store: GraphStore, keys: string[]): string[] {
   return keys.filter((k) => types.get(k) === 'external');
 }
 
-interface Hop { hop: number; edges: GraphEdge[]; total: number }
+interface Hop { hop: number; edges: GraphEdge[]; total: number; truncated: boolean }
 const HOP_EDGE_CAP = 1000;
 
-/** Transitive dependents of `scope`, hop by hop. A dependent reached only
- *  through `fileLevel` nodes is file-level too (added to the set). */
-function dependentHops(store: GraphStore, scope: string[], depth: number, fileLevel: Set<string>): { hops: Hop[]; repos: Set<string> } {
+/** Transitive dependents of `scope`, hop by hop: up to HOP_EDGE_CAP edges
+ *  kept and TRAVERSAL_MAX_NODES read per hop (`truncated`: the count
+ *  stopped there); no further hop once the budget runs out. A dependent
+ *  reached only through `fileLevel` nodes is file-level too (added to the set). */
+function dependentHops(store: GraphStore, scope: string[], depth: number, fileLevel: Set<string>, budget: TraversalBudget): { hops: Hop[]; repos: Set<string> } {
   const visited = new Set(scope);
   const repos = new Set<string>();
   const hops: Hop[] = [];
   let frontier = [...scope];
   for (let hop = 1; hop <= depth && frontier.length > 0; hop++) {
-    const d = store.dependents(frontier, HOP_EDGE_CAP);
+    budget.explored = visited.size;
+    if (!budget.hasRoom()) break;
+    const d = store.dependents(frontier, HOP_EDGE_CAP, TRAVERSAL_MAX_NODES);
     const edges = d.edges.filter((e) => !visited.has(e.source));
     const direct = new Set<string>();
     const next: string[] = [];
@@ -119,11 +194,15 @@ function dependentHops(store: GraphStore, scope: string[], depth: number, fileLe
       if (!visited.has(e.source)) { visited.add(e.source); next.push(e.source); }
     }
     for (const k of next) if (!direct.has(k)) fileLevel.add(k);
-    hops.push({ hop, edges, total: d.total - (d.edges.length - edges.length) });
+    hops.push({ hop, edges, total: d.total - (d.edges.length - edges.length), truncated: d.truncated });
     frontier = next;
   }
   return { hops, repos };
 }
+
+/** `+` after a count that stopped at TRAVERSAL_MAX_NODES. */
+const atLeast = (truncated: boolean): string => (truncated ? '+' : '');
+const AT_LEAST_NOTE = `_N+ = at least N: a hop counts at most ${TRAVERSAL_MAX_NODES} dependent edges._`;
 
 function edgeLine(e: GraphEdge, fileLevel: Set<string>): string {
   const arrow = SYMMETRIC_EDGE_TYPES.has(e.type ?? '') ? '↔' : '→';
@@ -289,7 +368,7 @@ export function registerGraphTools() {
     },
     {
       name: 'impact_analysis',
-      description: 'What is affected if a file or entity changes: everything that depends on it, transitively up to `depth` hops — over every relation (calls, imports, uses, type-refs, inheritance, cross-repo edges); shared-resource edges (topics, tables, Redis keys, buckets, shared types / constants / env vars / npm deps) count both ways. With `entity`, the cross-repo endpoints declared in the same file (routes, topics, tables …) are included and their dependents marked [file-level], since the graph can\'t tie them to one entity.',
+      description: 'What is affected if a file or entity changes: everything that depends on it, transitively up to `depth` hops — over every relation (calls, imports, uses, type-refs, inheritance, cross-repo edges); shared-resource edges (topics, tables, Redis keys, buckets, shared types / constants / env vars / npm deps) count both ways. With `entity`, the cross-repo endpoints declared in the same file (routes, topics, tables …) are included and their dependents marked [file-level], since the graph can\'t tie them to one entity. A hop counts at most 50,000 edges (shown as 50000+); hops stop after 1 s, with a note.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -303,7 +382,7 @@ export function registerGraphTools() {
     },
     {
       name: 'trace_path',
-      description: 'Trace a call chain across multiple hops. With "to", returns the shortest path (fewest hops, unweighted BFS) between two symbols; otherwise lists what is reachable, by depth (up to 50 nodes). Follows `calls` edges by default (`relations` for imports, type-refs, inheritance) and skips edges with confidence below 0.7. Names are matched exactly (a full "repo::file::entity" id works too) unless fuzzy:true.',
+      description: 'Trace a call chain across multiple hops. With "to", returns the shortest path (fewest hops, bidirectional BFS) between two symbols; otherwise lists what is reachable, by depth (up to 50 nodes). Follows `calls` edges by default (`relations` for imports, type-refs, inheritance) and skips edges with confidence below 0.7. Names are matched exactly (a full "repo::file::entity" id works too) unless fuzzy:true. A search stops after 50,000 nodes or 1 s and says so — then narrow it or lower maxDepth.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -500,8 +579,10 @@ export async function handleGraphTool(
       if (scope.length === 0) return toolError(`No entity "${entity}" in ${repo}/${file}.`);
       const endpoints = entity ? endpointsIn(store, fileKeys).filter((k) => !scope.includes(k)) : [];
       const fileLevel = new Set(endpoints);
-      const { hops, repos } = dependentHops(store, [...scope, ...endpoints], depth, fileLevel);
+      const budget = new TraversalBudget();
+      const { hops, repos } = dependentHops(store, [...scope, ...endpoints], depth, fileLevel, budget);
       const total = hops.reduce((n, h) => n + h.total, 0);
+      const truncated = hops.some((h) => h.truncated);
       const body = [
         `# Impact Analysis: ${repo}/${file}${entity ? `::${entity}` : ''} (depth ${depth})`,
         '',
@@ -511,11 +592,15 @@ export async function handleGraphTool(
       if (endpoints.length) {
         body.push('', `## File-level endpoints: ${endpoints.length} (cross-repo endpoints in ${file}, not tied to ${entity})`, ...endpoints.slice(0, 20).map((k) => `- \`${k}\``));
       }
-      body.push('', `## Dependents: ${total} edges from ${repos.size} repos`);
+      body.push('', `## Dependents: ${total}${atLeast(truncated)} edges from ${repos.size} repos`);
       for (const h of hops) {
         if (h.edges.length === 0) continue;
-        body.push(`### Hop ${h.hop} (${h.total})`, ...h.edges.slice(0, 30).map((e) => edgeLine(e, fileLevel)));
-        if (h.total > Math.min(h.edges.length, 30)) body.push(`... and ${h.total - Math.min(h.edges.length, 30)} more`);
+        body.push(`### Hop ${h.hop} (${h.total}${atLeast(h.truncated)})`, ...h.edges.slice(0, 30).map((e) => edgeLine(e, fileLevel)));
+        if (h.total > Math.min(h.edges.length, 30)) body.push(`... and ${h.total - Math.min(h.edges.length, 30)}${atLeast(h.truncated)} more`);
+      }
+      if (truncated) body.push('', AT_LEAST_NOTE);
+      if (budget.exhausted) {
+        body.push('', `_Stopped before hop ${hops.length + 1} at the traversal budget (explored ${budget.explored} nodes) — lower depth or pass an entity._`);
       }
       body.push('', `## Affected repos: ${[...repos].join(', ') || 'none'}`);
       return text(body.join('\n'));
@@ -533,12 +618,16 @@ export async function handleGraphTool(
 
       const fromKeys = store.resolveNodes(from, repo, fuzzy).map((m) => m.key);
       if (fromKeys.length === 0) return text(`No entity found matching "${from}".${fuzzy ? '' : ' Try fuzzy:true.'}`);
-      const getNeighbors = makeNeighborGetter(store, direction, edgeTypes(args));
+      const types = edgeTypes(args);
+      const budget = new TraversalBudget();
 
       if (to) {
-        const toKeys = new Set(store.resolveNodes(to, repo, fuzzy).map((m) => m.key));
-        if (toKeys.size === 0) return text(`No entity found matching target "${to}".${fuzzy ? '' : ' Try fuzzy:true.'}`);
-        const path = shortestPath(getNeighbors, fromKeys, toKeys, maxDepth);
+        const toKeys = store.resolveNodes(to, repo, fuzzy).map((m) => m.key);
+        if (toKeys.length === 0) return text(`No entity found matching target "${to}".${fuzzy ? '' : ' Try fuzzy:true.'}`);
+        const { path, depth } = shortestPath(store, fromKeys, toKeys, maxDepth, direction, types, budget);
+        if (!path && budget.exhausted) {
+          return text(`No path from "${from}" to "${to}" found within the traversal budget (explored ${budget.explored} nodes, depth ${depth} of ${maxDepth}, direction: ${direction}) — narrow the search (repo, exact names, relations) or lower maxDepth.`);
+        }
         if (!path) return text(`No path from "${from}" to "${to}" within ${maxDepth} hops (direction: ${direction}).`);
         const labelOf = store.labelsOf(path);
         const arrow = direction === 'callers' ? ' ← ' : ' → ';
@@ -546,8 +635,11 @@ export async function handleGraphTool(
         return text(`# Path (${path.length - 1} hops)\n\n${rendered}\n\n${path.map((k) => `- \`${k}\``).join('\n')}`);
       }
 
-      const nodes = reachable(getNeighbors, fromKeys, maxDepth);
-      if (nodes.length === 0) return text(`No ${direction} reachable from "${from}" within ${maxDepth} hops.`);
+      const nodes = reachable(store, fromKeys, maxDepth, direction, types, budget);
+      const stopped = budget.exhausted
+        ? `\n\n_Stopped early at the traversal budget (explored ${budget.explored} nodes) — narrow the search or lower maxDepth._`
+        : '';
+      if (nodes.length === 0) return text(`No ${direction} reachable from "${from}" within ${maxDepth} hops.${stopped}`);
       const labelOf = store.labelsOf(nodes.map((n) => n.key));
       const byDepth = new Map<number, string[]>();
       for (const { key, depth } of nodes) {
@@ -556,7 +648,7 @@ export async function handleGraphTool(
       }
       const sections = [...byDepth.entries()].sort((a, b) => a[0] - b[0])
         .map(([d, ks]) => `## Depth ${d}\n${ks.map((k) => `- ${k}`).join('\n')}`).join('\n\n');
-      return text(`# Reachable from "${from}" (${direction}, ≤${maxDepth} hops)\n\n${nodes.length} nodes:\n\n${sections}`);
+      return text(`# Reachable from "${from}" (${direction}, ≤${maxDepth} hops)\n\n${nodes.length} nodes:\n\n${sections}${stopped}`);
     }
 
     if (name === 'find_dead_code') {
@@ -682,6 +774,7 @@ export async function handleGraphTool(
       let hops: Hop[] = [];
       let depRepos = new Set<string>();
       const fileLevel = new Set<string>();
+      let budget: TraversalBudget | null = null;
       if (store) {
         // Added / deleted files: every node in them. Modified files: the
         // entities whose line range at the base overlaps a hunk.
@@ -712,10 +805,12 @@ export async function handleGraphTool(
           }
         }
         for (const k of endpoints) fileLevel.add(k);
-        ({ hops, repos: depRepos } = dependentHops(store, [...changedKeys, ...endpoints], 1, fileLevel));
+        budget = new TraversalBudget();
+        ({ hops, repos: depRepos } = dependentHops(store, [...changedKeys, ...endpoints], 1, fileLevel, budget));
       }
       const dependents = hops[0]?.edges ?? [];
       const depTotal = hops[0]?.total ?? 0;
+      const plus = atLeast(hops[0]?.truncated ?? false);
 
       const lines = [
         `# Changes since ${baseSha.slice(0, 7)} — ${repo}`,
@@ -734,9 +829,11 @@ export async function handleGraphTool(
       }
       lines.push(
         '',
-        `## Dependents: ${depTotal} edges from ${depRepos.size} repo(s)`,
+        `## Dependents: ${depTotal}${plus} edges from ${depRepos.size} repo(s)`,
         ...dependents.slice(0, limit).map((e) => edgeLine(e, fileLevel)),
-        ...(depTotal > Math.min(dependents.length, limit) ? [`... and ${depTotal - Math.min(dependents.length, limit)} more`] : []),
+        ...(depTotal > Math.min(dependents.length, limit) ? [`... and ${depTotal - Math.min(dependents.length, limit)}${plus} more`] : []),
+        ...(plus ? ['', AT_LEAST_NOTE] : []),
+        ...(budget?.exhausted ? ['', `_Dependents not looked up: ${budget.explored} affected nodes exceed the traversal budget — diff against a closer baseSha._`] : []),
         '',
         `## Affected repos: ${[...depRepos].join(', ') || 'none'}`,
       );

@@ -380,17 +380,27 @@ and inheritance are never reported as calls.
 | `get_cross_repo_edges` | `GraphStore` | `crossRepoEdges(repo?, 50)` — edges between repos plus same-repo `workspace-dep` edges (own section), each with its `evidence`; shared-resource types shown `↔` |
 | `find_callers` | `GraphStore` | `resolveNodes` → `callers(keys, 30, types)` grouped by relation; when none, names the other relations present |
 | `find_dependencies` | `GraphStore` | same, `dependencies(keys, 30, types)` |
-| `impact_analysis` | `GraphStore` | scope = `nodesInFiles(repo, [file], entity?)` (`entity` may be a full id) → `dependents` hop by hop up to `depth` (default 2, max 5); with `entity`, the file's `external` (cross-repo endpoint) nodes join the scope and their dependents are marked `[file-level]`; no nodes for the file → `isError` |
-| `trace_path` | `GraphStore` | BFS over `neighborsOf(key, direction, types)` (`confidence ≥ 0.7`, unweighted); shortest path (≥ 1 hop) to `to`, else the reachable tree (≤`maxDepth` ≤ 10, cap 50) |
+| `impact_analysis` | `GraphStore` | scope = `nodesInFiles(repo, [file], entity?)` (`entity` may be a full id) → `dependents` hop by hop up to `depth` (default 2, max 5; ≤ 1000 edges kept, ≤ 50k counted per hop — `N+` when capped); with `entity`, the file's `external` (cross-repo endpoint) nodes join the scope and their dependents are marked `[file-level]`; no nodes for the file → `isError` |
+| `trace_path` | `GraphStore` | level-by-level BFS over `neighborEdges(frontier, direction, types, limit)` (`confidence ≥ 0.7`, unweighted, one query per ≤ 400 keys); with `to`, bidirectional (smaller frontier first) shortest path (≥ 1 hop), else the reachable tree (≤`maxDepth` ≤ 10, cap 50) |
 | `search_graph` | `GraphStore` | `searchNodes`: name = case-insensitive regex over symbol labels (invalid → `isError`), type / file / repo filters; rank by non-`contains` degree; top `limit` |
 | `find_dead_code` | `<repo>/graph.json` + indexed chunk text | entity nodes (function/method/class/…) with zero non-`contains` in-degree whose name doesn't occur again in their own file (vector store `getChunksByFile`, else `chunks.json`) |
-| `detect_changes` | git + `GraphStore` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)`; added / deleted files → every node; modified files → entities whose range at the base overlaps a `git diff -U0` old-side hunk (ranges run from each entity's declaration line in `git show base:file` to the next declaration; an entity whose declaration isn't found is kept) + module node when a hunk falls outside every range + the file's endpoints (`[file-level]`) → one hop of `dependents` |
+| `detect_changes` | git + `GraphStore` + `<repo>/index_meta.json` | `getAllChanges(repoPath, baseSha)`; added / deleted files → every node; modified files → entities whose range at the base overlaps a `git diff -U0` old-side hunk (ranges run from each entity's declaration line in `git show base:file` to the next declaration; an entity whose declaration isn't found is kept) + module node when a hunk falls outside every range + the file's endpoints (`[file-level]`) → one hop of `dependents` (same caps as `impact_analysis`; skipped, with a note, when the affected nodes alone exceed the budget) |
 | `get_architecture` | `PROJECT_GRAPH.json` / `PROJECT_SUMMARY.md` / profiles | renders the CLI-generated project graph; degrades to profiles, then to a "no data" hint |
 
 `dependents` follows edges into the scope plus shared-resource cross-repo
 edges (`SYMMETRIC_EDGE_TYPES`: topics, tables, Redis keys, buckets, shared
 types / constants / env vars / npm deps) out of it, so both sides of a
 shared topic see each other.
+
+Traversal budget (`TraversalBudget` in `tools/graph.ts`): store queries are
+synchronous on the event loop, so every multi-hop traversal (`trace_path`,
+`impact_analysis` and `detect_changes` hops) stops at 50k discovered nodes
+(`TRAVERSAL_MAX_NODES`, which also caps the rows of one neighbour query or
+one hop of dependents) or 1 s of wall clock (`TRAVERSAL_BUDGET_MS`, checked
+before every query). The answer then says so: `trace_path` reports "found
+within the traversal budget (explored N nodes, depth D of M …)" instead of
+"No path"; a capped dependents count reads `N+`; a hop cut off by the clock
+is named.
 
 Node id convention: `<repo>::<filePath>::<entity>`, class members `<repo>::<filePath>::<Class>.<member>` (matches AST graph
 builder's namespacing). `get_architecture` reads `PROJECT_GRAPH.json` /

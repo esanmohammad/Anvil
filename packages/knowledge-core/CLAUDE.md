@@ -42,7 +42,8 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   merged system graph. `buildKB` streams each repo's nodes/edges and the
   cross-repo edges into `system_graph.sqlite` (better-sqlite3, else
   `node:sqlite`); `GraphStore` serves slice queries (callers, dependencies,
-  dependents, cross-repo edges, neighbors) to the retriever's graph expansion
+  dependents, cross-repo edges, neighbors — per key, or batched as
+  `neighborEdges` with a row limit) to the retriever's graph expansion
   and the MCP graph tools. Edges keep `type`, `confidence` and (cross-repo)
   `evidence`. Exact name resolution is case-sensitive and wildcard-free and
   accepts a full `repo::file::entity` id; `dependents` treats
@@ -205,7 +206,7 @@ pass credentials through the config struct.
   PHP `$variable`). Unknown languages fall through to `genericTokenize`.
 - `query-expander.ts` — `expandQuery(query, classification, llm, opts)`
   returns `{queries, weights}`. HyDE-lite: skips `identifier`/`path`/
-  `error-code` types unless `forceExpand`; LRU 128 / 10-min cache; uses
+  `error-code` types unless `forceExpand`; LRU 4096 / 10-min cache; uses
   any `LlmClient` adapter. `fuseRrf(rankings, weights, k=60)` merges
   expanded retrievals.
 - `rerank-cache.ts` — `RerankCache` on-disk LRU keyed by
@@ -320,7 +321,8 @@ hold. The embed step records `embeddingProvider` / `embeddingModel` /
   (default) — fused pipeline; graph expansion only in the `+graph` modes.
 - `repoFilter` (or `repos`) scopes the search. With neither, the query
   router filters repos only when `CODE_SEARCH_AUTO_ROUTE=1`.
-- Query embedding cached for 10 min (LRU 128).
+- Query embedding cached for 10 min (LRU 4096: a hit refreshes recency, a
+  full cache evicts the least recently used query).
 - Returns `{ chunks, graphContext, totalTokens, query }`. `graphContext`
   is always `''`.
 
