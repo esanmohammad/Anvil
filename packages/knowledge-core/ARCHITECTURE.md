@@ -526,16 +526,40 @@ repo's nodes/edges plus the cross-repo edges as `buildKB` goes, and
 `GraphStore` (`openSystemGraphStore` / `getGraphStore`) serves slice
 queries to the retriever and the MCP graph tools. Tables: `nodes(key,
 key_tail, repo, file, label, type, degree, attrs)` and `edges(source,
-target, type, confidence, source_repo, target_repo, evidence)` —
+target, type, confidence, source_repo, target_repo, evidence, cross_repo)` —
 `evidence` (the route / topic / table / package a cross-repo edge was
-matched on) is NULL for AST edges; `key_tail` is the key's text after its
-last `::` (indexed). `nodes_fts` is a contentless FTS5 table with the
+matched on) is NULL for AST edges; `cross_repo` is 1 on the cross-repo edges
+(same-repo `workspace-dep` ones included), NULL on repo-graph edges;
+`key_tail` is the key's text after its last `::` (indexed). Edges are also
+indexed by `target_repo` (and, partially, by `cross_repo`) for the updater's
+deletes. `nodes_fts` is a contentless FTS5 table with the
 `trigram` tokenizer over `nodes.label` (rowid = `nodes.rowid`), filled in
 one statement at finalize; a driver whose SQLite lacks FTS5 / trigram
-(< 3.34) writes the file without it. Files written before either column or
-`nodes_fts` existed are still read (`NULL AS evidence`; exact resolution by
-scan; fuzzy matching by a scan up to its limit) until the next index
-rebuilds them — readers never alter the schema.
+(< 3.34) writes the file without it. `meta` holds `nodeCount` and
+`schemaVersion` (1). Files written before any of these existed are still
+read (`NULL AS evidence`; exact resolution by scan; fuzzy matching by a scan
+up to its limit) until the next full rebuild — readers never alter the
+schema.
+
+A full rebuild (`createSystemGraphSqliteWriter`, or `writeSystemGraphSqlite`
+from a `ProjectGraphBuilder`) writes `system_graph.sqlite.tmp` and, once
+complete, renames it over the live file: a reader opening the path gets the
+old graph or the new one, never a partial one. Before the rename the live
+file's WAL is truncated; after it the old `-wal` / `-shm` are unlinked, so the
+new file never inherits them. Open connections keep reading the old file, and
+SQLite skips the checkpoint and sidecar delete when they close (the file has
+moved). `openSystemGraphSqliteUpdater` instead updates the live file in one
+write transaction (WAL readers see the old graph until it commits):
+`removeRepos(changed ∪ removed)` (nodes, their `nodes_fts` rows, every edge
+touching them) → `addRepoGraph` per changed or added repo → `replaceCrossRepoEdges(all)`
+(drops every `cross_repo` edge and `external` node, inserts the new set) →
+`finalize` (recounts degrees of the nodes whose edges changed, writes meta,
+commits, checkpoints the WAL into the file). Writer and updater insert
+through the same code, so an update leaves the same nodes, edges and degrees
+as a full rebuild from the same inputs; only rowids (insertion order) differ.
+It returns null — do a full rebuild — for a missing file, one not at the
+current `schemaVersion`, or one without `nodes_fts` / `key_tail`. `buildKB`
+still does full rebuilds.
 
 Query semantics (both the SQLite store and the JSON fallback):
 `resolveNodes` is exact by default — full key, `label`, or a `::name` key
@@ -677,7 +701,8 @@ Steps:
 7. Cross-repo edges (14 strategies): `correlateCrossRepoEdges` over per-repo `signals.json` bundles persisted at index time (extracted in the worker while the tree exists).
 8. LLM service mesh inference (skipped if `isLlmAvailable() === false`).
 9. Persist the system graph: finalize the streamed `system_graph.sqlite`
-   (uploaded when the blob backend is remote). With no SQLite driver, the
+   (built next to the live file and renamed over it; uploaded when the blob
+   backend is remote). With no SQLite driver, the
    in-memory `ProjectGraphBuilder` runs Louvain and writes
    `system_graph_v2.json` instead.
 10. Save `deleted_files.json` (changed + deleted files of previously indexed

@@ -58,7 +58,16 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   (`src/graph-store.ts`) + `getGraphStore` (`src/storage/resolve.ts`) — the
   merged system graph. `buildKB` streams each repo's nodes/edges and the
   cross-repo edges into `system_graph.sqlite` (better-sqlite3, else
-  `node:sqlite`); `GraphStore` serves slice queries (callers, dependencies,
+  `node:sqlite`) — a full rebuild, written to `system_graph.sqlite.tmp` and
+  renamed over the live file at finalize, so readers never see a partial
+  graph. `openSystemGraphSqliteUpdater` updates the live file in one write
+  transaction instead: `removeRepos(changed ∪ removed)` → `addRepoGraph` per
+  changed repo → `replaceCrossRepoEdges(all)` → `finalize`, leaving the same
+  nodes / edges / degrees as a full rebuild (it shares the writer's insert
+  code; `edges.cross_repo` marks the cross-repo edges it replaces); null for a
+  missing file, one not at `meta.schemaVersion`, or one without `nodes_fts` /
+  `key_tail` (→ full rebuild). `buildKB` doesn't call it.
+  `GraphStore` serves slice queries (callers, dependencies,
   dependents, cross-repo edges, neighbors — per key, or batched as
   `neighborEdges` with a row limit) to the retriever's graph expansion
   and the MCP graph tools. Edges keep `type`, `confidence` and (cross-repo)

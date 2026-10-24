@@ -12,7 +12,7 @@
  * available. See docs/SYSTEM-GRAPH-SQLITE-PLAN.md.
  */
 
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 // ---------------------------------------------------------------------------
@@ -129,6 +129,10 @@ function loadDriver(): Promise<Opener | null> {
 
 // nodes.key_tail = keyTail(key), indexed so exact `::name` resolution is a
 // btree lookup (files written before it existed have no such column).
+// edges.cross_repo = 1 on the edges addCrossRepoEdges wrote (same-repo
+// `workspace-dep` ones included), NULL on repo-graph edges: the updater
+// replaces exactly that set. idx_nodes_repo, idx_edges_crossrepo (source_repo)
+// and idx_edges_target_repo serve its per-repo deletes.
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS nodes (
   key TEXT PRIMARY KEY, key_tail TEXT, repo TEXT, file TEXT, label TEXT, type TEXT, degree INTEGER, attrs TEXT
@@ -140,13 +144,19 @@ CREATE INDEX IF NOT EXISTS idx_nodes_key_tail ON nodes(key_tail);
 CREATE INDEX IF NOT EXISTS idx_nodes_file  ON nodes(repo, file);
 CREATE TABLE IF NOT EXISTS edges (
   source TEXT NOT NULL, target TEXT NOT NULL, type TEXT, confidence REAL,
-  source_repo TEXT, target_repo TEXT, evidence TEXT
+  source_repo TEXT, target_repo TEXT, evidence TEXT, cross_repo INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_edges_source    ON edges(source, type);
 CREATE INDEX IF NOT EXISTS idx_edges_target    ON edges(target, type);
 CREATE INDEX IF NOT EXISTS idx_edges_crossrepo ON edges(source_repo, target_repo);
+CREATE INDEX IF NOT EXISTS idx_edges_target_repo ON edges(target_repo);
+CREATE INDEX IF NOT EXISTS idx_edges_cross     ON edges(cross_repo) WHERE cross_repo IS NOT NULL;
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 `;
+/** meta `schemaVersion`: the file has everything above (`nodes_fts` only when
+ *  the driver could build it). Absent: written before versioning — readers
+ *  feature-detect, the updater refuses the file. */
+const SCHEMA_VERSION = '1';
 
 const repoOf = (key: string): string => key.split('::')[0] ?? '';
 const fileOf = (key: string): string => key.split('::')[1] ?? '';
@@ -157,6 +167,57 @@ const keyTail = (key: string): string => {
   return i < 0 ? key : key.slice(i + 2);
 };
 const INSERT_NODE = 'INSERT OR REPLACE INTO nodes(key,key_tail,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?,?)';
+const INSERT_EDGE = 'INSERT INTO edges(source,target,type,confidence,source_repo,target_repo,evidence,cross_repo) VALUES(?,?,?,?,?,?,?,?)';
+
+function writeMeta(db: SqliteDb, nodeCount: number): void {
+  const set = db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)');
+  set.run('nodeCount', String(nodeCount));
+  set.run('schemaVersion', SCHEMA_VERSION);
+}
+
+/** A full rebuild writes here, next to the live file, and then
+ *  {@link publishGraphFile} renames it over the live file. One name, so a
+ *  rebuild that died is cleared by the next one (there is one writer). */
+const tempGraphPath = (dbPath: string): string => `${dbPath}.tmp`;
+
+/** A new, empty graph file at `path` (any old one and its -wal / -shm removed). */
+function createGraphFile(open: Opener, path: string): SqliteDb {
+  for (const f of [path, `${path}-wal`, `${path}-shm`]) {
+    try { rmSync(f, { force: true }); } catch { /* ok */ }
+  }
+  const db = open(path);
+  db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;');
+  db.exec(SCHEMA);
+  return db;
+}
+
+/**
+ * Swap a finished, closed graph file in for the live one by rename, so a
+ * reader opening `system_graph.sqlite` gets the old complete graph or the new
+ * one, never a partial one. Connections to the old file keep reading it (its
+ * inode lives until they close); SQLite sees that file has moved, so their
+ * close neither checkpoints into nor deletes the -wal / -shm at the path.
+ * Those belong to the old file: the old WAL is truncated before the rename and
+ * both are unlinked right after it, so new connections start fresh ones. A
+ * connection opened between the rename and the unlink finds no WAL frames but
+ * shares the old -shm, so it must be reopened before the file is next updated
+ * (readers reopen per index generation).
+ */
+function publishGraphFile(open: Opener, tmp: string, dbPath: string): void {
+  if (existsSync(dbPath)) {
+    try {
+      const live = open(dbPath);
+      try {
+        live.exec('PRAGMA busy_timeout = 5000');
+        live.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      } finally { live.close(); }
+    } catch { /* unreadable: replaced below all the same */ }
+  }
+  renameSync(tmp, dbPath);
+  for (const f of [`${dbPath}-wal`, `${dbPath}-shm`]) {
+    try { rmSync(f, { force: true }); } catch { /* ok */ }
+  }
+}
 
 /** Trigram FTS5 index over node labels (rowid = nodes.rowid; contentless, so
  *  it stores only the index) for fuzzy name matching. Skipped when the
@@ -169,22 +230,18 @@ function indexLabels(db: SqliteDb): void {
   db.exec('INSERT INTO nodes_fts(rowid, name) SELECT rowid, label FROM nodes');
 }
 
-/** Stream the in-memory graph into a fresh sqlite db. Returns false if no
- *  driver is available (caller falls back to the JSON write). */
+/** Stream the in-memory graph into a fresh sqlite db, swapped in for the live
+ *  one once complete. Returns false if no driver is available (caller falls
+ *  back to the JSON write). */
 export async function writeSystemGraphSqlite(basePath: string, graph: GraphIterable): Promise<boolean> {
   const open = await loadDriver();
   if (!open) return false;
   const dbPath = systemGraphSqlitePath(basePath);
-  // Full rebuild each index — drop any prior db (+ WAL sidecars) and recreate.
-  for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
-    try { rmSync(f, { force: true }); } catch { /* ok */ }
-  }
-  const db = open(dbPath);
-  db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;');
-  db.exec(SCHEMA);
+  const tmp = tempGraphPath(dbPath);
+  const db = createGraphFile(open, tmp);
 
   const insNode = db.prepare(INSERT_NODE);
-  const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo,evidence) VALUES(?,?,?,?,?,?,?)');
+  const insEdge = db.prepare(INSERT_EDGE);
 
   const degree = new Map<string, number>();
   db.exec('BEGIN');
@@ -193,7 +250,7 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
       const type = (attrs.type ?? attrs.relation ?? null) as string | null;
       const confidence = (typeof attrs.confidence === 'number' ? attrs.confidence : null) as number | null;
       const evidence = typeof attrs.evidence === 'string' ? attrs.evidence : null;
-      insEdge.run(source, target, type, confidence, repoOf(source), repoOf(target), evidence);
+      insEdge.run(source, target, type, confidence, repoOf(source), repoOf(target), evidence, attrs.crossRepo === true ? 1 : null);
       if (type !== 'contains') {
         degree.set(source, (degree.get(source) ?? 0) + 1);
         degree.set(target, (degree.get(target) ?? 0) + 1);
@@ -214,7 +271,7 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
         Object.keys(rest).length ? JSON.stringify(rest) : null,
       );
     });
-    db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)').run('nodeCount', String(nodeCount));
+    writeMeta(db, nodeCount);
     indexLabels(db);
     db.exec('COMMIT');
   } catch (err) {
@@ -223,6 +280,7 @@ export async function writeSystemGraphSqlite(basePath: string, graph: GraphItera
     throw err;
   }
   db.close();
+  publishGraphFile(open, tmp, dbPath);
   return true;
 }
 
@@ -248,87 +306,258 @@ export interface SystemGraphSqliteWriter {
   addRepoGraph(repoName: string, graph: RepoGraphInput): void;
   /** Insert cross-repo edges + synthetic endpoints (mirrors addCrossRepoEdges). */
   addCrossRepoEdges(edges: CrossEdgeInput[]): void;
-  /** Backfill node degrees, write meta, build the label index, close. */
+  /** Backfill node degrees, write meta, build the label index, close, and
+   *  rename the file over the live one. */
   finalize(): { nodeCount: number; edgeCount: number };
 }
 
+/** Where {@link insertRepoGraph} / {@link insertCrossRepoEdges} write — the
+ *  full writer and the updater — so both build the same graph from the same input. */
+interface GraphSink {
+  /** Insert the node unless its key is already in the graph. */
+  addNode(key: string, repo: string, file: string, label: string, type: string, attrs: string | null): void;
+  hasNode(key: string): boolean;
+  addEdge(source: string, target: string, type: string, confidence: number | null,
+    sourceRepo: string, targetRepo: string, evidence: string | null, crossRepo: 1 | null): void;
+}
+
+/** One repo's nodes and edges, keyed `<repo>::<id>` (mirrors
+ *  ProjectGraphBuilder.addRepoGraph): a duplicate key keeps its first node; an
+ *  edge needs both endpoints. */
+function insertRepoGraph(sink: GraphSink, repoName: string, graph: RepoGraphInput): void {
+  for (const node of graph.nodes ?? []) {
+    const key = `${repoName}::${node.id}`;
+    const attrs = node.community !== undefined ? JSON.stringify({ community: node.community }) : null;
+    sink.addNode(key, repoName, node.file ?? fileOf(key), node.label ?? labelFromKey(key), node.type ?? '', attrs);
+  }
+  for (const edge of graph.links ?? []) {
+    const src = `${repoName}::${edge.source}`;
+    const tgt = `${repoName}::${edge.target}`;
+    if (!sink.hasNode(src) || !sink.hasNode(tgt)) continue;
+    const conf = typeof edge.confidence === 'number' ? edge.confidence : 0.8;
+    sink.addEdge(src, tgt, edge.type ?? 'depends', conf, repoName, repoName, null, null);
+  }
+}
+
+/** Cross-repo edges, plus an `external` node for each endpoint not in the
+ *  graph (mirrors ProjectGraphBuilder.addCrossRepoEdges). */
+function insertCrossRepoEdges(sink: GraphSink, edges: CrossEdgeInput[]): void {
+  for (const e of edges ?? []) {
+    const src = `${e.sourceRepo}::${e.sourceNode}`;
+    const tgt = `${e.targetRepo}::${e.targetNode}`;
+    sink.addNode(src, e.sourceRepo, fileOf(src), e.sourceNode, 'external', null);
+    sink.addNode(tgt, e.targetRepo, fileOf(tgt), e.targetNode, 'external', null);
+    const conf = typeof e.confidence === 'number' ? e.confidence : null;
+    sink.addEdge(src, tgt, e.edgeType, conf, e.sourceRepo, e.targetRepo, e.evidence ?? null, 1);
+  }
+}
+
+/** A full rebuild: writes a new file next to the live one and renames it over
+ *  the live one at finalize, so readers never see a partial graph. */
 export async function createSystemGraphSqliteWriter(basePath: string): Promise<SystemGraphSqliteWriter | null> {
   const open = await loadDriver();
   if (!open) return null;
   const dbPath = systemGraphSqlitePath(basePath);
-  for (const f of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
-    try { rmSync(f, { force: true }); } catch { /* ok */ }
-  }
-  const db = open(dbPath);
-  db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;');
-  db.exec(SCHEMA);
+  const tmp = tempGraphPath(dbPath);
+  const db = createGraphFile(open, tmp);
   const insNode = db.prepare(INSERT_NODE);
-  const insEdge = db.prepare('INSERT INTO edges(source,target,type,confidence,source_repo,target_repo,evidence) VALUES(?,?,?,?,?,?,?)');
+  const insEdge = db.prepare(INSERT_EDGE);
   const updDegree = db.prepare('UPDATE nodes SET degree=? WHERE key=?');
 
   const nodeKeys = new Set<string>();
   const degree = new Map<string, number>();
   let edgeCount = 0;
-  const bump = (type: string | null, src: string, tgt: string) => {
-    if (type !== 'contains') {
-      degree.set(src, (degree.get(src) ?? 0) + 1);
-      degree.set(tgt, (degree.get(tgt) ?? 0) + 1);
-    }
+  const sink: GraphSink = {
+    addNode(key, repo, file, label, type, attrs) {
+      if (nodeKeys.has(key)) return; // dedup — mirrors the hasNode guard
+      nodeKeys.add(key);
+      insNode.run(key, keyTail(key), repo, file, label, type, 0, attrs);
+    },
+    hasNode: (key) => nodeKeys.has(key),
+    addEdge(src, tgt, type, conf, srcRepo, tgtRepo, evidence, crossRepo) {
+      insEdge.run(src, tgt, type, conf, srcRepo, tgtRepo, evidence, crossRepo);
+      edgeCount++;
+      if (type !== 'contains') {
+        degree.set(src, (degree.get(src) ?? 0) + 1);
+        degree.set(tgt, (degree.get(tgt) ?? 0) + 1);
+      }
+    },
+  };
+  const inTransaction = (fn: () => void) => {
+    db.exec('BEGIN');
+    try { fn(); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; }
   };
 
   return {
-    addRepoGraph(repoName, graph) {
-      db.exec('BEGIN');
-      try {
-        for (const node of graph.nodes ?? []) {
-          const key = `${repoName}::${node.id}`;
-          if (nodeKeys.has(key)) continue; // dedup — mirrors the hasNode guard
-          nodeKeys.add(key);
-          const attrs = node.community !== undefined ? JSON.stringify({ community: node.community }) : null;
-          insNode.run(key, keyTail(key), repoName, node.file ?? fileOf(key), node.label ?? labelFromKey(key), node.type ?? '', 0, attrs);
-        }
-        for (const edge of graph.links ?? []) {
-          const src = `${repoName}::${edge.source}`;
-          const tgt = `${repoName}::${edge.target}`;
-          if (!nodeKeys.has(src) || !nodeKeys.has(tgt)) continue; // both endpoints must exist
-          const type = edge.type ?? 'depends';
-          const conf = typeof edge.confidence === 'number' ? edge.confidence : 0.8;
-          insEdge.run(src, tgt, type, conf, repoName, repoName, null);
-          edgeCount++;
-          bump(type, src, tgt);
-        }
-        db.exec('COMMIT');
-      } catch (e) { db.exec('ROLLBACK'); throw e; }
-    },
-
-    addCrossRepoEdges(edges) {
-      db.exec('BEGIN');
-      try {
-        for (const e of edges ?? []) {
-          const src = `${e.sourceRepo}::${e.sourceNode}`;
-          const tgt = `${e.targetRepo}::${e.targetNode}`;
-          if (!nodeKeys.has(src)) { nodeKeys.add(src); insNode.run(src, keyTail(src), e.sourceRepo, fileOf(src), e.sourceNode, 'external', 0, null); }
-          if (!nodeKeys.has(tgt)) { nodeKeys.add(tgt); insNode.run(tgt, keyTail(tgt), e.targetRepo, fileOf(tgt), e.targetNode, 'external', 0, null); }
-          const conf = typeof e.confidence === 'number' ? e.confidence : null;
-          insEdge.run(src, tgt, e.edgeType, conf, e.sourceRepo, e.targetRepo, e.evidence ?? null);
-          edgeCount++;
-          bump(e.edgeType, src, tgt);
-        }
-        db.exec('COMMIT');
-      } catch (e) { db.exec('ROLLBACK'); throw e; }
-    },
+    addRepoGraph(repoName, graph) { inTransaction(() => insertRepoGraph(sink, repoName, graph)); },
+    addCrossRepoEdges(edges) { inTransaction(() => insertCrossRepoEdges(sink, edges)); },
 
     finalize() {
       db.exec('BEGIN');
       try {
         for (const [key, deg] of degree) updDegree.run(deg, key);
-        db.prepare('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)').run('nodeCount', String(nodeKeys.size));
+        writeMeta(db, nodeKeys.size);
         indexLabels(db);
         db.exec('COMMIT');
       } catch (e) { db.exec('ROLLBACK'); db.close(); throw e; }
       db.close();
+      publishGraphFile(open, tmp, dbPath);
       return { nodeCount: nodeKeys.size, edgeCount };
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// In-place updater — replaces the changed repos' slices of the live file in
+// one write transaction, instead of rewriting every repo's graph.
+// ---------------------------------------------------------------------------
+
+/**
+ * Updates `system_graph.sqlite` in place, in ONE write transaction: WAL
+ * readers keep the old graph until `finalize` commits. Call sequence:
+ *
+ *   removeRepos(changed ∪ removed)    — an added repo counts as changed
+ *   addRepoGraph(name, graph)          — for each changed (or added) repo
+ *   replaceCrossRepoEdges(allEdges)    — the complete cross-repo edge set
+ *   finalize()
+ *
+ * The result has the same nodes, edges and degrees as a full rebuild
+ * ({@link createSystemGraphSqliteWriter}) from the same per-repo graphs and
+ * cross-repo edges; only rowids — insertion order — differ. A call out of that
+ * order, `addRepoGraph` for a repo still in the file, or any error rolls the
+ * update back and closes it (later calls throw); `abort` does so on purpose.
+ */
+export interface SystemGraphSqliteUpdater {
+  /** Delete these repos' nodes (and their `nodes_fts` rows) and every edge touching them. */
+  removeRepos(names: string[]): void;
+  /** Insert one repo's nodes and edges, as {@link SystemGraphSqliteWriter.addRepoGraph}. */
+  addRepoGraph(repoName: string, graph: RepoGraphInput): void;
+  /** Drop every cross-repo edge and `external` endpoint node, then insert `edges`
+   *  as {@link SystemGraphSqliteWriter.addCrossRepoEdges}. */
+  replaceCrossRepoEdges(edges: CrossEdgeInput[]): void;
+  /** Recount degrees of the nodes whose edges changed, write meta, commit,
+   *  checkpoint the WAL into the file (waiting up to 5 s for readers) and close. */
+  finalize(): { nodeCount: number; edgeCount: number };
+  abort(): void;
+}
+
+/** Null when there is no driver or the file can't be updated in place —
+ *  missing, not at the current schema version, or without `nodes_fts` /
+ *  `nodes.key_tail`: rebuild it with {@link createSystemGraphSqliteWriter}. */
+export async function openSystemGraphSqliteUpdater(basePath: string): Promise<SystemGraphSqliteUpdater | null> {
+  const open = await loadDriver();
+  if (!open) return null;
+  const dbPath = systemGraphSqlitePath(basePath);
+  if (!existsSync(dbPath)) return null;
+  let db: SqliteDb;
+  try { db = open(dbPath); } catch { return null; }
+  try {
+    const version = db.prepare("SELECT v FROM meta WHERE k = 'schemaVersion'").get()?.v;
+    const hasKeyTail = db.prepare('PRAGMA table_info(nodes)').all().some((c) => c.name === 'key_tail');
+    if (version !== SCHEMA_VERSION || !hasKeyTail) throw new Error('not updatable');
+    db.prepare('SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?'); // throws: no table, or no FTS5 / trigram
+    db.exec('PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;');
+    db.exec('BEGIN IMMEDIATE');
+  } catch {
+    db.close();
+    return null;
+  }
+
+  const insNode = db.prepare('INSERT OR IGNORE INTO nodes(key,key_tail,repo,file,label,type,degree,attrs) VALUES(?,?,?,?,?,?,?,?)');
+  const insFts = db.prepare('INSERT INTO nodes_fts(rowid, name) VALUES(?, ?)');
+  const getNode = db.prepare('SELECT 1 FROM nodes WHERE key = ?');
+  const repoHasNodes = db.prepare('SELECT 1 FROM nodes WHERE repo = ? LIMIT 1');
+  const insEdge = db.prepare(INSERT_EDGE);
+  /** Nodes whose edge set changed — their degrees are recounted at finalize. */
+  const touched = new Set<string>();
+  const added = new Set<string>();
+  const touch = (rows: any[]) => { for (const r of rows) { touched.add(r.source as string); touched.add(r.target as string); } };
+  const sink: GraphSink = {
+    addNode(key, repo, file, label, type, attrs) {
+      const r = insNode.run(key, keyTail(key), repo, file, label, type, 0, attrs) as { changes: number | bigint; lastInsertRowid: number | bigint };
+      if (Number(r.changes) > 0) insFts.run(r.lastInsertRowid, label);
+    },
+    hasNode: (key) => getNode.get(key) !== undefined,
+    addEdge(src, tgt, type, conf, srcRepo, tgtRepo, evidence, crossRepo) {
+      insEdge.run(src, tgt, type, conf, srcRepo, tgtRepo, evidence, crossRepo);
+      if (type !== 'contains') { touched.add(src); touched.add(tgt); }
+    },
+  };
+
+  let step = 0;
+  let closed = false;
+  const abort = () => {
+    if (closed) return;
+    closed = true;
+    try { db.exec('ROLLBACK'); } catch { /* no transaction left to roll back */ }
+    db.close();
+  };
+  /** Run `fn` as the `next` step of the sequence; any error rolls everything back. */
+  const run = <T>(next: number, fn: () => T): T => {
+    if (closed) throw new Error('system graph updater is closed');
+    try {
+      if (next < step) throw new Error('system graph updater: call removeRepos → addRepoGraph → replaceCrossRepoEdges → finalize, in that order');
+      step = next;
+      return fn();
+    } catch (e) {
+      abort();
+      throw e;
+    }
+  };
+
+  return {
+    removeRepos(names) {
+      run(0, () => {
+        for (const batch of chunked([...new Set(names)])) {
+          const ph = placeholders(batch.length);
+          // A cross-repo edge into a removed repo also ends at a node that stays.
+          touch(db.prepare(`SELECT source, target FROM edges WHERE cross_repo IS NOT NULL AND (source_repo IN (${ph}) OR target_repo IN (${ph}))`).all(...batch, ...batch));
+          // Contentless FTS5 deletes a row given the values it indexed.
+          db.prepare(`INSERT INTO nodes_fts(nodes_fts, rowid, name) SELECT 'delete', rowid, label FROM nodes WHERE repo IN (${ph})`).run(...batch);
+          db.prepare(`DELETE FROM nodes WHERE repo IN (${ph})`).run(...batch);
+          db.prepare(`DELETE FROM edges WHERE source_repo IN (${ph}) OR target_repo IN (${ph})`).run(...batch, ...batch);
+        }
+      });
+    },
+
+    addRepoGraph(repoName, graph) {
+      run(1, () => {
+        if (!added.has(repoName) && repoHasNodes.get(repoName) !== undefined) {
+          throw new Error(`system graph updater: "${repoName}" is still in the graph — removeRepos it first`);
+        }
+        added.add(repoName);
+        insertRepoGraph(sink, repoName, graph);
+      });
+    },
+
+    replaceCrossRepoEdges(edges) {
+      run(2, () => {
+        touch(db.prepare('SELECT source, target FROM edges WHERE cross_repo IS NOT NULL').all());
+        db.exec("INSERT INTO nodes_fts(nodes_fts, rowid, name) SELECT 'delete', rowid, label FROM nodes WHERE type = 'external'");
+        db.exec("DELETE FROM nodes WHERE type = 'external'");
+        db.exec('DELETE FROM edges WHERE cross_repo IS NOT NULL');
+        insertCrossRepoEdges(sink, edges);
+      });
+    },
+
+    finalize() {
+      return run(3, () => {
+        const nonContains = "(type IS NULL OR type <> 'contains')";
+        const recount = db.prepare(`UPDATE nodes SET degree = (SELECT count(*) FROM edges WHERE source = ? AND ${nonContains})`
+          + ` + (SELECT count(*) FROM edges WHERE target = ? AND ${nonContains}) WHERE key = ?`);
+        for (const key of touched) recount.run(key, key, key);
+        const nodeCount = Number(db.prepare('SELECT count(*) c FROM nodes').get().c);
+        const edgeCount = Number(db.prepare('SELECT count(*) c FROM edges').get().c);
+        writeMeta(db, nodeCount);
+        db.exec('COMMIT');
+        closed = true;
+        // Into the file itself: an upload of system_graph.sqlite alone carries the update.
+        try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } finally { db.close(); }
+        return { nodeCount, edgeCount };
+      });
+    },
+
+    abort,
   };
 }
 
