@@ -96,7 +96,7 @@ export interface RepoJob {
   language: string;
   basePath: string;
   project: string;
-  chunking: { maxTokens: number; contextEnrichment: 'structural' | 'llm' | 'none' };
+  chunking: { maxTokens: number; contextEnrichment: 'structural' | 'llm' | 'none'; ignorePatterns?: string[] };
   doChunk: boolean;
   force: boolean;
   /** Serializable storage config — a live BlobStorePort cannot cross the
@@ -240,10 +240,10 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
         getChangedFilesList(diff!),
         getDeletedFilesList(diff!),
         repoPath,
-        { workspaceMap: workspaceMap ?? undefined },
+        { workspaceMap: workspaceMap ?? undefined, ignorePatterns: chunking.ignorePatterns },
       );
     } else {
-      graph = await buildAstGraph(repoPath, { workspaceMap: workspaceMap ?? undefined });
+      graph = await buildAstGraph(repoPath, { workspaceMap: workspaceMap ?? undefined, ignorePatterns: chunking.ignorePatterns });
     }
     // graph.json stays compact (JSON.stringify, no indent) for byte-parity.
     await blobs.putText(graphKey, JSON.stringify(graph));
@@ -257,7 +257,7 @@ async function processCheckout(job: RepoJob): Promise<RepoResult> {
   // the clone right after this function returns). Correlation joins these
   // persisted bundles later, on the main thread, without any tree.
   try {
-    await blobs.putJson(`${repoName}/signals.json`, extractCrossRepoSignals(repoPath));
+    await blobs.putJson(`${repoName}/signals.json`, extractCrossRepoSignals(repoPath, { ignorePatterns: chunking.ignorePatterns }));
   } catch {
     // Non-fatal: this repo contributes no cross-repo edges until its next index.
   }

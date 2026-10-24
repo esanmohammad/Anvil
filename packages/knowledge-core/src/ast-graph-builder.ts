@@ -606,11 +606,11 @@ function findEntityAtLine(entities: ExtractedEntity[], line: number): ExtractedE
 
 export async function buildAstGraph(
   repoPath: string,
-  opts?: { maxFiles?: number; workspaceMap?: WorkspaceMap },
+  opts?: { maxFiles?: number; workspaceMap?: WorkspaceMap; ignorePatterns?: string[] },
 ): Promise<GraphifyOutput> {
   // Phase 0 — Walk: collect all source files
   const files: string[] = [];
-  walkDir(repoPath, files);
+  walkDir(repoPath, files, new Set(opts?.ignorePatterns));
 
   const maxFiles = opts?.maxFiles ?? 5000;
   const sourceFiles = files.slice(0, maxFiles);
@@ -1095,7 +1095,7 @@ export async function incrementalGraphUpdate(
   changedFiles: string[],
   deletedFiles: string[],
   repoPath: string,
-  opts?: { workspaceMap?: any },
+  opts?: { workspaceMap?: any; ignorePatterns?: string[] },
 ): Promise<GraphifyOutput> {
   // If more than 30% of files changed, full rebuild is faster
   const totalFiles = new Set(existingGraph.nodes.filter(n => n.file).map(n => n.file)).size;

@@ -2,6 +2,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, extname } from 'node:path';
 import type { CrossRepoEdge, WorkspaceMap } from '@esankhan3/anvil-knowledge-core';
 import { detectWorkspace } from './workspace-detector.js';
+import { isIgnoredPath } from './file-walker.js';
 
 /**
  * Cross-repo edge detection, split into two phases (extract → correlate):
@@ -607,8 +608,34 @@ function extractConstants(repoPath: string): Record<string, { name: string; file
 }
 
 /** Scan one repo's working tree into the serializable signal bundle. Pure
- *  CPU + local FS — safe to run in a worker thread while the clone exists. */
-export function extractCrossRepoSignals(repoPath: string): CrossRepoSignals {
+ *  CPU + local FS — safe to run in a worker thread while the clone exists.
+ *  Signals found in files under `ignorePatterns` path segments are dropped. */
+export function extractCrossRepoSignals(repoPath: string, opts?: { ignorePatterns?: string[] }): CrossRepoSignals {
+  const signals = scanCrossRepoSignals(repoPath);
+  const ignore = new Set(opts?.ignorePatterns);
+  if (ignore.size === 0) return signals;
+  const keep = (file: string) => !isIgnoredPath(file, ignore);
+  const files = (m?: Record<string, string>) => m && Object.fromEntries(Object.entries(m).filter(([, f]) => keep(f)));
+  return {
+    ...signals,
+    types: files(signals.types),
+    events: files(signals.events),
+    apiRoutes: files(signals.apiRoutes),
+    apiClients: files(signals.apiClients),
+    grpcDefs: files(signals.grpcDefs),
+    grpcClients: files(signals.grpcClients),
+    dbTables: files(signals.dbTables),
+    redisPrefixes: files(signals.redisPrefixes),
+    buckets: files(signals.buckets),
+    apiSpecPaths: files(signals.apiSpecPaths),
+    httpCalls: files(signals.httpCalls),
+    composeRefs: signals.composeRefs?.filter((r) => keep(r.file)),
+    k8sRefs: signals.k8sRefs?.filter((r) => keep(r.file)),
+    constants: signals.constants && Object.fromEntries(Object.entries(signals.constants).filter(([, c]) => keep(c.filePath))),
+  };
+}
+
+function scanCrossRepoSignals(repoPath: string): CrossRepoSignals {
   const api = extractApiEndpoints(repoPath);
   const grpc = extractGrpc(repoPath);
   const openapi = extractOpenApi(repoPath);

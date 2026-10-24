@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { join, relative, extname, basename, dirname } from 'node:path';
 import type { CodeChunk } from '@esankhan3/anvil-knowledge-core';
-import { walkDir, langFromExt, extractImports, isSourceFile } from './file-walker.js';
+import { walkDir, langFromExt, extractImports, isSourceFile, isIgnoredPath } from './file-walker.js';
 import { parseFile, supportedLanguages } from './tree-sitter-parser.js';
 import type { TreeSitterEntity } from './tree-sitter-parser.js';
 
@@ -498,12 +498,12 @@ export async function chunkRepo(
   repoPath: string,
   repoName: string,
   project: string,
-  config: { maxTokens: number },
+  config: { maxTokens: number; ignorePatterns?: string[] },
   cachedFiles?: Record<string, FileIndexEntry>,
   onChunk?: (chunk: CodeChunk) => void,
 ): Promise<ChunkResult> {
   const files: string[] = [];
-  walkDir(repoPath, files);
+  walkDir(repoPath, files, new Set(config.ignorePatterns));
 
   // When a sink is provided, stream each chunk to it and NEVER accumulate the
   // full array: at org scale a single big repo (e.g. 8k+ files) produces a
@@ -569,11 +569,12 @@ export async function chunkChangedFiles(
   repoPath: string,
   repoName: string,
   project: string,
-  config: { maxTokens: number },
+  config: { maxTokens: number; ignorePatterns?: string[] },
   diff: { added: string[]; modified: string[]; deleted: string[] },
   onChunk?: (chunk: CodeChunk) => void,
   cachedFiles?: Record<string, FileIndexEntry>,
 ): Promise<ChunkResult> {
+  const ignore = new Set(config.ignorePatterns);
   const allChunks: CodeChunk[] = [];
   const changedFiles: string[] = [];
   const fileIndex: Record<string, FileIndexEntry> = { ...cachedFiles };
@@ -583,7 +584,7 @@ export async function chunkChangedFiles(
   for (const relPath of [...diff.added, ...diff.modified]) {
     const fullPath = join(repoPath, relPath);
     if (!existsSync(fullPath)) continue;
-    if (!isSourceFile(basename(fullPath))) continue;
+    if (!isSourceFile(basename(fullPath)) || isIgnoredPath(relPath, ignore)) continue;
 
     let contents: string;
     try {

@@ -182,7 +182,7 @@ export class KnowledgeIndexer {
     // and their per-repo artifacts are deleted — so this cycle isn't a no-op.
     const currentRepoNames = new Set(repos.map((r) => r.name));
     const prevStats = await storage.blobs
-      .getJson<{ repos?: Array<{ name: string }> }>('index_stats.json')
+      .getJson<{ repos?: Array<{ name: string }>; crossRepoEdges?: number }>('index_stats.json')
       .catch(() => null);
     const removedRepos = (prevStats?.repos ?? [])
       .map((r) => r.name)
@@ -191,7 +191,7 @@ export class KnowledgeIndexer {
     if (reposToIndex.length === 0 && removedRepos.length === 0) {
       log('All repos up to date — nothing to build.');
       report({ phase: 'done', message: 'All repos up to date', percent: 100, etaSeconds: 0, skippedRepos });
-      return { project, repos: [], totalChunks: 0, totalTokens: 0, crossRepoEdges: 0, durationMs: 0, chunksPath: join(basePath, 'chunks.json') };
+      return { project, repos: [], totalChunks: 0, totalTokens: 0, crossRepoEdges: prevStats?.crossRepoEdges ?? 0, durationMs: 0, chunksPath: join(basePath, 'chunks.json') };
     }
 
     // 2. LLM Repo Profiling (WS-1) — skipped if LLM_MODE=none
@@ -451,7 +451,8 @@ export class KnowledgeIndexer {
     const allStaleFiles: Array<{ repoName: string; filePath: string }> = [];
     for (const repo of reposToIndex) {
       const result = repoChunkResults.get(repo.name);
-      if (!result) continue;
+      // A repo indexed for the first time has no rows to wipe.
+      if (!result || !(await readRepoIndexMeta(basePath, repo.name, storage.blobs))) continue;
       for (const f of result.deletedFiles ?? []) {
         allStaleFiles.push({ repoName: repo.name, filePath: f });
       }
@@ -563,6 +564,10 @@ export class KnowledgeIndexer {
     // drop it and rebuild from chunks.json rather than failing every reindex.
     const vectorStore = storage.vectors;
     await vectorStore.init({ healCorrupt: true });
+    // Cross-repo edges are counted by buildKB (stats rollup), not here.
+    const crossRepoEdges = (await storage.blobs
+      .getJson<{ crossRepoEdges?: number }>('index_stats.json')
+      .catch(() => null))?.crossRepoEdges ?? 0;
 
     // Wipe the rows of changed/deleted files (listed by buildKB) BEFORE taking
     // the id snapshot below: chunk ids are hash(filePath, startLine, endLine),
@@ -655,7 +660,7 @@ export class KnowledgeIndexer {
         totalTokens,
         embeddingProvider: 'cached',
         embeddingDimensions: 0,
-        crossRepoEdges: 0,
+        crossRepoEdges,
         lastIndexed: new Date().toISOString(),
         indexDurationMs: Date.now() - startTime,
         ...(vectorIndex ? { vectorIndex } : {}),
@@ -822,7 +827,7 @@ export class KnowledgeIndexer {
       totalTokens,
       embeddingProvider: embedder.name,
       embeddingDimensions: embedder.dimensions,
-      crossRepoEdges: 0,
+      crossRepoEdges,
       lastIndexed: new Date().toISOString(),
       indexDurationMs: durationMs,
       ...(vectorIndex ? { vectorIndex } : {}),

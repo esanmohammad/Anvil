@@ -11,7 +11,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { KnowledgeIndexer } from '@esankhan3/anvil-knowledge-core';
+import { buildKBFromPath, indexFromPath, KnowledgeIndexer } from '@esankhan3/anvil-knowledge-core';
 import type { CodeChunk } from '@esankhan3/anvil-knowledge-core';
 import { fn, withKbFixture } from './kb-fixture.js';
 
@@ -123,6 +123,30 @@ describe('index integrity', () => {
       assert.deepEqual(names(rows), ['aaa', 'bbb']);
       const after = await blobs.getJson<{ chunkIdVersion?: number }>('svc/index_meta.json');
       assert.equal(typeof after?.chunkIdVersion, 'number');
+    });
+  });
+
+  it('reports the real cross-repo edge count, and a first index lists no files as stale', async (t) => {
+    await withKbFixture(t, async (f) => {
+      f.repo('pub', { 'p.ts': "export const TOPIC = 'order.created';\n" + fn('publish') });
+      f.repo('sub', { 's.ts': "export const TOPIC = 'order.created';\n" + fn('consume') });
+      await buildKBFromPath(f.project, f.ws, { config: f.config });
+      assert.deepEqual(await f.storage().blobs.getJson('deleted_files.json'), []);
+      const first = await indexFromPath(f.project, f.ws, { config: f.config });
+      assert.ok(first.crossRepoEdges > 0, 'index result reports 0 cross-repo edges');
+      const again = await indexFromPath(f.project, f.ws, { config: f.config }); // nothing changed
+      assert.equal(again.crossRepoEdges, first.crossRepoEdges);
+    });
+  });
+
+  it('leaves paths matching chunking.ignorePatterns out of chunks, rows and graph', async (t) => {
+    await withKbFixture(t, async (f) => {
+      f.config.chunking.ignorePatterns = ['generated'];
+      f.repo('svc', { 'src/a.ts': fn('aaa'), 'generated/client.ts': fn('genClient'), 'src/generated/b.ts': fn('genB') });
+      await f.index();
+      assert.deepEqual((await f.rows()).map((r) => r.filePath), ['src/a.ts']);
+      const graph = await f.storage().blobs.getJson<{ nodes: Array<{ id: string }> }>('svc/graph.json');
+      assert.ok(!graph?.nodes.some((n) => n.id.includes('generated/')), 'ignored files in the graph');
     });
   });
 

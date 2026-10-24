@@ -111,6 +111,9 @@ export interface KnowledgeConfig {
   chunking: {
     maxTokens: number;
     contextEnrichment: 'structural' | 'llm' | 'none';
+    /** Path segments (directory or file names) the indexer never reads, on top
+     *  of the built-in skips (node_modules, dist, .git, …). */
+    ignorePatterns?: string[];
   };
   retrieval: {
     maxChunks: number;
