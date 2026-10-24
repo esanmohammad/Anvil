@@ -1,5 +1,5 @@
 /**
- * AST-aware code chunking with regex-based fallback.
+ * Regex-based code chunking.
  *
  * Splits source files in a repository into semantic CodeChunk objects at
  * function / class / method boundaries.  Uses a simple recursive directory

@@ -86,12 +86,20 @@ interface CodeChunk {
 }
 ```
 
-### 2.2 `CrossRepoEdge.edgeType` — 18 strategies
+### 2.2 `CrossRepoEdge.edgeType`
 
 `shared-type` | `shared-dep` | `api-contract` | `event-schema` | `kafka` |
 `http` | `grpc` | `database` | `env-var` | `npm-dep` | `workspace-dep` |
 `workspace-import` | `llm-inferred` | `redis` | `s3` | `proto` |
 `docker-compose` | `k8s-service` | `shared-constant`.
+
+Emitted: the 14 detector strategies produce `npm-dep`, `shared-type`,
+`env-var`, `event-schema`, `http` (routes, docker-compose and k8s service
+refs), `workspace-dep`, `grpc`, `database`, `redis`, `s3`, `api-contract`
+and `shared-constant`; the service-mesh inferrer adds `kafka`, `http`,
+`grpc`, `database`, `redis`, `s3` and `llm-inferred`. `shared-dep`,
+`workspace-import`, `proto`, `docker-compose` and `k8s-service` are
+declared but never emitted.
 
 ### 2.3 `RepoProfile` + `ServiceEndpoint`
 
@@ -159,7 +167,7 @@ interface KnowledgeConfig {
 | `retrieval.maxChunks` | `8` |
 | `retrieval.maxTokens` | `12000` |
 | `retrieval.hybridWeights` | `{ vector: 0.5, bm25: 0.3, graph: 0.2 }` |
-| `retrieval.reranker` | `'ollama'` |
+| `retrieval.reranker` | `{ provider: 'ollama' }` |
 | `autoIndex` | `true` |
 
 Knowledge base path resolution (`getKnowledgeBasePath(project)`):
@@ -318,7 +326,7 @@ record. Training + health are recorded in `vector_index.json`.
 
 | Class | Default endpoint / model |
 |---|---|
-| `OllamaReranker` | `http://localhost:11434`, `qwen3:0.6b`, 30 s timeout |
+| `OllamaReranker` | `http://localhost:11434`, `qwen2.5-coder:7b`, 30 s timeout |
 | `CohereReranker` | Cohere API |
 | `VoyageReranker` | Voyage API |
 | `OpenAICompatibleReranker` | env-driven base URL |
@@ -338,7 +346,9 @@ checks `CODE_SEARCH_RERANKER_BASE_URL` else `OllamaReranker`.
 | `path` | 0.1 | 0.7 | 0.2 |
 | `error-code` | 0.1 | 0.7 | 0.2 |
 | `natural-language` | 0.6 | 0.2 | 0.2 |
-| `mixed` | 0.45 | 0.35 | 0.2 |
+| `mixed` | 0.4 | 0.35 | 0.25 |
+
+The retriever reads only `vector` and `bm25`; the `graph` column is unused.
 
 Detection patterns: camelCase, snake_case, PascalCase, dotted paths,
 file paths/extensions, hex codes, `ERR_*`, numeric error codes, HTTP
@@ -349,34 +359,50 @@ status, question words.
 `createQueryRouter(project, embedder)` — embeds each `RepoProfile`'s
 search-text representation, caches the result. `route(query)` embeds
 the query, ranks repos by cosine similarity, decides `'all'` vs
-`'filtered'` based on score distribution.
+`'filtered'` based on score distribution. The retriever consults it only
+when `CODE_SEARCH_AUTO_ROUTE=1` — off by default, because filtering repos
+by profile similarity before retrieval cost exact-symbol recall.
 
 ## 14. Hybrid retriever (`src/retriever.ts`)
 
 ```ts
-new HybridRetriever(vectorStore, embedder, graph, config, reranker?, queryRouter?)
+new HybridRetriever(vectorStore, embedder, graphStore, config, reranker?, queryRouter?)
 retriever.retrieve(query, { repos?, repoFilter?, maxChunks?, maxTokens?, mode? })
 ```
 
 Supported modes: `'vector'` | `'bm25'` | `'vector+bm25'` |
 `'vector+graph'` | `'vector+bm25+graph'` (default).
 
+Repo scope: `repoFilter` / `repos`; with neither, the query router filters
+repos only when `CODE_SEARCH_AUTO_ROUTE=1`.
+
 Pipeline (4 phases):
 
-1. **Phase 1** — `Promise.all([vectorSearch(50), fullTextSearch(50)])`.
-   Query embedding cached LRU-128, 10 min TTL.
-2. **Phase 2** — RRF fusion with weights from `classifyQuery` (falls
-   back to `config.hybridWeights`).
-3. **Phase 3** — AST tripartite expansion: pick 5 diversified seeds
-   (one per file), traverse outgoing (deps) + incoming (dependents) +
-   sibling edges with confidence ≥ 0.7, fetch chunks via
-   `getChunksByEntity`.
-4. **Phase 4** — Cross-encoder rerank over top-15 RRF + AST candidates.
-   Reranker failure → fall back to RRF order.
+1. **Phase 1** — in parallel: `vectorSearch(50)`, `fullTextSearch(50)`,
+   and two literal tiers — `searchByEntitySubstring` /
+   `searchByEntityName` (20) for a bare identifier, `phraseSearch` (20)
+   for a multi-token query of ≥ 8 chars. Query embedding cached LRU-128,
+   10 min TTL. `'vector'` / `'bm25'` modes return here (`'bm25'` puts the
+   literal hits first).
+2. **Phase 2** — weighted RRF (`k = CODE_SEARCH_RRF_K`, default 10):
+   vector + BM25 with weights from `classifyQuery` (falls back to
+   `config.hybridWeights`), literal tiers at weight 1. Then
+   `boostExactSymbol` pins exact entityName matches first, exact-content
+   duplicates are dropped, chunks are capped per file
+   (`CODE_SEARCH_MAX_PER_FILE`, default 2), and the top 15 form the pool.
+3. **Phase 3** — AST expansion (`+graph` modes), only when a reranker is
+   configured or the pool can't fill `maxChunks`: pick 5 diversified seeds
+   (one per file), take their one-hop neighbours in both directions
+   (non-`contains` edges with confidence ≥ 0.7, module/package nodes
+   dropped), fetch chunks via `getChunksByEntity`. Expanded chunks are
+   appended after the pool.
+4. **Phase 4** — Cross-encoder rerank over the pool + AST candidates
+   when a reranker is configured. Reranker failure → fall back to RRF
+   order.
 
 Final selection via `packWithinBudget(chunks, maxTokens, maxChunks)`.
 
-`graphContext` from `graph.exportForPrompt(2000)` when `useGraph`.
+`graphContext` is always `''`.
 
 ## 15. AST graph builder (`src/ast-graph-builder.ts`)
 
@@ -392,8 +418,9 @@ Final selection via `packWithinBudget(chunks, maxTokens, maxChunks)`.
 | 5 | Inheritance resolution |
 | 6 | Package→file `contains` edges |
 
-Per-edge `confidence` (0..1) used for weighted BFS in the retriever's
-tripartite expansion.
+Per-edge `confidence` (0..1). The retriever's expansion and the
+`trace_path` tool follow only non-`contains` edges with confidence ≥ 0.7 —
+a flat filter, not a weighting.
 
 `incrementalGraphUpdate(existingGraph, changedFiles, deletedFiles,
 repoPath, opts)` — re-parses only changed files, drops nodes/edges
@@ -403,17 +430,29 @@ from deleted files, merges into the existing graph.
 
 ## 16. Project graph (`src/project-graph-builder-core.ts` + `project-graph-builder.ts`)
 
-`ProjectGraphBuilder` — `graphology` directed multi-graph. Lazy-loads
-`graphology` + `graphology-communities-louvain` (`ensureGraphology`).
+The merged system graph normally lives in `system_graph.sqlite`
+(`src/graph-store.ts`): `createSystemGraphSqliteWriter` streams each
+repo's nodes/edges plus the cross-repo edges as `buildKB` goes, and
+`GraphStore` (`openSystemGraphStore` / `getGraphStore`) serves slice
+queries to the retriever and the MCP graph tools. Tables: `nodes(key,
+repo, file, label, type, degree, attrs)` and `edges(source, target, type,
+confidence, source_repo, target_repo)` — cross-repo `evidence` is not
+stored.
+
+`ProjectGraphBuilder` — `graphology` directed multi-graph, used by
+`buildKB` only when no SQLite driver loads. Lazy-loads `graphology` +
+`graphology-communities-louvain` (`ensureGraphology`).
 
 Methods: `addRepoGraph(name, graphJson)` (namespaces nodes as
 `<repo>::<id>`), `addCrossRepoEdges(edges)`, `detectCommunities()`
 (Louvain), `exportJson()`, `exportForPrompt(maxChars)`, `getGraph()`.
 
-`buildProjectGraph(project, opts)` — LLM-driven: assembles factory.yaml
-+ per-repo graph reports + cross-repo edges → single LLM call →
-`ProjectGraph` written to `PROJECT_GRAPH.json` + `PROJECT_SUMMARY.md`
-under the knowledge-base dir.
+`buildProjectGraph(project, opts)` — LLM-driven, run by the CLI `graph`
+command: assembles factory.yaml + per-repo graph reports + cross-repo
+edges → single LLM call → `ProjectGraph` written to `PROJECT_GRAPH.json` +
+`PROJECT_SUMMARY.md` under the knowledge-base dir. Cross-repo edges are
+read from `system_graph_v2.json`, so on the SQLite path the prompt gets
+none.
 
 `loadProjectGraph` / `loadProjectSummary` / `getProjectGraphStatus` /
 `estimateProjectGraphCost` — read-side helpers.
@@ -421,13 +460,17 @@ under the knowledge-base dir.
 ## 17. Cross-repo + semantic edges
 
 `detectCrossRepoEdges(repos, workspaceMaps?)`
-(`src/cross-repo-detector.ts`) — runs every detector strategy and
-unions the results. Each strategy walks files with a predicate
-matcher (`walkFiles(dir, match, maxFiles=5000)`) and emits typed
-`CrossRepoEdge` rows.
+(`src/cross-repo-detector.ts`) — two halves.
+`extractCrossRepoSignals(repoPath)` scans one repo's tree (bounded by
+`walkFiles(dir, match, maxFiles=5000)`) into a JSON-serializable
+`CrossRepoSignals` bundle; `buildKB` runs it in the worker and persists it
+as `<repo>/signals.json`. `correlateCrossRepoEdges(signals,
+workspaceMaps)` runs the 14 join strategies over those bundles and emits
+typed `CrossRepoEdge` rows, so partial cycles correlate stored signals
+without re-scanning unchanged repos.
 
 `detectSemanticEdges(...)` (`src/semantic-edge-detector.ts`) — LLM-inferred
-edges, fills gaps the deterministic strategies miss.
+edges between repos. Exported only; `buildKB` doesn't call it.
 
 ## 18. LLM-driven analysis
 
@@ -473,22 +516,28 @@ hallucination_count?, similarity?, overall }, costs, durations }`.
 
 ### 19.1 `KnowledgeIndexer.buildKB(project, repos, config, opts?)`
 
-12 steps:
+Steps:
 
-1. SHA-based skip check (`getRepoSha` + `index_meta.json`).
+1. Skip check against `index_meta.json`: HEAD sha (`getRepoSha`) and, for
+   local checkouts, the uncommitted working-tree state
+   (`getWorkingTreeState`).
 2. LLM repo profiling (skipped if `isLlmAvailable() === false`).
 3. Chunk repos: incremental via `chunkChangedFiles` if `git diff`
    succeeds + non-fallback + non-empty; else `chunkRepo`.
-4. Structural dedup via `deduplicateByStructure`.
+4. Structural dedup, streamed from the per-repo chunk shards straight into
+   `chunks.json` (`dedupShardsToChunks`).
 5. Workspace detection.
 6. AST graphs: `incrementalGraphUpdate` if possible; else `buildAstGraph`.
    Write `<repo>/graph.json` + `GRAPH_REPORT.md`.
 7. Cross-repo edges (14 strategies): `correlateCrossRepoEdges` over per-repo `signals.json` bundles persisted at index time (extracted in the worker while the tree exists).
-8. LLM service mesh inference.
-9. Louvain community detection.
-10. Save `system_graph_v2.json`.
-11. Save `chunks.json` + `deleted_files.json`.
-12. Per-repo `index_meta.json` writes.
+8. LLM service mesh inference (skipped if `isLlmAvailable() === false`).
+9. Persist the system graph: finalize the streamed `system_graph.sqlite`
+   (uploaded when the blob backend is remote). With no SQLite driver, the
+   in-memory `ProjectGraphBuilder` runs Louvain and writes
+   `system_graph_v2.json` instead.
+10. Save `deleted_files.json` (merged into a list not yet applied by an
+    embed run).
+11. Per-repo `index_meta.json` writes.
 
 ### 19.2 `KnowledgeIndexer.embedChunks(project, config, opts?)`
 
@@ -533,7 +582,7 @@ buildKBFromPath / embedFromPath / indexFromPath
 ```
 
 `getRetriever(project)` — load config → open store → build embedder +
-reranker + graph + queryRouter → return `HybridRetriever`.
+reranker + graph store + queryRouter → return `HybridRetriever`.
 
 ## 20. File layout
 
@@ -560,7 +609,8 @@ packages/knowledge-core/
     │
     ├── ast-graph-builder.ts               ← per-repo 6-phase graph
     ├── cross-repo-detector.ts             ← 14 strategies
-    ├── semantic-edge-detector.ts          ← LLM-inferred edges
+    ├── semantic-edge-detector.ts          ← LLM-inferred edges (not called by buildKB)
+    ├── graph-store.ts                     ← system_graph.sqlite writer + GraphStore
     ├── graph-metrics.ts                   ← quality reports
     ├── graph-query.ts                     ← traversal helpers
     ├── project-graph-builder-core.ts      ← ProjectGraphBuilder class

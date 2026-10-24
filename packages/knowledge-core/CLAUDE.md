@@ -1,4 +1,4 @@
-# CLAUDE.md — `@anvil/knowledge-core`
+# CLAUDE.md — `@esankhan3/anvil-knowledge-core`
 
 Guidance for Claude Code when working inside `packages/knowledge-core/`. The
 shared knowledge stack consumed by `@esankhan3/anvil-cli` and
@@ -8,8 +8,9 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 ## What this package owns
 
 ### Chunking + walking + AST
-- `chunkRepo` / `chunkChangedFiles` (`src/chunker.ts`) — AST-aware code
-  chunking with regex fallback. Splits at function/class/method boundaries.
+- `chunkRepo` / `chunkChangedFiles` (`src/chunker.ts`) — code chunking with
+  language-specific regex boundary patterns (no tree-sitter). Splits at
+  function/class/method boundaries.
 - `walkDir` / `langFromExt` / `extractImports` / `extractNamedImports`
   (`src/file-walker.ts`) — directory walker, language detection, import
   extraction.
@@ -25,22 +26,34 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   (`src/ast-graph-builder.ts`) — per-repo entity + import graph with
   6-phase build (workspace nodes, entity extraction, import resolution,
   type refs, call disambiguation, inheritance, contains edges).
-- `ProjectGraphBuilder` (`src/project-graph-builder-core.ts`) —
-  `graphology` directed multi-graph; namespaces nodes as `<repo>::<id>`,
-  detects communities via Louvain.
+- `createSystemGraphSqliteWriter` / `openSystemGraphStore`
+  (`src/graph-store.ts`) + `getGraphStore` (`src/storage/resolve.ts`) — the
+  merged system graph. `buildKB` streams each repo's nodes/edges and the
+  cross-repo edges into `system_graph.sqlite` (better-sqlite3, else
+  `node:sqlite`); `GraphStore` serves slice queries (callers, dependencies,
+  dependents, cross-repo edges, neighbors) to the retriever's graph expansion
+  and the MCP graph tools. Edges keep `type` + `confidence`; cross-repo
+  `evidence` is not stored.
+- `ProjectGraphBuilder` (`src/project-graph-builder-core.ts`) — in-memory
+  `graphology` directed multi-graph with Louvain communities; namespaces
+  nodes as `<repo>::<id>`. `buildKB` uses it only when no SQLite driver
+  loads (then writes `system_graph_v2.json`).
 - `buildProjectGraph` / `loadProjectGraph` / `loadProjectSummary` /
   `getProjectGraphStatus` / `estimateProjectGraphCost`
-  (`src/project-graph-builder.ts`) — LLM-powered semantic project graph.
+  (`src/project-graph-builder.ts`) — LLM-powered semantic project graph,
+  built only by the CLI `graph` command. Its cross-repo edge input comes
+  from `system_graph_v2.json`, which the SQLite path doesn't write.
 - `detectCrossRepoEdges` (`src/cross-repo-detector.ts`) — 14 strategies,
   split into `extractCrossRepoSignals(repoPath)` (per-repo tree scan, runs in
   the worker while the clone exists, persisted as `<repo>/signals.json`) +
   `correlateCrossRepoEdges(signals, workspaceMaps)` (pure data join — partial
   cycles correlate stored signals without cloning unchanged repos)
-  for inter-repo edges (shared types, kafka, http, grpc, db, env vars,
-  npm/workspace deps, k8s, docker-compose, proto, redis, s3, shared
-  constants).
+  for inter-repo edges (npm/workspace deps, shared types, env vars, shared
+  events/topics, HTTP routes, gRPC services, DB schemas, Redis keys, S3
+  buckets, OpenAPI contracts, docker-compose + k8s service refs — both
+  emitted as `http` — and shared constants).
 - `detectSemanticEdges` (`src/semantic-edge-detector.ts`) — LLM-inferred
-  edges between repos.
+  edges between repos. Exported only; `buildKB` doesn't call it.
 - `findRelatedNodes` + helpers (`src/graph-query.ts`) — graph traversal.
 - `graph-metrics.ts` — quality reports.
 
@@ -55,8 +68,13 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   detection.
 
 ### Retrieval
-- `HybridRetriever` (`src/retriever.ts`) — 4-phase: vector ⫽ BM25 → RRF
-  fusion → AST tripartite expansion → cross-encoder rerank.
+- `HybridRetriever` (`src/retriever.ts`) — vector ⫽ BM25 ⫽ literal tiers
+  (entityName exact/substring for bare identifiers, exact phrase for
+  multi-token queries) → weighted RRF (`CODE_SEARCH_RRF_K`, default 10) +
+  exact-symbol pin + dedupe + per-file cap → one-hop AST expansion →
+  optional cross-encoder rerank. Expansion runs only when a reranker is
+  configured or the fused pool can't fill `maxChunks`; its chunks are
+  appended after the fused pool.
 - `VectorStore` (`src/vector-store.ts`) — LanceDB-backed; supports
   vector + FTS search, file-level deletes, FTS index rebuild, IVF vector
   index build / in-place retrain (`ensureVectorIndex`), `vectorIndexState`.
@@ -71,26 +89,31 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
   `codestral` / `voyage` / `openai` / `ollama` / `gemini-oauth` /
   `openai-compatible`, plus `auto`.
 - `createReranker` (`src/reranker.ts`) — 4 providers: `ollama` (default,
-  Qwen3-Reranker), `cohere`, `voyage`, `openai-compatible`. `none` →
-  `null`.
+  model `qwen2.5-coder:7b`), `cohere`, `voyage`, `openai-compatible`.
+  `none` → `null`.
 - `classifyQuery` (`src/query-classifier.ts`) — `identifier` / `path` /
   `error-code` / `natural-language` / `mixed`; returns adaptive
-  `{ vector, bm25, graph }` weights.
+  `{ vector, bm25, graph }` weights (the retriever reads `vector` / `bm25`;
+  `graph` is unused).
 - `QueryRouter` / `createQueryRouter` (`src/query-router.ts`) — embeds
-  repo profiles + query, picks `'all'` or `'filtered'` strategy.
+  repo profiles + query, picks `'all'` or `'filtered'` strategy. The
+  retriever consults it only when `CODE_SEARCH_AUTO_ROUTE=1` (off by
+  default: its hard repo pre-filter cost exact-symbol recall).
 
 ### LLM-driven
 - `profileProject` / `loadProfile` / `loadAllProfiles` (`src/repo-profiler.ts`)
   — fingerprint files → LLM → `RepoProfile`. Cached by fingerprint hash.
+  `buildKB` runs it only when `isLlmAvailable()`.
 - `inferServiceMesh` (`src/service-mesh-inferrer.ts`) — Phase A
-  deterministic endpoint matching + Phase B LLM gap-fill.
+  deterministic endpoint matching (similarity-scored) + Phase B LLM
+  gap-fill for orphan repos. `buildKB` runs it only when `isLlmAvailable()`.
 - `runLLM` / `runClaude` / `runGemini` / `isLlmAvailable` /
   `resetLlmConfig` (`src/claude-runner.ts`) — **deprecated re-export**
   of `@anvil/agent-core`'s `single-shot.ts`. Kept so existing importers
   (repo-profiler, service-mesh-inferrer, rag-evaluator, indexer) keep
   working without rewrites.
 - `rag-evaluator.ts` — generate answers from retrieved context, judge
-  quality.
+  quality. Exported only; nothing in the repo calls it.
 
 ### Indexer entry points
 - `KnowledgeIndexer` class (`src/indexer.ts`) — `buildKB` (chunks +
@@ -146,7 +169,7 @@ one-shot `[knowledge-core] DEPRECATED:` stderr warning via
 `deprecatedEnv()`. Library env reads are removed in 1.0; consumers must
 pass credentials through the config struct.
 
-### P6 retrieval primitives (opt-in)
+### P6 retrieval primitives (exported, not wired)
 - `bm25-tokenizers.ts` — `tokenizerFor(language)`; per-language
   tokenizers for `typescript` / `javascript` / `python` / `go` / `rust` /
   `java` / `php` capture lang-significant tokens
@@ -159,8 +182,10 @@ pass credentials through the config struct.
   expanded retrievals.
 - `rerank-cache.ts` — `RerankCache` on-disk LRU keyed by
   SHA(query|chunkId|model). Default 50k entries, debounced 1s
-  serialization. Wiring into `HybridRetriever` is intentionally deferred —
-  the building blocks are public so future surgery is local.
+  serialization.
+
+None of the three is wired into `HybridRetriever` — the building blocks are
+public so future surgery is local.
 
 Public barrel: `src/index.ts`. Note: `tree-sitter-parser` re-exports are
 explicit (not `*`) because it had a `computeStructuralHash` symbol that
@@ -169,13 +194,12 @@ collided with `structural-hasher`'s.
 ## Build + test
 
 ```sh
-npm -w @anvil/knowledge-core run build       # tsc -b → dist/
-npm -w @anvil/knowledge-core test            # node --test on dist/__tests__/
-npm -w @anvil/knowledge-core run dev         # tsc -b --watch
+npm -w @esankhan3/anvil-knowledge-core run build   # tsc -b → dist/
+npm -w @esankhan3/anvil-knowledge-core test        # tsc -b + node --test on dist/__tests__/
+npm -w @esankhan3/anvil-knowledge-core run dev     # tsc -b --watch
 ```
 
-Tests at `src/__tests__/`: chunker, query-classifier, structural-hasher,
-retriever-defaults.
+Tests live in `src/__tests__/*.test.ts` and run from `dist/__tests__/`.
 
 ## Conventions
 
@@ -210,8 +234,8 @@ ideally add a structural-hasher comment-style entry to
 
 Add an extract function (per-repo tree scan → field on `CrossRepoSignals`)
 plus a correlate strategy (join over the persisted signals) inside
-`cross-repo-detector.ts`. Edge types are an open string union in
-`CrossRepoEdge.edgeType` — add the new value to `types.ts`.
+`cross-repo-detector.ts`. `CrossRepoEdge.edgeType` is a closed string
+union — add the new value to `types.ts`.
 
 ### Incremental indexing path
 
@@ -244,14 +268,15 @@ dataset versions readers may still hold.
 `HybridRetriever.retrieve(query, opts?)`:
 
 - `mode: 'vector'` / `'bm25'` — single-source shortcut, no fusion, no
-  graph, no rerank.
+  graph, no rerank. `'bm25'` (backs `search_exact`) puts the literal-tier
+  hits ahead of the BM25 hits.
 - `mode: 'vector+bm25'` / `'vector+graph'` / `'vector+bm25+graph'`
-  (default) — full 4-phase pipeline.
-- `repoFilter` (or `repos`) overrides the query router. Otherwise the
-  router decides `'all'` vs `'filtered'`.
+  (default) — fused pipeline; graph expansion only in the `+graph` modes.
+- `repoFilter` (or `repos`) scopes the search. With neither, the query
+  router filters repos only when `CODE_SEARCH_AUTO_ROUTE=1`.
 - Query embedding cached for 10 min (LRU 128).
 - Returns `{ chunks, graphContext, totalTokens, query }`. `graphContext`
-  is empty when `useGraph=false`.
+  is always `''`.
 
 ### Project layout on disk
 
@@ -259,14 +284,19 @@ dataset versions readers may still hold.
 <basePath>/<project>/
   chunks.json                    # written by buildKB; consumed by embedChunks
   deleted_files.json             # incremental embed cleanup hints
-  system_graph_v2.json           # merged project graph (Graphify format)
-  PROJECT_GRAPH.json             # LLM-generated semantic graph
+  system_graph.sqlite            # merged system graph (GraphStore)
+  system_graph_v2.json           # merged graph as JSON — only when no SQLite driver loads
+  index_stats.json               # stats rollup read by getStats()
+  index_generation               # bumped per writer run; readers reopen on change
+  profile_embeddings.json        # QueryRouter cache of embedded profiles
+  PROJECT_GRAPH.json             # LLM-generated semantic graph (CLI `graph` command)
   PROJECT_SUMMARY.md             # human-readable companion
   lancedb/                       # vector store
   vector_index.json              # vector-index training + health (writer-maintained)
   <repo>/
     profile.json                 # RepoProfile (cached by fingerprintHash)
     graph.json                   # per-repo AST graph
+    signals.json                 # cross-repo signals, re-correlated on partial cycles
     GRAPH_REPORT.md              # quality report
     index_meta.json              # { lastIndexedSha, workingTree, lastIndexedAt, files, chunkCount, embeddingProvider }
 ```
@@ -278,19 +308,20 @@ dataset versions readers may still hold.
 - No agentic LLM client inside knowledge-core. Anything LLM-driven
   (repo profiling, service mesh inference, RAG eval, project graph)
   goes through the deprecated `claude-runner.ts` shim → agent-core.
-- No graph database. `graphology` (in-process, JS-array-backed) handles
-  the project graph. Louvain for communities.
+- No graph database server. The system graph is an embedded SQLite file
+  (`system_graph.sqlite`) queried in-process; `graphology` + Louvain back
+  only the no-SQLite fallback.
 - No cli/mcp coupling — both consumers re-export this package's
   surface; the package itself doesn't depend on either.
 
 ## Where to look first
 
 - Indexing flow end-to-end? `src/indexer.ts:KnowledgeIndexer.buildKB`
-  is the 12-step orchestrator.
+  is the step-by-step orchestrator.
 - Retrieval end-to-end? `src/retriever.ts:HybridRetriever.retrieve` is
-  the 4-phase pipeline, ~200 LOC.
-- Chunking strategy? `src/chunker.ts:chunkRepo` (AST-aware with regex
-  fallback per language).
+  the whole pipeline, ~200 LOC.
+- Chunking strategy? `src/chunker.ts:chunkRepo` (regex boundary patterns
+  per language).
 - Cost / pricing for LLM-driven phases? Goes through agent-core's
   `cost.ts` via the runner shim.
 - Provider auto-detect? `embedder.ts:createEmbeddingProvider` `case 'auto':`.
