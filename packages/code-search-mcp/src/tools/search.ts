@@ -3,7 +3,7 @@
  */
 
 import type { ServerContext } from '../server.js';
-import { getRetriever, getBlobStore, findChunksInProject } from '@esankhan3/anvil-knowledge-core';
+import { getRetriever, findChunksInProject } from '@esankhan3/anvil-knowledge-core';
 import { resolvedKnowledgeConfig } from '../core/env-config.js';
 import { metrics } from '../observability/metrics.js';
 import { toolError, toolText, validateArgs, type InputSchema, type ToolResult } from './validate.js';
@@ -72,8 +72,8 @@ export async function handleSearchTool(
   const invalid = validateArgs(schema, args);
   if (invalid) return toolError(`${name}: ${invalid}`);
 
-  // get_code_snippet reads chunks.json directly — embedder-independent, so it
-  // does its own existence check rather than gating on ctx.indexReady.
+  // get_code_snippet reads the vector store, else the repo's chunk file —
+  // embedder-independent, so it doesn't gate on ctx.indexReady.
   if (name === 'get_code_snippet') return await handleGetCodeSnippet(args, ctx);
 
   // BM25 needs no embeddings, so search_exact serves whatever the index already
@@ -134,7 +134,7 @@ function namesEntity(c: { entityName?: string; parentEntity?: string }, entity: 
   return c.entityName === entity || (!!c.parentEntity && `${c.parentEntity}.${c.entityName}` === entity);
 }
 
-/** Fetch source for one entity from chunks.json (NDJSON or legacy array) by qualified name. */
+/** Fetch source for one entity by qualified name: the vector store, else the repo's chunk file. */
 async function handleGetCodeSnippet(
   args: Record<string, unknown>,
   ctx: ServerContext,
@@ -156,8 +156,8 @@ async function handleGetCodeSnippet(
   try {
     // Primary: indexed lookup in the vector store (scalar indexes on
     // repoName/filePath/entityName) — one bounded query instead of streaming
-    // the whole chunks.json per call (a full GridFS download at org scale on
-    // remote backends). The retriever is cached + generation-invalidated.
+    // the repo's chunk file per call (a GridFS download on remote backends).
+    // The retriever is cached + generation-invalidated.
     const esc = (v: string) => v.replace(/'/g, "''");
     let matches: Array<{ repoName: string; filePath: string; entityName?: string; startLine?: number; endLine?: number; language?: string; content: string }> = [];
     try {
@@ -170,19 +170,20 @@ async function handleGetCodeSnippet(
         scored = await store.searchByEntityName([entity], 5, `repoName = '${esc(repo)}'`);
       }
       matches = scored.slice(0, 5).map((sc) => sc.chunk);
-    } catch { /* vector store unavailable — fall through to chunks.json */ }
+    } catch { /* vector store unavailable — fall through to the chunk file */ }
 
     // Fallback for indexes that are built but not yet embedded (empty Lance
-    // table): stream chunks.json with early-exit through the blob port.
-    if (matches.length === 0 && (await getBlobStore(ctx.projectName, resolvedKnowledgeConfig()).exists('chunks.json'))) {
+    // table): stream the repo's chunk file with early-exit through the blob port.
+    if (matches.length === 0) {
       matches = await findChunksInProject(
         ctx.projectName,
         (c) => c.repoName === repo && c.filePath === file && (!entity || namesEntity(c, entity)),
         5,
         resolvedKnowledgeConfig(),
+        repo,
       );
       if (matches.length === 0 && entity) {
-        matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && namesEntity(c, entity), 5, resolvedKnowledgeConfig());
+        matches = await findChunksInProject(ctx.projectName, (c) => c.repoName === repo && namesEntity(c, entity), 5, resolvedKnowledgeConfig(), repo);
       }
     }
     if (matches.length === 0) {

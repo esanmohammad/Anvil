@@ -145,8 +145,8 @@ export interface RepoResult {
    *  or no prior fileIndex). False whenever a prior fileIndex existed: BOTH
    *  re-chunk paths then emit only changed files' chunks (chunkChangedFiles by
    *  git diff; chunkRepo skips content-hash-unchanged files via cachedFiles) —
-   *  the indexer must carry untouched files' chunks forward from the previous
-   *  chunks.json, filtered by changedFiles ∪ deletedFiles. */
+   *  the indexer must carry untouched files' chunks forward from the repo's
+   *  previous chunk file, filtered by changedFiles ∪ deletedFiles. */
   shardComplete: boolean;
   shardPath: string | null;
   fileIndex: Record<string, FileIndexEntry> | null;
@@ -178,8 +178,8 @@ export async function processRepoPipeline(job: RepoJob): Promise<RepoResult> {
 
 async function processCheckout(job: RepoJob): Promise<RepoResult> {
   const { repoName, repoPath, basePath, project, chunking, doChunk, force } = job;
-  // Chunk shards are LOCAL SCRATCH (streamed to disk, folded into chunks.json by
-  // the indexer) — they stay on the local fs regardless of blob backend.
+  // Chunk shards are LOCAL SCRATCH (streamed to disk, written to the repo's
+  // chunk file by the indexer) — they stay on the local fs regardless of blob backend.
   const repoKbDir = join(basePath, repoName);
   mkdirSync(repoKbDir, { recursive: true });
 

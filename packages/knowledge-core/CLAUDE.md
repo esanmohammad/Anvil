@@ -333,24 +333,35 @@ reverted ones re-chunked back to HEAD); after new commits it is
 non-fallback + non-empty → `chunkChangedFiles` + `incrementalGraphUpdate`;
 else full re-chunk (against the file cache) + full graph rebuild. Per-file
 metadata lives in `fileIndex` inside `index_meta.json` and always lists
-every file the repo has. Chunks of unchanged files are carried forward from
-the previous `chunks.json` only while their file is still in that index.
-A repo indexed last cycle (per `index_stats.json`) but no longer in the
-workspace drops out of `chunks.json` and has its `<repo>/` artifacts
-deleted — even when nothing else changed.
+every file the repo has. Each repo's chunks live in its own
+`<repo>/chunks.ndjson`, written only when the repo is re-chunked (a cycle's
+chunk I/O tracks the changed repos); a partially re-chunked repo carries its
+unchanged files' chunks forward from its own previous file, only while the
+file is still in that index. An index written before per-repo files (one
+project-wide `chunks.json`) is read as is and split once by the next cycle
+that builds anything (`repo-chunks.ts`). The repo change checks run
+concurrently (async git). A repo indexed last cycle (per `index_stats.json`)
+but no longer in the workspace has its `<repo>/` artifacts deleted — even
+when nothing else changed.
 
-`embedChunks` is independently incremental: it diffs `chunks.json`
-against existing chunk IDs in LanceDB and only embeds the new ones.
+`embedChunks` is independently incremental: `buildKB` lists the repos whose
+chunk files changed, or that were removed, in `embed_pending.json` (merged
+into a list not yet applied), and the embed step diffs only those repos'
+chunk files against their LanceDB ids, embeds the new chunks, deletes
+removed repos' rows by repo name, then clears the list. A full pass over
+every repo runs when the list is absent (an index from before it existed)
+or the table is empty; totals come from `index_stats.json`.
 Deleted and changed files are read from `deleted_files.json` (written by
 `buildKB`; a repo's first index lists nothing): their rows are stale. Chunk
 ids are position-keyed, so a changed file's new chunks can take a stale row's
 id — the diff treats stale ids as not embedded (a stale row whose id and text
 both come back is kept), and the stale rows are deleted after the embed loop
-by exact `(id, contentHash)`. Rows whose ids `chunks.json` no longer lists
-(removed repos, deletions a fallback re-chunk caught, older id schemes) are
-swept after the loop too; an empty `chunks.json` is never treated as "delete
-everything" (the fs backend writes NDJSON via temp file + rename, so a crash
-can't leave a truncated one). Until the sweep, stale and orphaned rows keep
+by exact `(id, contentHash)`. Rows of those repos whose ids their chunk files
+no longer list (deletions a fallback re-chunk caught, older id schemes; in a
+full pass, rows of any repo no longer indexed) are swept after the loop too;
+a full pass that finds no chunks is never treated as "delete everything"
+(the fs backend writes NDJSON via temp file + rename, so a crash can't leave
+a truncated one). Until the sweep, stale and orphaned rows keep
 their vectors available for **reuse by content**: each embed batch looks up
 `contentHash` (SHA-256 of the embedded text; BTREE-indexed) and takes a
 stored vector instead of a provider call. The first batch with hits embeds
@@ -387,8 +398,8 @@ hold. The embed step records `embeddingProvider` / `embeddingModel` /
 
 ```
 <basePath>/<project>/
-  chunks.json                    # written by buildKB; consumed by embedChunks
   deleted_files.json             # incremental embed cleanup hints
+  embed_pending.json             # repos whose chunk files changed / were removed since the last embed
   system_graph.sqlite            # merged system graph (GraphStore)
   system_graph_v2.json           # merged graph as JSON — only when no SQLite driver loads
   index_stats.json               # stats rollup read by getStats()
@@ -399,6 +410,7 @@ hold. The embed step records `embeddingProvider` / `embeddingModel` /
   lancedb/                       # vector store
   vector_index.json              # vector-index training + health (writer-maintained)
   <repo>/
+    chunks.ndjson                # the repo's chunks (written by buildKB when re-chunked; read by embedChunks)
     profile.json                 # RepoProfile (cached by fingerprintHash)
     graph.json                   # per-repo AST graph
     signals.json                 # cross-repo signals, re-correlated on partial cycles

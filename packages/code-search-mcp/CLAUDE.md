@@ -51,7 +51,7 @@ All implemented in `src/tools/`:
   metrics. `repos` may be an array, one name, or a comma-separated
   string (agents send all three). `search_exact` skips the `ctx.indexReady` gate (BM25 needs no
   embedder). `get_code_snippet` fetches one entity's source from the
-  vector store, else `chunks.json` (embedder-independent — works in
+  vector store, else the repo's chunk file (embedder-independent — works in
   BM25-only mode).
 - **Graph** (`graph.ts`) — `get_repo_graph`, `get_cross_repo_edges`,
   `find_callers`, `find_dependencies`, `impact_analysis`, `trace_path`

@@ -176,7 +176,7 @@ tools that any agent can call.
 
 ```
 ~/.anvil/knowledge-base/<project>/
-  chunks.json                    # canonical chunks (consumed by embedder)
+  <repo>/chunks.ndjson           # the repo's chunks (consumed by embedder)
   deleted_files.json             # incremental embed cleanup
   system_graph_v2.json           # merged project graph
   PROJECT_GRAPH.json             # LLM-generated semantic graph

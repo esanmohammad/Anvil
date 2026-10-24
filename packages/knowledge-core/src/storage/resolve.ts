@@ -18,6 +18,7 @@ import { getKnowledgeBasePath } from '../config.js';
 import { VectorStore } from '../vector-store.js';
 import { openSystemGraphStore } from '../graph-store.js';
 import { FsBlobStore } from './fs-blob-store.js';
+import { indexedRepoNames, iterateRepoChunks } from '../repo-chunks.js';
 import { MongoBlobStore } from './mongo-blob-store.js';
 import type { StorageBundle, BlobStorePort, GraphStorePort } from './ports.js';
 
@@ -201,20 +202,23 @@ export function getBlobStore(project: string, config?: KnowledgeConfig): BlobSto
 }
 
 /**
- * Stream a project's chunks.json through the blob port and return up to `limit`
- * matches, stopping early. Backend-agnostic replacement for the path-based
- * `findChunksInFile` — lets `get_code_snippet` fetch one entity without a raw
- * filesystem read (and without loading millions of chunks).
+ * Stream a project's chunk files (one repo's, given `repo`) through the blob
+ * port and return up to `limit` matches, stopping early. Backend-agnostic
+ * replacement for the path-based `findChunksInFile` — lets `get_code_snippet`
+ * fetch one entity without a raw filesystem read (and without loading
+ * millions of chunks).
  */
 export async function findChunksInProject(
   project: string,
   match: (c: CodeChunk) => boolean,
   limit: number,
   config?: KnowledgeConfig,
+  /** Read only this repo's chunk file. */
+  repo?: string,
 ): Promise<CodeChunk[]> {
   const blobs = resolveStorage(project, config).blobs;
   const out: CodeChunk[] = [];
-  for await (const c of blobs.iterateNdjson<CodeChunk>('chunks.json')) {
+  for await (const c of iterateRepoChunks(blobs, repo ? [repo] : await indexedRepoNames(blobs))) {
     if (match(c)) {
       out.push(c);
       if (out.length >= limit) break;

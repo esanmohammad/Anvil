@@ -81,11 +81,13 @@ buildKB(project, repos, config, opts):
   │     system_graph.sqlite (graphWriter.addRepoGraph — nodes namespaced
   │     <repo>::<id>). Skipped repos are served from their stored graph.json.
   │
-  ├─ Step 4 — Merge chunks (streamed)
-  │     mergeShardsToChunks(shards, carryForward) → <basePath>/chunks.json
-  │           ├─ fresh shards first, then the previous corpus filtered to
-  │           │  skipped repos + unchanged files still in a partial repo's fileIndex
+  ├─ Step 4 — Per-repo chunk files (streamed), re-chunked repos only
+  │     mergeShardsToChunks([shard], carryForward) → <basePath>/<repo>/chunks.ndjson
+  │           ├─ the fresh shard first, then (partial re-chunk) the repo's previous
+  │           │  file filtered to unchanged files still in its fileIndex
   │           └─ one chunk per id (no cross-file / cross-repo dedup)
+  │     a legacy project-wide chunks.json is split once (splitLegacyChunks);
+  │     embed_pending.json += re-chunked + removed repos
   │
   ├─ Step 5 — Workspace detection (in the per-repo worker)
   │     detectWorkspace(repo.path)
@@ -143,19 +145,22 @@ returns BuildKBResult { project, repos, totalChunks, totalTokens,
 ```
 embedChunks(project, config, opts):
   │
+  ├─ repos + totals + crossRepoEdges = index_stats.json        ← written by buildKB
   ├─ store = storage.vectors; await init({ healCorrupt: true })
-  ├─ crossRepoEdges = index_stats.json.crossRepoEdges     ← counted by buildKB
+  ├─ scope = embed_pending.json repos (all repos when the list is absent or the
+  │  table is empty); removed = its removed repos
   │
   ├─ Plan stale rows (ids are position-keyed — a changed file's new chunks
   │  can take its old rows' ids):
   │     deletedFiles = read(<basePath>/deleted_files.json) || []
   │     staleRows = store.getFileRowHashes(project, repo, files)   ← (id, contentHash)
   │
-  ├─ existingIds = await store.getChunkIds(project) − stale ids
-  ├─ stream chunks.json (NDJSON): totals, listedIds, newChunkCount
+  ├─ existingIds = await store.getChunkIds(project, scope) − stale ids
+  ├─ stream the scope's chunk files: listedIds, newChunkCount
   │     (a stale row whose id + contentHash come back is kept, not re-embedded)
-  ├─ orphanIds = existingIds − listedIds                         ← none if chunks.json is empty
+  ├─ orphanIds = existingIds − listedIds                 ← none if a full pass finds no chunks
   │  sweep() = store.deleteRows(stale rows left) + store.deleteChunksByIds(orphanIds)
+  │          + store.deleteRepoRows(removed)
   │
   ├─ if newChunkCount === 0 && deletedFiles.length === 0:
   │      sweep()
@@ -177,7 +182,7 @@ embedChunks(project, config, opts):
   │  concurrency = ollama ? 1 : CODE_SEARCH_EMBEDDING_CONCURRENCY ?? 8
   │
   ├─ ensureScalarIndexes (contentHash BTREE before the reuse lookups)
-  ├─ stream chunks.json again; new chunks → batches, `concurrency` in flight;
+  ├─ stream the scope's chunk files again; new chunks → batches, `concurrency` in flight;
   │  per batch: store.getVectorsByContentHash(hashes) → reuse stored vectors
   │  (first batch with hits embeds one of them and compares — same space only),
   │  embed the rest; rows go into a buffer that store.addChunks appends once it

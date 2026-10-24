@@ -228,8 +228,8 @@ function edgeLine(e: GraphEdge, fileLevel: Set<string>): string {
 }
 
 /** Indexed source of `files` in `repo` (their chunks' content), per file: the
- *  vector store first, else chunks.json for files it has nothing for (not
- *  embedded yet). */
+ *  vector store first, else the repo's chunk file for files it has nothing
+ *  for (not embedded yet). */
 async function indexedSources(project: string, repo: string, files: string[]): Promise<Map<string, string>> {
   const cfg = resolvedKnowledgeConfig();
   const parts = new Map<string, string[]>();
@@ -239,10 +239,10 @@ async function indexedSources(project: string, repo: string, files: string[]): P
       const chunks = await vs.getChunksByFile(repo, f);
       if (chunks.length > 0) parts.set(f, chunks.map((c) => c.content));
     }));
-  } catch { /* vector store unavailable — chunks.json below */ }
+  } catch { /* vector store unavailable — the repo's chunk file below */ }
   const missing = new Set(files.filter((f) => !parts.has(f)));
-  if (missing.size > 0 && (await getBlobStore(project, cfg).exists('chunks.json'))) {
-    const found = await findChunksInProject(project, (c) => c.repoName === repo && missing.has(c.filePath), Number.POSITIVE_INFINITY, cfg);
+  if (missing.size > 0) {
+    const found = await findChunksInProject(project, (c) => c.repoName === repo && missing.has(c.filePath), Number.POSITIVE_INFINITY, cfg, repo);
     for (const c of found) {
       if (!parts.has(c.filePath)) parts.set(c.filePath, []);
       parts.get(c.filePath)!.push(c.content);

@@ -122,8 +122,8 @@ export class FsBlobStore implements BlobStorePort {
     const abs = this.resolve(key);
     this.ensureParent(abs);
     // Written to a temp file and renamed into place: a crash mid-stream leaves
-    // the previous file intact rather than a truncated one (chunks.json is
-    // treated as the complete corpus by the embed step).
+    // the previous file intact rather than a truncated one (a repo's chunk
+    // file is treated as all of its chunks by the embed step).
     const tmp = `${abs}.tmp-${process.pid}`;
     const fd = openSync(tmp, 'w');
     let buf = '';
