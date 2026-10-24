@@ -471,6 +471,7 @@ export class VectorStore implements VectorStorePort {
     // with exact distance against the retained raw vectors (ADR §5.5).
     let query = this.table
       .search(queryEmbedding)
+      .select([...CHUNK_COLUMNS, '_distance'])
       .limit(opts?.limit ?? 20)
       .nprobes(opts?.nprobes ?? this.indexConfig?.nprobes ?? ENV_NPROBES ?? this.calibratedNprobes ?? DEFAULT_NPROBES);
     if (this.indexConfig?.refineFactor) query = query.refineFactor(this.indexConfig.refineFactor);
@@ -516,7 +517,7 @@ export class VectorStore implements VectorStorePort {
       // triggerToWebType) and outrank the definition.
       const splitQuery = splitIdentifiers(queryText.replace(/[A-Za-z0-9]*_[A-Za-z0-9_]*/g, ' '));
       const useSplit = /[A-Za-z0-9]/.test(splitQuery) && (await this.hasIndex('contentSplit_idx'));
-      const original = run(this.table.search(queryText, 'fts', 'contextualizedContent').limit(limit));
+      const original = run(this.table.search(queryText, 'fts', 'contextualizedContent').select(FTS_COLUMNS).limit(limit));
       let results: Array<{ row: any; score: number }>;
       if (useSplit) {
         // Original tokens on the original column, identifier parts on the
@@ -532,6 +533,7 @@ export class VectorStore implements VectorStorePort {
           original,
           run(this.table.query()
             .fullTextSearch(new MatchQuery(splitQuery, 'contentSplit', single ? { operator: Operator.And } : undefined))
+            .select(FTS_COLUMNS)
             .limit(limit)),
         ]);
         const byId = new Map<string, { row: any; score: number }>();
@@ -578,7 +580,7 @@ export class VectorStore implements VectorStorePort {
     const nameCond = `entityName IN (${names.map((n) => `'${esc(n)}'`).join(',')})`;
     const where = filter ? `(${nameCond}) AND (${filter})` : nameCond;
     try {
-      const results = await this.table.query().where(where).limit(limit).toArray();
+      const results = await this.table.query().where(where).select(CHUNK_COLUMNS).limit(limit).toArray();
       return results.map((r: any) => ({
         chunk: rowToChunk(r),
         score: 1,
@@ -608,13 +610,18 @@ export class VectorStore implements VectorStorePort {
         const { MatchQuery, Operator } = await import('@lancedb/lancedb');
         let fq = this.table.query()
           .fullTextSearch(new MatchQuery(query, 'entityName', { operator: Operator.And }))
+          .select(FTS_COLUMNS)
           .limit(limit * 4);
         if (filter) fq = fq.where(filter);
         rows = (await fq.toArray()).filter((r: any) => (r.entityName ?? '').toLowerCase().includes(q));
       } else {
         const esc = query.replace(/'/g, "''").replace(/([%_\\])/g, '\\$1');
         const cond = `entityName ILIKE '%${esc}%'`;
-        rows = await this.table.query().where(filter ? `(${cond}) AND (${filter})` : cond).limit(limit * 4).toArray();
+        rows = await this.table.query()
+          .where(filter ? `(${cond}) AND (${filter})` : cond)
+          .select(CHUNK_COLUMNS)
+          .limit(limit * 4)
+          .toArray();
       }
       const rank = (name: string): number => {
         const n = name.replace(/\$\d+$/, '').toLowerCase();
@@ -645,7 +652,7 @@ export class VectorStore implements VectorStorePort {
     try {
       const lancedb = await import('@lancedb/lancedb');
       const pq = new (lancedb as any).PhraseQuery(queryText, 'contextualizedContent');
-      let q = this.table.query().fullTextSearch(pq).limit(limit);
+      let q = this.table.query().fullTextSearch(pq).select(FTS_COLUMNS).limit(limit);
       if (filter) q = q.where(filter);
       const results = await q.toArray();
       return results.map((r: any) => ({
@@ -667,7 +674,7 @@ export class VectorStore implements VectorStorePort {
       // `.query().where()` — NOT the legacy `.filter()`, which is a no-op on this
       // binding (silently returns nothing). With the scalar index on `id` this is
       // an indexed lookup, not a scan.
-      const results = await this.table.query().where(filter).toArray();
+      const results = await this.table.query().where(filter).select(CHUNK_COLUMNS).toArray();
       return results.map((r: any) => rowToChunk(r));
     } catch {
       return [];
@@ -705,7 +712,7 @@ export class VectorStore implements VectorStorePort {
         // `.query().where()` — the legacy `.filter()` is a no-op on this binding
         // (this is why graph expansion silently returned nothing). The scalar
         // indexes on repoName/filePath/entityName make each an indexed lookup.
-        batches.map((batch) => this.table.query().where(batch).limit(batchSize * 2).toArray()),
+        batches.map((batch) => this.table.query().where(batch).select(CHUNK_COLUMNS).limit(batchSize * 2).toArray()),
       );
       return perBatch.flat().map((r: any) => ({
         chunk: rowToChunk(r),
@@ -909,6 +916,15 @@ function fileRowsFilter(project: string, repoName: string, filePaths: string[]):
   const files = filePaths.map((f) => `'${esc(f)}'`).join(', ');
   return `project = '${esc(project)}' AND repoName = '${esc(repoName)}' AND filePath IN (${files})`;
 }
+
+/** The columns rowToChunk reads: what a search fetches — not the vector or
+ *  the derived columns (5–11% of a query's CPU at 1M rows). */
+const CHUNK_COLUMNS = [
+  'id', 'filePath', 'repoName', 'project', 'startLine', 'endLine', 'content', 'contextPrefix',
+  'contextualizedContent', 'language', 'entityType', 'entityName', 'parentEntity', 'tokens',
+];
+/** Full-text searches name their score column too (omitting it is deprecated). */
+const FTS_COLUMNS = [...CHUNK_COLUMNS, '_score'];
 
 function rowToChunk(row: any): CodeChunk {
   return {
