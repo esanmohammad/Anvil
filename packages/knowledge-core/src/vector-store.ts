@@ -74,9 +74,19 @@ const DERIVED_COLUMNS = [
  *  index and drops the old one. */
 const FTS_INDEXES = [
   // Positions enable PhraseQuery (multi-token literal matching).
-  { column: 'contextualizedContent', name: 'contextualizedContent_idx', withPosition: true },
+  { column: 'contextualizedContent', name: 'contextualizedContent_idx', options: { withPosition: true } },
   // Compound-identifier parts for term search; phrases stay on the original column.
-  { column: 'contentSplit', name: 'contentSplit_idx', withPosition: false },
+  { column: 'contentSplit', name: 'contentSplit_idx', options: { withPosition: false } },
+  // Lowercased trigrams of entity names, verbatim (no stemming, punctuation
+  // kept): the substring tier's candidates (searchByEntitySubstring).
+  {
+    column: 'entityName',
+    name: 'entityName_ngram_idx',
+    options: {
+      withPosition: false, baseTokenizer: 'ngram' as const, ngramMinLength: 3, ngramMaxLength: 3,
+      stem: false, asciiFolding: false,
+    },
+  },
 ];
 
 export class VectorStore implements VectorStorePort {
@@ -89,9 +99,9 @@ export class VectorStore implements VectorStorePort {
   private initialized: boolean = false;
   private columnsEnsured = false;
   private calibratedNprobes?: number;
-  /** Whether the table has the identifier-split FTS index (absent on tables
-   *  no upgraded writer has touched yet); resolved on first search. */
-  private splitFts?: Promise<boolean>;
+  /** Names of the table's indexes (FTS_INDEXES added since are absent on
+   *  tables no upgraded writer has touched yet); resolved on first search. */
+  private indexNames?: Promise<Set<string>>;
 
   /** `dbPath` is a local directory (default) or an object-store URI
    *  (`s3://bucket/prefix`). `storageOptions` carries the LanceDB/object_store
@@ -206,10 +216,11 @@ export class VectorStore implements VectorStorePort {
         // silently breaks phrases containing them — and stop words are
         // meaningful tokens in code and error strings.
         await this.table.createIndex(spec.column, {
-          config: lancedb.Index.fts({ withPosition: spec.withPosition, removeStopWords: false }),
+          config: lancedb.Index.fts({ ...spec.options, removeStopWords: false }),
           name: spec.name,
           replace: true,
         });
+        this.indexNames = undefined;
         // Indexes built under another name carry an older config. Drop them
         // only after the current one exists, so search never lacks an index.
         for (const old of fts) await this.table.dropIndex(old.name);
@@ -460,6 +471,7 @@ export class VectorStore implements VectorStorePort {
     // with exact distance against the retained raw vectors (ADR §5.5).
     let query = this.table
       .search(queryEmbedding)
+      .select([...CHUNK_COLUMNS, '_distance'])
       .limit(opts?.limit ?? 20)
       .nprobes(opts?.nprobes ?? this.indexConfig?.nprobes ?? ENV_NPROBES ?? this.calibratedNprobes ?? DEFAULT_NPROBES);
     if (this.indexConfig?.refineFactor) query = query.refineFactor(this.indexConfig.refineFactor);
@@ -492,35 +504,51 @@ export class VectorStore implements VectorStorePort {
   async fullTextSearch(queryText: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
     if (!this.table) return [];
     try {
-      let q;
+      // Apply the same repo filter as vectorSearch — without it, BM25 results
+      // leak across repos even when the caller scoped to specific repos.
+      const run = (q: any) => (filter ? q.where(filter) : q).toArray();
+      // FTS rows carry `_score` on this binding (0.27.x); `_relevance_score`
+      // is the legacy field name — reading only that flattened every BM25
+      // score to the 0.5 fallback.
+      const score = (r: any): number => r._score ?? r._relevance_score ?? 0.5;
       // Words containing '_' are already split into terms on the original
       // column; sending them to the split column too would count them again
       // for camelCase spellings of the same words (TRIGGER_TO_WEB_TYPE vs
       // triggerToWebType) and outrank the definition.
       const splitQuery = splitIdentifiers(queryText.replace(/[A-Za-z0-9]*_[A-Za-z0-9_]*/g, ' '));
-      if (/[A-Za-z0-9]/.test(splitQuery) && (await this.hasSplitFts())) {
+      const useSplit = /[A-Za-z0-9]/.test(splitQuery) && (await this.hasIndex('contentSplit_idx'));
+      const original = run(this.table.search(queryText, 'fts', 'contextualizedContent').select(FTS_COLUMNS).limit(limit));
+      let results: Array<{ row: any; score: number }>;
+      if (useSplit) {
         // Original tokens on the original column, identifier parts on the
         // split column; a row's score is the sum. An exact identifier keeps
         // its rare full token, and "expected backlog count" also reaches
-        // `verifyExpectedBacklogCount`.
-        const { BooleanQuery, MatchQuery, Occur } = await import('@lancedb/lancedb');
-        q = this.table.query().fullTextSearch(new BooleanQuery([
-          [Occur.Should, new MatchQuery(queryText, 'contextualizedContent')],
-          [Occur.Should, new MatchQuery(splitQuery, 'contentSplit')],
-        ])).limit(limit);
+        // `verifyExpectedBacklogCount`. Two searches, not one BooleanQuery:
+        // that cost ~1.5× their sum at 1M rows. A single identifier matches
+        // by parts only where all of them occur — `getUserById` reaches
+        // `getUserByIdOrThrow`, not every row with a `get…` and an `…Id`.
+        const { MatchQuery, Operator } = await import('@lancedb/lancedb');
+        const single = !/\s/.test(queryText.trim());
+        const [a, b] = await Promise.all([
+          original,
+          run(this.table.query()
+            .fullTextSearch(new MatchQuery(splitQuery, 'contentSplit', single ? { operator: Operator.And } : undefined))
+            .select(FTS_COLUMNS)
+            .limit(limit)),
+        ]);
+        const byId = new Map<string, { row: any; score: number }>();
+        for (const r of [...a, ...b]) {
+          const hit = byId.get(r.id);
+          if (hit) hit.score += score(r);
+          else byId.set(r.id, { row: r, score: score(r) });
+        }
+        results = [...byId.values()].sort((x, y) => y.score - x.score).slice(0, limit);
       } else {
-        q = this.table.search(queryText, 'fts', 'contextualizedContent').limit(limit);
+        results = (await original).map((r: any) => ({ row: r, score: score(r) }));
       }
-      // Apply the same repo filter as vectorSearch — without it, BM25 results
-      // leak across repos even when the caller scoped to specific repos.
-      if (filter) q = q.where(filter);
-      const results = await q.toArray();
-      // FTS rows carry `_score` on this binding (0.27.x); `_relevance_score`
-      // is the legacy field name — reading only that flattened every BM25
-      // score to the 0.5 fallback.
-      return results.map((r: any) => ({
-        chunk: rowToChunk(r),
-        score: r._score ?? r._relevance_score ?? 0.5,
+      return results.map(({ row, score: s }) => ({
+        chunk: rowToChunk(row),
+        score: s,
         source: 'bm25' as const,
       }));
     } catch {
@@ -534,12 +562,12 @@ export class VectorStore implements VectorStorePort {
     this.calibratedNprobes = nprobes && nprobes > 0 ? nprobes : undefined;
   }
 
-  private hasSplitFts(): Promise<boolean> {
-    this.splitFts ??= (async () => {
+  private async hasIndex(name: string): Promise<boolean> {
+    this.indexNames ??= (async () => {
       const indexes: Array<{ name: string }> = await this.table.listIndices();
-      return indexes.some((i) => i.name === 'contentSplit_idx');
-    })().catch(() => false);
-    return this.splitFts;
+      return new Set(indexes.map((i) => i.name));
+    })().catch(() => new Set<string>());
+    return (await this.indexNames).has(name);
   }
 
   /** Exact-symbol lookup: chunks whose entityName equals one of `names`.
@@ -552,7 +580,7 @@ export class VectorStore implements VectorStorePort {
     const nameCond = `entityName IN (${names.map((n) => `'${esc(n)}'`).join(',')})`;
     const where = filter ? `(${nameCond}) AND (${filter})` : nameCond;
     try {
-      const results = await this.table.query().where(where).limit(limit).toArray();
+      const results = await this.table.query().where(where).select(CHUNK_COLUMNS).limit(limit).toArray();
       return results.map((r: any) => ({
         chunk: rowToChunk(r),
         score: 1,
@@ -565,20 +593,36 @@ export class VectorStore implements VectorStorePort {
 
   /** Substring symbol lookup: chunks whose entityName CONTAINS the query,
    *  case-insensitively — the Zoekt-style partial-identifier tier
-   *  (`SearchResponse` finds `CompanySearchResponse`). A projected ILIKE scan
-   *  over the short entityName column: measured ~50ms cold / ~3ms warm at
-   *  450k rows. Results ranked exact > prefix > infix, then shorter names
-   *  (tighter match) first. */
+   *  (`SearchResponse` finds `CompanySearchResponse`). Candidates come from
+   *  the entity-name trigram index (rows holding every trigram of the query,
+   *  shorter names first), kept if they contain the query; a table without
+   *  that index yet, or a query under 3 chars, scans with ILIKE instead —
+   *  ~140ms at 1.15M rows, the slowest search tier before the index. Results
+   *  ranked exact > prefix > infix, then shorter names (tighter match) first. */
   async searchByEntitySubstring(query: string, limit: number = 20, filter?: string): Promise<ScoredChunk[]> {
     if (!this.table || query.length === 0) return [];
-    const esc = query.replace(/'/g, "''").replace(/([%_\\])/g, '\\$1');
-    const cond = `entityName ILIKE '%${esc}%'`;
-    const where = filter ? `(${cond}) AND (${filter})` : cond;
+    const q = query.toLowerCase();
     try {
       // Over-fetch so the JS ranking below sees enough candidates to prefer
       // exact/prefix matches over incidental infix hits.
-      const rows = await this.table.query().where(where).limit(limit * 4).toArray();
-      const q = query.toLowerCase();
+      let rows: any[];
+      if (query.length >= 3 && (await this.hasIndex('entityName_ngram_idx'))) {
+        const { MatchQuery, Operator } = await import('@lancedb/lancedb');
+        let fq = this.table.query()
+          .fullTextSearch(new MatchQuery(query, 'entityName', { operator: Operator.And }))
+          .select(FTS_COLUMNS)
+          .limit(limit * 4);
+        if (filter) fq = fq.where(filter);
+        rows = (await fq.toArray()).filter((r: any) => (r.entityName ?? '').toLowerCase().includes(q));
+      } else {
+        const esc = query.replace(/'/g, "''").replace(/([%_\\])/g, '\\$1');
+        const cond = `entityName ILIKE '%${esc}%'`;
+        rows = await this.table.query()
+          .where(filter ? `(${cond}) AND (${filter})` : cond)
+          .select(CHUNK_COLUMNS)
+          .limit(limit * 4)
+          .toArray();
+      }
       const rank = (name: string): number => {
         const n = name.replace(/\$\d+$/, '').toLowerCase();
         if (n === q) return 0;
@@ -608,7 +652,7 @@ export class VectorStore implements VectorStorePort {
     try {
       const lancedb = await import('@lancedb/lancedb');
       const pq = new (lancedb as any).PhraseQuery(queryText, 'contextualizedContent');
-      let q = this.table.query().fullTextSearch(pq).limit(limit);
+      let q = this.table.query().fullTextSearch(pq).select(FTS_COLUMNS).limit(limit);
       if (filter) q = q.where(filter);
       const results = await q.toArray();
       return results.map((r: any) => ({
@@ -630,7 +674,7 @@ export class VectorStore implements VectorStorePort {
       // `.query().where()` — NOT the legacy `.filter()`, which is a no-op on this
       // binding (silently returns nothing). With the scalar index on `id` this is
       // an indexed lookup, not a scan.
-      const results = await this.table.query().where(filter).toArray();
+      const results = await this.table.query().where(filter).select(CHUNK_COLUMNS).toArray();
       return results.map((r: any) => rowToChunk(r));
     } catch {
       return [];
@@ -668,7 +712,7 @@ export class VectorStore implements VectorStorePort {
         // `.query().where()` — the legacy `.filter()` is a no-op on this binding
         // (this is why graph expansion silently returned nothing). The scalar
         // indexes on repoName/filePath/entityName make each an indexed lookup.
-        batches.map((batch) => this.table.query().where(batch).limit(batchSize * 2).toArray()),
+        batches.map((batch) => this.table.query().where(batch).select(CHUNK_COLUMNS).limit(batchSize * 2).toArray()),
       );
       return perBatch.flat().map((r: any) => ({
         chunk: rowToChunk(r),
@@ -872,6 +916,15 @@ function fileRowsFilter(project: string, repoName: string, filePaths: string[]):
   const files = filePaths.map((f) => `'${esc(f)}'`).join(', ');
   return `project = '${esc(project)}' AND repoName = '${esc(repoName)}' AND filePath IN (${files})`;
 }
+
+/** The columns rowToChunk reads: what a search fetches — not the vector or
+ *  the derived columns (5–11% of a query's CPU at 1M rows). */
+const CHUNK_COLUMNS = [
+  'id', 'filePath', 'repoName', 'project', 'startLine', 'endLine', 'content', 'contextPrefix',
+  'contextualizedContent', 'language', 'entityType', 'entityName', 'parentEntity', 'tokens',
+];
+/** Full-text searches name their score column too (omitting it is deprecated). */
+const FTS_COLUMNS = [...CHUNK_COLUMNS, '_score'];
 
 function rowToChunk(row: any): CodeChunk {
   return {

@@ -355,7 +355,7 @@ API:
 | `vectorIndexState()` | row count + the vector index's indexed / unindexed rows |
 | `optimizeIndexes()` | fold appended rows into every index, compact, prune old versions |
 
-Two FTS indexes:
+Three FTS indexes:
 
 - `contextualizedContent_idx` on `contextualizedContent` — positions (for
   phrase search), stop words kept.
@@ -364,11 +364,21 @@ Two FTS indexes:
   `verify Expected Backlog Count`; plain words, ALL_CAPS and punctuation
   dropped), so words fused into camelCase identifiers become terms without a
   plain word counting twice. No positions.
+- `entityName_ngram_idx` on `entityName` — lowercased trigrams of the name,
+  no stemming, punctuation kept. `searchByEntitySubstring` takes the rows
+  holding every trigram of the query (shorter names rank first) and keeps those
+  that contain it; with no such index yet (a table no upgraded writer has
+  touched) or a query under 3 characters it scans with `ILIKE` — about 140 ms
+  at 1.15M rows, the slowest search tier before the index.
 
 `fullTextSearch` sums a match of the query on the first and of its
 camelCase-split form on the second (words containing `_` stay off the split
-query — the tokenizer already splits them on the original column). On a table
-with no `contentSplit_idx` it searches the original column only.
+query — the tokenizer already splits them on the original column). They run as
+two searches whose top rows are merged by id (one `BooleanQuery` over both cost
+~1.5× the pair at 1M rows). For a single identifier the split form must match
+all its parts (`getUserById` reaches `getUserByIdOrThrow`, not every row with a
+`get…` and an `…Id`); multi-word queries match any. On a table with no
+`contentSplit_idx` it searches the original column only.
 
 The write path builds each index once; `optimize()` folds later appends in,
 and until then they are still found by term search (not by phrase search). An
