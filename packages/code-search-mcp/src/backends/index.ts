@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { InProcessBackend } from './in-process.js';
 import { DaemonBackend } from './daemon-client.js';
 import type { BackendConfig, SearchBackend } from './types.js';
+import { getComponentLogger } from '../observability/logger.js';
 
 export * from './types.js';
 export { InProcessBackend } from './in-process.js';
@@ -33,7 +34,7 @@ export async function pickBackend(cfg: BackendConfig): Promise<SearchBackend> {
     const daemon = new DaemonBackend({ ...cfg, socketPath });
     if (await daemon.ping()) return daemon;
     // Daemon unreachable; fall through.
-    process.stderr.write(`[code-search-mcp] daemon socket exists at ${socketPath} but ping failed; using in-process backend\n`);
+    getComponentLogger('code-search').warn(`daemon socket exists at ${socketPath} but ping failed; using in-process backend`);
   }
   return new InProcessBackend(cfg);
 }

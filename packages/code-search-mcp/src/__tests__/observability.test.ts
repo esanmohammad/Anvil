@@ -66,12 +66,11 @@ describe('Logger (P7)', () => {
     assert.match(lines[0], /"kept"/);
   });
 
-  it('falls back to text mode when structured=false', () => {
+  it('passes text through unchanged when structured=false', () => {
     const lines: string[] = [];
     const log = new Logger({ structured: false, write: (l) => lines.push(l) });
     log.error('boom');
-    assert.equal(lines.length, 1);
-    assert.match(lines[0], /ERROR/);
-    assert.match(lines[0], /boom/);
+    log.info('ready', { component: 'code-search-mcp' });
+    assert.deepEqual(lines, ['boom', '[code-search-mcp] ready']);
   });
 });

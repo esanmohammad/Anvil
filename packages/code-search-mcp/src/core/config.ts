@@ -16,8 +16,9 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
+import { Logger } from '../observability/logger.js';
 import type {
   KnowledgeStorageConfig,
   EmbeddingProviderConfig,
@@ -33,7 +34,7 @@ import type {
 
 export interface CodeSearchConfig {
   server: {
-    transport: 'stdio' | 'streamable-http' | 'sse';
+    transport: 'stdio' | 'streamable-http';
     port: number;
     host: string;
   };
@@ -86,9 +87,7 @@ export interface CodeSearchConfig {
     recordQueries: boolean;
   };
   daemon: {
-    /** Spawn an in-process daemon if no socket is found, or fall back to in-process index */
-    autoSpawn: boolean;
-    /** Disable daemon entirely; force in-process backend */
+    /** Never route CLI queries to a running daemon; force the in-process backend */
     disabled: boolean;
   };
 }
@@ -97,9 +96,11 @@ export interface CodeSearchConfig {
 // Defaults
 // ---------------------------------------------------------------------------
 
+/** knowledge-core's own fallback when CODE_SEARCH_DATA_DIR is unset
+ *  (`getKnowledgeBasePath`), so the default reported here is where KBs live. */
 function defaultDataDir(): string {
   return process.env.CODE_SEARCH_DATA_DIR
-    ?? join(homedir(), '.code-search', 'index');
+    ?? join(process.env.ANVIL_HOME || join(homedir(), '.anvil'), 'knowledge-base');
 }
 
 export const DEFAULTS: CodeSearchConfig = {
@@ -157,7 +158,6 @@ export const DEFAULTS: CodeSearchConfig = {
     recordQueries: false,
   },
   daemon: {
-    autoSpawn: false,
     disabled: false,
   },
 };
@@ -166,7 +166,7 @@ export const DEFAULTS: CodeSearchConfig = {
 // Deep-merge helper (partial-config layering)
 // ---------------------------------------------------------------------------
 
-type DeepPartial<T> = { [P in keyof T]?: T[P] extends object ? DeepPartial<T[P]> : T[P] };
+export type DeepPartial<T> = { [P in keyof T]?: T[P] extends object ? DeepPartial<T[P]> : T[P] };
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -294,14 +294,21 @@ function parseHeaders(s: string | undefined): Record<string, string> | undefined
   return Object.keys(out).length ? out : undefined;
 }
 
-function parseReindexMs(raw: string | undefined): number {
-  if (!raw || raw === '0' || raw === 'none') return 0;
-  const m = raw.match(/^(\d+)(m|h)$/);
-  if (!m) {
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) ? n : 0;
+/**
+ * Reindex interval from any layer → ms. Accepts `0` / `none` (off), `<n>m`,
+ * `<n>h`, or a plain millisecond count of at least one minute. Returns null
+ * for anything else (the resolver warns and disables auto-reindex).
+ */
+export function parseReindexInterval(raw: unknown): number | null {
+  if (raw === undefined || raw === null || raw === '' || raw === 0 || raw === '0' || raw === 'none') return 0;
+  const s = String(raw).trim();
+  const unit = s.match(/^(\d+)(m|h)$/);
+  if (unit) return parseInt(unit[1], 10) * (unit[2] === 'h' ? 3_600_000 : 60_000);
+  if (/^\d+$/.test(s)) {
+    const ms = parseInt(s, 10);
+    return ms >= 60_000 ? ms : null;
   }
-  return m[2] === 'h' ? parseInt(m[1], 10) * 60 * 60_000 : parseInt(m[1], 10) * 60_000;
+  return null;
 }
 
 /**
@@ -375,7 +382,7 @@ function envLayer(): DeepPartial<CodeSearchConfig> {
     server: {
       transport: transport,
       port: port ? parseInt(port, 10) : undefined,
-      host: env('HOST') ?? (authMode === 'none' || !authMode ? undefined : '0.0.0.0'),
+      host: env('HOST'),
     },
     auth: {
       mode: authMode,
@@ -408,7 +415,8 @@ function envLayer(): DeepPartial<CodeSearchConfig> {
     },
     indexing: {
       autoIndex: env('AUTO_INDEX') !== undefined ? env('AUTO_INDEX') !== 'false' && env('AUTO_INDEX') !== '0' : undefined,
-      reindexIntervalMs: env('REINDEX_INTERVAL') !== undefined ? parseReindexMs(env('REINDEX_INTERVAL')) : undefined,
+      // Raw string; normalised (and validated) by the resolver for every layer.
+      reindexIntervalMs: env('REINDEX_INTERVAL') as unknown as number | undefined,
       chunking: {
         maxTokens: chunkMaxTokens ? parseInt(chunkMaxTokens, 10) : undefined,
       },
@@ -433,7 +441,6 @@ function envLayer(): DeepPartial<CodeSearchConfig> {
       recordQueries: env('TELEMETRY_RECORD_QUERIES') === '1' || env('TELEMETRY_RECORD_QUERIES') === 'true' ? true : undefined,
     },
     daemon: {
-      autoSpawn: env('DAEMON_AUTO_SPAWN') === '1' || env('DAEMON_AUTO_SPAWN') === 'true' ? true : undefined,
       disabled: env('DAEMON_DISABLED') === '1' || env('DAEMON_DISABLED') === 'true' ? true : undefined,
     },
   };
@@ -446,8 +453,12 @@ function envLayer(): DeepPartial<CodeSearchConfig> {
 /**
  * Parse `--<dotted.path> <value>` flags into a DeepPartial<CodeSearchConfig>.
  * `--no-x.y` sets a boolean false. Boolean flags without a value are `true`.
+ * `--port` / `--host` / `--transport` / `--auth` are shorthands for
+ * `server.port` / `server.host` / `server.transport` / `auth.mode`.
  * Reserved subcommand-style flags (`--local`, `--remote`, `--serve`, etc.)
- * are passed back to the caller as `rest`.
+ * and their values are passed back to the caller as `rest`. Flags naming no
+ * config leaf land in `unknown` — callers reject them (a typo must not be
+ * silently ignored).
  */
 const RESERVED_FLAGS = new Set([
   '--local',
@@ -462,23 +473,55 @@ const RESERVED_FLAGS = new Set([
   '--force',
   '--workspace',
   '--no-daemon',
-  '--auto-spawn-daemon',
-  '--config',
   '--format',
   '--top-k',
   '--mode',
   '--repo',
-  '--language',
 ]);
+
+const ROOT_ALIASES: Record<string, string[]> = {
+  '--port': ['server', 'port'],
+  '--host': ['server', 'host'],
+  '--transport': ['server', 'transport'],
+  '--auth': ['auth', 'mode'],
+};
+
+/** Settable leaves with no compiled-in default. */
+const OPTIONAL_LEAVES = [
+  'auth.jwtSecret',
+  'embedding.model', 'embedding.apiKey', 'embedding.baseUrl', 'embedding.ollamaHost',
+  'reranker.model', 'reranker.apiKey', 'reranker.baseUrl', 'reranker.timeoutMs',
+  'llm.apiKey', 'llm.baseUrl',
+  'github.token',
+  'telemetry.otelEndpoint',
+];
+/** Subtrees passed through verbatim — any key below them is accepted. */
+const OPEN_SUBTREES = ['storage.backends.', 'telemetry.otelHeaders.'];
+
+function leafPaths(obj: Record<string, unknown>, prefix: string, out: Set<string>): Set<string> {
+  for (const [k, v] of Object.entries(obj)) {
+    if (isPlainObject(v)) leafPaths(v, `${prefix}${k}.`, out);
+    else out.add(`${prefix}${k}`);
+  }
+  return out;
+}
+const KNOWN_LEAVES = leafPaths(DEFAULTS as unknown as Record<string, unknown>, '', new Set(OPTIONAL_LEAVES));
+
+function isKnownPath(path: string): boolean {
+  return KNOWN_LEAVES.has(path) || OPEN_SUBTREES.some((p) => path.startsWith(p));
+}
 
 export interface CliParseResult {
   patch: DeepPartial<CodeSearchConfig>;
   rest: string[];
+  /** Flags that name no config leaf (as typed, e.g. `--retrieval.max-chunkz`). */
+  unknown: string[];
 }
 
 export function parseCliFlags(argv: string[]): CliParseResult {
   const patch: Record<string, unknown> = {};
   const rest: string[] = [];
+  const unknown: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -486,14 +529,17 @@ export function parseCliFlags(argv: string[]): CliParseResult {
       rest.push(arg);
       continue;
     }
-    let key = arg.slice(2);
+    let path = ROOT_ALIASES[arg];
     let negate = false;
-    if (key.startsWith('no-')) {
-      negate = true;
-      key = key.slice(3);
+    if (!path) {
+      let key = arg.slice(2);
+      if (key.startsWith('no-')) {
+        negate = true;
+        key = key.slice(3);
+      }
+      // Map kebab-case to camelCase per segment.
+      path = key.split('.').map((seg) => seg.replace(/-([a-z])/g, (_, c) => c.toUpperCase()));
     }
-    // Map kebab-case to camelCase per segment.
-    const path = key.split('.').map((seg) => seg.replace(/-([a-z])/g, (_, c) => c.toUpperCase()));
     let val: unknown;
     if (negate) {
       val = false;
@@ -502,9 +548,13 @@ export function parseCliFlags(argv: string[]): CliParseResult {
     } else {
       val = true;
     }
+    if (!isKnownPath(path.join('.'))) {
+      unknown.push(arg);
+      continue;
+    }
     setDeep(patch, path, val);
   }
-  return { patch: patch as DeepPartial<CodeSearchConfig>, rest };
+  return { patch: patch as DeepPartial<CodeSearchConfig>, rest, unknown };
 }
 
 function setDeep(obj: Record<string, unknown>, path: string[], value: unknown): void {
@@ -536,9 +586,42 @@ export function resolveCodeSearchConfig(opts: ResolveOpts = {}): CodeSearchConfi
   const yaml2 = opts.workspaceDir ? (loadYamlFile(join(opts.workspaceDir, '.code-search.yaml')) ?? {}) : {};
   const env = envLayer();
   const cli = opts.cli ?? {};
-  const cfg = deepMerge(DEFAULTS, yaml1, yaml2, env, cli);
+  const layers: Array<DeepPartial<CodeSearchConfig>> = [yaml1, yaml2, env, cli];
+  const cfg = deepMerge(
+    structuredClone(DEFAULTS) as unknown as Record<string, unknown>,
+    ...(layers as Array<DeepPartial<Record<string, unknown>>>),
+  ) as unknown as CodeSearchConfig;
+  // Auth on and no layer chose a host → listen publicly (auth protects it).
+  if (cfg.auth.mode !== 'none' && !layers.some((l) => l.server?.host !== undefined)) {
+    cfg.server.host = '0.0.0.0';
+  }
+  const rawInterval = cfg.indexing.reindexIntervalMs as unknown;
+  const intervalMs = parseReindexInterval(rawInterval);
+  if (intervalMs === null) {
+    warnOnce(cfg, `[code-search] invalid reindex interval ${JSON.stringify(String(rawInterval))} ` +
+      `(use 30m, 1h, … — at least one minute — or 0); auto-reindex disabled`);
+  }
+  cfg.indexing.reindexIntervalMs = intervalMs ?? 0;
+  cfg.storage.dataDir = resolve(cfg.storage.dataDir);
   bridgeLegacyEnvVars(cfg);
   return cfg;
+}
+
+const warned = new Set<string>();
+function warnOnce(cfg: CodeSearchConfig, msg: string): void {
+  if (warned.has(msg)) return;
+  warned.add(msg);
+  new Logger({ structured: cfg.telemetry.structuredLogs }).warn(msg);
+}
+
+/**
+ * knowledge-core reads its data dir from CODE_SEARCH_DATA_DIR only. Entry
+ * points call this with the resolved config so a `storage.dataDir` from YAML
+ * or the CLI actually moves the KB (and daemon sockets / pid files, which
+ * live under the same dir).
+ */
+export function exportDataDir(cfg: CodeSearchConfig): void {
+  process.env.CODE_SEARCH_DATA_DIR = cfg.storage.dataDir;
 }
 
 /**
@@ -583,24 +666,38 @@ export function toKnowledgeConfig(c: CodeSearchConfig): KnowledgeConfig {
 // --print-config — debuggability
 // ---------------------------------------------------------------------------
 
-const SECRET_KEYS = new Set([
-  'apiKey',
-  'jwtSecret',
-  'token',
-  'githubToken',
-]);
+const SECRET_KEY = /pass(word)?|secret|token|authorization|api[-_]?keys?|credential/i;
+/** `scheme://userinfo@` — keep the user name, drop whatever authenticates it. */
+const URI_USERINFO = /([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+)@/gi;
 
+function redactString(v: string): string {
+  return `***redacted (${v.length} chars)`;
+}
+
+/**
+ * --print-config redaction: values of secret-named keys (password, secret,
+ * token, authorization, api key, credential — any nesting), every OTEL header
+ * value (they carry auth), and credentials embedded in URIs
+ * (`mongodb://user:pass@`, `https://token@`).
+ */
 export function redactSecrets<T>(value: T, parentKey = ''): T {
+  if (typeof value === 'string') {
+    return value.replace(URI_USERINFO, (_m, scheme: string, info: string) => {
+      const colon = info.indexOf(':');
+      return `${scheme}${colon >= 0 ? info.slice(0, colon + 1) : ''}***@`;
+    }) as unknown as T;
+  }
   if (Array.isArray(value)) {
     return value.map((v) => redactSecrets(v, parentKey)) as unknown as T;
   }
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      if (SECRET_KEYS.has(k) && typeof v === 'string' && v.length > 0) {
-        out[k] = `***redacted (${v.length} chars)`;
-      } else if (k === 'apiKeys' && Array.isArray(v)) {
-        out[k] = v.map((s) => `***redacted (${(s as string).length} chars)`);
+      const secret = SECRET_KEY.test(k) || parentKey === 'otelHeaders';
+      if (secret && typeof v === 'string' && v.length > 0) {
+        out[k] = redactString(v);
+      } else if (secret && Array.isArray(v)) {
+        out[k] = v.map((s) => (typeof s === 'string' ? redactString(s) : redactSecrets(s, k)));
       } else {
         out[k] = redactSecrets(v, k);
       }

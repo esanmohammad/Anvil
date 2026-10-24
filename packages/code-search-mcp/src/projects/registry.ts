@@ -1,23 +1,22 @@
 /**
- * Project registry (P8) — multi-project workspaces inside one daemon /
- * server. Each project has its own config overrides, repos, and (eventually)
- * its own auth scope + spend ceiling.
+ * Project registry (P8) — per-project metadata read from
+ * `<dataDir>/projects/<name>/project.yaml`:
  *
- * On-disk layout (see CODE-SEARCH-MCP-STANDALONE-PLAN.md §3.9):
- *
- *   <dataDir>/projects/<name>/project.yaml
  *     workspace: /path/to/repos
- *     repos: [a, b]               # optional restrict-list
- *     config:                     # optional partial CodeSearchConfig override
- *       embedding:
- *         provider: codestral
+ *     repos: [a, b]                 # restrict-list — parsed, not enforced
  *     quotas:
- *       max_queries_per_minute: 60
- *       max_embedding_cost_usd: 5
- *     scopes: [team-a]
+ *       max_queries_per_minute: 60  # enforced on /mcp
+ *       max_embedding_cost_usd: 5   # parsed, not enforced
+ *       max_llm_cost_usd: 5         # parsed, not enforced
+ *     scopes: [team-a]              # enforced on /mcp
  *
- * The registry is a thin file-backed reader. Daemon/server iterate the
- * directory at boot to discover projects.
+ * A `config:` block is not read: a project's config is its workspace's
+ * `.code-search.yaml` layer (`ProjectEntry.config`).
+ *
+ * The HTTP server (`server.ts`) loads the registry once at boot and, when the
+ * project it serves has an entry, gates every /mcp request on it: scopes via
+ * `projectAccessAllowed`, the query quota via `projectQuotaKey`. Nothing else
+ * consumes the registry.
  */
 
 import { readdirSync, existsSync, statSync, readFileSync } from 'node:fs';
@@ -26,11 +25,12 @@ import {
   resolveCodeSearchConfig,
   type CodeSearchConfig,
 } from '../core/config.js';
+import { localRateHit } from '../middleware/rate-limit.js';
 
 export interface ProjectEntry {
   name: string;
   workspaceDir: string;
-  /** Optional restrict-list of repo names; empty → all repos under workspace */
+  /** Restrict-list of repo names as written (not enforced anywhere). */
   repos: string[];
   /** Resolved config (merged DEFAULTS → global → workspace overlay). */
   config: CodeSearchConfig;
@@ -41,9 +41,9 @@ export interface ProjectEntry {
 
 export interface ProjectQuotas {
   maxQueriesPerMinute: number;
-  /** Hard ceiling on embedding spend (USD). 0 = unlimited. */
+  /** Embedding spend ceiling (USD) as written — not enforced. */
   maxEmbeddingCostUsd: number;
-  /** Hard ceiling on LLM spend (USD) for profiling+service-mesh. */
+  /** LLM spend ceiling (USD) as written — not enforced. */
   maxLlmCostUsd: number;
 }
 
@@ -201,25 +201,23 @@ export function projectAccessAllowed(
   return false;
 }
 
-/**
- * Per-project sliding-window query quota. Mirrors the auth.ts limiter
- * but keyed by (identity, project) so a single identity scanning N
- * projects can have N separate rates.
- */
-const projectRateBuckets = new Map<string, { count: number; resetAt: number }>();
+/** Rate-limiter key for the per-(identity, project) query quota. */
+export function projectQuotaKey(project: ProjectEntry, identity: string): string {
+  return `project:${project.name}|${identity}`;
+}
 
-export function checkProjectQuota(project: ProjectEntry, identity: string): { ok: true } | { ok: false; reason: string } {
-  if (project.quotas.maxQueriesPerMinute <= 0) return { ok: true };
-  const key = `${identity}|${project.name}`;
-  const now = Date.now();
-  const bucket = projectRateBuckets.get(key);
-  if (!bucket || now > bucket.resetAt) {
-    projectRateBuckets.set(key, { count: 1, resetAt: now + 60_000 });
-    return { ok: true };
-  }
-  if (bucket.count >= project.quotas.maxQueriesPerMinute) {
-    return { ok: false, reason: `quota exceeded for project="${project.name}": ${project.quotas.maxQueriesPerMinute}/min` };
-  }
-  bucket.count++;
-  return { ok: true };
+/**
+ * Per-project sliding-window query quota, keyed by (identity, project) so a
+ * single identity scanning N projects has N separate rates. Same window as
+ * the auth limiter (`middleware/rate-limit.ts`); the HTTP server checks it
+ * through its (cluster-global) RateLimiter with the same key.
+ */
+export function checkProjectQuota(project: ProjectEntry, identity: string): { ok: true } | { ok: false; reason: string; retryAfterSec: number } {
+  const d = localRateHit(projectQuotaKey(project, identity), project.quotas.maxQueriesPerMinute);
+  if (d.ok) return { ok: true };
+  return {
+    ok: false,
+    reason: `quota exceeded for project="${project.name}": ${project.quotas.maxQueriesPerMinute}/min`,
+    retryAfterSec: d.retryAfterSec,
+  };
 }

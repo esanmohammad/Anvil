@@ -165,8 +165,19 @@ function killAllTracked() {
   }
   activeProcesses.clear();
 }
-process.on('SIGINT', killAllTracked);
-process.on('SIGTERM', killAllTracked);
+
+// Any SIGINT/SIGTERM listener disables Node's default "terminate on signal".
+// A host with its own listener owns shutdown; when ours is the only one,
+// re-raise the signal with it removed so the default disposition terminates
+// the process (exit status 128+signo), exactly as without agent-core loaded.
+function onTerminationSignal(signal: NodeJS.Signals): void {
+  killAllTracked();
+  if (process.listenerCount(signal) > 1) return;
+  process.removeListener(signal, onTerminationSignal);
+  process.kill(process.pid, signal);
+}
+process.on('SIGINT', onTerminationSignal);
+process.on('SIGTERM', onTerminationSignal);
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
