@@ -176,7 +176,11 @@ Public functions:
   `CODE_SEARCH_LLM_*` so agent-core (loaded lazily inside knowledge-core)
   reads the canonical names and doesn't emit `[anvil-llm] DEPRECATED`
   noise. Only writes when canonical is unset, so explicit `ANVIL_*`
-  always wins.
+  always wins. `llm.headers` (`CODE_SEARCH_LLM_HEADERS`, `Name=value,…`)
+  goes over as `ANVIL_LLM_HEADERS`; `embedding.headers`
+  (`CODE_SEARCH_EMBEDDING_HEADERS`) flows to knowledge-core's
+  OpenAI-compatible embedder through `toKnowledgeConfig`. Header values are
+  redacted by `--print-config`.
 - `parseCliFlags(argv)` → `{ patch: DeepPartial<CodeSearchConfig>, rest,
   unknown }`. Reserved-flag set (`--local`, `--remote`, `--serve`,
   `--workspace`, …) is forwarded to the caller via `rest`; `--port` /

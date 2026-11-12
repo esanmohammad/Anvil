@@ -246,7 +246,9 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 
 ### Provider classes — env reads are deprecated (P2)
 Every embedder + reranker constructor takes `apiKey`/`baseUrl`/`ollamaHost`/
-`timeoutMs` directly. The classes still fall back to documented env vars
+`timeoutMs` directly. `OpenAICompatibleEmbedder` also takes
+`EmbeddingProviderConfig.headers` — extra headers on every request (e.g. a
+gateway's access headers) that never replace `Content-Type`/`Authorization`. The classes still fall back to documented env vars
 (`MISTRAL_API_KEY`, `VOYAGE_API_KEY`, `OPENAI_API_KEY`, `COHERE_API_KEY`,
 `OLLAMA_HOST`, `CODE_SEARCH_EMBEDDING_BASE_URL` / `_MODEL` / `_API_KEY`,
 `CODE_SEARCH_RERANKER_BASE_URL` / `_MODEL` / `_API_KEY`,
