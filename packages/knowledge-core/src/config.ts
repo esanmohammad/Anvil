@@ -44,6 +44,9 @@ export interface EmbeddingProviderConfig {
   dimensions?: number;
   apiKey?: string;
   baseUrl?: string;
+  /** Extra headers on every request of the `openai-compatible` provider, e.g. the
+   *  access headers of a gateway behind an auth proxy. Never replace its auth. */
+  headers?: Record<string, string>;
   ollamaHost?: string;
   /** @deprecated Use `apiKey` directly. Kept for back-compat of older configs. */
   apiKeyEnv?: string;

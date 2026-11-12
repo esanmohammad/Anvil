@@ -74,6 +74,10 @@ export interface CodeSearchConfig {
     model: string;
     apiKey?: string;
     baseUrl?: string;
+    /** Extra headers on every LLM API request (`CODE_SEARCH_LLM_HEADERS`,
+     *  `Name=value,…`), e.g. a gateway's access headers. Bridged to agent-core
+     *  as `ANVIL_LLM_HEADERS`. */
+    headers?: Record<string, string>;
     claudeBin: string;
   };
   github: {
@@ -401,6 +405,7 @@ function envLayer(): DeepPartial<CodeSearchConfig> {
       dimensions: embedDims ? parseInt(embedDims, 10) : undefined,
       apiKey: env('EMBEDDING_API_KEY'),
       baseUrl: env('EMBEDDING_BASE_URL'),
+      headers: parseHeaders(env('EMBEDDING_HEADERS')),
       ollamaHost: env('OLLAMA_HOST') ?? process.env.OLLAMA_HOST,
     },
     reranker: {
@@ -428,6 +433,7 @@ function envLayer(): DeepPartial<CodeSearchConfig> {
       model: env('LLM_MODEL'),
       apiKey: env('LLM_API_KEY') ?? process.env.ANTHROPIC_API_KEY ?? process.env.OPENAI_API_KEY,
       baseUrl: env('LLM_BASE_URL'),
+      headers: parseHeaders(env('LLM_HEADERS')),
       claudeBin: env('CLAUDE_BIN') ?? process.env.CLAUDE_BIN,
     },
     github: {
@@ -640,6 +646,9 @@ function bridgeLegacyEnvVars(cfg: CodeSearchConfig): void {
   process.env.ANVIL_LLM_MODEL    ??= process.env.CODE_SEARCH_LLM_MODEL    ?? cfg.llm.model;
   if (cfg.llm.apiKey)   process.env.ANVIL_LLM_API_KEY  ??= cfg.llm.apiKey;
   if (cfg.llm.baseUrl)  process.env.ANVIL_LLM_BASE_URL ??= cfg.llm.baseUrl;
+  if (cfg.llm.headers) {
+    process.env.ANVIL_LLM_HEADERS ??= Object.entries(cfg.llm.headers).map(([k, v]) => `${k}=${v}`).join(',');
+  }
   if (cfg.llm.claudeBin) process.env.ANVIL_CLAUDE_BIN  ??= cfg.llm.claudeBin;
 }
 
@@ -676,8 +685,8 @@ function redactString(v: string): string {
 
 /**
  * --print-config redaction: values of secret-named keys (password, secret,
- * token, authorization, api key, credential — any nesting), every OTEL header
- * value (they carry auth), and credentials embedded in URIs
+ * token, authorization, api key, credential — any nesting), every OTEL and
+ * request-header value (they carry auth), and credentials embedded in URIs
  * (`mongodb://user:pass@`, `https://token@`).
  */
 export function redactSecrets<T>(value: T, parentKey = ''): T {
@@ -693,7 +702,7 @@ export function redactSecrets<T>(value: T, parentKey = ''): T {
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
-      const secret = SECRET_KEY.test(k) || parentKey === 'otelHeaders';
+      const secret = SECRET_KEY.test(k) || parentKey === 'otelHeaders' || parentKey === 'headers';
       if (secret && typeof v === 'string' && v.length > 0) {
         out[k] = redactString(v);
       } else if (secret && Array.isArray(v)) {

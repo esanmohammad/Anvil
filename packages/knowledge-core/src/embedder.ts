@@ -62,6 +62,8 @@ function isRetryableNetworkError(err: unknown): boolean {
 async function embedFetch(opts: {
   url: string;
   apiKey?: string;
+  /** Extra headers; they never replace Content-Type or Authorization. */
+  headers?: Record<string, string>;
   body: unknown;
   provider: string;
 }): Promise<Response> {
@@ -72,7 +74,7 @@ async function embedFetch(opts: {
   // honoring Retry-After. With a small shared budget a few 429s exhaust it, a
   // worker throws, and an otherwise-healthy run gets wrongly marked failed.
   const max429 = parseInt(process.env.CODE_SEARCH_EMBEDDING_MAX_429_RETRIES ?? '', 10) || 30;
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const headers: Record<string, string> = { ...opts.headers, 'Content-Type': 'application/json' };
   if (opts.apiKey) headers.Authorization = `Bearer ${opts.apiKey}`;
   const payload = JSON.stringify(opts.body);
 
@@ -520,11 +522,15 @@ export class OpenAICompatibleEmbedder implements EmbeddingProvider {
   readonly model: string;
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
+  private readonly headers: Record<string, string> | undefined;
 
-  constructor(options?: { model?: string; dimensions?: number; baseUrl?: string; apiKey?: string }) {
+  constructor(options?: {
+    model?: string; dimensions?: number; baseUrl?: string; apiKey?: string; headers?: Record<string, string>;
+  }) {
     this.baseUrl = options?.baseUrl ?? deprecatedEnv('CODE_SEARCH_EMBEDDING_BASE_URL') ?? '';
     this.model = options?.model ?? deprecatedEnv('CODE_SEARCH_EMBEDDING_MODEL') ?? '';
     this.apiKey = options?.apiKey ?? deprecatedEnv('CODE_SEARCH_EMBEDDING_API_KEY');
+    this.headers = options?.headers;
     this.dimensions = options?.dimensions ?? 1024;
 
     if (!this.baseUrl) throw new Error('Embedding base URL required. Pass config.embedding.baseUrl or set CODE_SEARCH_EMBEDDING_BASE_URL');
@@ -535,6 +541,7 @@ export class OpenAICompatibleEmbedder implements EmbeddingProvider {
     const response = await embedFetch({
       url: `${this.baseUrl.replace(/\/$/, '')}/v1/embeddings`,
       apiKey: this.apiKey,
+      headers: this.headers,
       provider: 'Embedding',
       body: {
         model: this.model,
@@ -622,6 +629,7 @@ export function createEmbeddingProvider(
         dimensions: cfg.dimensions,
         baseUrl: cfg.baseUrl,
         apiKey: cfg.apiKey,
+        headers: cfg.headers,
       });
     case 'auto': {
       // Auto-detect: explicit baseUrl → openai-compatible; local Ollama →
@@ -633,6 +641,7 @@ export function createEmbeddingProvider(
           dimensions: cfg.dimensions,
           baseUrl: cfg.baseUrl,
           apiKey: cfg.apiKey,
+          headers: cfg.headers,
         });
       }
       if (isOllamaRunning(host)) {

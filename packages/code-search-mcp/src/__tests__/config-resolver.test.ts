@@ -23,6 +23,9 @@ const ENV_KEYS = [
   'CODE_SEARCH_AUTH_API_KEYS',
   'CODE_SEARCH_DATA_DIR',
   'CODE_SEARCH_REINDEX_INTERVAL',
+  'CODE_SEARCH_EMBEDDING_HEADERS',
+  'CODE_SEARCH_LLM_HEADERS',
+  'ANVIL_LLM_HEADERS',
 ];
 
 let tmp = '';
@@ -108,6 +111,40 @@ describe('toKnowledgeConfig (P3 adapter)', () => {
     // Reranker is a struct on both sides now.
     const r = typeof k.retrieval.reranker === 'string' ? { provider: k.retrieval.reranker } : k.retrieval.reranker;
     assert.equal(r.provider, cfg.reranker.provider);
+  });
+});
+
+describe('gateway request headers', () => {
+  const RAW = 'CF-Access-Client-Id=id.access,CF-Access-Client-Secret=s3cret';
+  const PARSED = { 'CF-Access-Client-Id': 'id.access', 'CF-Access-Client-Secret': 's3cret' };
+
+  it('CODE_SEARCH_EMBEDDING_HEADERS reach the embedder config', () => {
+    process.env.CODE_SEARCH_EMBEDDING_HEADERS = RAW;
+    const cfg = resolveCodeSearchConfig({ configPath: join(tmp, 'missing.yaml') });
+    assert.deepEqual(cfg.embedding.headers, PARSED);
+    assert.deepEqual(toKnowledgeConfig(cfg).embedding.headers, PARSED);
+  });
+
+  it('CODE_SEARCH_LLM_HEADERS reach agent-core as ANVIL_LLM_HEADERS', () => {
+    process.env.CODE_SEARCH_LLM_HEADERS = RAW;
+    const cfg = resolveCodeSearchConfig({ configPath: join(tmp, 'missing.yaml') });
+    assert.deepEqual(cfg.llm.headers, PARSED);
+    assert.equal(process.env.ANVIL_LLM_HEADERS, RAW);
+  });
+
+  it('llm.headers from YAML reach agent-core too', () => {
+    const file = join(tmp, 'config.yaml');
+    writeFileSync(file, 'llm:\n  headers:\n    CF-Access-Client-Id: id.access\n    CF-Access-Client-Secret: s3cret\n');
+    resolveCodeSearchConfig({ configPath: file });
+    assert.equal(process.env.ANVIL_LLM_HEADERS, RAW);
+  });
+
+  it('--print-config redacts every header value', () => {
+    const out = redactSecrets({ embedding: { headers: PARSED }, llm: { headers: PARSED } });
+    for (const h of [out.embedding.headers, out.llm.headers]) {
+      assert.match(h['CF-Access-Client-Id'], /redacted/);
+      assert.match(h['CF-Access-Client-Secret'], /redacted/);
+    }
   });
 });
 

@@ -49,7 +49,7 @@ With the default `auto` provider, the first available option wins:
 | **OpenAI** | `export OPENAI_API_KEY=…` |
 | **Voyage** | `export VOYAGE_API_KEY=…` |
 | **Mistral Codestral Embed** | `export MISTRAL_API_KEY=…` |
-| **Any OpenAI-compatible server** | `export CODE_SEARCH_EMBEDDING_BASE_URL=http://host:port/v1` (plus `_MODEL`, `_DIMENSIONS`, `_API_KEY` as needed) |
+| **Any OpenAI-compatible server** | `export CODE_SEARCH_EMBEDDING_BASE_URL=http://host:port` (no `/v1`: requests go to `<base>/v1/embeddings`; plus `_MODEL`, `_DIMENSIONS`, `_API_KEY`, `_HEADERS` as needed) |
 | **Gemini** | `export GEMINI_API_KEY=…`, or a logged-in Gemini CLI |
 
 To be explicit instead of relying on detection:
@@ -364,6 +364,7 @@ Every setting is also a flag: `--<dotted.path> <value>`, e.g.
 | `EMBEDDING_PROVIDER` | `auto` | `auto`, `ollama`, `openai`, `voyage`, `codestral`, `openai-compatible`, `gemini-oauth`, `custom` |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | per provider / `1024` | Model and vector size |
 | `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` | none | Credentials and endpoint |
+| `EMBEDDING_HEADERS` | none | Extra headers on every `openai-compatible` embedding request, as `Name=value,Name2=value2` — e.g. `CF-Access-Client-Id=…,CF-Access-Client-Secret=…` for a gateway behind Cloudflare Access. They never replace the API key's `Authorization` |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama endpoint |
 | `RERANKER_PROVIDER` | `ollama` | `ollama`, `cohere`, `voyage`, `openai-compatible`, `custom`, `none` |
 | `RERANKER_MODEL` / `RERANKER_API_KEY` / `RERANKER_BASE_URL` | `qwen2.5-coder:7b` for Ollama | Reranker settings |
@@ -409,6 +410,7 @@ Every setting is also a flag: `--<dotted.path> <value>`, e.g.
 |---|---|---|
 | `LLM_MODE` | `none` | `api` or `cli` turns on LLM-written repository profiles and service-mesh inference |
 | `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | `anthropic` / `sonnet` | The model that writes profiles and infers the service mesh. `anthropic` calls Anthropic's API (`ANTHROPIC_API_KEY` also works as the key). Any other provider (e.g. `openai-compatible`) posts to `<LLM_BASE_URL>/v1/chat/completions` with `LLM_MODEL` as is — an OpenAI-compatible endpoint or a gateway such as LiteLLM or OpenRouter. Give the base URL without `/v1` |
+| `LLM_HEADERS` | none | Extra headers on every LLM API request, same `Name=value,…` format as `EMBEDDING_HEADERS` (passed to agent-core as `ANVIL_LLM_HEADERS`) |
 
 ### Observability
 

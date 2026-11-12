@@ -77,8 +77,20 @@ interface LlmConfig {
   llmModel: string;
   llmApiKey: string | undefined;
   llmBaseUrl: string | undefined;
+  /** Extra headers on every API request (ANVIL_LLM_HEADERS), e.g. a gateway's access headers. */
+  llmHeaders: Record<string, string>;
   claudeBin: string;
   geminiBin: string;
+}
+
+/** `Name=value,Name2=value2` → headers. A value may itself contain `=`. */
+function parseHeaderList(raw: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const pair of (raw ?? '').split(',')) {
+    const eq = pair.indexOf('=');
+    if (eq > 0) out[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+  return out;
 }
 
 let _cachedConfig: LlmConfig | null = null;
@@ -133,6 +145,7 @@ function loadLlmConfig(): LlmConfig {
     llmModel: readAliased('ANVIL_LLM_MODEL', 'CODE_SEARCH_LLM_MODEL') ?? 'sonnet',
     llmApiKey: apiKey,
     llmBaseUrl: readAliased('ANVIL_LLM_BASE_URL', 'CODE_SEARCH_LLM_BASE_URL'),
+    llmHeaders: parseHeaderList(process.env.ANVIL_LLM_HEADERS),
     claudeBin,
     geminiBin,
   };
@@ -440,8 +453,11 @@ async function runViaApi(
 
     let body: string;
     let headers: Record<string, string>;
+    // Extra headers first, so they can add to a request but never replace its
+    // content type or credentials.
     if (isAnthropic) {
       headers = {
+        ...config.llmHeaders,
         'Content-Type': 'application/json',
         'x-api-key': config.llmApiKey,
         'anthropic-version': '2023-06-01',
@@ -454,6 +470,7 @@ async function runViaApi(
       });
     } else {
       headers = {
+        ...config.llmHeaders,
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${config.llmApiKey}`,
       };

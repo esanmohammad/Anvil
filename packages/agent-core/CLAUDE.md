@@ -66,6 +66,9 @@ belong in ADRs, not here.
   (provider `anthropic`, short names resolved via `resolveModelAlias`) or,
   for any other provider, to `<ANVIL_LLM_BASE_URL>/v1/chat/completions`
   with the model id as is (any OpenAI-compatible endpoint or gateway).
+  `ANVIL_LLM_HEADERS` (`Name=value,…`) adds headers to every API request —
+  e.g. a gateway's access headers — without replacing its content type or
+  credentials.
 - Agent lifecycle layer at `src/agent/session/`:
   - `AgentProcess` — one logical agent. EventEmitter, supports `start()` →
     `sendInput()` resume → `kill()`.
