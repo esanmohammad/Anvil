@@ -33,7 +33,7 @@
 import { spawn, execSync, ChildProcess } from 'node:child_process';
 import { withInvokeSpan } from './telemetry/instrument.js';
 import { GenAi } from './telemetry/attributes.js';
-import { calculateCostBreakdown } from './cost.js';
+import { calculateCostBreakdown, resolveModelAlias } from './cost.js';
 import {
   getFetchPool,
   recycleFetchPoolOnFailure,
@@ -137,6 +137,11 @@ function loadLlmConfig(): LlmConfig {
     geminiBin,
   };
   return _cachedConfig;
+}
+
+/** The model a call without its own `model` uses: `ANVIL_LLM_MODEL`, default `sonnet`. */
+export function getLlmModel(): string {
+  return loadLlmConfig().llmModel;
 }
 
 /** Test seam — reset cached config (call between tests that override env). */
@@ -442,7 +447,7 @@ async function runViaApi(
         'anthropic-version': '2023-06-01',
       };
       body = JSON.stringify({
-        model,
+        model: resolveModelAlias(model),
         max_tokens: 8192,
         system: [{ type: 'text', text: systemPrompt }],
         messages: [{ role: 'user', content: prompt }],

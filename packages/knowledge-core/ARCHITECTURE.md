@@ -655,7 +655,8 @@ edges between repos. Exported only; `buildKB` doesn't call it.
    (manifests, READMEs, entry points, top-level config) capped at
    `MAX_FINGERPRINT_CHARS = 6000`.
 2. Skip if `fingerprintHash` matches existing `profile.json`.
-3. Send to LLM with the `PROFILER_SYSTEM_PROMPT`. Concurrency capped at
+3. Send to LLM with the `PROFILER_SYSTEM_PROMPT` — the configured model
+   (`getLlmModel()`) unless `opts.model` names one. Concurrency capped at
    `MAX_CONCURRENT = 3`.
 4. Parse JSON → `RepoProfile`. Write to `<basePath>/<repo>/profile.json`.
 
@@ -669,7 +670,8 @@ edges between repos. Exported only; `buildKB` doesn't call it.
   every other repo's `exposes`. `normalizeIdentifier` (lowercase,
   collapse separators, strip version prefixes, normalize path params)
   enables fuzzy matching.
-- **Phase B** — LLM gap-fill for orphan repos (no detected edges).
+- **Phase B** — LLM gap-fill for orphan repos (no detected edges), with
+  the same model choice as the profiler.
 
 Returns `CrossRepoEdge[]` to feed into `ProjectGraphBuilder`.
 
@@ -683,7 +685,8 @@ hallucination_count?, similarity?, overall }, costs, durations }`.
 
 **Deprecated re-export** of `@anvil/agent-core`'s
 `single-shot.ts`. Re-exports `runLLM`, `runClaude`, `runGemini`,
-`isLlmAvailable`, `resetLlmConfig`, `LLMRunOptions`, `ClaudeResult`.
+`isLlmAvailable`, `getLlmModel`, `resetLlmConfig`, `LLMRunOptions`,
+`ClaudeResult`.
 
 ## 19. Indexer (`src/indexer.ts`)
 

@@ -9,7 +9,7 @@
  * Phase B: LLM gap-filling for orphan repos with no detected connections.
  */
 
-import { runLLM } from './claude-runner.js';
+import { runLLM, getLlmModel } from './claude-runner.js';
 import type { RepoProfile, ServiceEndpoint, CrossRepoEdge } from '@esankhan3/anvil-knowledge-core';
 
 // ---------------------------------------------------------------------------
@@ -295,7 +295,7 @@ export async function inferOrphanConnections(
 
   const userPrompt = `The following repos have NO detected connections to any other repo:\n${JSON.stringify(orphanNames, null, 2)}\n\nHere are profiles of those repos and their domain neighbors:\n${JSON.stringify(slimProfiles, null, 2)}\n\nIdentify likely connections between these orphan repos and any other repo listed above.`;
 
-  const model = opts?.model ?? 'claude-sonnet-4-6';
+  const model = opts?.model ?? getLlmModel();
 
   const result = await runLLM(
     userPrompt,

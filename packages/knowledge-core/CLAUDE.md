@@ -180,12 +180,15 @@ store, hybrid retrieval, project graph, structural hashing, repo profiling.
 ### LLM-driven
 - `profileProject` / `loadProfile` / `loadAllProfiles` (`src/repo-profiler.ts`)
   — fingerprint files → LLM → `RepoProfile`. Cached by fingerprint hash.
-  `buildKB` runs it only when `isLlmAvailable()`.
+  `buildKB` runs it only when `isLlmAvailable()`. Without `opts.model` it
+  uses the configured model (`getLlmModel()` = `ANVIL_LLM_MODEL`), recorded
+  as `profiledBy`.
 - `inferServiceMesh` (`src/service-mesh-inferrer.ts`) — Phase A
   deterministic endpoint matching (similarity-scored) + Phase B LLM
-  gap-fill for orphan repos. `buildKB` runs it only when `isLlmAvailable()`.
+  gap-fill for orphan repos (configured model, as for profiling). `buildKB`
+  runs it only when `isLlmAvailable()`.
 - `runLLM` / `runClaude` / `runGemini` / `isLlmAvailable` /
-  `resetLlmConfig` (`src/claude-runner.ts`) — **deprecated re-export**
+  `getLlmModel` / `resetLlmConfig` (`src/claude-runner.ts`) — **deprecated re-export**
   of `@anvil/agent-core`'s `single-shot.ts`. Kept so existing importers
   (repo-profiler, service-mesh-inferrer, rag-evaluator, indexer) keep
   working without rewrites.
