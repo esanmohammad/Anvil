@@ -408,7 +408,7 @@ Every setting is also a flag: `--<dotted.path> <value>`, e.g.
 | Variable (`CODE_SEARCH_…`) | Default | Purpose |
 |---|---|---|
 | `LLM_MODE` | `none` | `api` or `cli` turns on LLM-written repository profiles and service-mesh inference |
-| `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | `anthropic` / `sonnet` | LLM settings |
+| `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | `anthropic` / `sonnet` | The model that writes profiles and infers the service mesh. `anthropic` calls Anthropic's API (`ANTHROPIC_API_KEY` also works as the key). Any other provider (e.g. `openai-compatible`) posts to `<LLM_BASE_URL>/v1/chat/completions` with `LLM_MODEL` as is — an OpenAI-compatible endpoint or a gateway such as LiteLLM or OpenRouter. Give the base URL without `/v1` |
 
 ### Observability
 

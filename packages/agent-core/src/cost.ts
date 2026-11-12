@@ -71,6 +71,11 @@ const MODEL_ALIASES: Record<string, string> = {
   'claude-haiku-4':    'claude-haiku-4-5',
 };
 
+/** The model id an Anvil short name (`sonnet`) stands for; any other id unchanged. */
+export function resolveModelAlias(model: string): string {
+  return MODEL_ALIASES[model.toLowerCase()] ?? model;
+}
+
 // ── Lookup ────────────────────────────────────────────────────────────────
 
 /**

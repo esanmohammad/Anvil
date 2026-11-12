@@ -12,6 +12,7 @@ export {
   runClaude,
   runGemini,
   isLlmAvailable,
+  getLlmModel,
   resetLlmConfig,
   type LLMRunOptions,
   type ClaudeResult,

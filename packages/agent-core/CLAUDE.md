@@ -61,6 +61,11 @@ belong in ADRs, not here.
   `instrumentModelAdapter` at registration time.
 - Single-shot runner: `runLLM` / `runClaude` / `runGemini` (`src/single-shot.ts`).
   Spawns a CLI subprocess or hits the HTTP API based on `ANVIL_LLM_MODE`.
+  A call without its own `model` uses `getLlmModel()` (`ANVIL_LLM_MODEL`,
+  default `sonnet`). The API transport posts to Anthropic's Messages API
+  (provider `anthropic`, short names resolved via `resolveModelAlias`) or,
+  for any other provider, to `<ANVIL_LLM_BASE_URL>/v1/chat/completions`
+  with the model id as is (any OpenAI-compatible endpoint or gateway).
 - Agent lifecycle layer at `src/agent/session/`:
   - `AgentProcess` — one logical agent. EventEmitter, supports `start()` →
     `sendInput()` resume → `kill()`.

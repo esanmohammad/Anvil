@@ -10,7 +10,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
-import { runLLM } from './claude-runner.js';
+import { runLLM, getLlmModel } from './claude-runner.js';
 import type { RepoProfile } from '@esankhan3/anvil-knowledge-core';
 import type { KnowledgeConfig } from './config.js';
 import { FsBlobStore } from './storage/fs-blob-store.js';
@@ -340,7 +340,7 @@ export async function profileRepo(
   fingerprint: RepoFingerprint,
   opts?: { model?: string; provider?: 'claude' | 'gemini' },
 ): Promise<RepoProfile> {
-  const model = opts?.model ?? 'claude-sonnet-4-6';
+  const model = opts?.model ?? getLlmModel();
 
   const fingerprintText = buildFingerprintText(fingerprint);
 
