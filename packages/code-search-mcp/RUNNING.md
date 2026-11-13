@@ -238,7 +238,9 @@ claude mcp add --transport http code-search http://search.example.internal:3100/
 
 **Scale across cores:** `CODE_SEARCH_WORKERS=4` forks four HTTP workers on
 the same port. The primary process does all indexing; workers only serve.
-Status, readiness and rate limits are consistent across workers.
+Status, readiness and rate limits are consistent across workers. Each process
+(the primary and every worker) has its own LanceDB cache, up to about 7 GB by
+default; `CODE_SEARCH_STORAGE_CACHE_MAX_BYTES` caps it per process.
 
 **Per-project access and quotas:** create
 `<dataDir>/projects/acme/project.yaml`:
