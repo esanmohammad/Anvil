@@ -79,13 +79,15 @@ describe('resolveStorage().vectors — real LanceDB round-trip (P0b wiring)', ()
     }
   });
 
-  // P1b — a resolved storage.cache builds a bounded LanceDB Session. Proves the
-  // `new Session(...)` + connect(uri, opts, session) wiring is accepted by the
-  // real native binding and doesn't break the round-trip (local store; the
-  // Session path is backend-agnostic, so this also covers the S3 path).
+  // P1b — a resolved storage.cache builds a bounded LanceDB Session and the
+  // connection actually uses it (its caches fill on a search: a Session the
+  // connection ignored stays at an unused Session's size), without breaking the
+  // round-trip (local store; the Session path is backend-agnostic, so this also
+  // covers the S3 path).
   it('round-trips with a bounded RAM cache Session (storage.cache)', async (t) => {
+    let lancedb: typeof import('@lancedb/lancedb');
     try {
-      await import('@lancedb/lancedb');
+      lancedb = await import('@lancedb/lancedb');
     } catch {
       t.skip('lancedb native binding unavailable on this platform');
       return;
@@ -111,6 +113,10 @@ describe('resolveStorage().vectors — real LanceDB round-trip (P0b wiring)', ()
       assert.equal((await v.getStats())?.rowCount, 2);
       const near = await v.vectorSearch(e1, { limit: 1 });
       assert.equal(near[0]?.chunk.id, 'a');
+      const session = (v as unknown as { session?: { sizeBytes(): bigint } }).session;
+      assert.ok(session, 'a bounded cache builds a Session');
+      const unused = new lancedb.Session(48n * 1024n * 1024n, 16n * 1024n * 1024n).sizeBytes();
+      assert.ok(session.sizeBytes() > unused, `the connection must use the bounded Session (size ${session.sizeBytes()} = unused ${unused})`);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

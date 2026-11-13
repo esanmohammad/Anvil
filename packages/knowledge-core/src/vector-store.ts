@@ -95,6 +95,7 @@ export class VectorStore implements VectorStorePort {
   private dbPath: string;
   private storageOptions?: Record<string, string>;
   private cacheBudget?: { indexCacheBytes: number; metadataCacheBytes: number };
+  private session?: any; // lancedb.Session built from cacheBudget
   private indexConfig?: IvfPqIndexConfig;
   private initialized: boolean = false;
   private columnsEnsured = false;
@@ -107,8 +108,8 @@ export class VectorStore implements VectorStorePort {
    *  (`s3://bucket/prefix`). `storageOptions` carries the LanceDB/object_store
    *  S3 connection knobs (endpoint, region, path-style, …) for MinIO; omit for
    *  local. Access key/secret are read from the environment by object_store.
-   *  `cacheBudget` (S3 deployments) bounds LanceDB's in-RAM index/metadata
-   *  Session caches so a memory-limited pod stays under its limit; omit ⇒
+   *  `cacheBudget` bounds LanceDB's in-RAM index/metadata Session caches (per
+   *  process, local or S3) so a memory-limited pod stays under its limit; omit ⇒
    *  LanceDB defaults (≈6 GiB / 1 GiB). LanceDB has no on-disk fragment cache,
    *  so this RAM Session is the only adapter-level caching lever (ADR §5.5).
    *  `indexConfig` (ADR §5.5, `storage.vector.lancedb.index`) enables the IVF_PQ
@@ -130,13 +131,15 @@ export class VectorStore implements VectorStorePort {
     return !/^[a-z0-9]+:\/\//i.test(this.dbPath);
   }
 
-  /** Positional args for `lancedb.connect(uri, options?, session?)`. */
-  private connectArgs(
-    session?: any, // lancedb.Session — matches the `any` lancedb types used throughout
-  ): [string, { storageOptions: Record<string, string> }?, any?] {
-    const opts = this.storageOptions ? { storageOptions: this.storageOptions } : undefined;
-    if (session) return [this.dbPath, opts, session];
-    return opts ? [this.dbPath, opts] : [this.dbPath];
+  /** Options for `lancedb.connect({ uri, … })`. The object form, because the
+   *  `connect(uri, options, session)` overload never passes the session on
+   *  (LanceDB 0.27), which left the cache budget without effect. */
+  private connectOptions(): { uri: string; storageOptions?: Record<string, string>; session?: any } {
+    return {
+      uri: this.dbPath,
+      ...(this.storageOptions ? { storageOptions: this.storageOptions } : {}),
+      ...(this.session ? { session: this.session } : {}),
+    };
   }
 
   /** Initialize connection, create or open table.
@@ -154,18 +157,18 @@ export class VectorStore implements VectorStorePort {
         '@lancedb/lancedb is not installed. Install it with: npm install @lancedb/lancedb',
       );
     }
-    // Bounded in-RAM Session (S3 deployments) — index + metadata caches sized
-    // from storage.cache. Built only when a budget was resolved; otherwise
-    // connect() with no session uses LanceDB defaults (today's behavior). The
-    // `Session` export guards a binding too old to have it (native optional dep).
-    const session =
+    // Bounded in-RAM Session — index + metadata caches sized from storage.cache.
+    // Built only when a budget was resolved; otherwise connect() with no session
+    // uses LanceDB defaults (≈6 GiB / 1 GiB). The `Session` export guards a
+    // binding too old to have it (native optional dep).
+    this.session =
       this.cacheBudget && lancedb.Session
         ? new lancedb.Session(
             BigInt(this.cacheBudget.indexCacheBytes),
             BigInt(this.cacheBudget.metadataCacheBytes),
           )
         : undefined;
-    this.db = await lancedb.connect(...this.connectArgs(session));
+    this.db = await lancedb.connect(this.connectOptions());
     try {
       this.table = await this.db.openTable('chunks');
       // A 0-byte fragment from a killed-mid-write often opens fine but throws on
@@ -190,7 +193,7 @@ export class VectorStore implements VectorStorePort {
         if (this.isLocal) {
           try { rmSync(this.dbPath, { recursive: true, force: true }); } catch { /* best effort */ }
         }
-        this.db = await lancedb.connect(...this.connectArgs(session));
+        this.db = await lancedb.connect(this.connectOptions());
       }
       // else: table doesn't exist yet (first run) — created on first upsert.
     }
